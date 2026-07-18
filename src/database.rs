@@ -111,30 +111,48 @@ impl Database {
         }
     }
 
-    /// `FROM`を伴わない`SELECT`。式リストをその場で評価するだけで、行は常に
-    /// ちょうど1件返る。
+    /// `FROM`を伴わない`SELECT`。列を1つも持たない空の`Schema`に対する、値も
+    /// 持たないちょうど1件のタプルを暗黙の入力とみなして実行する。
     ///
-    /// `FROM`が無いので列参照できる列は無く、`executor::infer_type`に渡す
-    /// `Schema`は空(`Schema::new(Vec::new())`)になる。`FROM`を伴う`SELECT`
-    /// (`execute_select_with_from`、`executor::project`が担う)と同じく、
-    /// 各射影式を`eval_expr`で実際に評価する前に`executor::infer_type`で
-    /// 静的に型検査する。`eval_arith`のような実行時の評価関数は、両辺の型を
-    /// 検査するより先に`NULL`を伝播させて早期リターンするため、この静的検査を
-    /// 経由しない経路のままだと`SELECT NULL + 'x'`のような型不正の式が
-    /// `NULL`として黙って成功してしまう(`FROM`を伴う`SELECT NULL + 'x' FROM t`は
-    /// `executor::project`がすでに`infer_type`で拒否する)。`FROM`の有無で
-    /// 成否が変わらないよう、こちらの経路にも同じ静的検査を先に通す。
-    /// 構文としてだけ受理する(`from`が無いと意味を持たない)`WHERE`句も、
-    /// 同じ理由で`executor::check_predicate_type`にかけておく。
+    /// `WHERE`があれば、この1件のタプルに対して`executor::filter`をそのまま
+    /// かける。`filter`は`FROM`を伴う`SELECT`(`execute_select_with_from`)でも
+    /// 使っている演算子で、内部で`executor::check_predicate_type`による静的な
+    /// 型検査と、`executor::predicate_matches`による三値論理の絞り込みの両方を
+    /// 行う。この1件を再利用することで、`WHERE`句の意味論(`TRUE`なら1行、
+    /// `FALSE`または`NULL`なら0行)を`FROM`を伴う`SELECT`と同じコードで揃える。
+    /// `WHERE`が無ければ、常に1件がそのまま残ったものとして扱う。
+    ///
+    /// 出力列の型は、`FROM`を伴う`SELECT`(`executor::project`)と同じく
+    /// `executor::infer_type`が静的に決める。`eval_arith`のような実行時の
+    /// 評価関数は、両辺の型を検査するより先に`NULL`を伝播させて早期リターン
+    /// するため、この静的検査を経由しない経路のままだと`SELECT NULL + 'x'`の
+    /// ような型不正の式が`NULL`として黙って成功したり、`SELECT NULL + 1`の
+    /// ような型として正しい式でも、実際に評価した`Value`の型(`NULL`は
+    /// `data_type()`が`None`)から列の型を決めてしまい、`FROM`を伴う場合と
+    /// 異なる型(`TEXT`)になってしまったりする。`infer_type`が返す`Some(T)`を
+    /// そのまま列の型として使い、`None`(`NULL`単体などで型が定まらない場合)
+    /// だけを`TEXT`のプレースホルダーで代用することで、`FROM`の有無に関係なく
+    /// 同じ列の型になる。
+    ///
+    /// `WHERE`が`TRUE`にならなかった場合、この1件は結果に含まれないため、
+    /// 射影式は`executor::project`が0件の行を評価しないのと同じ理由で評価しない
+    /// (値に依存するエラーがもし起きても、そもそも結果に含まれない行なので
+    /// 表面化させない)。
     fn execute_select_without_from(
         &self,
         sql: &str,
         select: &SelectStatement,
     ) -> DbResult<QueryResult> {
         let empty_schema = Schema::new(Vec::new());
-        if let Some(predicate) = &select.where_clause {
-            executor::check_predicate_type(predicate, &empty_schema, &self.functions)?;
-        }
+        let implicit_row = Tuple::new(&empty_schema, Vec::new())
+            .expect("空のSchemaに対する空の値の並びは常にスキーマ検査を通る");
+        let matched = match &select.where_clause {
+            Some(predicate) => {
+                !executor::filter(&empty_schema, &self.functions, vec![implicit_row], predicate)?
+                    .is_empty()
+            }
+            None => true,
+        };
 
         let mut columns = Vec::with_capacity(select.items.len());
         let mut values = Vec::with_capacity(select.items.len());
@@ -147,25 +165,35 @@ impl Database {
                     ));
                 }
             };
-            executor::infer_type(expr, &empty_schema, &self.functions)?;
-            let value = eval::eval_expr(expr, &self.functions, None)?;
-            // `Value::Null`はどの`DataType`にも属さないため、結果列の表示用の型を
-            // 決められない。この章ではPostgreSQLの`unknown`型のような専用の型を
-            // 別途設けず、`TEXT`をプレースホルダーとして使う(値そのものは
-            // `Value::Null`のままなので、表示や後続の計算がこの選択に影響されることはない)。
-            let data_type = value.data_type().unwrap_or(DataType::Text);
-            let nullable = value.is_null();
+            // `infer_type`が型を決められない(`None`を返す)式は`TEXT`で代用する。
+            // このプレースホルダーの理由は`executor::infer_type`のドキュメント
+            // コメント参照。
+            let data_type =
+                executor::infer_type(expr, &empty_schema, &self.functions)?.unwrap_or(DataType::Text);
             let name = sql[item.span().start..item.span().end].to_string();
-            columns.push(Column::new(name, data_type, nullable));
-            values.push(value);
+
+            if matched {
+                let value = eval::eval_expr(expr, &self.functions, None)?;
+                columns.push(Column::new(name, data_type, value.is_null()));
+                values.push(value);
+            } else {
+                // この1件は`WHERE`で除外されたので評価しない。`nullable`は
+                // `executor::project`の計算列と同じく常に`true`にする(行ごとに
+                // `NULL`になったりならなかったりしうるため)。
+                columns.push(Column::new(name, data_type, true));
+            }
         }
 
         let schema = Schema::new(columns);
-        let tuple = Tuple::new(&schema, values)?;
+        let rows = if matched {
+            vec![Tuple::new(&schema, values)?]
+        } else {
+            Vec::new()
+        };
 
         Ok(QueryResult {
             schema,
-            rows: vec![tuple],
+            rows,
             command_tag: None,
         })
     }
@@ -520,6 +548,132 @@ mod tests {
 
         assert_eq!(without_from_message, empty_from_message);
         assert_eq!(without_from_message, populated_from_message);
+    }
+
+    #[test]
+    fn select_without_from_where_true_returns_the_one_row() {
+        let mut db = Database::memory();
+        let result = db.execute("SELECT 1 WHERE TRUE;").unwrap();
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::BigInt(1)]);
+    }
+
+    #[test]
+    fn select_without_from_where_false_returns_no_rows() {
+        // `FROM`が無い`SELECT`は、列を持たない空の`Schema`に対するちょうど1件の
+        // タプルを暗黙の入力とみなす。`WHERE FALSE`はその1件を除外するので、
+        // 結果は0行になる(以前は`WHERE`が全く評価されず常に1行返っていた)。
+        let mut db = Database::memory();
+        let result = db.execute("SELECT 1 WHERE FALSE;").unwrap();
+        assert!(result.rows().is_empty());
+    }
+
+    #[test]
+    fn select_without_from_where_null_returns_no_rows() {
+        // `NULL`(UNKNOWN)も`FALSE`と同じく「一致しなかった」側に含まれるので、
+        // 0行になる。
+        let mut db = Database::memory();
+        let result = db.execute("SELECT 1 WHERE NULL;").unwrap();
+        assert!(result.rows().is_empty());
+    }
+
+    #[test]
+    fn select_without_from_where_non_boolean_is_an_eval_error() {
+        // `WHERE 1`のような`BOOLEAN`でも`NULL`でもない述語は、`FROM`を伴う
+        // `SELECT`と同じく`DbError::Eval`になる(黙って0行や1行にはしない)。
+        let mut db = Database::memory();
+        let result = db.execute("SELECT 1 WHERE 1;");
+        assert!(matches!(result, Err(DbError::Eval(_))));
+    }
+
+    #[test]
+    fn select_without_from_where_false_skips_evaluating_the_projection() {
+        // `WHERE`が`TRUE`にならなかった1件は結果に含まれないため、射影式は
+        // 評価しない。`1 / 0`は値に依存するエラーだが、この行がそもそも結果に
+        // 含まれないので表面化しない(`executor::project`がフィルタ後の行だけを
+        // 評価するのと同じ理由)。
+        let mut db = Database::memory();
+        let result = db.execute("SELECT 1 / 0 WHERE FALSE;").unwrap();
+        assert!(result.rows().is_empty());
+    }
+
+    #[test]
+    fn null_plus_bigint_column_type_matches_with_and_without_from() {
+        // 以前は`FROM`が無い経路の結果列の型を、実際に評価した`Value`の
+        // `data_type()`(`NULL`なら`None`)から決めていたため、`NULL + 1`の列の
+        // 型が`FROM`が無ければ`TEXT`、`FROM`があれば(`infer_type`が静的に
+        // `BigInt`と決めるので)`BIGINT`という食い違いが起きていた。
+        // `infer_type`の`Some(DataType)`をそのまま列の型に使うことで一致する。
+        let without_from = Database::memory().execute("SELECT NULL + 1;").unwrap();
+
+        let mut empty_db = users_db();
+        let empty_from = empty_db.execute("SELECT NULL + 1 FROM users").unwrap();
+
+        let mut populated_db = users_db();
+        populated_db
+            .execute("INSERT INTO users VALUES (1, 'Alice')")
+            .unwrap();
+        let populated_from = populated_db.execute("SELECT NULL + 1 FROM users").unwrap();
+
+        assert_eq!(without_from.schema().columns()[0].data_type, DataType::BigInt);
+        assert_eq!(
+            without_from.schema().columns()[0].data_type,
+            empty_from.schema().columns()[0].data_type
+        );
+        assert_eq!(
+            without_from.schema().columns()[0].data_type,
+            populated_from.schema().columns()[0].data_type
+        );
+    }
+
+    #[test]
+    fn abs_of_null_column_type_matches_with_and_without_from() {
+        let without_from = Database::memory().execute("SELECT abs(NULL);").unwrap();
+
+        let mut empty_db = users_db();
+        let empty_from = empty_db.execute("SELECT abs(NULL) FROM users").unwrap();
+
+        let mut populated_db = users_db();
+        populated_db
+            .execute("INSERT INTO users VALUES (1, 'Alice')")
+            .unwrap();
+        let populated_from = populated_db.execute("SELECT abs(NULL) FROM users").unwrap();
+
+        assert_eq!(without_from.schema().columns()[0].data_type, DataType::BigInt);
+        assert_eq!(
+            without_from.schema().columns()[0].data_type,
+            empty_from.schema().columns()[0].data_type
+        );
+        assert_eq!(
+            without_from.schema().columns()[0].data_type,
+            populated_from.schema().columns()[0].data_type
+        );
+    }
+
+    #[test]
+    fn bare_null_column_type_matches_with_and_without_from() {
+        // `NULL`単体は`infer_type`が`None`(型が定まらない)を返す唯一のケースで、
+        // `FROM`の有無に関係なく`TEXT`のプレースホルダーに揃う。
+        let without_from = Database::memory().execute("SELECT NULL;").unwrap();
+
+        let mut empty_db = users_db();
+        let empty_from = empty_db.execute("SELECT NULL FROM users").unwrap();
+
+        let mut populated_db = users_db();
+        populated_db
+            .execute("INSERT INTO users VALUES (1, 'Alice')")
+            .unwrap();
+        let populated_from = populated_db.execute("SELECT NULL FROM users").unwrap();
+
+        assert_eq!(without_from.schema().columns()[0].data_type, DataType::Text);
+        assert_eq!(
+            without_from.schema().columns()[0].data_type,
+            empty_from.schema().columns()[0].data_type
+        );
+        assert_eq!(
+            without_from.schema().columns()[0].data_type,
+            populated_from.schema().columns()[0].data_type
+        );
     }
 
     #[test]

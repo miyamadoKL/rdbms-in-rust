@@ -59,10 +59,14 @@ pub struct Ident {
 pub struct SelectStatement {
     /// `SELECT`の直後に並ぶ、カンマ区切りの式リスト。
     pub items: Vec<SelectItem>,
-    /// `FROM <table>`。省略した`SELECT`は式だけを評価し、行は1件だけ返す。
+    /// `FROM <table>`。省略した`SELECT`は、列を持たない空のSchemaに対する
+    /// 1件のタプルを暗黙の入力とみなして実行する(`where_clause`のドキュメント
+    /// コメント参照)。
     pub from: Option<Ident>,
-    /// `WHERE <expr>`。`from`を伴わない`SELECT`では構文としては受理するが、
-    /// 意味を持たない。
+    /// `WHERE <expr>`。`from`を伴わない`SELECT`でも構文として受理するだけでなく、
+    /// 意味も持つ。`from`が無い`SELECT`は、この1件の暗黙のタプルに対して
+    /// `where_clause`を適用し、`TRUE`なら1行、`FALSE`または`NULL`(UNKNOWN)なら
+    /// 0行を返す(`database`モジュールの`execute_select_without_from`参照)。
     pub where_clause: Option<Expr>,
     pub span: Span,
 }

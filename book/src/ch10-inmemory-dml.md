@@ -407,7 +407,13 @@ minidb> SELECT id FROM users WHERE 1;
 `infer_type`による静的検査は、`FROM`を伴う`SELECT`(`executor::project`)と`WHERE`(`check_predicate_type`)にはすでに通っていますが、`FROM`を伴わない`SELECT`(第7章で導入した`execute_select_without_from`)には元は通っていませんでした。
 `execute_select_without_from`は各射影式を`eval::eval_expr`でその場で評価するだけだったため、`SELECT NULL + 'x'`のような型として誤った式が、`eval_arith`のNULL伝播(前章までで見たとおり、`if l.is_null() || r.is_null()`という早期リターンが型の検査より先に働く)にすり抜けられ、`NULL`として黙って成功してしまいます。
 一方、同じ式に`FROM`を付けた`SELECT NULL + 'x' FROM users`は、`executor::project`がすでに`infer_type`で拒否します。
-`FROM`の有無だけで成否が変わってしまうこの非対称を無くすため、`execute_select_without_from`にも`executor::infer_type`と`executor::check_predicate_type`を追加しました(`infer_type`と`check_predicate_type`はこの章のために`pub(crate)`にしています)。
+
+さらに、`WHERE`句そのものの扱いにも見落としがありました。
+第7章で`WHERE`の構文を受理したときは「`from`を伴わない`SELECT`では構文として受理するが、意味を持たない」という約束にしていましたが、これはSQL標準の挙動とは違います。
+標準的なSQLエンジンは、`FROM`が無い`SELECT`を「列を持たない空のテーブルに対する、値も持たないちょうど1行」を暗黙に読み取る`SELECT`とみなし、`WHERE`はその1行を通常どおり絞り込みます。
+`SELECT 1 WHERE FALSE`は0行、`SELECT 1 WHERE TRUE`は1行になるべきで、`WHERE`を無視して常に1行返す実装は誤りです。
+
+これらをまとめて直すため、`execute_select_without_from`を次のように書き直しました。
 
 ```rust
 fn execute_select_without_from(
@@ -416,9 +422,15 @@ fn execute_select_without_from(
     select: &SelectStatement,
 ) -> DbResult<QueryResult> {
     let empty_schema = Schema::new(Vec::new());
-    if let Some(predicate) = &select.where_clause {
-        executor::check_predicate_type(predicate, &empty_schema, &self.functions)?;
-    }
+    let implicit_row = Tuple::new(&empty_schema, Vec::new())
+        .expect("空のSchemaに対する空の値の並びは常にスキーマ検査を通る");
+    let matched = match &select.where_clause {
+        Some(predicate) => {
+            !executor::filter(&empty_schema, &self.functions, vec![implicit_row], predicate)?
+                .is_empty()
+        }
+        None => true,
+    };
 
     let mut columns = Vec::with_capacity(select.items.len());
     let mut values = Vec::with_capacity(select.items.len());
@@ -431,34 +443,69 @@ fn execute_select_without_from(
                 ));
             }
         };
-        executor::infer_type(expr, &empty_schema, &self.functions)?;
-        let value = eval::eval_expr(expr, &self.functions, None)?;
-        // `Value::Null`はどの`DataType`にも属さないため、結果列の表示用の型を
-        // 決められない。この章ではPostgreSQLの`unknown`型のような専用の型を
-        // 別途設けず、`TEXT`をプレースホルダーとして使う(値そのものは
-        // `Value::Null`のままなので、表示や後続の計算がこの選択に影響されることはない)。
-        let data_type = value.data_type().unwrap_or(DataType::Text);
-        let nullable = value.is_null();
+        // `infer_type`が型を決められない(`None`を返す)式は`TEXT`で代用する。
+        // このプレースホルダーの理由は`executor::infer_type`のドキュメント
+        // コメント参照。
+        let data_type =
+            executor::infer_type(expr, &empty_schema, &self.functions)?.unwrap_or(DataType::Text);
         let name = sql[item.span().start..item.span().end].to_string();
-        columns.push(Column::new(name, data_type, nullable));
-        values.push(value);
+
+        if matched {
+            let value = eval::eval_expr(expr, &self.functions, None)?;
+            columns.push(Column::new(name, data_type, value.is_null()));
+            values.push(value);
+        } else {
+            // この1件は`WHERE`で除外されたので評価しない。`nullable`は
+            // `executor::project`の計算列と同じく常に`true`にする(行ごとに
+            // `NULL`になったりならなかったりしうるため)。
+            columns.push(Column::new(name, data_type, true));
+        }
     }
 
     let schema = Schema::new(columns);
-    let tuple = Tuple::new(&schema, values)?;
+    let rows = if matched {
+        vec![Tuple::new(&schema, values)?]
+    } else {
+        Vec::new()
+    };
 
     Ok(QueryResult {
         schema,
-        rows: vec![tuple],
+        rows,
         command_tag: None,
     })
 }
 ```
 
-`FROM`が無いので列参照できる列は無く、`infer_type`と`check_predicate_type`に渡す`Schema`は空(`Schema::new(Vec::new())`)です。
-`WHERE`句は`from`が無いと構文としてだけ受理され意味を持たない(このクレートでは実際にフィルタしない)ままですが、型だけは同じ規則で検査しておきます。
+`FROM`が無いので列参照できる列は無く、`infer_type`に渡す`Schema`は空(`Schema::new(Vec::new())`)です。
+その空の`Schema`に対して、値も持たない空のタプル(`implicit_row`)をちょうど1件だけ用意し、`WHERE`があればそのままFilter演算子(`executor::filter`)にかけます。
+`filter`は`FROM`を伴う`SELECT`でもすでに使っている演算子で、内部で`check_predicate_type`による静的な型検査と`predicate_matches`による三値論理の絞り込みの両方を行うため、新しいコードを増やさずに同じ意味論を再利用できます。
+返ってきた`Vec`が空でなければ(`TRUE`)この1件は生き残り、空なら(`FALSE`または`NULL`)0件になり、`matched`という`bool`にまとめます。
+
+`matched`が`false`のとき、射影式はもう評価しません。
+`executor::project`がFilter演算子で絞り込んだ後の行だけを評価するのと同じ理由で、`WHERE`で除外された1件に対して値に依存するエラー(`1 / 0`など)が起きても表面化させないためです。
+列の型(`data_type`)は`matched`の真偽に関係なく、`infer_type`が静的に決めた型をそのまま使います。
+以前は評価した`Value`の`data_type()`(`NULL`なら`None`)から列の型を決めていたため、`SELECT NULL + 1`の列の型が`FROM`が無ければ`TEXT`、`FROM`があれば(`infer_type`が静的に`BigInt`と決めるので)`BIGINT`という食い違いが起きていました。
+`infer_type`が返す`Some(T)`をそのまま列の型として使い、`None`(`NULL`単体などで型が定まらない場合)だけを`TEXT`のプレースホルダーで代用することで、`FROM`の有無に関係なく同じ列の型になります。
+
+```console
+minidb> SELECT 1 WHERE TRUE;
+1
+-
+1
+(1 row)
+minidb> SELECT 1 WHERE FALSE;
+1
+-
+(0 rows)
+minidb> SELECT 1 WHERE NULL;
+1
+-
+(0 rows)
+```
+
 `SELECT NULL + 'x'`と`SELECT NULL + 'x' FROM users`は、テーブルが空でも行を持っていても、これで同じ`エラー`(`算術演算はBIGINT同士にのみ使えます: NULLとTEXT`)になります。
-逆に`SELECT NULL + 1`のように両辺が`BigInt`か`None`(型未定の`NULL`)であれば`infer_type`の検査を正しく通過するので、型として正しい式に対する`eval_arith`の`NULL`伝播(前章で述べたとおり)はそのまま働き、結果は`NULL`のまま成功します。
+逆に`SELECT NULL + 1`のように両辺が`BigInt`か`None`(型未定の`NULL`)であれば`infer_type`の検査を正しく通過するので、型として正しい式に対する`eval_arith`の`NULL`伝播(前章で述べたとおり)はそのまま働き、結果は`NULL`のまま成功し、列の型は`FROM`の有無によらず`BIGINT`になります。
 
 Filter演算子は、`守るべき不変条件`の1番目を、`check_predicate_type`と`predicate_matches`の2段構えでコードにしています。
 
