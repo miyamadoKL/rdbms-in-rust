@@ -5,11 +5,33 @@
 //! この章の演算子は、表全体を`Vec<Tuple>`としてまとめて受け取り、まとめて
 //! 返す素朴な関数にとどめる。`Database::execute`は、これらの関数を文の種類
 //! ごとに正しい順序で呼び出す配線役に徹する。
+//!
+//! # 行の供給源が2つある
+//!
+//! 第16章から、行の供給源は`MemTable`(第10章、プロセスのメモリ上)と
+//! `Storage`(第15章、ディスク上のファイル)の2つになった。`filter`・
+//! `project`は`Vec<Tuple>`だけを受け取る関数のままなので、供給源が
+//! どちらであっても変更なく使い回せる。変更が要るのは、供給源に直接触れる
+//! 演算子(`seq_scan`・`insert`・`update`・`delete`)だけである。それぞれに
+//! `storage_`を接頭辞に持つ対の関数(`storage_seq_scan`・`storage_insert`・
+//! `storage_update`・`storage_delete`)を追加し、既存の(接頭辞の無い)関数は
+//! `MemTable`向けのまま変えていない。
+//!
+//! 1つの関数を`enum`や`trait`で両対応させる案も検討したが、この章では見送った。
+//! `MemTable`は行を`Vec<Tuple>`の添字で直接指すのに対し、`Storage`は
+//! `RecordId`(第13章)で指す。`update`・`delete`が「どの行を書き換えるか」を
+//! 特定する手段そのものが両者で異なるため、共通化すると分岐だらけの抽象が
+//! 必要になる。将来Volcano Executor(第19章)が演算子をtraitとして抽象化する
+//! ときには、この共通化はそちらの設計に沿った形で自然に生まれる。先取りして
+//! 今traitを導入する理由はない。
 
 use crate::ast::{Assignment, BinaryOperator, Expr, Ident, SelectItem, UnaryOperator};
 use crate::error::{DbError, DbResult};
 use crate::eval::{FunctionRegistry, eval_expr};
+use crate::ids::{RecordId, TableId};
+use crate::storage::Storage;
 use crate::storage_mem::MemTable;
+use crate::tuple_codec::{decode_tuple, encode_tuple};
 use crate::types::{Column, DataType, Row, Schema, Tuple, Value};
 
 /// `WHERE`・`SET`の`predicate`が評価された結果を、SQLの三値論理に従って
@@ -84,6 +106,21 @@ pub(crate) fn check_predicate_type(
 /// 読む以外に行へたどり着く手段が無い。
 pub fn seq_scan(table: &MemTable) -> Vec<Tuple> {
     table.rows().to_vec()
+}
+
+/// Sequential Scan演算子の`Storage`版。`table_id`のテーブルが使う全ページを
+/// 先頭から順に読み、生きている(削除されていない)全タプルを`decode_tuple`
+/// (第13章)で復元して返す。
+///
+/// `Storage::scan`が返すのは`(RecordId, バイト列)`の組だが、ここでは
+/// `RecordId`を捨ててバイト列だけを`Tuple`へ復元する。`RecordId`は
+/// `storage_update`・`storage_delete`が書き換え・削除の対象を特定するのに
+/// 使うが、読み取るだけの`Sequential Scan`にはそもそも要らない。
+pub fn storage_seq_scan(storage: &Storage, table_id: TableId, schema: &Schema) -> DbResult<Vec<Tuple>> {
+    storage
+        .scan(table_id)?
+        .map(|entry| entry.and_then(|(_, bytes)| decode_tuple(schema, &bytes)))
+        .collect()
 }
 
 /// Filter演算子。`predicate`を各行に対して評価し、`TRUE`になった行だけを残す。
@@ -408,6 +445,56 @@ pub fn insert(
     columns: Option<&[Ident]>,
     rows: &[Vec<Expr>],
 ) -> DbResult<usize> {
+    let planned = plan_insert_rows(schema, functions, columns, rows)?;
+    let count = planned.len();
+    table.rows_mut().extend(planned);
+    Ok(count)
+}
+
+/// Insert演算子の`Storage`版。`plan_insert_rows`で全行を検証してから、
+/// 1件ずつ`encode_tuple`(第13章)でバイト列へ変換し、`Storage::insert`
+/// (第15章)へ渡す。
+///
+/// `plan_insert_rows`が全行を検証し終えるまでは`storage`に一切触れないため、
+/// 「一部の行だけ挿入されたINSERT」を避けるという不変条件は`insert`
+/// (`MemTable`版)と同じ形で保たれる。ただし、検証をすべて通過した後の
+/// `storage.insert`自体が個々の呼び出しで失敗する場合(たとえば
+/// `DbError::CatalogTooLarge`)は、その手前まで挿入済みの行を巻き戻さない。
+/// これは`Storage::insert`自身がすでに採用している割り切り(第15章)を
+/// そのまま引き継いだもので、この章のスコープでは新たに解決しない。
+pub fn storage_insert(
+    storage: &mut Storage,
+    table_id: TableId,
+    schema: &Schema,
+    functions: &FunctionRegistry,
+    columns: Option<&[Ident]>,
+    rows: &[Vec<Expr>],
+) -> DbResult<usize> {
+    let planned = plan_insert_rows(schema, functions, columns, rows)?;
+    let count = planned.len();
+    for tuple in planned {
+        let bytes = encode_tuple(schema, &tuple);
+        storage.insert(table_id, &bytes)?;
+    }
+    Ok(count)
+}
+
+/// `VALUES`の各行を評価し、`Tuple::new`によるスキーマ検査に通った`Tuple`の
+/// 並びを返す。`insert`・`storage_insert`の両方が使う共通部分で、供給源
+/// (`MemTable`か`Storage`か)には一切触れない。
+///
+/// 検査は`table`または`storage`へ1行も書き込む前に、全行に対して済ませる。
+/// 3行目の型が`NOT NULL`列に違反していた場合、1・2行目の検査がどれだけ
+/// 成功していても、`?`によってその場で打ち切られ、呼び出し元は何も
+/// 書き込まない。「一部だけ挿入された`INSERT`」という中途半端な状態を避ける
+/// この順序は、`CREATE TABLE`が列定義を1つずつ検査してから最後に1回だけ
+/// 登録する(第9章)のと同じ考え方である。
+fn plan_insert_rows(
+    schema: &Schema,
+    functions: &FunctionRegistry,
+    columns: Option<&[Ident]>,
+    rows: &[Vec<Expr>],
+) -> DbResult<Vec<Tuple>> {
     let mut planned = Vec::with_capacity(rows.len());
     for row_exprs in rows {
         // `VALUES`の各要素は、テーブルの行を伴わない文脈で評価する。
@@ -420,10 +507,7 @@ pub fn insert(
         let full_values = expand_to_schema(schema, columns, evaluated)?;
         planned.push(Tuple::new(schema, full_values)?);
     }
-
-    let count = planned.len();
-    table.rows_mut().extend(planned);
-    Ok(count)
+    Ok(planned)
 }
 
 /// 列名指定(`INSERT INTO t (a, b) VALUES ...`)がある場合に、評価済みの値を
@@ -516,6 +600,64 @@ pub fn update(
     Ok(count)
 }
 
+/// Update演算子の`Storage`版。`update`(`MemTable`版)が書き換え対象を`Vec`の
+/// 添字で直接指すのに対し、こちらは`Storage::scan`(第15章)が返す
+/// `(RecordId, バイト列)`から`RecordId`(第13章)で対象を指す。行はページを
+/// またいで散らばっているため、`Vec`の添字のような単純な位置情報では
+/// そもそも1件を指せない。
+///
+/// `update`と同じく、`predicate`に一致した行の新しい値をすべて`planned`へ
+/// 集め終えてから、`storage.update`で1件ずつ書き戻す。`SET`の右辺は
+/// 更新前の値(`decode_tuple`で復元した`tuple`)を使って評価するため、複数の
+/// 列を書き換える`UPDATE`でも後続の代入が直前の代入結果を見ることはない
+/// (`update`と同じ規則)。
+///
+/// `table`が空でも`WHERE 1`のような書き誤りを見逃さないよう、行ループへ
+/// 入る前に`check_predicate_type`で`predicate`の型を静的に検査する(`filter`・
+/// `update`と同じ理由)。
+pub fn storage_update(
+    storage: &mut Storage,
+    table_id: TableId,
+    schema: &Schema,
+    functions: &FunctionRegistry,
+    assignments: &[Assignment],
+    predicate: Option<&Expr>,
+) -> DbResult<usize> {
+    if let Some(pred) = predicate {
+        check_predicate_type(pred, schema, functions)?;
+    }
+
+    let mut planned: Vec<(RecordId, Tuple)> = Vec::new();
+    for entry in storage.scan(table_id)? {
+        let (rid, bytes) = entry?;
+        let tuple = decode_tuple(schema, &bytes)?;
+        let row = Row::new(schema, &tuple);
+        let matched = match predicate {
+            None => true,
+            Some(pred) => predicate_matches(eval_expr(pred, functions, Some(&row))?)?,
+        };
+        if !matched {
+            continue;
+        }
+
+        let mut new_values = tuple.values().to_vec();
+        for assignment in assignments {
+            let target = schema.index_of(&assignment.column.name).ok_or_else(|| {
+                DbError::Eval(format!("列'{}'が見つかりません", assignment.column.name))
+            })?;
+            new_values[target] = eval_expr(&assignment.value, functions, Some(&row))?;
+        }
+        planned.push((rid, Tuple::new(schema, new_values)?));
+    }
+
+    let count = planned.len();
+    for (rid, new_tuple) in planned {
+        let bytes = encode_tuple(schema, &new_tuple);
+        storage.update(table_id, rid, &bytes)?;
+    }
+    Ok(count)
+}
+
 /// Delete演算子。`predicate`が`TRUE`になった行を`table`から取り除く。
 ///
 /// `Filter`演算子と対になる形で、生き残る行(`predicate`が`TRUE`にならなかった
@@ -551,6 +693,50 @@ pub fn delete(
 
     *table.rows_mut() = kept;
     Ok(deleted)
+}
+
+/// Delete演算子の`Storage`版。`storage_update`と同じ理由で、削除対象を
+/// `Vec`の添字ではなく`Storage::scan`が返す`RecordId`で指す。
+///
+/// `predicate`に一致した行の`RecordId`をすべて`to_delete`へ集め終えてから、
+/// `storage.delete`で1件ずつ削除する。`delete`(`MemTable`版)が生き残る行を
+/// 新しい`Vec`へ集めるのとは集め方が逆(こちらは消す側を集める)だが、
+/// どちらも「対象を確定させてから初めて書き換える」という順序は同じであり、
+/// 集め終える前に評価が失敗すれば`storage`はまだ何も変更されていない。
+///
+/// `table`が空でも`WHERE 1`のような書き誤りを見逃さないよう、行ループへ
+/// 入る前に`check_predicate_type`で`predicate`の型を静的に検査する(`filter`・
+/// `delete`と同じ理由)。
+pub fn storage_delete(
+    storage: &mut Storage,
+    table_id: TableId,
+    schema: &Schema,
+    functions: &FunctionRegistry,
+    predicate: Option<&Expr>,
+) -> DbResult<usize> {
+    if let Some(pred) = predicate {
+        check_predicate_type(pred, schema, functions)?;
+    }
+
+    let mut to_delete: Vec<RecordId> = Vec::new();
+    for entry in storage.scan(table_id)? {
+        let (rid, bytes) = entry?;
+        let tuple = decode_tuple(schema, &bytes)?;
+        let row = Row::new(schema, &tuple);
+        let matched = match predicate {
+            None => true,
+            Some(pred) => predicate_matches(eval_expr(pred, functions, Some(&row))?)?,
+        };
+        if matched {
+            to_delete.push(rid);
+        }
+    }
+
+    let count = to_delete.len();
+    for rid in to_delete {
+        storage.delete(table_id, rid)?;
+    }
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -939,5 +1125,167 @@ mod tests {
 
         let result = delete(&mut table, &schema, &functions, Some(&expr("1")));
         assert!(matches!(result, Err(DbError::Eval(_))));
+    }
+
+    // ---- Storage版(seq_scan/insert/update/delete) ----
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "minidb-executor-test-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        path.push(unique);
+        path
+    }
+
+    /// `users_schema`のテーブルを1つ持つ`Storage`を作り、その`TableId`と
+    /// 一緒に返す。呼び出し側はテスト終了時に`std::fs::remove_file`で
+    /// 一時ファイルを片付ける。
+    fn users_storage(name: &str) -> (std::path::PathBuf, Storage, TableId) {
+        let path = temp_path(name);
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("users", users_schema()).unwrap();
+        (path, storage, table_id)
+    }
+
+    #[test]
+    fn storage_insert_then_storage_seq_scan_round_trips() {
+        let (path, mut storage, table_id) = users_storage("insert-scan");
+        let schema = users_schema();
+        let functions = FunctionRegistry::with_builtins();
+
+        let rows = vec![vec![expr("1"), expr("'Alice'")], vec![expr("2"), expr("'Bob'")]];
+        let count = storage_insert(&mut storage, table_id, &schema, &functions, None, &rows).unwrap();
+        assert_eq!(count, 2);
+
+        let scanned = storage_seq_scan(&storage, table_id, &schema).unwrap();
+        assert_eq!(scanned.len(), 2);
+        assert_eq!(scanned[0].values(), tuple(1, Some("Alice")).values());
+        assert_eq!(scanned[1].values(), tuple(2, Some("Bob")).values());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn storage_insert_is_all_or_nothing_when_a_row_fails_validation() {
+        let (path, mut storage, table_id) = users_storage("insert-validation");
+        let schema = users_schema();
+        let functions = FunctionRegistry::with_builtins();
+
+        // 1行目は妥当だが、2行目は`id`(NOT NULL)にNULLを渡していて失敗する。
+        let rows = vec![
+            vec![expr("1"), expr("'Alice'")],
+            vec![expr("NULL"), expr("'Bob'")],
+        ];
+        let result = storage_insert(&mut storage, table_id, &schema, &functions, None, &rows);
+        assert!(result.is_err());
+        assert!(storage_seq_scan(&storage, table_id, &schema).unwrap().is_empty());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn storage_update_changes_only_matched_rows_and_keeps_the_record_id() {
+        let (path, mut storage, table_id) = users_storage("update");
+        let schema = users_schema();
+        let functions = FunctionRegistry::with_builtins();
+        storage_insert(
+            &mut storage,
+            table_id,
+            &schema,
+            &functions,
+            None,
+            &[
+                vec![expr("1"), expr("'Alice'")],
+                vec![expr("2"), expr("'Bob'")],
+            ],
+        )
+        .unwrap();
+
+        let assignments = vec![Assignment {
+            column: ident("name"),
+            value: expr("'Carol'"),
+            span: Span::new(0, 0),
+        }];
+        let count = storage_update(
+            &mut storage,
+            table_id,
+            &schema,
+            &functions,
+            &assignments,
+            Some(&expr("id = 1")),
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+
+        let scanned = storage_seq_scan(&storage, table_id, &schema).unwrap();
+        assert_eq!(scanned.len(), 2);
+        assert!(scanned.contains(&tuple(1, Some("Carol"))));
+        assert!(scanned.contains(&tuple(2, Some("Bob"))));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn storage_delete_removes_only_matched_rows() {
+        let (path, mut storage, table_id) = users_storage("delete");
+        let schema = users_schema();
+        let functions = FunctionRegistry::with_builtins();
+        storage_insert(
+            &mut storage,
+            table_id,
+            &schema,
+            &functions,
+            None,
+            &[
+                vec![expr("1"), expr("'Alice'")],
+                vec![expr("2"), expr("'Bob'")],
+            ],
+        )
+        .unwrap();
+
+        let count = storage_delete(&mut storage, table_id, &schema, &functions, Some(&expr("id = 1"))).unwrap();
+        assert_eq!(count, 1);
+
+        let scanned = storage_seq_scan(&storage, table_id, &schema).unwrap();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].values()[0], Value::BigInt(2));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn storage_update_and_storage_delete_reject_a_non_boolean_predicate_even_on_an_empty_table() {
+        // `update`・`delete`(MemTable版)と同じ理由で、行ループへ入る前の
+        // `check_predicate_type`が無いと、テーブルが空の間は`WHERE 1`のような
+        // 書き誤りを見逃してしまう。
+        let (path, mut storage, table_id) = users_storage("empty-predicate");
+        let schema = users_schema();
+        let functions = FunctionRegistry::with_builtins();
+
+        let assignments = vec![Assignment {
+            column: ident("name"),
+            value: expr("'Carol'"),
+            span: Span::new(0, 0),
+        }];
+        let update_result = storage_update(
+            &mut storage,
+            table_id,
+            &schema,
+            &functions,
+            &assignments,
+            Some(&expr("1")),
+        );
+        assert!(matches!(update_result, Err(DbError::Eval(_))));
+
+        let delete_result = storage_delete(&mut storage, table_id, &schema, &functions, Some(&expr("1")));
+        assert!(matches!(delete_result, Err(DbError::Eval(_))));
+
+        std::fs::remove_file(&path).unwrap();
     }
 }

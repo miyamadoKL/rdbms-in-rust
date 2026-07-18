@@ -17,7 +17,10 @@
 //! 固定容量のページキャッシュを置く`buffer_pool`が加わる。第15章では、
 //! ページごとの空き容量の見積もりを保持する`free_space_map`と、テーブル定義
 //! そのものを1つのファイルへ永続化し、複数のテーブルを1つのファイルに同居させる
-//! ストレージエンジン`storage`が加わる。
+//! ストレージエンジン`storage`が加わる。第16章では、`database`のSQL実行経路が
+//! `storage`(永続モード、`Database::open`)と`storage_mem`(インメモリモード、
+//! `Database::memory`)のどちらでも動くようになり、`CREATE TABLE`・`INSERT`・
+//! `SELECT`・`UPDATE`・`DELETE`が再起動をまたいで残る。
 
 pub mod ast;
 pub mod buffer_pool;

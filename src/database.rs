@@ -1,51 +1,144 @@
 //! SQL文字列を受け取り、結果を返す実行の入口。
 //!
 //! `Database::execute`は、まずSQL文字列を`parser::parse_statement`でASTへ変換する。
-//! `CREATE TABLE`・`DROP TABLE`は`catalog`モジュールの`Catalog`にテーブル定義を
-//! 登録・削除する。`SELECT`・`INSERT`・`UPDATE`・`DELETE`は、`Catalog`でテーブル
-//! 定義を引いたうえで、`executor`モジュールのSequential Scan・Filter・
-//! Projection・Insert・Update・Delete演算子を正しい順序で呼び出す。行そのものは
-//! `storage_mem`モジュールの`MemStorage`が、`TableId`ごとにプロセスのメモリ上へ
-//! 保持する。
+//! `CREATE TABLE`・`DROP TABLE`はテーブル定義を登録・削除し、`SELECT`・
+//! `INSERT`・`UPDATE`・`DELETE`は、テーブル定義を引いたうえで`executor`
+//! モジュールのSequential Scan・Filter・Projection・Insert・Update・Delete
+//! 演算子を正しい順序で呼び出す。テーブル定義と行を実際にどこへ持つかは
+//! [`Backend`]が決める。
+//!
+//! # `Backend`: メモリとディスクの切り替え
+//!
+//! 第16章から、`Database`は2つの姿を持つ。`Database::memory`が作る
+//! インメモリのDatabase(第9・10章由来)は`Catalog`と`MemStorage`にテーブル
+//! 定義と行を分けて持ち、プロセスの終了とともに消える。`Database::open`が作る
+//! 永続モードのDatabaseは、その両方を1つの`Storage`(第15章)にまとめて持ち、
+//! ファイルへ書き出す。
+//!
+//! この2つを`Backend`という`enum`で切り替える設計を選んだのは、`Database`の
+//! 呼び出し側(`execute`とその先のSQL文ごとの実行関数)に「今どちらのバックエンド
+//! を使っているか」を毎回意識させないためである。`execute`自身はバックエンドに
+//! 触れず、各`execute_*`関数だけが`match &self.backend`で分岐する。`trait`で
+//! 抽象化する案も検討したが、バックエンドは`Database::memory`か`Database::open`
+//! かで起動時に1回だけ決まり、実行中に差し替わることはないため、動的ディスパッチ
+//! や型引数を持ち込むほどの可変性が無い。`enum`の分岐のほうが、2つの実装を
+//! 並べて読み比べられる分、この章の分量では見通しがよい。
+
+use std::path::Path;
 
 use crate::ast::{
     CreateTableStatement, DeleteStatement, DropTableStatement, InsertStatement, SelectItem,
     SelectStatement, Statement, UpdateStatement,
 };
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, TableInfo};
 use crate::error::{DbError, DbResult};
 use crate::eval::{self, FunctionRegistry};
 use crate::executor;
+use crate::storage::Storage;
 use crate::storage_mem::MemStorage;
 use crate::types::{Column, DataType, Schema, Tuple, Value};
 
+/// テーブル定義と行を実際に保持する場所。
+///
+/// `Memory`はテーブル定義を`Catalog`(第9章)、行を`MemStorage`(第10章)という
+/// プロセスのメモリ上だけの2つの部品に分けて持つ。`Disk`は両方を1つの
+/// `Storage`(第15章)にまとめて持ち、ファイルへ永続化する。モジュール冒頭の
+/// 説明も参照。
+enum Backend {
+    Memory { catalog: Catalog, storage: MemStorage },
+    Disk { storage: Storage },
+}
+
 /// minidbのデータベース1つを表す。
 ///
-/// Scalar Functionのレジストリ、テーブル定義を保持する`Catalog`、テーブルの行を
-/// 保持する`MemStorage`を持つ。テーブルは`Catalog`(定義)と`MemStorage`(中身)の
-/// 両方に、同じ`TableId`のもとで存在する。ディスクへの永続化は第2部で
-/// `Database::open`のような別のコンストラクタとして追加する。
+/// Scalar Functionのレジストリと、テーブル定義・行を実際に保持する
+/// [`Backend`]を持つ。
 pub struct Database {
     functions: FunctionRegistry,
-    catalog: Catalog,
-    storage: MemStorage,
+    backend: Backend,
 }
 
 impl Database {
     /// インメモリのDatabaseを作る。組み込みのScalar Function(`abs`、`length`)は
     /// 最初から登録済みの状態で始まり、カタログとストレージはどちらも空の
     /// 状態で始まる。
+    ///
+    /// 第1部から続く、テストと使い捨てのSQL実行のための入口。プロセスを
+    /// 終了すればテーブルも行もすべて消える。
     pub fn memory() -> Self {
         Database {
             functions: FunctionRegistry::with_builtins(),
-            catalog: Catalog::new(),
-            storage: MemStorage::new(),
+            backend: Backend::Memory {
+                catalog: Catalog::new(),
+                storage: MemStorage::new(),
+            },
+        }
+    }
+
+    /// `path`のファイルに永続化されたDatabaseを開く。
+    ///
+    /// `path`がまだ存在しなければ、新しいデータベースファイルとして初期化する
+    /// (`Storage::create`)。すでに存在すれば、その内容を読み込んで復元する
+    /// (`Storage::open`)。この2つの区別は、呼び出し側に「これは新規作成か、
+    /// 再オープンか」を明示的に選ばせるのではなく、パスの存在だけから自動的に
+    /// 決める。第1章の冒頭で示した`Database::open("example.db")?`という
+    /// コード例は、初回の実行では新規作成、2回目以降の実行では再オープンとして
+    /// 動くことをこの振る舞いが支えている。
+    ///
+    /// キャッシュされた変更をファイルへ書き戻すには、以後[`Database::flush`]を
+    /// 明示的に呼ぶ必要がある(`Storage`・`BufferPool`が第14・15章から一貫して
+    /// 採っている、dirtyなページを明示的にflushするまで書き戻さない方針を
+    /// 引き継ぐ)。
+    pub fn open<P: AsRef<Path>>(path: P) -> DbResult<Self> {
+        let path = path.as_ref();
+        let storage = if path.exists() {
+            Storage::open(path)?
+        } else {
+            Storage::create(path)?
+        };
+        Ok(Database {
+            functions: FunctionRegistry::with_builtins(),
+            backend: Backend::Disk { storage },
+        })
+    }
+
+    /// キャッシュされているdirtyなページをすべてディスクへ書き戻す。
+    ///
+    /// インメモリのDatabase(`Database::memory`)に対しては何もしない(書き戻す
+    /// 先となるファイルがそもそも無い)。永続モードのDatabase(`Database::open`)
+    /// に対しては`Storage::flush`をそのまま呼ぶ。`Database`自体は`Drop`で
+    /// 自動的にflushしない。`HeapFile`(第13章)・`Storage`(第15章)がすでに
+    /// 採っている、書き戻しのタイミングを呼び出し側の`unwrap`可能な操作として
+    /// 明示させる設計をここでも踏襲する。
+    pub fn flush(&self) -> DbResult<()> {
+        match &self.backend {
+            Backend::Memory { .. } => Ok(()),
+            Backend::Disk { storage } => storage.flush(),
         }
     }
 
     /// 現在のカタログへの参照。
+    ///
+    /// `Database::memory`で作ったDatabaseでのみ使える。永続モードの
+    /// Database(`Database::open`)は`Catalog`という型そのものを経由せず、
+    /// `Storage`(第15章)が独自にテーブル定義を保持しているため、このメソッドを
+    /// 呼ぶとpanicする。
     pub fn catalog(&self) -> &Catalog {
-        &self.catalog
+        match &self.backend {
+            Backend::Memory { catalog, .. } => catalog,
+            Backend::Disk { .. } => {
+                panic!("catalog()はDatabase::memory()で作ったDatabaseでのみ使えます")
+            }
+        }
+    }
+
+    /// テーブル名から`TableInfo`を引く。バックエンドの違いを吸収する、
+    /// 各`execute_*`が共通して使う入口。
+    fn table_info(&self, name: &str) -> Option<&TableInfo> {
+        match &self.backend {
+            Backend::Memory { catalog, .. } => catalog.table(name),
+            Backend::Disk { storage } => storage.table(name),
+        }
     }
 
     /// SQL文字列を1本実行し、結果を返す。
@@ -91,16 +184,29 @@ impl Database {
         }
 
         let schema = Schema::new(columns);
-        let id = self.catalog.create_table(&create.table.name, schema)?;
-        self.storage.create_table(id);
+        match &mut self.backend {
+            Backend::Memory { catalog, storage } => {
+                let id = catalog.create_table(&create.table.name, schema)?;
+                storage.create_table(id);
+            }
+            Backend::Disk { storage } => {
+                storage.create_table(&create.table.name, schema)?;
+            }
+        }
         Ok(QueryResult::command("CREATE TABLE"))
     }
 
-    /// `DROP TABLE`を実行し、`Catalog`からテーブル定義を、`MemStorage`から
-    /// その行をまとめて削除する。
+    /// `DROP TABLE`を実行し、テーブル定義とその行をまとめて削除する。
     fn execute_drop_table(&mut self, drop: &DropTableStatement) -> DbResult<QueryResult> {
-        let id = self.catalog.drop_table(&drop.table.name)?;
-        self.storage.drop_table(id);
+        match &mut self.backend {
+            Backend::Memory { catalog, storage } => {
+                let id = catalog.drop_table(&drop.table.name)?;
+                storage.drop_table(id);
+            }
+            Backend::Disk { storage } => {
+                storage.drop_table(&drop.table.name)?;
+            }
+        }
         Ok(QueryResult::command("DROP TABLE"))
     }
 
@@ -200,6 +306,10 @@ impl Database {
 
     /// `FROM`を伴う`SELECT`。Sequential Scan→(あれば)Filter→Projectionの順に
     /// `executor`の演算子を適用する。
+    ///
+    /// Sequential Scanだけがバックエンドで実装が分かれる(`executor::seq_scan`
+    /// と`executor::storage_seq_scan`)。どちらも復元済みの`Vec<Tuple>`を返す
+    /// ため、その先のFilter・Projectionはバックエンドを意識しない。
     fn execute_select_with_from(
         &self,
         sql: &str,
@@ -207,15 +317,21 @@ impl Database {
         table_name: &str,
     ) -> DbResult<QueryResult> {
         let table_info = self
-            .catalog
-            .table(table_name)
+            .table_info(table_name)
             .ok_or_else(|| DbError::TableNotFound(table_name.to_string()))?;
-        let mem_table = self
-            .storage
-            .table(table_info.id)
-            .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
 
-        let scanned = executor::seq_scan(mem_table);
+        let scanned = match &self.backend {
+            Backend::Memory { storage, .. } => {
+                let mem_table = storage
+                    .table(table_info.id)
+                    .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
+                executor::seq_scan(mem_table)
+            }
+            Backend::Disk { storage } => {
+                executor::storage_seq_scan(storage, table_info.id, &table_info.schema)?
+            }
+        };
+
         let filtered = match &select.where_clause {
             Some(predicate) => {
                 executor::filter(&table_info.schema, &self.functions, scanned, predicate)?
@@ -237,71 +353,110 @@ impl Database {
         })
     }
 
-    /// `INSERT INTO`を実行する。`executor::insert`が、`VALUES`の評価から
-    /// `MemStorage`への書き込みまでを行う。
+    /// `INSERT INTO`を実行する。`executor::insert`(または`executor::storage_insert`)
+    /// が、`VALUES`の評価から書き込みまでを行う。
+    ///
+    /// `table_info`をここで複製(`clone`)しているのは、この後`&mut self.backend`
+    /// を借用するためである。`self.table_info(...)`が返す`&TableInfo`は
+    /// `self`(の`backend`フィールド)を不変借用したままなので、複製せずに
+    /// 保持し続けると、直後の可変借用と両立しない。
     fn execute_insert(&mut self, insert: &InsertStatement) -> DbResult<QueryResult> {
         let table_info = self
-            .catalog
-            .table(&insert.table.name)
-            .ok_or_else(|| DbError::TableNotFound(insert.table.name.clone()))?;
+            .table_info(&insert.table.name)
+            .ok_or_else(|| DbError::TableNotFound(insert.table.name.clone()))?
+            .clone();
         let schema = &table_info.schema;
-        let mem_table = self
-            .storage
-            .table_mut(table_info.id)
-            .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
 
-        let count = executor::insert(
-            mem_table,
-            schema,
-            &self.functions,
-            insert.columns.as_deref(),
-            &insert.rows,
-        )?;
+        let count = match &mut self.backend {
+            Backend::Memory { storage, .. } => {
+                let mem_table = storage
+                    .table_mut(table_info.id)
+                    .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
+                executor::insert(
+                    mem_table,
+                    schema,
+                    &self.functions,
+                    insert.columns.as_deref(),
+                    &insert.rows,
+                )?
+            }
+            Backend::Disk { storage } => executor::storage_insert(
+                storage,
+                table_info.id,
+                schema,
+                &self.functions,
+                insert.columns.as_deref(),
+                &insert.rows,
+            )?,
+        };
         Ok(QueryResult::command_with_count("INSERT", count))
     }
 
-    /// `UPDATE`を実行する。`executor::update`が、`WHERE`に一致した行への
-    /// `SET`の適用までを行う。
+    /// `UPDATE`を実行する。`executor::update`(または`executor::storage_update`)
+    /// が、`WHERE`に一致した行への`SET`の適用までを行う。`table_info`を複製する
+    /// 理由は`execute_insert`のコメントを参照。
     fn execute_update(&mut self, update: &UpdateStatement) -> DbResult<QueryResult> {
         let table_info = self
-            .catalog
-            .table(&update.table.name)
-            .ok_or_else(|| DbError::TableNotFound(update.table.name.clone()))?;
+            .table_info(&update.table.name)
+            .ok_or_else(|| DbError::TableNotFound(update.table.name.clone()))?
+            .clone();
         let schema = &table_info.schema;
-        let mem_table = self
-            .storage
-            .table_mut(table_info.id)
-            .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
 
-        let count = executor::update(
-            mem_table,
-            schema,
-            &self.functions,
-            &update.assignments,
-            update.where_clause.as_ref(),
-        )?;
+        let count = match &mut self.backend {
+            Backend::Memory { storage, .. } => {
+                let mem_table = storage
+                    .table_mut(table_info.id)
+                    .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
+                executor::update(
+                    mem_table,
+                    schema,
+                    &self.functions,
+                    &update.assignments,
+                    update.where_clause.as_ref(),
+                )?
+            }
+            Backend::Disk { storage } => executor::storage_update(
+                storage,
+                table_info.id,
+                schema,
+                &self.functions,
+                &update.assignments,
+                update.where_clause.as_ref(),
+            )?,
+        };
         Ok(QueryResult::command_with_count("UPDATE", count))
     }
 
-    /// `DELETE FROM`を実行する。`executor::delete`が、`WHERE`に一致した行の
-    /// 削除までを行う。
+    /// `DELETE FROM`を実行する。`executor::delete`(または`executor::storage_delete`)
+    /// が、`WHERE`に一致した行の削除までを行う。`table_info`を複製する理由は
+    /// `execute_insert`のコメントを参照。
     fn execute_delete(&mut self, delete: &DeleteStatement) -> DbResult<QueryResult> {
         let table_info = self
-            .catalog
-            .table(&delete.table.name)
-            .ok_or_else(|| DbError::TableNotFound(delete.table.name.clone()))?;
+            .table_info(&delete.table.name)
+            .ok_or_else(|| DbError::TableNotFound(delete.table.name.clone()))?
+            .clone();
         let schema = &table_info.schema;
-        let mem_table = self
-            .storage
-            .table_mut(table_info.id)
-            .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
 
-        let count = executor::delete(
-            mem_table,
-            schema,
-            &self.functions,
-            delete.where_clause.as_ref(),
-        )?;
+        let count = match &mut self.backend {
+            Backend::Memory { storage, .. } => {
+                let mem_table = storage
+                    .table_mut(table_info.id)
+                    .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
+                executor::delete(
+                    mem_table,
+                    schema,
+                    &self.functions,
+                    delete.where_clause.as_ref(),
+                )?
+            }
+            Backend::Disk { storage } => executor::storage_delete(
+                storage,
+                table_info.id,
+                schema,
+                &self.functions,
+                delete.where_clause.as_ref(),
+            )?,
+        };
         Ok(QueryResult::command_with_count("DELETE", count))
     }
 }
@@ -1222,5 +1377,89 @@ mod tests {
         let remaining = db.execute("SELECT id FROM users").unwrap();
         assert_eq!(remaining.rows().len(), 1);
         assert_eq!(remaining.rows()[0].values(), &[Value::BigInt(1)]);
+    }
+
+    // ---- Database::open(永続モード) ----
+    //
+    // 再起動をまたぐ復元そのもの(プロセスの再起動を模して`Database`を作り
+    // 直す一連の流れ)は`tests/persistence.rs`の統合テストで確認する。ここでは
+    // `Backend::Disk`の配線(`execute_*`が`Storage`を正しく呼び分けること)を、
+    // 1つの`Database`を使い回す範囲で確認する。
+
+    fn temp_db_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "minidb-database-test-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        path.push(unique);
+        path
+    }
+
+    #[test]
+    fn open_on_a_missing_path_creates_a_new_database() {
+        let path = temp_db_path("open-missing");
+        assert!(!path.exists());
+
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE users (id BIGINT NOT NULL)")
+            .unwrap();
+        assert_eq!(
+            db.execute("INSERT INTO users VALUES (1)").unwrap().to_string(),
+            "INSERT 1"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn disk_backend_supports_the_same_dml_as_the_memory_backend() {
+        // insert_select_update_delete_round_tripと同じ流れを、Backend::Diskで
+        // 確認する。executor::insert/update/deleteとexecutor::storage_insert/
+        // storage_update/storage_deleteが同じ結果になることの確認でもある。
+        let path = temp_db_path("dml-round-trip");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE users (id BIGINT NOT NULL, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        assert_eq!(db.execute("SELECT * FROM users").unwrap().rows().len(), 2);
+
+        db.execute("UPDATE users SET name = 'Alicia' WHERE id = 1")
+            .unwrap();
+        let updated = db.execute("SELECT name FROM users WHERE id = 1").unwrap();
+        assert_eq!(
+            updated.rows()[0].values(),
+            &[Value::Text("Alicia".to_string())]
+        );
+
+        db.execute("DELETE FROM users WHERE id = 2").unwrap();
+        let remaining = db.execute("SELECT id FROM users").unwrap();
+        assert_eq!(remaining.rows().len(), 1);
+        assert_eq!(remaining.rows()[0].values(), &[Value::BigInt(1)]);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn flush_on_a_memory_database_is_a_no_op() {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE users (id BIGINT NOT NULL)")
+            .unwrap();
+        assert!(db.flush().is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "catalog()はDatabase::memory()")]
+    fn catalog_panics_on_a_disk_backed_database() {
+        let path = temp_db_path("catalog-panics");
+        let db = Database::open(&path).unwrap();
+        let _ = db.catalog();
+        // panicするのでここには到達しないが、後始末のため一応残しておく。
+        std::fs::remove_file(&path).unwrap();
     }
 }
