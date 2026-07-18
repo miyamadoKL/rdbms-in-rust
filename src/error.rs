@@ -18,6 +18,10 @@ pub enum DbError {
     /// 値の並びがSchemaの列数・型・nullable制約に適合しないエラー。
     #[error("スキーマ不一致: {0}")]
     SchemaMismatch(String),
+
+    /// SQL文字列を構文解析できなかったエラー。
+    #[error("構文エラー: {0}")]
+    Parse(String),
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

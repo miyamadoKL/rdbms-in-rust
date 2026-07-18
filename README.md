@@ -5,7 +5,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 
 ## 目次
 
-現在執筆済みなのは[はじめに](book/src/index.md)と第1〜4章のみで、第5章以降は準備中です。
+現在執筆済みなのは[はじめに](book/src/index.md)と第1〜5章のみで、第6章以降は準備中です。
 
 ### 第0部 設計と開発環境
 
@@ -16,7 +16,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 ### 第1部 Bare Bones: 最小のインメモリSQLデータベース
 
 - [第4章 関係モデルとSQLサブセット](book/src/ch04-relational-model.md)
-- 第5章 `SELECT 1`を実行する
+- [第5章 `SELECT 1`を実行する](book/src/ch05-select-one.md)
 - 第6章 字句解析器
 - 第7章 構文解析器とAST
 - 第8章 型、NULL、式評価

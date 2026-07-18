@@ -1,18 +1,22 @@
-//! SQL Golden Test ランナーの骨格。
+//! SQL Golden Test ランナー。
 //!
 //! `tests/golden/*.sql` と同名の `*.expected` をペアにして突き合わせる。
-//! まだクエリエンジンが存在しないため、`run_sql` は「入力をそのまま返す」
-//! 仮実装(エコー)になっている。第5章以降でここを実際のエンジン呼び出しへ
-//! 差し替えていく。
+//! `run_sql` は `Database::execute` を呼び出し、成功時は `QueryResult` の表示形式を、
+//! 失敗時は `ERROR: `に続けてエラーメッセージを返す。
+
+mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// 仮実装: クエリエンジンがまだ無いので、SQLをそのままエコーするだけ。
-///
-/// 第5章以降、ここを `minidb` のパーサ・実行エンジン呼び出しに置き換える。
+use common::execute_sql;
+
+/// SQLを1本実行し、Golden Testと突き合わせるための文字列表現を返す。
 fn run_sql(sql: &str) -> String {
-    sql.to_string()
+    match execute_sql(sql) {
+        Ok(result) => result.to_string(),
+        Err(e) => format!("ERROR: {e}"),
+    }
 }
 
 /// `tests/golden/` 以下の `.sql` ファイルを列挙する。

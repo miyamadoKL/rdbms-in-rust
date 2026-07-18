@@ -9,7 +9,7 @@
 # 第1部 Bare Bones: 最小のインメモリSQLデータベース
 
 - [第4章 関係モデルとSQLサブセット](ch04-relational-model.md)
-- [第5章 `SELECT 1`を実行する]()
+- [第5章 `SELECT 1`を実行する](ch05-select-one.md)
 - [第6章 字句解析器]()
 - [第7章 構文解析器とAST]()
 - [第8章 型、NULL、式評価]()
