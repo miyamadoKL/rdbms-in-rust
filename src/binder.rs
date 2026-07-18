@@ -273,6 +273,7 @@ pub struct BoundAssignment {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundInsert {
     pub table_id: TableId,
+    pub table_name: String,
     pub schema: Schema,
     /// 明示された列名を、`schema`上の列インデックスへ解決した並び。`None`なら
     /// `VALUES`の並びをそのままスキーマの列順とみなす。
@@ -285,6 +286,7 @@ pub struct BoundInsert {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundUpdate {
     pub table_id: TableId,
+    pub table_name: String,
     pub schema: Schema,
     pub assignments: Vec<BoundAssignment>,
     pub predicate: Option<BoundExpr>,
@@ -295,6 +297,7 @@ pub struct BoundUpdate {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundDelete {
     pub table_id: TableId,
+    pub table_name: String,
     pub schema: Schema,
     pub predicate: Option<BoundExpr>,
     pub span: Span,
@@ -440,6 +443,7 @@ impl<'a> Binder<'a> {
 
         Ok(BoundInsert {
             table_id: table.table_id,
+            table_name: table.table_name,
             schema: table.schema,
             columns,
             rows: insert.rows,
@@ -463,6 +467,7 @@ impl<'a> Binder<'a> {
 
         Ok(BoundUpdate {
             table_id: table.table_id,
+            table_name: table.table_name,
             schema: table.schema,
             assignments,
             predicate,
@@ -492,6 +497,7 @@ impl<'a> Binder<'a> {
 
         Ok(BoundDelete {
             table_id: table.table_id,
+            table_name: table.table_name,
             schema: table.schema,
             predicate,
             span: delete.span,

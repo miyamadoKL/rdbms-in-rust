@@ -1,16 +1,27 @@
 //! SQL文字列を受け取り、結果を返す実行の入口。
 //!
-//! 第17章から、`Database::execute`は3段階のパイプラインになった。
+//! 第18章から、`Database::execute`は4段階のパイプラインになった。
 //!
 //! 1. **構文解析**(`parser::parse_statement`): SQL文字列を`Statement`(AST)へ変換する。
 //! 2. **名前解決**(`binder::Binder::bind`): `Statement`をカタログと突き合わせ、
 //!    テーブル名・列名を解決し、式の型を検査した`BoundStatement`(Bound AST)へ
 //!    変換する。未知のテーブル・列、曖昧な列参照、型不一致は、この段階で
 //!    位置情報付きの`DbError::Bind`として検出される。
-//! 3. **実行**: `CREATE TABLE`・`DROP TABLE`はテーブル定義を登録・削除し、
-//!    `SELECT`・`INSERT`・`UPDATE`・`DELETE`は`executor`モジュールの
-//!    Sequential Scan・Filter・Projection・Insert・Update・Delete演算子を
-//!    正しい順序で呼び出す。
+//! 3. **計画**(`logical_plan::build_*`): `BoundStatement`(`Select`・`Insert`・
+//!    `Update`・`Delete`)を、関係代数の演算子木である[`LogicalPlan`]へ変換する。
+//!    `Database::execute_select_with_from`(第17章まで)がSequential Scan→
+//!    Filter→Projectionという順序を関数呼び出しの並びとして手続き的に決めて
+//!    いたのに対し、この段階からはその順序が`Filter`・`Projection`の親子関係
+//!    として木の形に現れる。
+//! 4. **実行**: `CREATE TABLE`・`DROP TABLE`は`LogicalPlan`を経由せず、
+//!    テーブル定義を直接登録・削除する(`CREATE TABLE`が`Binder`を素通りする
+//!    のと同じ理由。モジュール冒頭の説明は[`crate::binder`]を参照)。
+//!    `SELECT`・`INSERT`・`UPDATE`・`DELETE`は、`LogicalPlan`の木を根から葉へ
+//!    たどりながら`executor`モジュールの演算子を呼び出す(`eval_query_plan`・
+//!    `execute_insert`・`execute_update`・`execute_delete`)。演算子を`next()`
+//!    で1行ずつ引っ張り出すVolcano型の実行はまだ無く、各ノードは子の結果を
+//!    `Vec<Tuple>`としてまとめて受け取り、まとめて返す(第19章で`Executor`
+//!    traitへ分離する)。
 //!
 //! テーブル定義と行を実際にどこへ持つかは[`Backend`]が決める。
 //!
@@ -34,11 +45,12 @@
 use std::path::Path;
 
 use crate::ast::{CreateTableStatement, DropTableStatement, Statement};
-use crate::binder::{Binder, BoundDelete, BoundInsert, BoundSelect, BoundStatement, BoundUpdate};
+use crate::binder::{Binder, BoundStatement};
 use crate::catalog::Catalog;
 use crate::error::{DbError, DbResult};
 use crate::eval::{self, FunctionRegistry};
 use crate::executor;
+use crate::logical_plan::{self, DeleteNode, InsertNode, LogicalPlan, UpdateNode};
 use crate::storage::Storage;
 use crate::storage_mem::MemStorage;
 use crate::types::{Column, DataType, Schema, Tuple, Value};
@@ -160,19 +172,22 @@ impl Database {
 
     /// SQL文字列を1本実行し、結果を返す。
     ///
-    /// 構文解析(`parser::parse_statement`)→名前解決(`Binder::bind`)→実行という
-    /// 3段階を順に通す。構文解析の失敗(`DbError::Lex`・`DbError::Parse`)、
-    /// 名前解決の失敗(`DbError::Bind`)は、どちらもそのまま呼び出し元に伝わる。
+    /// 構文解析(`parser::parse_statement`)→名前解決(`Binder::bind`)→計画
+    /// (`logical_plan::build_*`)→実行という4段階を順に通す。構文解析の失敗
+    /// (`DbError::Lex`・`DbError::Parse`)、名前解決の失敗(`DbError::Bind`)は、
+    /// どちらもそのまま呼び出し元に伝わる。`LogicalPlan`への変換自体は失敗しない
+    /// (`Binder`がすでに名前・型を確定させているため、`BoundStatement`から
+    /// `LogicalPlan`への変換は形を組み替えるだけで、新たに検出すべき誤りが無い)。
     pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
         let statement = crate::parser::parse_statement(sql)?;
         let bound = self.bind(statement, sql)?;
         match bound {
-            BoundStatement::Select(select) => self.execute_select(&select),
+            BoundStatement::Select(select) => self.execute_select(logical_plan::build_select(select)),
             BoundStatement::CreateTable(create) => self.execute_create_table(&create),
             BoundStatement::DropTable(drop) => self.execute_drop_table(&drop),
-            BoundStatement::Insert(insert) => self.execute_insert(insert),
-            BoundStatement::Update(update) => self.execute_update(update),
-            BoundStatement::Delete(delete) => self.execute_delete(delete),
+            BoundStatement::Insert(insert) => self.execute_insert(logical_plan::build_insert(insert)),
+            BoundStatement::Update(update) => self.execute_update(logical_plan::build_update(update)),
+            BoundStatement::Delete(delete) => self.execute_delete(logical_plan::build_delete(delete)),
         }
     }
 
@@ -244,154 +259,108 @@ impl Database {
         Ok(QueryResult::command("DROP TABLE"))
     }
 
-    /// 束縛済みの`SELECT`を実行する。`tables`が空なら`FROM`が無い`SELECT`、
-    /// 1つあれば`FROM`を伴う`SELECT`として分岐する。
-    fn execute_select(&self, select: &BoundSelect) -> DbResult<QueryResult> {
-        if select.tables.is_empty() {
-            self.execute_select_without_from(select)
-        } else {
-            self.execute_select_with_from(select)
-        }
+    /// `LogicalPlan`に組み立てた`SELECT`を実行する。
+    ///
+    /// `logical_plan::build_select`が返す木は、必ず根に`Projection`を持つ。
+    /// `eval_query_plan`で木全体を根から葉へたどりながら`executor`の演算子を
+    /// 適用し、その結果をそのまま`QueryResult`に詰める。
+    fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {
+        let (schema, rows) = self.eval_query_plan(&plan)?;
+        Ok(QueryResult { schema, rows, command_tag: None })
     }
 
-    /// `FROM`を伴わない`SELECT`。列を1つも持たない空の`Schema`に対する、値も
-    /// 持たないちょうど1件のタプルを暗黙の入力とみなして実行する。
+    /// `LogicalPlan`の木を根から葉へたどり、各ノードに対応する`executor`の
+    /// 演算子を適用しながら`(Schema, Vec<Tuple>)`を組み立てる。
     ///
-    /// `WHERE`があれば、この1件のタプルに対して`executor::filter`をそのまま
-    /// かける。`filter`は`FROM`を伴う`SELECT`(`execute_select_with_from`)でも
-    /// 使っている演算子で、`predicate_matches`による三値論理の絞り込みを行う。
-    /// `predicate`が`BOOLEAN`(または型未定の`NULL`)を返す式であることは
-    /// `Binder`がすでに検査済みなので、この1件を再利用することで、`WHERE`句の
-    /// 意味論(`TRUE`なら1行、`FALSE`または`NULL`なら0行)を`FROM`を伴う
-    /// `SELECT`と同じコードで揃える。`WHERE`が無ければ、常に1件がそのまま
-    /// 残ったものとして扱う。
+    /// `Scan`・`Values`が行を生成する葉であり、`Filter`・`Projection`は子の
+    /// 結果を受け取って加工するだけの中間ノードである。この関数は`Filter`・
+    /// `Projection`の呼び出しのたびに自分自身を再帰呼び出しすることで、木の
+    /// 深さに関係なく同じコードで根から葉まで処理できる。第17章までの
+    /// `execute_select_with_from`が「Sequential Scan→Filter→Projection」という
+    /// 順序を1つの関数の中に手続きとして書き下ろしていたのに対し、この関数は
+    /// その順序を`LogicalPlan`の親子関係から読み取るだけであり、`WHERE`の
+    /// 有無で分岐を書き分ける必要も無い(`WHERE`が無ければ`Filter`ノード自体が
+    /// 木に現れないため)。
     ///
-    /// 出力列の型は、`FROM`を伴う`SELECT`(`executor::project`)と同じく
-    /// `item.expr.data_type()`(`Binder`が静的に決めた型)をそのまま使う。
-    /// `eval_arith`のような実行時の評価関数は、両辺の型を検査するより先に
-    /// `NULL`を伝播させて早期リターンするため、`Binder`の静的検査を経由しない
-    /// 経路のままだと`SELECT NULL + 'x'`のような型不正の式が`NULL`として
-    /// 黙って成功したり、`SELECT NULL + 1`のような型として正しい式でも、
-    /// 実際に評価した`Value`の型(`NULL`は`data_type()`が`None`)から列の型を
-    /// 決めてしまい、`FROM`を伴う場合と異なる型(`TEXT`)になってしまったり
-    /// する。`Binder`が返す`Some(T)`をそのまま列の型として使い、`None`
-    /// (`NULL`単体などで型が定まらない場合)だけを`TEXT`のプレースホルダーで
-    /// 代用することで、`FROM`の有無に関係なく同じ列の型になる。
-    ///
-    /// `WHERE`が`TRUE`にならなかった場合、この1件は結果に含まれないため、
-    /// 射影式は`executor::project`が0件の行を評価しないのと同じ理由で評価しない
-    /// (値に依存するエラーがもし起きても、そもそも結果に含まれない行なので
-    /// 表面化させない)。
-    fn execute_select_without_from(&self, select: &BoundSelect) -> DbResult<QueryResult> {
-        let empty_schema = Schema::new(Vec::new());
-        let implicit_row = Tuple::new(&empty_schema, Vec::new())
-            .expect("空のSchemaに対する空の値の並びは常にスキーマ検査を通る");
-        let matched = match &select.predicate {
-            Some(predicate) => {
-                !executor::filter(&empty_schema, &self.functions, vec![implicit_row], predicate)?
-                    .is_empty()
+    /// `FROM`を伴わない`SELECT`(`Values(1 row)`が根の`Scan`の代わりを務める)も、
+    /// この関数の中では特別扱いしない。`Values`の1件が`Filter`で0件に絞られれば、
+    /// 後続の`Projection`はその0件に対してだけ動くため、`WHERE`が`TRUE`に
+    /// ならなかった暗黙の1行に対して射影式を評価してしまうことも無い。
+    /// これは、`Filter`が先に行を絞り込んでから`Projection`が動くという
+    /// 演算子の順序そのものが持つ性質であり、`Values`だけを特別扱いする理由が
+    /// 無くなったことが、この章で`execute_select_without_from`を削れた理由でもある。
+    fn eval_query_plan(&self, plan: &LogicalPlan) -> DbResult<(Schema, Vec<Tuple>)> {
+        match plan {
+            LogicalPlan::Scan(scan) => {
+                let rows = match &self.backend {
+                    Backend::Memory { storage, .. } => {
+                        let mem_table = storage
+                            .table(scan.table_id)
+                            .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
+                        executor::seq_scan(mem_table)
+                    }
+                    Backend::Disk { storage } => executor::storage_seq_scan(storage, scan.table_id, &scan.schema)?,
+                };
+                Ok((scan.schema.clone(), rows))
             }
-            None => true,
-        };
-
-        let mut columns = Vec::with_capacity(select.projection.len());
-        let mut values = Vec::with_capacity(select.projection.len());
-        for item in &select.projection {
-            let data_type = item.expr.data_type().unwrap_or(DataType::Text);
-
-            if matched {
-                let value = eval::eval_bound_expr(&item.expr, &self.functions, None)?;
-                columns.push(Column::new(item.output_name.clone(), data_type, value.is_null()));
-                values.push(value);
-            } else {
-                // この1件は`WHERE`で除外されたので評価しない。`nullable`は
-                // `executor::project`の計算列と同じく常に`true`にする(行ごとに
-                // `NULL`になったりならなかったりしうるため)。
-                columns.push(Column::new(item.output_name.clone(), data_type, true));
+            LogicalPlan::Values(values) => {
+                let mut rows = Vec::with_capacity(values.rows.len());
+                for row_exprs in &values.rows {
+                    let evaluated = row_exprs
+                        .iter()
+                        .map(|expr| eval::eval_expr(expr, &self.functions, None))
+                        .collect::<DbResult<Vec<_>>>()?;
+                    rows.push(Tuple::new(&values.schema, evaluated)?);
+                }
+                Ok((values.schema.clone(), rows))
+            }
+            LogicalPlan::Filter(filter) => {
+                let (schema, rows) = self.eval_query_plan(&filter.input)?;
+                let filtered = executor::filter(&schema, &self.functions, rows, &filter.predicate)?;
+                Ok((schema, filtered))
+            }
+            LogicalPlan::Projection(projection) => {
+                let (schema, rows) = self.eval_query_plan(&projection.input)?;
+                executor::project(&schema, &self.functions, &rows, &projection.projection)
+            }
+            LogicalPlan::Insert(_) | LogicalPlan::Update(_) | LogicalPlan::Delete(_) => {
+                unreachable!("Insert/Update/DeleteはSELECTの計画に現れない(logical_plan::build_selectは作らない)")
             }
         }
-
-        let schema = Schema::new(columns);
-        let rows = if matched {
-            vec![Tuple::new(&schema, values)?]
-        } else {
-            Vec::new()
-        };
-
-        Ok(QueryResult {
-            schema,
-            rows,
-            command_tag: None,
-        })
-    }
-
-    /// `FROM`を伴う`SELECT`。Sequential Scan→(あれば)Filter→Projectionの順に
-    /// `executor`の演算子を適用する。
-    ///
-    /// Sequential Scanだけがバックエンドで実装が分かれる(`executor::seq_scan`
-    /// と`executor::storage_seq_scan`)。どちらも復元済みの`Vec<Tuple>`を返す
-    /// ため、その先のFilter・Projectionはバックエンドを意識しない。テーブル名の
-    /// 解決(`TableId`の取得)はすでに`Binder`が済ませているため、この関数は
-    /// `select.tables[0]`が指す`TableId`と`Schema`をそのまま使うだけでよい。
-    fn execute_select_with_from(&self, select: &BoundSelect) -> DbResult<QueryResult> {
-        let table = &select.tables[0];
-
-        let scanned = match &self.backend {
-            Backend::Memory { storage, .. } => {
-                let mem_table = storage
-                    .table(table.table_id)
-                    .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::seq_scan(mem_table)
-            }
-            Backend::Disk { storage } => {
-                executor::storage_seq_scan(storage, table.table_id, &table.schema)?
-            }
-        };
-
-        let filtered = match &select.predicate {
-            Some(predicate) => executor::filter(&table.schema, &self.functions, scanned, predicate)?,
-            None => scanned,
-        };
-        let (schema, rows) =
-            executor::project(&table.schema, &self.functions, &filtered, &select.projection)?;
-
-        Ok(QueryResult {
-            schema,
-            rows,
-            command_tag: None,
-        })
     }
 
     /// `INSERT INTO`を実行する。`executor::insert`(または`executor::storage_insert`)
     /// が、`VALUES`の評価から書き込みまでを行う。
     ///
+    /// `plan`は`logical_plan::build_insert`が組み立てた`Insert(Values)`の木で、
+    /// 根が`LogicalPlan::Insert`、その唯一の子が`LogicalPlan::Values`である
+    /// ことは`build_insert`の作り方から保証されている。`Values`の`rows`は
+    /// まだ評価していない`Expr`のままなので、`executor::insert`・
+    /// `storage_insert`にそのまま渡す(第17章までの`BoundInsert::rows`と
+    /// 同じ扱い)。
+    ///
     /// テーブル名・明示された列名の解決は`Binder`の`bind_insert`が済ませて
-    /// いるため、`BoundInsert`は`table_id`と`schema`を独立に(カタログからの
+    /// いるため、`InsertNode`は`table_id`と`schema`を独立に(カタログからの
     /// 借用ではなく複製として)持っている。第16章まではこの複製を`execute_insert`
     /// 自身が`table_info.clone()`という形で行っていたが、`Binder`が返す時点で
     /// 複製済みになったことで、その回避策はここでは要らなくなった。
-    fn execute_insert(&mut self, insert: BoundInsert) -> DbResult<QueryResult> {
+    fn execute_insert(&mut self, plan: LogicalPlan) -> DbResult<QueryResult> {
+        let LogicalPlan::Insert(InsertNode { table_id, schema, columns, input, .. }) = plan else {
+            unreachable!("logical_plan::build_insertは常にLogicalPlan::Insertを返す")
+        };
+        let LogicalPlan::Values(values) = *input else {
+            unreachable!("logical_plan::build_insertはInsertの子に常にValuesを積む")
+        };
+
         let count = match &mut self.backend {
             Backend::Memory { storage, .. } => {
-                let mem_table = storage
-                    .table_mut(insert.table_id)
-                    .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::insert(
-                    mem_table,
-                    &insert.schema,
-                    &self.functions,
-                    insert.columns.as_deref(),
-                    &insert.rows,
-                )?
+                let mem_table =
+                    storage.table_mut(table_id).expect("catalogに登録されたテーブルはstorageにも必ず存在する");
+                executor::insert(mem_table, &schema, &self.functions, columns.as_deref(), &values.rows)?
             }
-            Backend::Disk { storage } => executor::storage_insert(
-                storage,
-                insert.table_id,
-                &insert.schema,
-                &self.functions,
-                insert.columns.as_deref(),
-                &insert.rows,
-            )?,
+            Backend::Disk { storage } => {
+                executor::storage_insert(storage, table_id, &schema, &self.functions, columns.as_deref(), &values.rows)?
+            }
         };
         Ok(QueryResult::command_with_count("INSERT", count))
     }
@@ -400,55 +369,48 @@ impl Database {
     /// が、`WHERE`に一致した行への`SET`の適用までを行う。テーブル名・`SET`の
     /// 対象列・`WHERE`の名前解決と型検査は、いずれも`Binder`の`bind_update`が
     /// 済ませている。
-    fn execute_update(&mut self, update: BoundUpdate) -> DbResult<QueryResult> {
+    ///
+    /// `UpdateNode::input`(`Scan`)は、書き換え対象のテーブルを演算子木として
+    /// 表すために持っているが、`executor::update`自身が「走査しながら
+    /// `predicate`を評価し、一致した行だけ書き換える」という1回の走査に
+    /// まとめて行うため、ここでは`input`を実際にたどらず`table_id`・`schema`
+    /// だけを取り出す(`logical_plan::build_update`のドキュメント参照)。
+    fn execute_update(&mut self, plan: LogicalPlan) -> DbResult<QueryResult> {
+        let LogicalPlan::Update(UpdateNode { table_id, schema, assignments, predicate, .. }) = plan else {
+            unreachable!("logical_plan::build_updateは常にLogicalPlan::Updateを返す")
+        };
+
         let count = match &mut self.backend {
             Backend::Memory { storage, .. } => {
-                let mem_table = storage
-                    .table_mut(update.table_id)
-                    .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::update(
-                    mem_table,
-                    &update.schema,
-                    &self.functions,
-                    &update.assignments,
-                    update.predicate.as_ref(),
-                )?
+                let mem_table =
+                    storage.table_mut(table_id).expect("catalogに登録されたテーブルはstorageにも必ず存在する");
+                executor::update(mem_table, &schema, &self.functions, &assignments, predicate.as_ref())?
             }
-            Backend::Disk { storage } => executor::storage_update(
-                storage,
-                update.table_id,
-                &update.schema,
-                &self.functions,
-                &update.assignments,
-                update.predicate.as_ref(),
-            )?,
+            Backend::Disk { storage } => {
+                executor::storage_update(storage, table_id, &schema, &self.functions, &assignments, predicate.as_ref())?
+            }
         };
         Ok(QueryResult::command_with_count("UPDATE", count))
     }
 
     /// `DELETE FROM`を実行する。`executor::delete`(または`executor::storage_delete`)
     /// が、`WHERE`に一致した行の削除までを行う。テーブル名・`WHERE`の名前解決と
-    /// 型検査は`Binder`の`bind_delete`が済ませている。
-    fn execute_delete(&mut self, delete: BoundDelete) -> DbResult<QueryResult> {
+    /// 型検査は`Binder`の`bind_delete`が済ませている。`DeleteNode::input`を
+    /// 実際にたどらない理由は`execute_update`と同じ。
+    fn execute_delete(&mut self, plan: LogicalPlan) -> DbResult<QueryResult> {
+        let LogicalPlan::Delete(DeleteNode { table_id, schema, predicate, .. }) = plan else {
+            unreachable!("logical_plan::build_deleteは常にLogicalPlan::Deleteを返す")
+        };
+
         let count = match &mut self.backend {
             Backend::Memory { storage, .. } => {
-                let mem_table = storage
-                    .table_mut(delete.table_id)
-                    .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::delete(
-                    mem_table,
-                    &delete.schema,
-                    &self.functions,
-                    delete.predicate.as_ref(),
-                )?
+                let mem_table =
+                    storage.table_mut(table_id).expect("catalogに登録されたテーブルはstorageにも必ず存在する");
+                executor::delete(mem_table, &schema, &self.functions, predicate.as_ref())?
             }
-            Backend::Disk { storage } => executor::storage_delete(
-                storage,
-                delete.table_id,
-                &delete.schema,
-                &self.functions,
-                delete.predicate.as_ref(),
-            )?,
+            Backend::Disk { storage } => {
+                executor::storage_delete(storage, table_id, &schema, &self.functions, predicate.as_ref())?
+            }
         };
         Ok(QueryResult::command_with_count("DELETE", count))
     }

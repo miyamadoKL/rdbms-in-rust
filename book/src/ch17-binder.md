@@ -395,6 +395,7 @@ fn bind(&self, statement: Statement, sql: &str) -> DbResult<BoundStatement> {
 ```rust
 pub struct BoundInsert {
     pub table_id: TableId,
+    pub table_name: String,
     pub schema: Schema,
     pub columns: Option<Vec<usize>>,
     pub rows: Vec<Vec<Expr>>,

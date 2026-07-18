@@ -23,7 +23,9 @@
 //! `SELECT`・`UPDATE`・`DELETE`が再起動をまたいで残る。第17章では、ASTを
 //! カタログと突き合わせて名前解決・型検査を行う`Binder`が加わり、`database`の
 //! 実行経路は構文解析(`parser`)→名前解決(`binder`)→実行(`executor`)という
-//! 3段階になる。
+//! 3段階になる。第18章では、`BoundStatement`を関係代数の演算子木
+//! (`LogicalPlan`)へ変換する`logical_plan`が加わり、`database`の実行経路は
+//! 構文解析→名前解決→計画(`logical_plan`)→実行という4段階になる。
 
 pub mod ast;
 pub mod binder;
@@ -38,6 +40,7 @@ pub mod free_space_map;
 pub mod heap_file;
 pub mod ids;
 pub mod lexer;
+pub mod logical_plan;
 pub mod page;
 pub mod parser;
 pub mod slotted_page;
@@ -58,6 +61,7 @@ pub use free_space_map::FreeSpaceMap;
 pub use heap_file::{HeapFile, Scan};
 pub use ids::{PageId, RecordId, SlotId, TableId, TransactionId};
 pub use lexer::{Keyword, Span, Token, TokenKind, tokenize};
+pub use logical_plan::LogicalPlan;
 pub use page::{
     FILE_HEADER_SIZE, FORMAT_VERSION, MAGIC, PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, PAGE_SIZE,
     FileHeader, Page, PageType,

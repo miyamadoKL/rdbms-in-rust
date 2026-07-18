@@ -28,7 +28,7 @@
 # 第3部 Query Execution: SQLを実行計画へ変換する
 
 - [第17章 Binderと名前解決](ch17-binder.md)
-- [第18章 関係代数とLogical Plan]()
+- [第18章 関係代数とLogical Plan](ch18-logical-plan.md)
 - [第19章 Physical PlanとVolcano Executor]()
 - [第20章 制約]()
 - [第21章 Sort、Limit、Distinct、Aggregate]()
