@@ -1,0 +1,38 @@
+name: mermaid
+
+# ドキュメント内の Mermaid 図がすべてレンダリング可能かを検査する。
+# GitHub の rich display と同じ Mermaid エンジン(mermaid-cli)でパースするため、
+# 「Unable to render rich display」になる壊れた図を CI で検出できる。
+# 検査ロジックは .github/scripts/check-mermaid.sh に置き、ローカルでも同じスクリプトで実行できる。
+#
+# このリポジトリは小規模なので、差分ディレクトリへの絞り込みは行わず、
+# 常にリポジトリ全体の Markdown を検査する。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/*.md"
+      - ".github/workflows/mermaid.yml"
+      - ".github/scripts/check-mermaid.sh"
+  pull_request:
+    paths:
+      - "**/*.md"
+      - ".github/workflows/mermaid.yml"
+      - ".github/scripts/check-mermaid.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  mermaid:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: Install mermaid-cli
+        run: npm install -g @mermaid-js/mermaid-cli@11
+      - name: Validate mermaid diagrams render
+        run: bash .github/scripts/check-mermaid.sh

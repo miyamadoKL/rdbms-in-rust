@@ -239,7 +239,7 @@ fn run_sql(sql: &str) -> String {
 
 ここまでの内容は`cargo test`で確認できます。
 
-```
+```console
 $ cargo test
 running 1 test
 test tests::page_id_equality ... ok

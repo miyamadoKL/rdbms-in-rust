@@ -1,0 +1,26 @@
+{
+  // markdownlint-cli2 設定。CI(GitHub Actions)とローカル(npx markdownlint-cli2)で共有する。
+  // 詳細: https://github.com/DavidAnson/markdownlint-cli2
+  "globs": [
+    "README.md",
+    "book/src/**/*.md",
+    // book/src/SUMMARY.mdはmdBook専用の目次ファイルで、前付け(prefix chapter)への
+    // リンクを見出しなしで先頭に置き、未執筆章を`[章タイトル]()`という空リンク
+    // (draft chapter)として記載するmdBook公式の記法を使う。これらはMD041/MD042の
+    // 通常の違反パターンと衝突するため、SUMMARY.mdはlint対象から除外する(構造の
+    // 妥当性はmdbook buildが検証する)。他のファイルではMD041/MD042を有効なまま
+    // 保ち、章本文に紛れ込んだ空リンク等の執筆ミスは引き続き検出する。
+    "!book/src/SUMMARY.md"
+  ],
+  "config": {
+    "default": true,
+    // MD013(line-length): 日本語の「一文一行」スタイルのため行長制限は設けない。
+    "MD013": false,
+    // MD060(table-column-style): 全角文字を含む表は桁揃えが定まらないため無効化。
+    "MD060": false,
+    // MD024(no-duplicate-heading): 親見出しが異なれば同名の小見出しを許容する。
+    "MD024": {
+      "siblings_only": true
+    }
+  }
+}

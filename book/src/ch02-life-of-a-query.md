@@ -176,5 +176,5 @@ Executorが最終的に受け取るのは、こうしてページから取り出
 
 次章では、この経路を実装していくためのRustプロジェクトの骨格と、各章の変更を検証するためのテスト基盤を整えます。手を動かすのはそこからです。
 
-[^sqlite-arch]: SQLiteのアーキテクチャについては https://sqlite.org/arch.html を参照。
+[^sqlite-arch]: SQLiteのアーキテクチャについては <https://sqlite.org/arch.html> を参照。
 [^pg-arch]: PostgreSQLのクエリ処理経路(Parser、Transformation、Planner、Executor)については、PostgreSQL公式ドキュメントのクエリ処理の章を参照。
