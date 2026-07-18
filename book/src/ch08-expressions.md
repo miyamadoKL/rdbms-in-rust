@@ -57,23 +57,24 @@ fn and(l: Option<bool>, r: Option<bool>) -> Option<bool> {
 ```
 
 このコードは`and(Some(true), Some(false))`を`Some(false)`に、`and(None, None)`を`None`に正しく変換します。
+`and(Some(false), None)`を試しても、結果は`Some(false)`になります。
+Rustの`&&`は左辺が`false`のとき右辺を評価しない短絡評価を行うため、`l?`が`false`に解決した時点で`r?`には触れず、`r`が`None`であっても結果に影響しないからです。
 ここまでは三値論理の直感と一致しているように見えます。
 
-ところが`and(Some(false), None)`を試すと、`Some(false)`を返してほしいところで`None`が返ります。
-`r?`が`None`に出会った時点で、関数全体が即座に`None`を返してしまうからです。
-`l`の値がすでに`FALSE`だと確定しているにもかかわらず、`r`が`UNKNOWN`だというだけで、関数は`l`を見ずに投げ出してしまいます。
+ところが、引数の順序を入れ替えて`and(None, Some(false))`を試すと、`Some(false)`を返してほしいところで`None`が返ります。
+`l?`が`None`に出会った時点で、関数全体がその場で`None`を返して打ち切られてしまうからです。
+`r`の値がすでに`FALSE`だと確定しているにもかかわらず、`l`が`UNKNOWN`だというだけで、関数は`r`を見ずに投げ出してしまいます。
 
 これは`Option`の`?`という道具そのものの性質です。
 `?`は「最初に出会った`None`で処理を打ち切る」という短絡評価のために設計されており、Rustのエラー伝播にはうってつけの挙動です。
 しかし三値論理の`AND`が要求する規則は、これとは違います。
-`FALSE AND UNKNOWN`は、2つの引数のうちどちらが先に読まれたかに関係なく`FALSE`でなければなりません。
-`FALSE`という値は、もう一方が何であっても結果を決定づける、いわば「勝つ」値だからです。
-`?`による短絡評価は、`None`(UNKNOWN)を「勝つ」値として扱ってしまう点で、三値論理の規則と食い違います。
+`FALSE AND UNKNOWN`と`UNKNOWN AND FALSE`は、どちらも`FALSE`でなければならず、2つの引数のどちらを先に書くかによって結果が変わってはいけません。
+`?`による`None`の伝播は、書かれた順に左から評価を打ち切るだけの規則なので、SQLでは同じ答えになるべき`and(Some(false), None)`と`and(None, Some(false))`という2つの呼び出しに、異なる結果を返してしまいます。
 
 `Option<bool>`という型そのものが間違っているわけではありません。
-問題は、Rustの標準コンビネータ(`?`、`and_then`、`zip`など)がどれも`None`を伝播させる方向にしか短絡評価しない、という一点です。
-三値論理の`AND`は`FALSE`が、`OR`は`TRUE`が、それぞれ`UNKNOWN`より強い値として振る舞う必要があります。
-この非対称な勝ち負けのルールを表現するには、コンビネータに頼らず、2引数の総当たりで真理値表そのものを書き下すしかありません。
+問題は、`?`や、素朴に連ねた`and_then`のように「最初に出会った`None`で打ち切る」という評価順序に結果を依存させるコンビネータでは、引数を書いた順序がそのまま答えに漏れ出してしまう、という一点です。
+三値論理の`AND`は、`FALSE`がどちらの引数の位置にあっても`UNKNOWN`より強い値として振る舞う、引数の順序に依存しない規則を必要とします。
+この規則を表現するには、評価順序に頼る短絡評価をやめ、2引数の総当たりで真理値表そのものを書き下すしかありません。
 
 ## 真理値表をコードに落とす
 
@@ -96,15 +97,22 @@ fn value_to_tri(value: &Value) -> DbResult<Tri> {
         Value::Null => Ok(Tri::Unknown),
         Value::Boolean(true) => Ok(Tri::True),
         Value::Boolean(false) => Ok(Tri::False),
-        other => Err(DbError::Eval(format!(
-            "論理演算はBOOLEANまたはNULLに対してのみ使えます: {:?}が渡されました",
-            other.data_type()
-        ))),
+        other => {
+            // `Value::Null`と`Value::Boolean`は直前の分岐で処理済みなので、
+            // `data_type()`は必ず`Some`を返す。
+            let data_type = other
+                .data_type()
+                .expect("NullとBooleanは既に処理済みなのでdata_type()は必ずSomeを返す");
+            Err(DbError::Eval(format!(
+                "論理演算はBOOLEANまたはNULLに対してのみ使えます: {data_type}が渡されました"
+            )))
+        }
     }
 }
 ```
 
-`BOOLEAN`でも`NULL`でもない値(`BigInt`や`Text`)を論理演算に渡すとエラーになります。
+`BOOLEAN`でも`NULL`でもない値(`BIGINT`や`TEXT`)を論理演算に渡すとエラーになります。
+エラーメッセージには`Option<DataType>`のRust内部表現(`Some(BigInt)`)ではなく、`DataType`の`Display`実装によるSQLの型名(`BIGINT`)だけを表示します。
 `1 AND true`のような式を暗黙に`Boolean`へ変換して通す設計も選べますが、この章では暗黙変換を採らない方針(次節で改めて述べます)を通しています。
 
 `AND`と`OR`は、前節の`?`で崩れた規則を、9通りの組み合わせをすべて列挙するmatch式で書き直します。
@@ -203,11 +211,19 @@ fn eval_arith(op: BinaryOperator, l: Value, r: Value) -> DbResult<Value> {
                 .map(Value::BigInt)
                 .ok_or_else(|| DbError::Eval(format!("整数オーバーフロー: {l} {op:?} {r}")))
         }
-        (l, r) => Err(DbError::Eval(format!(
-            "算術演算はBIGINT同士にのみ使えます: {:?}と{:?}",
-            l.data_type(),
-            r.data_type()
-        ))),
+        (l, r) => {
+            // `Value::Null`は直前の分岐で処理済みなので、両辺とも`data_type()`は
+            // 必ず`Some`を返す。
+            let l_type = l
+                .data_type()
+                .expect("Nullは既に処理済みなのでdata_type()は必ずSomeを返す");
+            let r_type = r
+                .data_type()
+                .expect("Nullは既に処理済みなのでdata_type()は必ずSomeを返す");
+            Err(DbError::Eval(format!(
+                "算術演算はBIGINT同士にのみ使えます: {l_type}と{r_type}"
+            )))
+        }
     }
 }
 ```
@@ -240,10 +256,16 @@ fn eval_compare(op: BinaryOperator, l: Value, r: Value) -> DbResult<Value> {
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
         (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
         _ => {
+            // `Value::Null`は直前の分岐で処理済みなので、両辺とも`data_type()`は
+            // 必ず`Some`を返す。
+            let l_type = l
+                .data_type()
+                .expect("Nullは既に処理済みなのでdata_type()は必ずSomeを返す");
+            let r_type = r
+                .data_type()
+                .expect("Nullは既に処理済みなのでdata_type()は必ずSomeを返す");
             return Err(DbError::Eval(format!(
-                "比較演算は同じ型同士にのみ使えます: {:?}と{:?}",
-                l.data_type(),
-                r.data_type()
+                "比較演算は同じ型同士にのみ使えます: {l_type}と{r_type}"
             )));
         }
     };
@@ -353,10 +375,17 @@ fn eval_cast(value: Value, target: DataType) -> DbResult<Value> {
                 "TEXTからBOOLEANへのCASTに失敗しました: {s:?}"
             ))),
         },
-        (value, target) => Err(DbError::Eval(format!(
-            "{:?}から{target:?}へのCASTは対応していません",
-            value.data_type()
-        ))),
+        (value, target) => {
+            // `Value::Null`は直前の分岐で処理済みなので、`data_type()`は必ず
+            // `Some`を返す。`target`も含め、Rustの`Debug`表現(`BigInt`)ではなく
+            // `Display`によるSQLの型名(`BIGINT`)で表示する。
+            let data_type = value
+                .data_type()
+                .expect("Nullは既に処理済みなのでdata_type()は必ずSomeを返す");
+            Err(DbError::Eval(format!(
+                "{data_type}から{target}へのCASTは対応していません"
+            )))
+        }
     }
 }
 ```
@@ -420,10 +449,16 @@ fn builtin_abs(args: &[Value]) -> DbResult<Value> {
             .checked_abs()
             .map(Value::BigInt)
             .ok_or_else(|| DbError::Eval(format!("整数オーバーフロー: abs({n})"))),
-        other => Err(DbError::Eval(format!(
-            "absはBIGINTを引数に取ります: {:?}が渡されました",
-            other.data_type()
-        ))),
+        other => {
+            // `Value::Null`は直前の分岐で処理済みなので、`data_type()`は必ず
+            // `Some`を返す。
+            let data_type = other
+                .data_type()
+                .expect("Nullは既に処理済みなのでdata_type()は必ずSomeを返す");
+            Err(DbError::Eval(format!(
+                "absはBIGINTを引数に取ります: {data_type}が渡されました"
+            )))
+        }
     }
 }
 ```
@@ -431,7 +466,10 @@ fn builtin_abs(args: &[Value]) -> DbResult<Value> {
 `checked_abs`を使っているのは、算術演算と同じ理由です。
 `i64::MIN.abs()`は表現できる範囲を超えるため、ここでもオーバーフローをエラーとして検出します。
 `builtin_length`は`TEXT`の文字数(`chars().count()`)を`BIGINT`として返します。
-バイト数ではなく文字数を数えているのは、`TEXT`が可変長の文字列を表す型である以上、利用者が`length`に期待するのは目に見える文字の個数であり、UTF-8のバイト表現という実装の都合を漏らすべきではないと判断したためです。
+バイト数ではなく文字数を数えているのは、`TEXT`が可変長の文字列を表す型である以上、UTF-8のバイト表現という実装の都合を利用者に漏らすべきではないと判断したためです。
+ただし`chars()`が数えるのはRustの`char`、つまりUnicodeのスカラー値の個数であり、画面上で1文字に見える単位(書記素クラスタ)とは一致しません。
+`é`という同じ見た目の文字も、単一のコードポイントとして書かれていれば`chars().count()`は1を返しますが、`e`と結合用アクセント記号の2つに分解して書かれていれば2を返します。
+この章の`length`は、この差を吸収する書記素クラスタ単位の実装までは持たない、という割り切りのもとにあります。
 
 `FunctionRegistry`を利用者が直接使う場面もこの章の設計に含めています。
 `register`が公開メソッドなので、`abs`や`length`以外の関数を後から追加登録できます。

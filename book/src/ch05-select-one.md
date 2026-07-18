@@ -78,12 +78,17 @@ pub enum ToyExpr {
 ```rust
 impl ToyExpr {
     /// 式を評価して`Value`を返す。
-    pub fn eval(&self) -> Value {
+    ///
+    /// 整数どうしの加算がオーバーフローする場合は`DbError::Eval`を返す。
+    pub fn eval(&self) -> DbResult<Value> {
         match self {
-            ToyExpr::IntLiteral(v) => Value::BigInt(*v),
-            ToyExpr::BoolLiteral(v) => Value::Boolean(*v),
-            ToyExpr::Add(lhs, rhs) => match (lhs.eval(), rhs.eval()) {
-                (Value::BigInt(l), Value::BigInt(r)) => Value::BigInt(l + r),
+            ToyExpr::IntLiteral(v) => Ok(Value::BigInt(*v)),
+            ToyExpr::BoolLiteral(v) => Ok(Value::Boolean(*v)),
+            ToyExpr::Add(lhs, rhs) => match (lhs.eval()?, rhs.eval()?) {
+                (Value::BigInt(l), Value::BigInt(r)) => l
+                    .checked_add(r)
+                    .map(Value::BigInt)
+                    .ok_or_else(|| DbError::Eval(format!("整数オーバーフロー: {l} + {r}"))),
                 _ => unreachable!(
                     "ToyExpr::Addの両辺はparse_selectが整数リテラルにしか構築しない"
                 ),
@@ -97,6 +102,12 @@ impl ToyExpr {
 真偽値どうしの加算のような組み合わせは、この関数の中で弾いているわけではありません。
 弾いているのは構文解析側です。
 `parse_select`が`ToyExpr::Add`を組み立てられるのは、両辺がともに整数リテラルであると確認できたときだけに限定するので、`eval`側では「両辺が整数である」という前提を安全に置けます。
+
+一方で、両辺が整数であることは、その加算結果が`i64`の範囲に収まることまでは保証しません。
+素の`+`演算子は、`debug`ビルドでは範囲を超えた瞬間にパニックします。
+`SELECT`文1本の入力がプロセス全体を落とすのは、この章の不変条件1への違反です。
+そのため`Add`の評価には`checked_add`を使い、範囲を超えたら`None`を`DbError::Eval`に変換して呼び出し元へ返すようにしています。
+オーバーフローの扱いをどう設計するかは第8章で改めて詰めますが、この仮実装の段階でも「パニックさせない」という条件だけは満たしておく必要があります。
 
 構文解析の入り口が`parse_select`です。
 
@@ -199,7 +210,7 @@ impl Database {
     /// 仮実装に委ねている。
     pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
         let select = toy_sql::parse_select(sql)?;
-        let value = select.expr.eval();
+        let value = select.expr.eval()?;
         let data_type = value
             .data_type()
             .expect("toy_sqlが生成する式はリテラルの評価結果しか返さず、NULLにはならない");
@@ -352,10 +363,15 @@ true
 ----
 true
 (1 row)
+minidb> SELECT 9223372036854775807 + 1;
+エラー: 評価エラー: 整数オーバーフロー: 9223372036854775807 + 1
 minidb> bogus
 エラー: 構文エラー: SELECT文ではありません: "bogus"
 minidb> \q
 ```
+
+`i64`の最大値`9223372036854775807`に`1`を足す入力も、プロセスを落とすことなく`エラー:`の1行として返ってきます。
+`checked_add`が`None`を返し、`eval`がそれを`DbError::Eval`に変換した結果です。
 
 エラーを起こしても、その1行だけがエラーとして表示され、プロンプトは次の入力を受け付け続けます。
 不変条件1が守られていることが、この動作で確認できます。

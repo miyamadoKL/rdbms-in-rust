@@ -6,11 +6,38 @@
 //! 返す素朴な関数にとどめる。`Database::execute`は、これらの関数を文の種類
 //! ごとに正しい順序で呼び出す配線役に徹する。
 
-use crate::ast::{Assignment, Expr, Ident, SelectItem};
+use crate::ast::{Assignment, BinaryOperator, Expr, Ident, SelectItem, UnaryOperator};
 use crate::error::{DbError, DbResult};
 use crate::eval::{FunctionRegistry, eval_expr};
 use crate::storage_mem::MemTable;
 use crate::types::{Column, DataType, Row, Schema, Tuple, Value};
+
+/// `WHERE`・`SET`の`predicate`が評価された結果を、SQLの三値論理に従って
+/// 「その行にマッチしたかどうか」の`bool`へ変換する。
+///
+/// `TRUE`だけがマッチで、`FALSE`と`NULL`(`UNKNOWN`)はどちらもマッチしない
+/// (`filter`・`update`・`delete`が共通して従うべき規則)。`BIGINT`や`TEXT`の
+/// ような`BOOLEAN`ではない値が渡された場合は、それを黙って「マッチしない」
+/// 側に丸めてしまうと`WHERE 1`のような書き誤りを見逃すことになるため、
+/// `DbError::Eval`にする。
+fn predicate_matches(value: Value) -> DbResult<bool> {
+    match value {
+        Value::Boolean(true) => Ok(true),
+        Value::Boolean(false) | Value::Null => Ok(false),
+        other => {
+            // `Value::Boolean`と`Value::Null`は直前の分岐で処理済みなので、ここに
+            // 来る`other`は必ず`data_type()`が`Some`を返す値(`BigInt`/`Text`)である。
+            // `Option`を`{:?}`でそのまま表示すると`Some(BigInt)`のようにRustの内部
+            // 表現が利用者に漏れてしまうため、`unwrap`してSQLの型名だけを見せる。
+            let data_type = other
+                .data_type()
+                .expect("BooleanとNullは既に処理済みなのでdata_type()は必ずSomeを返す");
+            Err(DbError::Eval(format!(
+                "WHERE句はBOOLEANまたはNULLを返す式である必要があります: {data_type}が渡されました"
+            )))
+        }
+    }
+}
 
 /// Sequential Scan演算子。テーブルの全行を、格納順のまま複製して返す。
 ///
@@ -24,8 +51,9 @@ pub fn seq_scan(table: &MemTable) -> Vec<Tuple> {
 ///
 /// SQLの`WHERE`は三値論理で評価するため、`FALSE`はもちろん`UNKNOWN`(`NULL`)に
 /// なった行も、`TRUE`ではないので落ちる。`NULL`の行を「一致しなかった」側に
-/// 含めるこの規則は、`eval`モジュールが実装する三値論理(第8章)をそのまま
-/// 使うだけで、この関数自身が判定するのは`Value::Boolean(true)`かどうかだけである。
+/// 含めるこの規則、および`BOOLEAN`でも`NULL`でもない値(`WHERE 1`など)を
+/// エラーにする規則は、`predicate_matches`が`update`・`delete`とも共通して
+/// 適用する。
 pub fn filter(
     schema: &Schema,
     functions: &FunctionRegistry,
@@ -35,10 +63,8 @@ pub fn filter(
     let mut kept = Vec::with_capacity(rows.len());
     for tuple in rows {
         let row = Row::new(schema, &tuple);
-        if matches!(
-            eval_expr(predicate, functions, Some(&row))?,
-            Value::Boolean(true)
-        ) {
+        let value = eval_expr(predicate, functions, Some(&row))?;
+        if predicate_matches(value)? {
             kept.push(tuple);
         }
     }
@@ -53,11 +79,11 @@ pub fn filter(
 /// 見ればよい。
 ///
 /// 出力列の型・nullableは、単純な列参照であれば`table_schema`の定義をそのまま
-/// 使うため常に正確だが、計算結果(`id + 1`のような式)は静的な型検査を
-/// まだ持たないため、実際に1行評価してみてその結果から`data_type`を決める
-/// (行が1件も無ければ`TEXT`で代用する。第8章で`NULL`リテラルの結果列に
-/// 使ったのと同じ折衷案)。この場合の`nullable`は、行ごとに`NULL`になったり
-/// ならなかったりしうるため、常に`true`とする。静的な型検査は第17章のBinderで
+/// 使うため常に正確である。計算結果(`id + 1`のような式)の型は、行を実際に
+/// 評価せず、式のASTと`table_schema`だけから`infer_type`が静的に決める
+/// (1行目がNULLだったり、テーブルが空だったりしても型がぶれない)。
+/// この場合の`nullable`は、行ごとに`NULL`になったりならなかったりしうる
+/// ため、常に`true`とする。名前解決を伴う本格的な型検査は第17章のBinderで
 /// 置き換える。
 pub fn project(
     table_schema: &Schema,
@@ -79,15 +105,7 @@ pub fn project(
             continue;
         }
 
-        let data_type = match rows.first() {
-            Some(first) => {
-                let row = Row::new(table_schema, first);
-                eval_expr(expr, functions, Some(&row))?
-                    .data_type()
-                    .unwrap_or(DataType::Text)
-            }
-            None => DataType::Text,
-        };
+        let data_type = infer_type(expr, table_schema, functions)?;
         out_columns.push(Column::new(name.clone(), data_type, true));
     }
     let out_schema = Schema::new(out_columns);
@@ -102,6 +120,60 @@ pub fn project(
         out_rows.push(Tuple::new(&out_schema, values)?);
     }
     Ok((out_schema, out_rows))
+}
+
+/// 式の出力`DataType`を、行を実際に評価せず、式のASTと`schema`だけから静的に決める。
+///
+/// `project`が`SELECT`の出力列の型を決めるのに使う。ルールは次のとおり。
+/// - 整数・文字列・真偽値リテラルは、そのリテラルが表す型。
+/// - `NULL`リテラル単体は`DataType::Text`とする。`Value::Null`はどの`DataType`
+///   にも属さない(`Value::data_type`が`None`を返す)ため本来型を持たないが、
+///   出力列は必ず何らかの`DataType`を持たねばならないので、便宜上`TEXT`を
+///   割り当てる。`NULL`を含む式の本格的な型推論・伝播は第17章のBinderの
+///   仕事とし、ここでは意図的にこの折衷案にとどめる。
+/// - 列参照は、`schema`に定義された、その列の型。
+/// - 算術演算(`+ - * /`、単項`-`)は`BigInt`。
+/// - 比較演算・論理演算(`AND` `OR` `NOT`)・`IS [NOT] NULL`は`Boolean`。
+/// - `CAST(expr AS type)`は`type`が指す型。
+/// - 関数呼び出しは、`functions`に登録された戻り値の型。
+/// - 括弧`(expr)`は中身の式の型。
+fn infer_type(expr: &Expr, schema: &Schema, functions: &FunctionRegistry) -> DbResult<DataType> {
+    match expr {
+        Expr::IntLiteral { .. } => Ok(DataType::BigInt),
+        Expr::StringLiteral { .. } => Ok(DataType::Text),
+        Expr::BoolLiteral { .. } => Ok(DataType::Boolean),
+        // `NULL`単体の型については、この関数のドキュメントコメントを参照。
+        Expr::NullLiteral { .. } => Ok(DataType::Text),
+        Expr::ColumnRef { name, .. } => schema
+            .column(name)
+            .map(|column| column.data_type)
+            .ok_or_else(|| DbError::Eval(format!("列'{name}'が見つかりません"))),
+        Expr::UnaryOp { op, expr, .. } => match op {
+            UnaryOperator::Negate => infer_type(expr, schema, functions),
+            UnaryOperator::Not => Ok(DataType::Boolean),
+        },
+        Expr::BinaryOp { op, .. } => match op {
+            // 両辺の型が正しいかどうかの検査自体は`eval_expr`の役目であり、
+            // ここでは演算子の種類だけから出力の型を決める。
+            BinaryOperator::Add
+            | BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide => Ok(DataType::BigInt),
+            BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+            | BinaryOperator::And
+            | BinaryOperator::Or => Ok(DataType::Boolean),
+        },
+        Expr::IsNull { .. } => Ok(DataType::Boolean),
+        Expr::Cast { type_name, .. } => DataType::from_sql_name(&type_name.name)
+            .ok_or_else(|| DbError::Eval(format!("未知の型名です: {}", type_name.name))),
+        Expr::FunctionCall { name, .. } => functions.return_type(name),
+        Expr::Paren { expr, .. } => infer_type(expr, schema, functions),
+    }
 }
 
 /// `SelectItem`の並びを、`*`を展開したうえで`(評価する式, 出力列名)`の並びに変換する。
@@ -223,10 +295,7 @@ pub fn update(
         let row = Row::new(schema, tuple);
         let matched = match predicate {
             None => true,
-            Some(pred) => matches!(
-                eval_expr(pred, functions, Some(&row))?,
-                Value::Boolean(true)
-            ),
+            Some(pred) => predicate_matches(eval_expr(pred, functions, Some(&row))?)?,
         };
         if !matched {
             continue;
@@ -267,10 +336,7 @@ pub fn delete(
         let row = Row::new(schema, tuple);
         let matched = match predicate {
             None => true,
-            Some(pred) => matches!(
-                eval_expr(pred, functions, Some(&row))?,
-                Value::Boolean(true)
-            ),
+            Some(pred) => predicate_matches(eval_expr(pred, functions, Some(&row))?)?,
         };
         if matched {
             deleted += 1;
@@ -355,6 +421,52 @@ mod tests {
         assert_eq!(kept[0].values()[0], Value::BigInt(1));
     }
 
+    #[test]
+    fn filter_rejects_a_non_boolean_predicate_instead_of_silently_dropping_rows() {
+        // `WHERE 1`はBIGINTを返す式であり、暗黙にBOOLEANへ変換したり
+        // 「一致しなかった」側へ黙って丸めたりせず、エラーにする。
+        let schema = users_schema();
+        let functions = FunctionRegistry::with_builtins();
+        let rows = vec![tuple(1, Some("Alice"))];
+
+        let result = filter(&schema, &functions, rows, &expr("1"));
+        assert!(matches!(result, Err(DbError::Eval(_))));
+    }
+
+    // ---- predicate_matches ----
+
+    #[test]
+    fn predicate_matches_true_only_for_boolean_true() {
+        assert!(predicate_matches(Value::Boolean(true)).unwrap());
+        assert!(!predicate_matches(Value::Boolean(false)).unwrap());
+        assert!(!predicate_matches(Value::Null).unwrap());
+    }
+
+    #[test]
+    fn predicate_matches_rejects_non_boolean_values() {
+        assert!(matches!(
+            predicate_matches(Value::BigInt(1)),
+            Err(DbError::Eval(_))
+        ));
+        assert!(matches!(
+            predicate_matches(Value::Text("x".to_string())),
+            Err(DbError::Eval(_))
+        ));
+    }
+
+    #[test]
+    fn predicate_matches_error_message_shows_the_sql_type_name_not_rust_debug_output() {
+        // `Value::data_type()`は`Option<DataType>`を返すため、`{:?}`でそのまま
+        // 表示すると`Some(BigInt)`のようにRustの内部表現が利用者に漏れてしまう。
+        // ここではSQLの型名(`BIGINT`)だけが出ることを固定する。
+        let err = predicate_matches(Value::BigInt(1)).unwrap_err();
+        let DbError::Eval(message) = err else {
+            panic!("DbError::Evalを期待したが{err:?}が返った");
+        };
+        assert!(message.contains("BIGINTが渡されました"));
+        assert!(!message.contains("Some("));
+    }
+
     // ---- Projection ----
 
     #[test]
@@ -395,6 +507,65 @@ mod tests {
         let (out_schema, out_rows) = project(&schema, &functions, &rows, &items, sql).unwrap();
         assert!(out_schema.columns()[1].nullable);
         assert_eq!(out_rows.len(), 2);
+    }
+
+    /// テスト用に、`SELECT`文のSQLから`items`(対象式リスト)だけを取り出す。
+    fn select_items(sql: &str) -> Vec<SelectItem> {
+        match crate::parser::parse_statement(sql).unwrap() {
+            Statement::Select(select) => select.items,
+            other => panic!("SELECT文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn project_infers_computed_column_type_statically_even_when_first_row_is_null() {
+        // `x`はNULLを許すBIGINT列。1行目が`abs(x)`をNULLにする値でも、出力列の
+        // 型は実際に1行評価した結果ではなく、式のASTと入力`Schema`だけから
+        // 静的に決まるため`BigInt`のままになる。もし旧実装のように1行目を
+        // 評価して`data_type()`(NULLは`None`)から型を決めていたら、ここが
+        // `Text`にフォールバックし、2行目の非NULLなBIGINTを`Tuple::new`の
+        // スキーマ検査が`SchemaMismatch`として拒否していた。
+        let schema = Schema::new(vec![Column::new("x", DataType::BigInt, true)]);
+        let functions = FunctionRegistry::with_builtins();
+        let rows = vec![
+            Tuple::new(&schema, vec![Value::Null]).unwrap(),
+            Tuple::new(&schema, vec![Value::BigInt(-5)]).unwrap(),
+        ];
+        let items = select_items("SELECT abs(x)");
+
+        let (out_schema, out_rows) =
+            project(&schema, &functions, &rows, &items, "SELECT abs(x)").unwrap();
+        assert_eq!(out_schema.columns()[0].data_type, DataType::BigInt);
+        assert_eq!(out_rows[0].values()[0], Value::Null);
+        assert_eq!(out_rows[1].values()[0], Value::BigInt(5));
+    }
+
+    #[test]
+    fn project_infers_computed_column_type_on_an_empty_table() {
+        // 行が1件も無くても、`infer_type`は式のASTだけから型を決められる。
+        let schema = users_schema();
+        let functions = FunctionRegistry::with_builtins();
+        let rows: Vec<Tuple> = vec![];
+        let items = select_items("SELECT id + 1");
+
+        let (out_schema, out_rows) =
+            project(&schema, &functions, &rows, &items, "SELECT id + 1").unwrap();
+        assert_eq!(out_schema.columns()[0].data_type, DataType::BigInt);
+        assert!(out_rows.is_empty());
+    }
+
+    #[test]
+    fn project_scalar_function_on_non_null_rows_still_works() {
+        let schema = users_schema();
+        let functions = FunctionRegistry::with_builtins();
+        let rows = vec![tuple(1, Some("Alice")), tuple(2, Some("Bob"))];
+        let items = select_items("SELECT length(name)");
+
+        let (out_schema, out_rows) =
+            project(&schema, &functions, &rows, &items, "SELECT length(name)").unwrap();
+        assert_eq!(out_schema.columns()[0].data_type, DataType::BigInt);
+        assert_eq!(out_rows[0].values()[0], Value::BigInt(5));
+        assert_eq!(out_rows[1].values()[0], Value::BigInt(3));
     }
 
     // ---- Insert ----

@@ -137,7 +137,7 @@ pub fn eval_expr(expr: &Expr, functions: &FunctionRegistry, row: Option<&Row>) -
 
 実装に入る前に、この章のDMLが守るべき条件を3つ決めます。
 
-1. **WHEREはTRUEの行だけを採用する**: SQLの`WHERE`は三値論理で評価するため、`FALSE`になった行はもちろん、`UNKNOWN`(`NULL`)になった行も結果から落とす
+1. **WHEREはTRUEの行だけを採用する**: SQLの`WHERE`は三値論理で評価するため、`FALSE`になった行はもちろん、`UNKNOWN`(`NULL`)になった行も結果から落とす。`BOOLEAN`でも`NULL`でもない値(`WHERE 1`など)は、黙って「一致しなかった」側に丸めず、エラーにする
 2. **INSERT、UPDATEはAll-or-Nothing**: 複数行の`INSERT`や、複数行にまたがる`UPDATE`は、1行でもスキーマ検査(`NOT NULL`違反など)に失敗したら、それより前に検査を通っていた行も含めて一切反映しない
 3. **UPDATEのSET右辺は更新前の行を見る**: `SET a = b, b = a`のように複数列を書き換えるとき、後続の代入は直前の代入結果ではなく、その行の更新前の値を使う
 
@@ -317,7 +317,46 @@ let (schema, rows) = executor::project(
 )?;
 ```
 
-Filter演算子は、`守るべき不変条件`の1番目をそのままコードにしただけです。
+`WHERE`の評価結果を「一致したかどうか」という`bool`へ変換する部分は、`Filter`だけでなく`Update`や`Delete`にも共通して必要です。
+`predicate`には`WHERE id = 1`のような`BOOLEAN`を返す式が書かれているのが普通ですが、`WHERE 1`のように`BIGINT`を返す式を書き誤ることもありえます。
+そのような値を、`TRUE`でないというだけで黙って「一致しなかった」側に丸めてしまうと、書き誤りに気づけないまま0行という結果を正常応答として返してしまいます。
+そこで、この変換は`predicate_matches`という1つの関数にまとめ、`filter`、`update`、`delete`の3箇所から共通して呼びます。
+
+```rust
+fn predicate_matches(value: Value) -> DbResult<bool> {
+    match value {
+        Value::Boolean(true) => Ok(true),
+        Value::Boolean(false) | Value::Null => Ok(false),
+        other => {
+            // `Value::Boolean`と`Value::Null`は直前の分岐で処理済みなので、
+            // ここに来る`other`は必ず`data_type()`が`Some`を返す値(`BigInt`/`Text`)
+            // である。`Option`を`{:?}`でそのまま表示すると`Some(BigInt)`のように
+            // Rustの内部表現が利用者に漏れてしまうため、`unwrap`してSQLの型名
+            // だけを見せる。
+            let data_type = other
+                .data_type()
+                .expect("BooleanとNullは既に処理済みなのでdata_type()は必ずSomeを返す");
+            Err(DbError::Eval(format!(
+                "WHERE句はBOOLEANまたはNULLを返す式である必要があります: {data_type}が渡されました"
+            )))
+        }
+    }
+}
+```
+
+`predicate_matches`の分岐は3種類です。
+`Boolean(true)`だけが一致で、`Boolean(false)`と`Value::Null`(三値論理のUNKNOWN)はどちらも一致しません。
+「UNKNOWNの行を、一致しなかった行と同じように扱う」という三値論理の規則は、この2つ目の分岐が担っています。
+`BIGINT`や`TEXT`のような`BOOLEAN`でもNULLでもない値は、3つ目の分岐で`DbError::Eval`にします。
+`WHERE 1`のような式は、この分岐によって「0行がマッチした」という静かな誤答ではなく、実行時エラーとしてはっきり報告されます。
+エラーメッセージにSQLの型名だけを見せるため、`DataType`には`Display`実装(`BIGINT`/`TEXT`/`BOOLEAN`という表示名)を用意し、`Option<DataType>`をそのまま`{:?}`で表示することは避けています。
+
+```console
+minidb> SELECT id FROM users WHERE 1;
+エラー: 評価エラー: WHERE句はBOOLEANまたはNULLを返す式である必要があります: BIGINTが渡されました
+```
+
+Filter演算子は、`守るべき不変条件`の1番目を、この`predicate_matches`を使ってそのままコードにしただけです。
 
 ```rust
 pub fn filter(
@@ -329,19 +368,14 @@ pub fn filter(
     let mut kept = Vec::with_capacity(rows.len());
     for tuple in rows {
         let row = Row::new(schema, &tuple);
-        if matches!(
-            eval_expr(predicate, functions, Some(&row))?,
-            Value::Boolean(true)
-        ) {
+        let value = eval_expr(predicate, functions, Some(&row))?;
+        if predicate_matches(value)? {
             kept.push(tuple);
         }
     }
     Ok(kept)
 }
 ```
-
-`eval_expr`が返す`Value`が`Boolean(true)`かどうかだけを見ているので、`Boolean(false)`はもちろん、`Value::Null`(三値論理のUNKNOWN)もこの`if`を通らず、`kept`に積まれません。
-「UNKNOWNの行を、一致しなかった行と同じように扱う」という三値論理の規則は、`eval`モジュール(第8章)が計算した結果をそのまま使うだけで、この関数自身が特別な分岐を書く必要はありませんでした。
 
 Projection演算子は、`*`をテーブルの全列参照へ展開してから、「列参照または式のリスト」という1種類の形だけを扱います。
 
@@ -370,27 +404,70 @@ fn resolve_items(table_schema: &Schema, items: &[SelectItem], sql: &str) -> Vec<
 }
 ```
 
-出力列の型と`nullable`は、単純な列参照であれば`table_schema`の定義をそのまま使います。
+出力列の型と`nullable`は、単純な列参照であれば`table_schema`の定義をそのままコピーします。
 これなら、行が1件も無いテーブルに対する`SELECT id FROM empty_table`でも、列の型を正確に決められます。
-一方、`id + 1`のような計算結果は、まだ静的な型検査を持たない(それは第17章のBinderの仕事です)ため、実際に1行評価してみて、その結果から型を決めるという折衷案を採ります。
+
+`id + 1`のような計算結果の型を決めるには、もう一段考える必要があります。
+実際に1行評価してみて、その結果の`Value`から`data_type()`を読む案も考えられますが、この案には見落としがあります。
+`CREATE TABLE t (x BIGINT); INSERT INTO t VALUES (NULL), (1);`のように、1行目の`x`が`NULL`であるテーブルを考えてください。
+`SELECT abs(x) FROM t`を実行するとき、1行目を評価した結果は`Value::Null`で、`Value::Null`はどの`DataType`にも属さないため`data_type()`は`None`を返します。
+ここで安易に`TEXT`を仮の型として採用すると、出力列の型は`TEXT`のまま固定されてしまいます。
+2行目の`abs(1)`が返す`Value::BigInt(1)`を`Tuple::new`に渡した瞬間、宣言した列の型(`TEXT`)と実際の値の型(`BigInt`)が食い違うという`DbError::SchemaMismatch`が飛んできます。
+1行目が`NULL`だったというだけの理由で、2行目以降の正しい計算結果までエラーにしてしまうわけです。
+
+この章の`project`は、行を1行も評価せずに出力列の型を決める`infer_type`という関数を使い、この問題を避けます。
 
 ```rust
-let data_type = match rows.first() {
-    Some(first) => {
-        let row = Row::new(table_schema, first);
-        eval_expr(expr, functions, Some(&row))?
-            .data_type()
-            .unwrap_or(DataType::Text)
+fn infer_type(expr: &Expr, schema: &Schema, functions: &FunctionRegistry) -> DbResult<DataType> {
+    match expr {
+        Expr::IntLiteral { .. } => Ok(DataType::BigInt),
+        Expr::StringLiteral { .. } => Ok(DataType::Text),
+        Expr::BoolLiteral { .. } => Ok(DataType::Boolean),
+        // `NULL`単体の型については、この関数のドキュメントコメントを参照。
+        Expr::NullLiteral { .. } => Ok(DataType::Text),
+        Expr::ColumnRef { name, .. } => schema
+            .column(name)
+            .map(|column| column.data_type)
+            .ok_or_else(|| DbError::Eval(format!("列'{name}'が見つかりません"))),
+        Expr::UnaryOp { op, expr, .. } => match op {
+            UnaryOperator::Negate => infer_type(expr, schema, functions),
+            UnaryOperator::Not => Ok(DataType::Boolean),
+        },
+        Expr::BinaryOp { op, .. } => match op {
+            // 両辺の型が正しいかどうかの検査自体は`eval_expr`の役目であり、
+            // ここでは演算子の種類だけから出力の型を決める。
+            BinaryOperator::Add
+            | BinaryOperator::Subtract
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide => Ok(DataType::BigInt),
+            BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+            | BinaryOperator::And
+            | BinaryOperator::Or => Ok(DataType::Boolean),
+        },
+        Expr::IsNull { .. } => Ok(DataType::Boolean),
+        Expr::Cast { type_name, .. } => DataType::from_sql_name(&type_name.name)
+            .ok_or_else(|| DbError::Eval(format!("未知の型名です: {}", type_name.name))),
+        Expr::FunctionCall { name, .. } => functions.return_type(name),
+        Expr::Paren { expr, .. } => infer_type(expr, schema, functions),
     }
-    None => DataType::Text,
-};
-out_columns.push(Column::new(name.clone(), data_type, true));
+}
 ```
 
-行が1件も無ければ`TEXT`で代用します。
-これは、第8章で`SELECT NULL`の結果列に`TEXT`を仮の型として使ったのと同じ折衷です。
-計算結果の`nullable`を常に`true`にしているのは、行ごとに`NULL`になったりならなかったりしうる式の`nullable`を、1行だけ覗いて`false`と決め打ってしまうと、2行目以降で本当に`NULL`が出てきたときに`Tuple::new`のスキーマ検査がその`NULL`を不当に拒否してしまうからです。
+`infer_type`は式のASTと`table_schema`だけを見て、行の値には一度も触れません。
+リテラルはそのリテラルが表す型を、列参照は`schema`に定義された型を、算術演算(`+ - * /`、単項`-`)は`BigInt`を、比較演算や論理演算、`IS [NOT] NULL`は`Boolean`を、`CAST`は`type`が指す型を、それぞれ返します。
+関数呼び出しは、`FunctionRegistry`に登録された戻り値の型(`functions.return_type(name)`)をそのまま返すので、`abs(x)`の型は`abs`の戻り値の型(`BigInt`)だけから決まり、`x`の1行目が`NULL`かどうかには依存しません。
+先ほどの`SELECT abs(x) FROM t`は、この章では`x`が`NULL`の行を含んでいても、常に`BigInt`列として実行できます。
+`NULL`リテラル単体だけは例外で、`Value::Null`がどの`DataType`にも属さないのと同じ理由で型を持たないため、`TEXT`を仮の型として割り当てます。
+
+計算結果の`nullable`は常に`true`にしています。
+行ごとに`NULL`になったりならなかったりしうる式の`nullable`を、静的な型推論だけで`false`と決め打ってしまうと、実際に`NULL`が出てきた行で`Tuple::new`のスキーマ検査がその`NULL`を不当に拒否してしまうからです。
 列参照そのものであれば`table_schema`の`nullable`をそのまま使えるので、この問題は起きません。
+名前解決を伴う本格的な型検査は、第17章のBinderが引き継ぎます。
 
 ## `UPDATE`と`DELETE`を実装する
 
@@ -426,10 +503,7 @@ pub fn update(
         let row = Row::new(schema, tuple);
         let matched = match predicate {
             None => true,
-            Some(pred) => matches!(
-                eval_expr(pred, functions, Some(&row))?,
-                Value::Boolean(true)
-            ),
+            Some(pred) => predicate_matches(eval_expr(pred, functions, Some(&row))?)?,
         };
         if !matched {
             continue;
@@ -475,10 +549,7 @@ pub fn delete(
         let row = Row::new(schema, tuple);
         let matched = match predicate {
             None => true,
-            Some(pred) => matches!(
-                eval_expr(pred, functions, Some(&row))?,
-                Value::Boolean(true)
-            ),
+            Some(pred) => predicate_matches(eval_expr(pred, functions, Some(&row))?)?,
         };
         if matched {
             deleted += 1;
@@ -564,13 +635,48 @@ Golden Testは、これまで1ファイルにつき1文しか置けませんで�
 `CREATE TABLE`と`INSERT`をまたぐ流れは、複数文を実行できる単体テストの役目として書き分ける、という方針を第9章で採っています。
 しかしこの章のDMLは、`CREATE TABLE`で作ったテーブルに`INSERT`してから`SELECT`で覗く、という組み合わせを抜きにして単独では意味を持ちません。
 そこで、Golden Testのランナーを拡張し、`.sql`ファイルが`;`区切りの複数文を持てるようにしました。
+文を分ける実装は、`;`という文字だけを見て`str::split`する素朴な形にはしません。
+`SELECT 'a;b'`のような文字列リテラルや、`-- a;b`のようなコメントの内側にも`;`は現れるため、その`;`まで文の区切りとして誤認してしまうからです。
+そこで`split_statements`は、字句解析器の`tokenize`を一度通し、`TokenKind::Semicolon`のトークンだけを区切りとして扱います。
+
+```rust
+fn split_statements(sql: &str) -> Vec<&str> {
+    let tokens =
+        tokenize(sql).unwrap_or_else(|e| panic!("golden testのSQLをtokenizeできません: {e}"));
+
+    let mut statements = Vec::new();
+    let mut start = 0usize;
+    for token in &tokens {
+        match token.kind {
+            TokenKind::Semicolon => {
+                let text = sql[start..token.span.start].trim();
+                if !text.is_empty() {
+                    statements.push(text);
+                }
+                start = token.span.end;
+            }
+            TokenKind::Eof => {
+                let text = sql[start..token.span.start].trim();
+                if !text.is_empty() {
+                    statements.push(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    statements
+}
+```
+
+各`Token`は元のソース上のバイト範囲を`Span`として持っているので、`Semicolon`トークンに出会うたびに、直前の区切り位置からそのトークンの開始位置までを`sql`からそのままスライスします。
+文字列リテラルやコメントの中身がどんな文字を含んでいても、`tokenize`がその範囲を1つのトークン(または読み飛ばすコメント)として扱う以上、区切りの`TokenKind::Semicolon`として誤検出されることはありません。
+`run_sql`は、この`split_statements`が返した文をそのまま`Database`に順に流し込みます。
 
 ```rust
 fn run_sql(sql: &str) -> String {
     let mut db = temp_db();
-    sql.split(';')
-        .map(str::trim)
-        .filter(|statement| !statement.is_empty())
+    split_statements(sql)
+        .into_iter()
         .map(|statement| match db.execute(statement) {
             Ok(result) => result.to_string(),
             Err(e) => format!("ERROR: {e}"),
@@ -582,6 +688,17 @@ fn run_sql(sql: &str) -> String {
 
 すべての文を同じ`Database`で順に実行し、各文の結果を空行区切りで連結したものを期待値と突き合わせます。
 `tests/golden/017_update.sql`は、`CREATE TABLE`、`INSERT`、`UPDATE`、`SELECT`の4文を1ファイルに書き、対応する`.expected`が4つの結果を並べたものになります。
+`tests/golden/019_semicolon_in_string_and_comment.sql`は、この`split_statements`が守るべき規則そのものを回帰テストにしたものです。
+
+```sql
+-- comment with a semicolon; embedded here
+SELECT 'a;b'; -- trailing line comment; also has one
+/* block comment
+   with a semicolon; embedded here too */
+SELECT 'c;d';
+```
+
+行コメント、ブロックコメント、文字列リテラルのどれもが`;`を内側に含みますが、`split_statements`はこれらを区切りと誤認せず、`SELECT 'a;b'`と`SELECT 'c;d'`という2文に正しく分けます。
 
 ```console
 $ cargo test
@@ -632,37 +749,53 @@ fn assert_same_result(setup: &[&str], query: &str) {
 minidbが対応する`CREATE TABLE`、`INSERT`、`UPDATE`、`DELETE`の構文は、SQLiteが受け入れる構文の範囲に収まっているからです。
 `BIGINT`や`TEXT`という型名も、SQLiteでは「型名の文字列に`INT`を含めば整数の扱いにする」といったゆるい型付け(型アフィニティ)のもとで問題なく通ります。
 
-比較そのものは、2つのRDBMSが返す値をそれぞれ正規化してから行います。
+比較そのものは、2つのRDBMSが返す値を、それぞれ型タグ付きの中間表現へ変換してから行います。
+最初に思いつく素朴な方法は、`.to_string()`のような文字列化を経由してから比較することですが、この方法には見落としがあります。
+`Value::Null`と、文字列の中身がたまたま`"NULL"`である`Value::Text("NULL".to_string())`は、どちらも文字列化すると同じ`"NULL"`になってしまいます。
+整数`1`と文字列`"1"`も同様に、どちらも`"1"`という同じ文字列に潰れます。
+異なる型の値が同じ文字列表現を持つことがある以上、文字列化してからの比較は、この2つを取り違えたまま「一致した」と誤判定しかねません。
+
+そこでこの章のDifferential Testは、値を文字列へ変換する代わりに、型ごとに別のバリアントを持つ`DiffValue`という列挙型に変換してから比較します。
 
 ```rust
-fn format_minidb_value(value: &Value) -> String {
-    match value {
-        Value::Null => "NULL".to_string(),
-        Value::Boolean(b) => b.to_string(),
-        Value::BigInt(n) => n.to_string(),
-        Value::Text(s) => s.clone(),
-    }
-}
-
-fn format_sqlite_value(value: ValueRef) -> String {
-    match value {
-        ValueRef::Null => "NULL".to_string(),
-        ValueRef::Integer(n) => n.to_string(),
-        ValueRef::Real(f) => f.to_string(),
-        ValueRef::Text(bytes) => String::from_utf8_lossy(bytes).to_string(),
-        ValueRef::Blob(_) => panic!("このサブセットにBLOBは存在しないはずです"),
-    }
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum DiffValue {
+    Null,
+    Boolean(bool),
+    Integer(i64),
+    Text(String),
 }
 ```
 
-`NULL`はどちらも`"NULL"`という文字列に、整数は10進数の文字列表現に、文字列はそのままの内容にそろえます。
-`BOOLEAN`列は、この正規化の対象から外しています。
-SQLiteは真偽値専用の型を持たず、内部的には`0`、`1`という整数として扱うため、`true`、`false`という文字列を返すminidbとは同じ正規化関数では比較できません。
-この章のDifferential Testは、両者の表示が素直に一致する範囲(`BIGINT`、`TEXT`、`NULL`)に限定し、`BOOLEAN`列を含む比較は今後の課題として残します。
+`Null`と`Text("NULL".to_string())`、`Integer(1)`と`Text("1".to_string())`は、`DiffValue`では異なるバリアントなので、`PartialEq`による比較で取り違えることがありません。
+
+`BOOLEAN`列の扱いにも、同じ理由で一工夫が要ります。
+SQLiteは真偽値専用の型を持たず、`BOOLEAN`列も内部的には`0`または`1`という整数として保持します。
+この`0`や`1`を値だけ見て「`BOOLEAN`だろう」と推測するのは、`BIGINT`列にたまたま`0`や`1`が入っている場合と区別がつかず危険です。
+そこでこの章のDifferential Testは、値からの推測に頼らず、minidb側で`query`を実行して得られる`QueryResult`のスキーマから、SELECTした各列の`DataType`を求め、その列型が`DataType::Boolean`だと分かっている列でだけ、SQLiteの整数`0`や`1`をそれぞれ`DiffValue::Boolean(false)`、`DiffValue::Boolean(true)`に読み替えます。
+
+結果の比較は、行の順序を無視した比較にしています。
+
+```rust
+fn assert_same_result(setup: &[&str], query: &str) {
+    let (mut minidb_rows, column_types) = run_minidb(setup, query);
+    let mut sqlite_rows = run_sqlite(setup, query, &column_types);
+
+    minidb_rows.sort();
+    sqlite_rows.sort();
+
+    assert_eq!(
+        minidb_rows, sqlite_rows,
+        "minidbとSQLiteの結果が一致しません: setup={setup:?}, query={query:?}"
+    );
+}
+```
 
 `ORDER BY`はまだ構文解析器が受理しません(第21章で追加します)。
-そのため、比較する`SELECT`はどれも`ORDER BY`を持たず、Sequential Scanが挿入順を保つminidbと、単純な全表走査ではおおむね挿入順(rowid順)で行を返すSQLiteが、たまたま同じ順序になるという前提に乗っています。
-索引やJoinが絡む複雑なクエリではこの前提が崩れるので、`ORDER BY`が使えるようになった章で、テストケースにも付け直す必要があります。
+`ORDER BY`の無い`SELECT`の行順序はSQLの意味論上未規定なので、Sequential Scanが挿入順を保つminidbと、SQLiteの実装詳細(たいてい挿入順やrowid順)が、行の集合として同じでも順序だけ食い違うことがあります。
+順序のまま`Vec`同士を比較していると、この食い違いだけでテストが偽の失敗をします。
+`minidb_rows`と`sqlite_rows`をそれぞれ`.sort()`してから`assert_eq!`することで、行の集合としての一致(多重集合としての一致)だけを見るようにし、順序の違いを比較の対象から外しています。
+ソートは重複行の個数を潰さないため、`(1, 'a'), (1, 'a'), (2, 'b')`という結果は`(1, 'a'), (2, 'b'), (1, 'a')`とは一致しても`(1, 'a'), (2, 'b')`とは一致しません。
 
 三値論理の扱いをminidbとSQLiteで突き合わせるテストは、次のようになりました。
 
@@ -680,11 +813,30 @@ fn where_with_null_drops_unknown_rows() {
 }
 ```
 
-`cargo test --test differential`を実行すると、`CREATE`、複数行の`INSERT`、列名指定、`WHERE`の三値論理、`UPDATE`、`DELETE`、算術式を含む7ケースがすべて通ります。
+`Value::Null`と文字列`'NULL'`、整数`1`と文字列`'1'`が取り違えられないことも、それぞれ専用のテストで確認しています。
+
+```rust
+#[test]
+fn null_is_not_confused_with_the_text_null() {
+    assert_same_result(
+        &[
+            "CREATE TABLE t (id BIGINT NOT NULL, label TEXT)",
+            "INSERT INTO t (id) VALUES (1)",
+            "INSERT INTO t VALUES (2, 'NULL')",
+        ],
+        "SELECT id, label FROM t",
+    );
+}
+```
+
+`id = 1`の行は`label`が`NULL`、`id = 2`の行は`label`が文字列`'NULL'`です。
+`DiffValue`が型ごとにバリアントを分けているおかげで、この2つの行がminidbとSQLiteのどちらでも取り違えられないことを、このテストが確認します。
+
+`cargo test --test differential`を実行すると、`CREATE`、複数行の`INSERT`、列名指定、`WHERE`の三値論理、`UPDATE`、`DELETE`、算術式、行順序の無視、多重集合としての一致、`NULL`と`BOOLEAN`列の型の取り違え防止を含む12ケースがすべて通ります。
 
 ```console
 $ cargo test --test differential
-running 7 tests
+running 12 tests
 test create_insert_select ... ok
 test multi_row_insert_with_where ... ok
 test insert_with_explicit_columns_fills_omitted_columns_with_null ... ok
@@ -692,22 +844,26 @@ test where_with_null_drops_unknown_rows ... ok
 test update_changes_matching_rows ... ok
 test delete_removes_matching_rows ... ok
 test arithmetic_and_string_comparison_in_where ... ok
+test multi_row_insert_returns_rows_in_any_order ... ok
+test bag_comparison_preserves_duplicate_row_counts ... ok
+test null_is_not_confused_with_the_text_null ... ok
+test integer_is_not_confused_with_its_text_representation ... ok
+test boolean_column_is_reconciled_against_sqlite_zero_one ... ok
 
-test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
 
 ## 壊して確認する
 
-Filter演算子の三値論理の判定を、実際に壊して確認します。
-「TRUEの行だけを残す」を、「FALSEでない行を残す」に書き換えると、一見同じことを言っているように見えます。
+`predicate_matches`の三値論理の判定を、実際に壊して確認します。
+「`TRUE`の行だけをマッチとする」を、「`FALSE`でない行をマッチとする」に書き換えると、一見同じことを言っているように見えます。
 
 ```rust
-// if matches!(eval_expr(predicate, functions, Some(&row))?, Value::Boolean(true)) {
-if !matches!(
-    eval_expr(predicate, functions, Some(&row))?,
-    Value::Boolean(false)
-) {
-    kept.push(tuple);
+fn predicate_matches(value: Value) -> DbResult<bool> {
+    match value {
+        Value::Boolean(false) => Ok(false),
+        _ => Ok(true), // UNKNOWNの特別扱いを消した
+    }
 }
 ```
 
@@ -721,23 +877,23 @@ assertion `left == right` failed
 ```
 
 `name`が`NULL`の行の`name = 'Alice'`は、`FALSE`ではなく`UNKNOWN`(`Value::Null`)です。
-「`FALSE`でない」という条件は`UNKNOWN`にも成り立ってしまうため、壊した`filter`はこの行を「一致した」側に誤って残します。
-`WHERE id FROM users`は本来1行(`id = 2`)だけを返すべきところ、`id = 1`の行(`name`が`NULL`)まで一緒に返してしまい、テストの`left: 2`という行数がその混入を示しています。
+「`FALSE`でない」という条件は`UNKNOWN`にも成り立ってしまうため、壊した`predicate_matches`はこの行を「一致した」側に誤って残します。
+`SELECT id FROM users WHERE name = 'Alice'`は本来1行(`id = 2`)だけを返すべきところ、`id = 1`の行(`name`が`NULL`)まで一緒に返してしまい、テストの`left: 2`という行数がその混入を示しています。
 
 同じ壊れ方を、SQLiteとのDifferential Testも独立に検出します。
 
 ```console
 thread 'where_with_null_drops_unknown_rows' panicked at tests/differential.rs:32:5:
 assertion `left == right` failed: minidbとSQLiteの結果が一致しません: ...
-  left: [["1"], ["2"]]
- right: [["2"]]
+  left: [[Integer(1)], [Integer(2)]]
+ right: [[Integer(2)]]
 ```
 
-`left`(minidb)が`UNKNOWN`の行を混入させて2行返しているのに対し、`right`(SQLite)は本来の1行だけを返しています。
+`left`(minidb、ソート済み)が`UNKNOWN`の行を混入させて2行返しているのに対し、`right`(SQLite、ソート済み)は本来の1行だけを返しています。
 `select_where_drops_unknown_rows`は「minidbの実装が、minidbのテストが期待する答えからずれた」ことしか教えてくれませんが、このDifferential Testは「minidbの答えが、SQLiteという独立した実装の答えからもずれた」ことまで教えてくれます。
 自分で書いたテストと期待値が両方とも同じ勘違いに基づいていたら検出できない種類のバグを、この章で導入したDifferential Testは検出できる位置に立っています。
 
-`if !matches!(..., Value::Boolean(false))`を元の`if matches!(..., Value::Boolean(true))`に戻すと、両方のテストが再び緑に戻ります。
+`predicate_matches`を元の実装(`Boolean(true)`だけを`Ok(true)`、`Boolean(false)`と`Null`を`Ok(false)`、それ以外をエラーにする3分岐)に戻すと、両方のテストが再び緑に戻ります。
 
 ## 第1部の到達点
 
@@ -774,12 +930,12 @@ id | name
 
 ### 必須課題
 
-1. `executor::update`と`executor::delete`は、`predicate`が`None`のとき全行を対象にします。`UPDATE users SET name = 'X'`のようにWHEREを省略した`UPDATE`が、本当に全行を書き換えることを確認する単体テストを追加してください。
+1. `src/database.rs`の`update_without_where_changes_every_row`と`src/executor.rs`の`delete_without_predicate_removes_every_row`を読んでください。どちらも`WHERE`を省略した`UPDATE`や`DELETE`が全行を対象にすることを確認していますが、確認の粒度が異なります(片方は`Database::execute`を通した結果の行数、もう片方は`executor::delete`単体の戻り値と`table`の中身)。この2つのテストが同じ主張を別の層で検証していると言えるのはなぜか、そしてこの章の「全行を評価し終えてから一括で書き込む」というAll-or-Nothingの順序が、`predicate`が`None`の場合(検査すべき`WHERE`が無い場合)にどう関わるかを説明してください。
 2. `INSERT INTO users (id, id) VALUES (1, 2)`のように、同じ列名を`INSERT`の列リストに2回書いた場合の挙動を確認してください。`expand_to_schema`のどの分岐がこれを検出しているか、コードを読んで説明したうえで、対応するテストが無ければ追加してください。
 3. `SELECT id, * FROM users`のように、`*`と通常の式を同じ対象式リストに混ぜて書けることを確認してください。`resolve_items`の実装がこれをどう扱っているかを読み、対応するテストが無ければ追加してください。
 
 ### 発展課題
 
-1. この章のDifferential Testは`BOOLEAN`列を比較の対象から外しています。SQLiteの`0`/`1`とminidbの`true`/`false`を、列の宣言型を見て正規化する仕組みを設計し、実装してください。`CREATE TABLE`のSQLからどうやって列の型を取り出すか(SQLiteに問い合わせるか、テスト側で別途宣言するか)を検討する必要があります。
+1. この章のDifferential Testは、`setup`と`query`がどちらも成功する場合しか比較していません。`SELECT 1 / 0`のようにminidbが`DbError::Eval`を返すべき入力を、SQLiteに投げるとどうなるか調べてください。SQLiteは整数の`0`除算をエラーにせず`NULL`を返し、`i64`の範囲を超える加算もエラーにせず浮動小数点数へ黙って昇格させます。両者のエラー挙動の違いを比較するテストの枠組みをどう設計すべきか(`assert_same_result`をそのまま使えるか、エラーになったかどうかだけを比較する専用の関数が要るか)を考えてください。
 2. `UPDATE`と`DELETE`は、対象の行を`Vec<Tuple>`の添字で直接書き換えています。行数が多いテーブルに対して`WHERE`無しの`DELETE`を繰り返し実行するベンチマークを書き、`*table.rows_mut() = kept`という書き戻し方の計算量を確認してください。第2部でHeap Fileに置き換わったとき、この書き戻し方がどう変わるべきかを考察してください。
 3. `INSERT INTO users SELECT id, name FROM other_users`のような、`VALUES`の代わりに`SELECT`の結果を挿入元にする構文(`INSERT ... SELECT`)は、このSQLサブセットにまだありません。`InsertStatement`と`executor::insert`をどう変更すればこの構文に対応できるか、設計だけ考えてみてください(実装は必須ではありません)。

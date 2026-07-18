@@ -49,6 +49,21 @@ impl DataType {
     }
 }
 
+impl std::fmt::Display for DataType {
+    /// `from_sql_name`と対になる、SQLの型名としての表示。
+    ///
+    /// エラーメッセージなど利用者向けの出力は、Rustの`Debug`表現(`BigInt`)ではなく
+    /// SQLの型名(`BIGINT`)を見せるため、この`Display`実装を経由する。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            DataType::Boolean => "BOOLEAN",
+            DataType::BigInt => "BIGINT",
+            DataType::Text => "TEXT",
+        };
+        write!(f, "{name}")
+    }
+}
+
 impl Value {
     /// この値の`DataType`を返す。
     ///

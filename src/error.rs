@@ -23,6 +23,10 @@ pub enum DbError {
     #[error("テーブルはすでに存在します: {0}")]
     DuplicateTable(String),
 
+    /// `CREATE TABLE`の列定義に、同じ列名が2回以上出てきたエラー。
+    #[error("列名が重複しています: {0}")]
+    DuplicateColumn(String),
+
     /// `DROP TABLE`が、カタログに登録されていないテーブル名を指定したエラー。
     #[error("テーブルが存在しません: {0}")]
     TableNotFound(String),

@@ -64,10 +64,18 @@ fn eval_unary(op: UnaryOperator, value: Value) -> DbResult<Value> {
                 .checked_neg()
                 .map(Value::BigInt)
                 .ok_or_else(|| DbError::Eval(format!("整数オーバーフロー: -({n})"))),
-            other => Err(DbError::Eval(format!(
-                "単項-はBIGINTに対してのみ使えます: {:?}が渡されました",
-                other.data_type()
-            ))),
+            other => {
+                // `Value::Null`は直前の分岐で処理済みなので、`data_type()`は必ず
+                // `Some`を返す。`Option`を`{:?}`でそのまま表示すると
+                // `Some(BigInt)`のようにRustの内部表現が漏れるため、`unwrap`して
+                // SQLの型名だけを見せる。
+                let data_type = other
+                    .data_type()
+                    .expect("Nullは既に処理済みなのでdata_type()は必ずSomeを返す");
+                Err(DbError::Eval(format!(
+                    "単項-はBIGINTに対してのみ使えます: {data_type}が渡されました"
+                )))
+            }
         },
         UnaryOperator::Not => Ok(tri_to_value(!value_to_tri(&value)?)),
     }
@@ -139,11 +147,19 @@ fn eval_arith(op: BinaryOperator, l: Value, r: Value) -> DbResult<Value> {
                 .map(Value::BigInt)
                 .ok_or_else(|| DbError::Eval(format!("整数オーバーフロー: {l} {op:?} {r}")))
         }
-        (l, r) => Err(DbError::Eval(format!(
-            "算術演算はBIGINT同士にのみ使えます: {:?}と{:?}",
-            l.data_type(),
-            r.data_type()
-        ))),
+        (l, r) => {
+            // `Value::Null`は直前の分岐で処理済みなので、両辺とも`data_type()`は
+            // 必ず`Some`を返す。
+            let l_type = l
+                .data_type()
+                .expect("Nullは既に処理済みなのでdata_type()は必ずSomeを返す");
+            let r_type = r
+                .data_type()
+                .expect("Nullは既に処理済みなのでdata_type()は必ずSomeを返す");
+            Err(DbError::Eval(format!(
+                "算術演算はBIGINT同士にのみ使えます: {l_type}と{r_type}"
+            )))
+        }
     }
 }
 
@@ -162,10 +178,16 @@ fn eval_compare(op: BinaryOperator, l: Value, r: Value) -> DbResult<Value> {
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
         (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
         _ => {
+            // `Value::Null`は直前の分岐で処理済みなので、両辺とも`data_type()`は
+            // 必ず`Some`を返す。
+            let l_type = l
+                .data_type()
+                .expect("Nullは既に処理済みなのでdata_type()は必ずSomeを返す");
+            let r_type = r
+                .data_type()
+                .expect("Nullは既に処理済みなのでdata_type()は必ずSomeを返す");
             return Err(DbError::Eval(format!(
-                "比較演算は同じ型同士にのみ使えます: {:?}と{:?}",
-                l.data_type(),
-                r.data_type()
+                "比較演算は同じ型同士にのみ使えます: {l_type}と{r_type}"
             )));
         }
     };
@@ -207,10 +229,16 @@ fn value_to_tri(value: &Value) -> DbResult<Tri> {
         Value::Null => Ok(Tri::Unknown),
         Value::Boolean(true) => Ok(Tri::True),
         Value::Boolean(false) => Ok(Tri::False),
-        other => Err(DbError::Eval(format!(
-            "論理演算はBOOLEANまたはNULLに対してのみ使えます: {:?}が渡されました",
-            other.data_type()
-        ))),
+        other => {
+            // `Value::Null`と`Value::Boolean`は直前の分岐で処理済みなので、
+            // `data_type()`は必ず`Some`を返す。
+            let data_type = other
+                .data_type()
+                .expect("NullとBooleanは既に処理済みなのでdata_type()は必ずSomeを返す");
+            Err(DbError::Eval(format!(
+                "論理演算はBOOLEANまたはNULLに対してのみ使えます: {data_type}が渡されました"
+            )))
+        }
     }
 }
 
@@ -289,21 +317,36 @@ fn eval_cast(value: Value, target: DataType) -> DbResult<Value> {
                 "TEXTからBOOLEANへのCASTに失敗しました: {s:?}"
             ))),
         },
-        (value, target) => Err(DbError::Eval(format!(
-            "{:?}から{target:?}へのCASTは対応していません",
-            value.data_type()
-        ))),
+        (value, target) => {
+            // `Value::Null`は直前の分岐で処理済みなので、`data_type()`は必ず
+            // `Some`を返す。`target`も含め、Rustの`Debug`表現(`BigInt`)ではなく
+            // `Display`によるSQLの型名(`BIGINT`)で表示する。
+            let data_type = value
+                .data_type()
+                .expect("Nullは既に処理済みなのでdata_type()は必ずSomeを返す");
+            Err(DbError::Eval(format!(
+                "{data_type}から{target}へのCASTは対応していません"
+            )))
+        }
     }
 }
 
 /// Scalar Functionの実装本体。引数の`Value`列を受け取り、戻り値の`Value`を返す。
 type ScalarFn = Box<dyn Fn(&[Value]) -> DbResult<Value> + Send + Sync>;
 
+/// レジストリに登録された1個のScalar Function。実装本体に加えて、戻り値の
+/// `DataType`を静的に持つ。`project`(第10章の`executor`モジュール)が、
+/// 実際に1行評価する前に`SELECT`の出力列の型を決めるのに使う。
+struct FunctionEntry {
+    func: ScalarFn,
+    return_type: DataType,
+}
+
 /// Scalar Functionの名前とその実装を対応づけるレジストリ。
 ///
 /// 名前解決は大文字小文字を区別しない(`ABS`と`abs`は同じ関数を指す)。
 pub struct FunctionRegistry {
-    functions: HashMap<String, ScalarFn>,
+    functions: HashMap<String, FunctionEntry>,
 }
 
 impl FunctionRegistry {
@@ -317,24 +360,43 @@ impl FunctionRegistry {
     /// 組み込み関数(`abs`、`length`)だけを登録したレジストリを作る。
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
-        registry.register("abs", builtin_abs);
-        registry.register("length", builtin_length);
+        registry.register("abs", DataType::BigInt, builtin_abs);
+        registry.register("length", DataType::BigInt, builtin_length);
         registry
     }
 
     /// 関数を1つ登録する。同名の関数がすでにあれば上書きする。
+    ///
+    /// `return_type`は、この関数がNULL以外の入力に対して返す`Value`の型。
+    /// 静的な型検査(`executor::infer_type`)がこの値を使う。
     pub fn register(
         &mut self,
         name: &str,
+        return_type: DataType,
         f: impl Fn(&[Value]) -> DbResult<Value> + Send + Sync + 'static,
     ) {
-        self.functions.insert(name.to_ascii_lowercase(), Box::new(f));
+        self.functions.insert(
+            name.to_ascii_lowercase(),
+            FunctionEntry {
+                func: Box::new(f),
+                return_type,
+            },
+        );
     }
 
     /// 名前と引数から関数を呼び出す。登録されていない名前は`DbError::Eval`にする。
     pub fn call(&self, name: &str, args: &[Value]) -> DbResult<Value> {
         match self.functions.get(&name.to_ascii_lowercase()) {
-            Some(f) => f(args),
+            Some(entry) => (entry.func)(args),
+            None => Err(DbError::Eval(format!("未知の関数です: {name}"))),
+        }
+    }
+
+    /// 名前から、この関数の戻り値の`DataType`を引く。登録されていない名前は
+    /// `DbError::Eval`にする。
+    pub fn return_type(&self, name: &str) -> DbResult<DataType> {
+        match self.functions.get(&name.to_ascii_lowercase()) {
+            Some(entry) => Ok(entry.return_type),
             None => Err(DbError::Eval(format!("未知の関数です: {name}"))),
         }
     }
@@ -364,10 +426,16 @@ fn builtin_abs(args: &[Value]) -> DbResult<Value> {
             .checked_abs()
             .map(Value::BigInt)
             .ok_or_else(|| DbError::Eval(format!("整数オーバーフロー: abs({n})"))),
-        other => Err(DbError::Eval(format!(
-            "absはBIGINTを引数に取ります: {:?}が渡されました",
-            other.data_type()
-        ))),
+        other => {
+            // `Value::Null`は直前の分岐で処理済みなので、`data_type()`は必ず
+            // `Some`を返す。
+            let data_type = other
+                .data_type()
+                .expect("Nullは既に処理済みなのでdata_type()は必ずSomeを返す");
+            Err(DbError::Eval(format!(
+                "absはBIGINTを引数に取ります: {data_type}が渡されました"
+            )))
+        }
     }
 }
 
@@ -375,10 +443,16 @@ fn builtin_length(args: &[Value]) -> DbResult<Value> {
     match expect_one_arg("length", args)? {
         Value::Null => Ok(Value::Null),
         Value::Text(s) => Ok(Value::BigInt(s.chars().count() as i64)),
-        other => Err(DbError::Eval(format!(
-            "lengthはTEXTを引数に取ります: {:?}が渡されました",
-            other.data_type()
-        ))),
+        other => {
+            // `Value::Null`は直前の分岐で処理済みなので、`data_type()`は必ず
+            // `Some`を返す。
+            let data_type = other
+                .data_type()
+                .expect("Nullは既に処理済みなのでdata_type()は必ずSomeを返す");
+            Err(DbError::Eval(format!(
+                "lengthはTEXTを引数に取ります: {data_type}が渡されました"
+            )))
+        }
     }
 }
 
@@ -435,6 +509,12 @@ mod tests {
     }
 
     #[test]
+    fn evaluates_i64_min_and_i64_max_literals() {
+        assert_eq!(eval_sql("-9223372036854775808").unwrap(), Value::BigInt(i64::MIN));
+        assert_eq!(eval_sql("9223372036854775807").unwrap(), Value::BigInt(i64::MAX));
+    }
+
+    #[test]
     fn arithmetic_overflow_is_an_error() {
         let sql = format!("{} + 1", i64::MAX);
         assert!(matches!(eval_sql(&sql), Err(DbError::Eval(_))));
@@ -442,9 +522,12 @@ mod tests {
 
     #[test]
     fn unary_negate_overflow_is_an_error() {
-        // `i64::MIN`は絶対値が`i64::MAX`を超えるため、SQLの整数リテラルとしては
-        // そもそも書けない(Lexerが拒否する)。オーバーフローを再現するには、
-        // `Expr`を直接組み立てて`i64::MIN`を単項`-`に渡す。
+        // SQLの`-9223372036854775808`は、Parserが符号込みで`Expr::IntLiteral`に
+        // 変換するため`UnaryOp`を経由しない(第7章のParserのテスト参照)。
+        // `eval_unary`自身の`checked_neg`によるオーバーフロー検出は、`Expr`を
+        // 直接組み立てて`i64::MIN`を単項`-`に渡すことで確かめる。
+        // (`i64::MIN`を単項`-`するとオーバーフローするのは、`i64`の範囲が
+        // `-9223372036854775808..=9223372036854775807`と非対称なため。)
         let expr = Expr::UnaryOp {
             op: UnaryOperator::Negate,
             expr: Box::new(Expr::IntLiteral {
@@ -711,8 +794,24 @@ mod tests {
     #[test]
     fn custom_function_can_be_registered() {
         let mut registry = FunctionRegistry::new();
-        registry.register("answer", |_args| Ok(Value::BigInt(42)));
+        registry.register("answer", DataType::BigInt, |_args| Ok(Value::BigInt(42)));
         assert_eq!(registry.call("answer", &[]).unwrap(), Value::BigInt(42));
+    }
+
+    #[test]
+    fn return_type_looks_up_a_registered_functions_declared_return_type() {
+        let registry = FunctionRegistry::with_builtins();
+        assert_eq!(registry.return_type("abs").unwrap(), DataType::BigInt);
+        assert_eq!(registry.return_type("LENGTH").unwrap(), DataType::BigInt);
+    }
+
+    #[test]
+    fn return_type_of_unknown_function_is_an_error() {
+        let registry = FunctionRegistry::with_builtins();
+        assert!(matches!(
+            registry.return_type("no_such_fn"),
+            Err(DbError::Eval(_))
+        ));
     }
 
     #[test]

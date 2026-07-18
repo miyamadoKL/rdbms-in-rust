@@ -451,6 +451,26 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Minus => {
                 let start = self.advance().span.start;
+
+                // `-`の直後が整数リテラルなら、`UnaryOp`を経由せずその場で
+                // 符号付きの`Expr::IntLiteral`へ組み立てる。`i64::MIN`の絶対値
+                // (`9223372036854775808`)は正の`i64`として表現できないため、
+                // 一度正の`i64`にしてから`checked_neg`する経路(`UnaryOp` +
+                // `eval_unary`)では`-9223372036854775808`を書けない。ここで
+                // 符号と絶対値を同時に見て`i64`へ変換することで、この値だけを
+                // 特別扱いせずに済む。
+                if let TokenKind::IntLiteral(magnitude) = *self.peek_kind() {
+                    let magnitude_token = self.advance();
+                    let value = negate_u64_to_i64(magnitude).ok_or_else(|| {
+                        self.error_at(
+                            magnitude_token.span,
+                            format!("整数リテラルの範囲を超えています: -{magnitude}"),
+                        )
+                    })?;
+                    let span = Span::new(start, magnitude_token.span.end);
+                    return Ok(Expr::IntLiteral { value, span });
+                }
+
                 let operand = self.parse_expr(NEGATE_RBP)?;
                 let span = Span::new(start, operand.span().end);
                 Ok(Expr::UnaryOp {
@@ -465,9 +485,19 @@ impl<'a> Parser<'a> {
 
     fn parse_primary(&mut self) -> DbResult<Expr> {
         match self.peek_kind().clone() {
-            TokenKind::IntLiteral(value) => {
-                let span = self.advance().span;
-                Ok(Expr::IntLiteral { value, span })
+            TokenKind::IntLiteral(magnitude) => {
+                let token = self.advance();
+                // 符号の無い整数リテラルは非負の`i64`にしか変換できない
+                // (`i64::MIN`は符号付きの経路、`parse_prefix`のMinus分岐でのみ
+                // 書ける)。`i64::MAX`(`9223372036854775807`)を超える場合は
+                // ここで構文エラーにする。
+                let value = i64::try_from(magnitude).map_err(|_| {
+                    self.error_at(
+                        token.span,
+                        format!("整数リテラルの範囲を超えています: {magnitude}"),
+                    )
+                })?;
+                Ok(Expr::IntLiteral { value, span: token.span })
             }
             TokenKind::StringLiteral(value) => {
                 let span = self.advance().span;
@@ -545,6 +575,16 @@ impl<'a> Parser<'a> {
             span: Span::new(name_span.start, end),
         })
     }
+}
+
+/// 符号の無い絶対値`magnitude`に負符号を適用し、`i64`へ変換する。
+///
+/// `i64`の範囲(`-9223372036854775808..=9223372036854775807`)に収まらない
+/// 場合は`None`を返す。`i128`へ一度持ち上げてから引き算することで、
+/// `magnitude`が`u64::MAX`まで取りうる値でもオーバーフローせずに判定できる。
+fn negate_u64_to_i64(magnitude: u64) -> Option<i64> {
+    let negated = -(magnitude as i128);
+    i64::try_from(negated).ok()
 }
 
 /// 二項演算子のbinding power(左結合力, 右結合力)。
@@ -672,16 +712,37 @@ mod tests {
     #[test]
     fn unary_minus_binds_tighter_than_addition() {
         // `-1 + 2`は`(-1) + 2`であって`-(1 + 2)`ではない。
+        // `-`の直後が整数リテラルの場合、`UnaryOp::Negate`は経由せず符号込みの
+        // `Expr::IntLiteral`へ直接組み立てる(`i64::MIN`を書けるようにする
+        // ための変更。詳細は`parse_prefix`のコメント参照)。
         assert_expr_eq(
             "-1 + 2",
             Expr::BinaryOp {
                 op: BinaryOperator::Add,
-                lhs: Box::new(Expr::UnaryOp {
-                    op: UnaryOperator::Negate,
-                    expr: int(1),
+                lhs: int(-1),
+                rhs: int(2),
+                span: Span::new(0, 0),
+            },
+        );
+    }
+
+    #[test]
+    fn unary_minus_before_a_non_literal_still_uses_unary_op() {
+        // `-`の直後がリテラル以外(括弧で囲まれた式など)の場合は、これまで
+        // どおり`UnaryOp::Negate`を使う。
+        assert_expr_eq(
+            "-(1 + 2)",
+            Expr::UnaryOp {
+                op: UnaryOperator::Negate,
+                expr: Box::new(Expr::Paren {
+                    expr: Box::new(Expr::BinaryOp {
+                        op: BinaryOperator::Add,
+                        lhs: int(1),
+                        rhs: int(2),
+                        span: Span::new(0, 0),
+                    }),
                     span: Span::new(0, 0),
                 }),
-                rhs: int(2),
                 span: Span::new(0, 0),
             },
         );
@@ -1019,6 +1080,44 @@ mod tests {
     #[test]
     fn accepts_trailing_semicolon() {
         assert!(parse_statement("SELECT 1;").is_ok());
+    }
+
+    // ---- 整数リテラルの符号と範囲(i64::MINを含む) ----
+
+    #[test]
+    fn parses_i64_min_as_a_single_signed_int_literal() {
+        // `-9223372036854775808`は`UnaryOp::Negate`を経由せず、符号込みの
+        // `Expr::IntLiteral`1個になる(`parse_prefix`のMinus分岐のコメント参照)。
+        assert_expr_eq(
+            "-9223372036854775808",
+            Expr::IntLiteral {
+                value: i64::MIN,
+                span: Span::new(0, 0),
+            },
+        );
+    }
+
+    #[test]
+    fn parses_i64_max() {
+        assert_expr_eq(
+            "9223372036854775807",
+            Expr::IntLiteral {
+                value: i64::MAX,
+                span: Span::new(0, 0),
+            },
+        );
+    }
+
+    #[test]
+    fn magnitude_one_more_than_i64_min_is_rejected() {
+        let err = parse_statement("SELECT -9223372036854775809").unwrap_err();
+        assert!(matches!(err, DbError::Parse { .. }));
+    }
+
+    #[test]
+    fn magnitude_one_more_than_i64_max_is_rejected() {
+        let err = parse_statement("SELECT 9223372036854775808").unwrap_err();
+        assert!(matches!(err, DbError::Parse { .. }));
     }
 
     #[test]

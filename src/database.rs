@@ -66,9 +66,23 @@ impl Database {
 
     /// `CREATE TABLE`を実行し、列定義を`Schema`へ変換したうえで`Catalog`に登録し、
     /// `MemStorage`に空のテーブルを作る。
+    ///
+    /// 列名の重複検査(`DbError::DuplicateColumn`)は`Schema::new`自体ではなく、
+    /// ここ(`CREATE TABLE`の実行経路)で行う。`Schema`は`SELECT`の出力列を
+    /// 表すのにも使われ(`executor::project`)、`SELECT a, a FROM t`のように
+    /// 計算結果の列名が重複するのはSQLとして正当なので、`Schema`という型
+    /// そのものに「列名は必ず一意」という不変条件を持たせることはできない。
+    /// 一意性が必要なのは「実表の列定義」という文脈に限られるため、検査は
+    /// その文脈を知っているこの関数に置く。列名の比較は、`Schema::index_of`
+    /// や`Catalog`のテーブル名比較と同じく大文字小文字を区別する(`id`と
+    /// `ID`は別の列として許す)。
     fn execute_create_table(&mut self, create: &CreateTableStatement) -> DbResult<QueryResult> {
         let mut columns = Vec::with_capacity(create.columns.len());
+        let mut seen_names = std::collections::HashSet::with_capacity(create.columns.len());
         for column_def in &create.columns {
+            if !seen_names.insert(column_def.name.name.as_str()) {
+                return Err(DbError::DuplicateColumn(column_def.name.name.clone()));
+            }
             let data_type = DataType::from_sql_name(&column_def.type_name.name).ok_or_else(
                 || DbError::Eval(format!("未知の型名です: {}", column_def.type_name.name)),
             )?;
@@ -540,6 +554,24 @@ mod tests {
         assert!(matches!(result, Err(DbError::Eval(_))));
         // 型名の解決に失敗した時点でカタログには何も登録されない。
         assert!(db.catalog().table("users").is_none());
+    }
+
+    #[test]
+    fn create_table_rejects_duplicate_column_name() {
+        let mut db = Database::memory();
+        let result = db.execute("CREATE TABLE dup (id BIGINT, id TEXT)");
+        assert!(matches!(result, Err(DbError::DuplicateColumn(name)) if name == "id"));
+        // 列名の重複を検出した時点でカタログには何も登録されない。
+        assert!(db.catalog().table("dup").is_none());
+    }
+
+    #[test]
+    fn create_table_column_names_are_case_sensitive() {
+        // `id`と`ID`は別列として許す。`Catalog`のテーブル名比較(第9章)と
+        // 揃えた方針。
+        let mut db = Database::memory();
+        let result = db.execute("CREATE TABLE t (id BIGINT, ID TEXT)");
+        assert!(result.is_ok());
     }
 
     // ---- DROP TABLE ----

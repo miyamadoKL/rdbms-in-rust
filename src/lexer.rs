@@ -99,8 +99,13 @@ pub enum TokenKind {
     Ident(String),
     /// 予約語。
     Keyword(Keyword),
-    /// 整数リテラル。
-    IntLiteral(i64),
+    /// 整数リテラル。符号を持たない絶対値のまま保持する。
+    ///
+    /// `i64::MIN`(`-9223372036854775808`)の絶対値`9223372036854775808`は
+    /// `i64`の範囲を超える(`i64::MAX`は`9223372036854775807`)ため、`i64`では
+    /// なく`u64`で持つ。符号を`i64`へ適用して範囲検査する仕事は、単項`-`と
+    /// このTokenを組み合わせる`Parser`(第7章)に委ねる。
+    IntLiteral(u64),
     /// 文字列リテラル。`''`によるエスケープは解決済みの値を持つ。
     StringLiteral(String),
     /// `+`
@@ -307,7 +312,13 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    /// 数字が連続する間読み進め、`i64`として解析する。
+    /// 数字が連続する間読み進め、`u64`として解析する(符号は付けない。
+    /// `TokenKind::IntLiteral`のドキュメント参照)。
+    ///
+    /// 数字の直後に識別子文字(英字・数字・`_`)が続く場合(`1abc`、`1_2`)は、
+    /// `1`と`abc`の2個のTokenへ黙って分割せず、字句エラーにする。区切りの
+    /// 無い数字と識別子の並びを許すと、`1abc`が`1 abc`と書いたのと同じ意味に
+    /// 誤読されかねないため。
     fn lex_number(&mut self) -> DbResult<TokenKind> {
         let start_line = self.line;
         let start_column = self.column;
@@ -325,7 +336,28 @@ impl<'a> Lexer<'a> {
 
         let end = self.peek_offset().unwrap_or(self.source.len());
         let text = &self.source[start..end];
-        text.parse::<i64>()
+
+        if let Some(c) = self.peek_char()
+            && is_ident_continue(c)
+        {
+            // メッセージに残りの識別子文字も含めるため、字句解析の位置は
+            // 動かさずに`remaining()`を覗き見して`is_ident_continue`が
+            // 続く分だけを切り出す。
+            let tail_len = self
+                .remaining()
+                .char_indices()
+                .find(|(_, c)| !is_ident_continue(*c))
+                .map(|(offset, _)| offset)
+                .unwrap_or_else(|| self.remaining().len());
+            let tail = &self.remaining()[..tail_len];
+            return Err(DbError::Lex {
+                message: format!("数値リテラルの直後に識別子文字が続いています: {text}{tail}"),
+                line: start_line,
+                column: start_column,
+            });
+        }
+
+        text.parse::<u64>()
             .map(TokenKind::IntLiteral)
             .map_err(|_| DbError::Lex {
                 message: format!("整数リテラルの範囲を超えています: {text}"),
@@ -477,6 +509,51 @@ mod tests {
     #[test]
     fn tokenizes_integer_literal() {
         assert_eq!(kinds("42"), vec![TokenKind::IntLiteral(42), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn tokenizes_a_magnitude_close_to_i64_min_as_u64() {
+        // `i64::MIN`(`-9223372036854775808`)の絶対値`9223372036854775808`は
+        // `i64::MAX`(`9223372036854775807`)を1超えるため`i64`には収まらないが、
+        // `IntLiteral`が`u64`を持つようになったことでLexerの時点では問題なく
+        // 読める。符号を適用した最終的な範囲検査はParserの仕事(第7章)。
+        assert_eq!(
+            kinds("9223372036854775808"),
+            vec![TokenKind::IntLiteral(9223372036854775808), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn integer_literal_beyond_u64_range_is_a_lex_error() {
+        let err = tokenize("99999999999999999999999999999999").unwrap_err();
+        assert!(matches!(err, DbError::Lex { .. }));
+    }
+
+    #[test]
+    fn integer_literal_immediately_followed_by_identifier_chars_is_a_lex_error() {
+        let err = tokenize("1abc").unwrap_err();
+        match err {
+            DbError::Lex { message, .. } => assert!(message.contains("1abc")),
+            other => panic!("DbError::Lexを期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn integer_literal_immediately_followed_by_underscore_and_digit_is_a_lex_error() {
+        let err = tokenize("1_2").unwrap_err();
+        assert!(matches!(err, DbError::Lex { .. }));
+    }
+
+    #[test]
+    fn integer_literal_followed_by_whitespace_then_identifier_still_lexes_as_two_tokens() {
+        assert_eq!(
+            kinds("1 abc"),
+            vec![
+                TokenKind::IntLiteral(1),
+                TokenKind::Ident("abc".to_string()),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]

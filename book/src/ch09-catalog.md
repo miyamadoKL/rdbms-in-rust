@@ -186,11 +186,16 @@ pub struct Database {
 ```
 
 `execute_create_table`は、`CreateTableStatement`の`columns`(`Vec<ColumnDef>`)を`Vec<Column>`に変換してから`Catalog::create_table`を呼びます。
+列定義を1件ずつ処理するこの`for`ループでは、型名の解決と合わせて列名の重複も検査します。
 
 ```rust
 fn execute_create_table(&mut self, create: &CreateTableStatement) -> DbResult<QueryResult> {
     let mut columns = Vec::with_capacity(create.columns.len());
+    let mut seen_names = std::collections::HashSet::with_capacity(create.columns.len());
     for column_def in &create.columns {
+        if !seen_names.insert(column_def.name.name.as_str()) {
+            return Err(DbError::DuplicateColumn(column_def.name.name.clone()));
+        }
         let data_type = DataType::from_sql_name(&column_def.type_name.name).ok_or_else(
             || DbError::Eval(format!("未知の型名です: {}", column_def.type_name.name)),
         )?;
@@ -204,11 +209,23 @@ fn execute_create_table(&mut self, create: &CreateTableStatement) -> DbResult<Qu
 }
 ```
 
+`seen_names`は列名を1つずつ挿入していく`HashSet<&str>`です。
+`HashSet::insert`はすでに同じ値が入っていれば`false`を返すので、`id BIGINT, id TEXT`のように同じ列名が2回現れた時点で`insert`が`false`を返し、`DbError::DuplicateColumn`になります。
+
+```console
+minidb> CREATE TABLE dup (id BIGINT, id TEXT);
+エラー: 列名が重複しています: id
+```
+
+この検査を`Schema::new`自体ではなく`execute_create_table`(`CREATE TABLE`の実行経路)に置いているのは、`Schema`が`CREATE TABLE`の列定義だけでなく、`SELECT`の出力列を表すのにも使われるためです。
+`SELECT a, a FROM t`のように、計算結果の列名が重複するのはSQLとして正当なので、`Schema`という型そのものに「列名は必ず一意」という不変条件を持たせることはできません。
+一意性が必要なのは実表の列定義という文脈に限られるため、検査はその文脈を知っている`execute_create_table`に置きます。
+
 `nullable`が`!column_def.not_null`の否定になっているのは、`ColumnDef`が`NOT NULL`の有無をそのまま保持しているのに対し、`Column`は「NULLを許すかどうか」という向きでフィールドを持っているためです(第4章)。
 `id BIGINT NOT NULL`は`not_null: true`のASTから`nullable: false`の`Column`になり、`name TEXT`(`NOT NULL`無し)は`not_null: false`から`nullable: true`になります。
 
-この`for`ループは、すべての列定義の型名を解決し終えるまで`self.catalog.create_table`を一度も呼びません。
-3列目の型名が未知だった場合、1列目と2列目の解決がどれだけ成功していても、`?`によってループはその場で打ち切られ、`Catalog`には何も登録されません。
+この`for`ループは、すべての列定義の検査を終えるまで`self.catalog.create_table`を一度も呼びません。
+3列目の型名が未知だった場合や、列名が途中で重複していた場合、それより前の列の解決がどれだけ成功していても、`?`または明示的な`return Err(...)`によってループはその場で打ち切られ、`Catalog`には何も登録されません。
 「一部だけ登録されたテーブル」という中途半端な状態が生まれないのは、`columns`という`Vec`をローカルに組み立て切ってから、最後に1回だけ`create_table`を呼ぶという順序そのものが保証しています。
 
 型名の解決に使っている`DataType::from_sql_name`は、この章で新しく`types.rs`に追加した関数です。
@@ -281,7 +298,7 @@ fn execute_drop_table(&mut self, drop: &DropTableStatement) -> DbResult<QueryRes
 
 `DROP TABLE users`のように削除するテーブル名だけを受け取り、そのテーブルを参照している他のテーブルや索引を巻き込んで消す`CASCADE`、逆に参照があれば拒否する`RESTRICT`のような指定は扱いません。
 このSQLサブセットには外部キー制約もインデックスもまだ存在しないので、「他から参照されているかどうか」を考える対象自体がなく、`CASCADE`と`RESTRICT`のどちらを既定にするかという選択も、今の`Catalog`には無関係です。
-外部キーが第20章で、インデックスが第24章で加わったとき、`drop_table`はそれらの参照を検査する形へ改めて手を入れることになります。
+外部キーが発展編Bで、インデックスが第24章で加わったとき、`drop_table`はそれらの参照を検査する形へ改めて手を入れることになります。
 
 ## 完了をどう表現するか
 
@@ -341,7 +358,7 @@ fn table_id_is_not_reused_after_drop() {
 }
 ```
 
-`database`側には、`CREATE TABLE`がカタログへ正しい`Schema`を登録すること、`NOT NULL`の有無が`nullable`へ正しく反転すること、重複と不存在がそれぞれ`DbError::DuplicateTable`、`DbError::TableNotFound`になることを確認するテストを加えています。
+`database`側には、`CREATE TABLE`がカタログへ正しい`Schema`を登録すること、`NOT NULL`の有無が`nullable`へ正しく反転すること、テーブル名の重複と不存在がそれぞれ`DbError::DuplicateTable`、`DbError::TableNotFound`になること、列名の重複が`DbError::DuplicateColumn`になり、その場合はカタログに何も登録されないことを確認するテストを加えています。
 削除してから同じ名前で作り直す一連の流れも、1つのテストにまとめました。
 
 ```rust
@@ -438,7 +455,7 @@ stored schema = Schema { columns: [Column { name: "id", data_type: BigInt, nulla
 ### 必須課題
 
 1. `Catalog`に、登録されているテーブル名の一覧を返す`table_names(&self) -> Vec<&str>`を追加してください。順序は問いませんが、テストでは順序に依存しない比較(`HashSet`への変換や`sort`など)を使ってください。
-2. `CREATE TABLE`の列定義に同じ列名が2回現れた場合(`CREATE TABLE t (id BIGINT, id TEXT)`)、現在の実装がどう振る舞うか確認してください。`Schema::new`はこの状況を検査しません。`DuplicateTable`と同じ考え方で`DbError`の新しいバリアント(例: `DuplicateColumn`)を追加し、`execute_create_table`で検査するように変更してください。
+2. `DuplicateColumn`の検査は、テーブル名の重複検査と同じく大文字小文字を区別します(`CREATE TABLE t (id BIGINT, ID TEXT)`は別の列名として通ります)。この章で選んだ「テーブル名は大文字小文字を区別する」という方針と、この列名の検査を一貫させる以外に、列名だけ畳み込んで比較する設計にする実益があるかどうかを考察してください。
 
 ### 発展課題
 
