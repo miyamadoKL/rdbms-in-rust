@@ -60,6 +60,11 @@ pub enum DbError {
         /// 発生位置の列番号(1始まり)。
         column: usize,
     },
+
+    /// File HeaderまたはPageのバイト列が壊れているエラー(Magic Number不一致、
+    /// Format Version不一致、checksum不一致、バイト数不一致、未知のPage Typeなど)。
+    #[error("破損したページです: {0}")]
+    CorruptPage(String),
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。
