@@ -1,22 +1,32 @@
 //! SQL Golden Test ランナー。
 //!
 //! `tests/golden/*.sql` と同名の `*.expected` をペアにして突き合わせる。
-//! `run_sql` は `Database::execute` を呼び出し、成功時は `QueryResult` の表示形式を、
-//! 失敗時は `ERROR: `に続けてエラーメッセージを返す。
+//! `.sql`ファイルは`;`区切りで複数の文を持てる。すべての文は同じ`Database`を
+//! 使い回して順に実行し、各文の結果(成功時は`QueryResult`の表示形式、失敗時は
+//! `ERROR: `に続けてエラーメッセージ)を空行区切りで連結したものが期待値になる。
+//! `CREATE TABLE`と`INSERT`を1ファイルにまとめて書けるのはこのためであり、
+//! 第9章の時点では1ファイル1文しか置けなかった制約をこの章で外している。
 
 mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::execute_sql;
+use common::temp_db;
 
-/// SQLを1本実行し、Golden Testと突き合わせるための文字列表現を返す。
+/// `sql`を`;`区切りの文へ分け、1つの`Database`で順に実行する。
+/// 各文の結果を空行区切りで連結した文字列を返す。
 fn run_sql(sql: &str) -> String {
-    match execute_sql(sql) {
-        Ok(result) => result.to_string(),
-        Err(e) => format!("ERROR: {e}"),
-    }
+    let mut db = temp_db();
+    sql.split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        .map(|statement| match db.execute(statement) {
+            Ok(result) => result.to_string(),
+            Err(e) => format!("ERROR: {e}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// `tests/golden/` 以下の `.sql` ファイルを列挙する。

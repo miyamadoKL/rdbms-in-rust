@@ -198,6 +198,30 @@ impl Tuple {
     }
 }
 
+/// `Expr::ColumnRef`を解決するための、列名から値を引く行環境。
+///
+/// `Schema`と`Tuple`を1組にまとめただけの薄いラッパーで、`eval_expr`が
+/// `WHERE`句や`SET`の右辺のような「今処理している1行」を必要とする式を
+/// 評価するときに使う。式の評価自体に行が要らない場面(`INSERT`の`VALUES`
+/// など)では`eval_expr`に`None`を渡し、`Row`を作る必要がない。
+#[derive(Debug, Clone, Copy)]
+pub struct Row<'a> {
+    schema: &'a Schema,
+    tuple: &'a Tuple,
+}
+
+impl<'a> Row<'a> {
+    /// `schema`に従う`tuple`を1行分の環境として包む。
+    pub fn new(schema: &'a Schema, tuple: &'a Tuple) -> Self {
+        Row { schema, tuple }
+    }
+
+    /// 列名から値を引く。この行の`Schema`に無い列名なら`None`を返す。
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        self.tuple.get_by_name(self.schema, name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

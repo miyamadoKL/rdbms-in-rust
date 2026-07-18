@@ -1,46 +1,55 @@
 //! `Expr`を`Value`へ変換する式評価器。
 //!
-//! この章で対応するのは、算術演算・比較演算・SQLの三値論理・`IS [NOT] NULL`・
-//! `CAST`・Scalar Function呼び出しである。列参照(`Expr::ColumnRef`)は、行の値を
-//! 名前から引く環境がまだ存在しないため、この章では評価できず`DbError::NotImplemented`
-//! を返す。その環境は第10章のDML実行で導入する。
+//! 対応するのは、算術演算・比較演算・SQLの三値論理・`IS [NOT] NULL`・`CAST`・
+//! Scalar Function呼び出し・列参照(`Expr::ColumnRef`)である。列参照は、
+//! `row`引数で渡された行環境(`Row`、第10章で導入)から値を引く。`INSERT`の
+//! `VALUES`のように行を伴わない文脈では`row`に`None`を渡し、列参照が現れれば
+//! `DbError::Eval`にする。
 
 use std::collections::HashMap;
 
 use crate::ast::{BinaryOperator, Expr, UnaryOperator};
 use crate::error::{DbError, DbResult};
-use crate::types::{DataType, Value};
+use crate::types::{DataType, Row, Value};
 
 /// 式を評価して`Value`を返す。
 ///
 /// `functions`はScalar Function呼び出し(`Expr::FunctionCall`)を解決するために使う。
-pub fn eval_expr(expr: &Expr, functions: &FunctionRegistry) -> DbResult<Value> {
+/// `row`は列参照(`Expr::ColumnRef`)を解決するための行環境で、行を伴わない文脈
+/// (`INSERT`の`VALUES`など)では`None`を渡す。
+pub fn eval_expr(expr: &Expr, functions: &FunctionRegistry, row: Option<&Row>) -> DbResult<Value> {
     match expr {
         Expr::IntLiteral { value, .. } => Ok(Value::BigInt(*value)),
         Expr::StringLiteral { value, .. } => Ok(Value::Text(value.clone())),
         Expr::BoolLiteral { value, .. } => Ok(Value::Boolean(*value)),
         Expr::NullLiteral { .. } => Ok(Value::Null),
-        Expr::ColumnRef { name, .. } => Err(DbError::NotImplemented(format!(
-            "列参照'{name}'の評価(行の値を名前から引く環境)は第10章で対応します"
-        ))),
-        Expr::Paren { expr, .. } => eval_expr(expr, functions),
-        Expr::UnaryOp { op, expr, .. } => eval_unary(*op, eval_expr(expr, functions)?),
-        Expr::BinaryOp { op, lhs, rhs, .. } => eval_binary(*op, lhs, rhs, functions),
+        Expr::ColumnRef { name, .. } => match row {
+            Some(row) => row
+                .get(name)
+                .cloned()
+                .ok_or_else(|| DbError::Eval(format!("列'{name}'が見つかりません"))),
+            None => Err(DbError::Eval(format!(
+                "列参照'{name}'は行を伴わない文脈では使えません"
+            ))),
+        },
+        Expr::Paren { expr, .. } => eval_expr(expr, functions, row),
+        Expr::UnaryOp { op, expr, .. } => eval_unary(*op, eval_expr(expr, functions, row)?),
+        Expr::BinaryOp { op, lhs, rhs, .. } => eval_binary(*op, lhs, rhs, functions, row),
         Expr::IsNull { expr, negated, .. } => {
-            let is_null = eval_expr(expr, functions)?.is_null();
+            let is_null = eval_expr(expr, functions, row)?.is_null();
             Ok(Value::Boolean(if *negated { !is_null } else { is_null }))
         }
         Expr::Cast {
             expr, type_name, ..
         } => {
-            let value = eval_expr(expr, functions)?;
+            let value = eval_expr(expr, functions, row)?;
             let target = resolve_data_type(&type_name.name)?;
             eval_cast(value, target)
         }
         Expr::FunctionCall { name, args, .. } => {
             let values = args
                 .iter()
-                .map(|arg| eval_expr(arg, functions))
+                .map(|arg| eval_expr(arg, functions, row))
                 .collect::<DbResult<Vec<_>>>()?;
             functions.call(name, &values)
         }
@@ -69,32 +78,37 @@ fn eval_binary(
     lhs: &Expr,
     rhs: &Expr,
     functions: &FunctionRegistry,
+    row: Option<&Row>,
 ) -> DbResult<Value> {
     match op {
         BinaryOperator::And => {
-            let l = value_to_tri(&eval_expr(lhs, functions)?)?;
-            let r = value_to_tri(&eval_expr(rhs, functions)?)?;
+            let l = value_to_tri(&eval_expr(lhs, functions, row)?)?;
+            let r = value_to_tri(&eval_expr(rhs, functions, row)?)?;
             Ok(tri_to_value(tri_and(l, r)))
         }
         BinaryOperator::Or => {
-            let l = value_to_tri(&eval_expr(lhs, functions)?)?;
-            let r = value_to_tri(&eval_expr(rhs, functions)?)?;
+            let l = value_to_tri(&eval_expr(lhs, functions, row)?)?;
+            let r = value_to_tri(&eval_expr(rhs, functions, row)?)?;
             Ok(tri_to_value(tri_or(l, r)))
         }
         BinaryOperator::Add
         | BinaryOperator::Subtract
         | BinaryOperator::Multiply
-        | BinaryOperator::Divide => {
-            eval_arith(op, eval_expr(lhs, functions)?, eval_expr(rhs, functions)?)
-        }
+        | BinaryOperator::Divide => eval_arith(
+            op,
+            eval_expr(lhs, functions, row)?,
+            eval_expr(rhs, functions, row)?,
+        ),
         BinaryOperator::Eq
         | BinaryOperator::NotEq
         | BinaryOperator::Lt
         | BinaryOperator::LtEq
         | BinaryOperator::Gt
-        | BinaryOperator::GtEq => {
-            eval_compare(op, eval_expr(lhs, functions)?, eval_expr(rhs, functions)?)
-        }
+        | BinaryOperator::GtEq => eval_compare(
+            op,
+            eval_expr(lhs, functions, row)?,
+            eval_expr(rhs, functions, row)?,
+        ),
     }
 }
 
@@ -377,10 +391,13 @@ mod tests {
     fn eval_sql(sql: &str) -> DbResult<Value> {
         let statement = parse_statement(&format!("SELECT {sql}")).unwrap();
         let expr = match statement {
-            crate::ast::Statement::Select(select) => select.items.into_iter().next().unwrap().expr,
+            crate::ast::Statement::Select(select) => match select.items.into_iter().next().unwrap() {
+                crate::ast::SelectItem::Expr { expr, .. } => expr,
+                crate::ast::SelectItem::Wildcard { .. } => panic!("式を期待したがWildcardが返った"),
+            },
             other => panic!("SELECT文を期待したが{other:?}が返った"),
         };
-        eval_expr(&expr, &FunctionRegistry::with_builtins())
+        eval_expr(&expr, &FunctionRegistry::with_builtins(), None)
     }
 
     fn dummy_span() -> Span {
@@ -436,7 +453,7 @@ mod tests {
             }),
             span: dummy_span(),
         };
-        let result = eval_expr(&expr, &FunctionRegistry::with_builtins());
+        let result = eval_expr(&expr, &FunctionRegistry::with_builtins(), None);
         assert!(matches!(result, Err(DbError::Eval(_))));
     }
 
@@ -648,13 +665,45 @@ mod tests {
     // ---- 列参照 ----
 
     #[test]
-    fn column_ref_is_not_implemented_yet() {
+    fn column_ref_without_a_row_is_an_error() {
         let expr = Expr::ColumnRef {
             name: "id".to_string(),
             span: dummy_span(),
         };
-        let result = eval_expr(&expr, &FunctionRegistry::with_builtins());
-        assert!(matches!(result, Err(DbError::NotImplemented(_))));
+        let result = eval_expr(&expr, &FunctionRegistry::with_builtins(), None);
+        assert!(matches!(result, Err(DbError::Eval(_))));
+    }
+
+    #[test]
+    fn column_ref_resolves_from_a_row() {
+        use crate::types::{Column, DataType, Row, Schema, Tuple};
+
+        let schema = Schema::new(vec![Column::new("id", DataType::BigInt, false)]);
+        let tuple = Tuple::new(&schema, vec![Value::BigInt(42)]).unwrap();
+        let row = Row::new(&schema, &tuple);
+
+        let expr = Expr::ColumnRef {
+            name: "id".to_string(),
+            span: dummy_span(),
+        };
+        let result = eval_expr(&expr, &FunctionRegistry::with_builtins(), Some(&row)).unwrap();
+        assert_eq!(result, Value::BigInt(42));
+    }
+
+    #[test]
+    fn column_ref_to_unknown_column_is_an_error() {
+        use crate::types::{Column, DataType, Row, Schema, Tuple};
+
+        let schema = Schema::new(vec![Column::new("id", DataType::BigInt, false)]);
+        let tuple = Tuple::new(&schema, vec![Value::BigInt(42)]).unwrap();
+        let row = Row::new(&schema, &tuple);
+
+        let expr = Expr::ColumnRef {
+            name: "does_not_exist".to_string(),
+            span: dummy_span(),
+        };
+        let result = eval_expr(&expr, &FunctionRegistry::with_builtins(), Some(&row));
+        assert!(matches!(result, Err(DbError::Eval(_))));
     }
 
     // ---- FunctionRegistry ----
@@ -676,7 +725,7 @@ mod tests {
             rhs: Box::new(lit_null()),
             span: dummy_span(),
         };
-        let result = eval_expr(&expr, &FunctionRegistry::with_builtins()).unwrap();
+        let result = eval_expr(&expr, &FunctionRegistry::with_builtins(), None).unwrap();
         assert_eq!(result, Value::Null);
     }
 }

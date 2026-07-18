@@ -5,10 +5,12 @@
 //! を参照。
 //!
 //! 対応する構文は次のとおり。
-//! - `SELECT <式> [, <式> ...] [FROM <table>] [WHERE <式>]`
+//! - `SELECT <式|*> [, <式|*> ...] [FROM <table>] [WHERE <式>]`
 //! - `CREATE TABLE <table> (<col> <type> [NOT NULL], ...)`
 //! - `DROP TABLE <table>`
-//! - `INSERT INTO <table> VALUES (<式>, ...)`
+//! - `INSERT INTO <table> [(<col>, ...)] VALUES (<式>, ...), ...`
+//! - `UPDATE <table> SET <col> = <式> [, ...] [WHERE <式>]`
+//! - `DELETE FROM <table> [WHERE <式>]`
 //! - 式: リテラル(整数・文字列・真偽値・`NULL`)、列参照、二項演算(`+ - * /`、
 //!   比較、`AND` `OR`)、単項演算(`-` `NOT`)、`IS [NOT] NULL`、関数呼び出し、
 //!   `CAST(expr AS type)`、括弧
@@ -16,8 +18,9 @@
 //! 優先順位は低い順に`OR` < `AND` < `NOT` < 比較 < `+` `-` < `*` `/` < 単項`-`。
 
 use crate::ast::{
-    BinaryOperator, ColumnDef, CreateTableStatement, DropTableStatement, Expr, Ident,
-    InsertStatement, SelectItem, SelectStatement, Statement, UnaryOperator,
+    Assignment, BinaryOperator, ColumnDef, CreateTableStatement, DeleteStatement,
+    DropTableStatement, Expr, Ident, InsertStatement, SelectItem, SelectStatement, Statement,
+    UnaryOperator, UpdateStatement,
 };
 use crate::error::{DbError, DbResult};
 use crate::lexer::{self, Keyword, Span, Token, TokenKind};
@@ -138,7 +141,15 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Insert) => {
                 self.parse_insert_statement().map(Statement::Insert)
             }
-            _ => Err(self.unexpected("SELECT・CREATE TABLE・DROP TABLE・INSERT INTOのいずれか")),
+            TokenKind::Keyword(Keyword::Update) => {
+                self.parse_update_statement().map(Statement::Update)
+            }
+            TokenKind::Keyword(Keyword::Delete) => {
+                self.parse_delete_statement().map(Statement::Delete)
+            }
+            _ => Err(self.unexpected(
+                "SELECT・CREATE TABLE・DROP TABLE・INSERT INTO・UPDATE・DELETE FROMのいずれか",
+            )),
         }
     }
 
@@ -152,7 +163,7 @@ impl<'a> Parser<'a> {
             self.advance();
             items.push(self.parse_select_item()?);
         }
-        let mut end = items.last().expect("直前にpushしたばかり").span.end;
+        let mut end = items.last().expect("直前にpushしたばかり").span().end;
 
         let from = if let TokenKind::Keyword(Keyword::From) = self.peek_kind() {
             self.advance();
@@ -180,10 +191,16 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `*`は`parse_expr`(乗算の`*`と同じToken)に渡すと式として解釈できないため、
+    /// ここで先読みして`SelectItem::Wildcard`に振り分ける。
     fn parse_select_item(&mut self) -> DbResult<SelectItem> {
+        if *self.peek_kind() == TokenKind::Star {
+            let span = self.advance().span;
+            return Ok(SelectItem::Wildcard { span });
+        }
         let expr = self.parse_expr(0)?;
         let span = expr.span();
-        Ok(SelectItem { expr, span })
+        Ok(SelectItem::Expr { expr, span })
     }
 
     // ---- CREATE TABLE ----
@@ -250,7 +267,42 @@ impl<'a> Parser<'a> {
         let start = self.expect_keyword(Keyword::Insert, "INSERT")?.start;
         self.expect_keyword(Keyword::Into, "INTO")?;
         let table = self.expect_ident()?;
+
+        let columns = if *self.peek_kind() == TokenKind::LParen {
+            self.advance();
+            let mut columns = vec![self.expect_ident()?];
+            while *self.peek_kind() == TokenKind::Comma {
+                self.advance();
+                columns.push(self.expect_ident()?);
+            }
+            self.expect_punct(TokenKind::RParen, ")")?;
+            Some(columns)
+        } else {
+            None
+        };
+
         self.expect_keyword(Keyword::Values, "VALUES")?;
+
+        let (first_row, mut end) = self.parse_values_row()?;
+        let mut rows = vec![first_row];
+        while *self.peek_kind() == TokenKind::Comma {
+            self.advance();
+            let (row, row_end) = self.parse_values_row()?;
+            rows.push(row);
+            end = row_end;
+        }
+
+        Ok(InsertStatement {
+            table,
+            columns,
+            rows,
+            span: Span::new(start, end),
+        })
+    }
+
+    /// `VALUES`の1行分、`(<式>, <式>, ...)`を読む。式の並びと、閉じ括弧の
+    /// 終端位置(`InsertStatement`全体のSpanを組み立てるのに使う)を返す。
+    fn parse_values_row(&mut self) -> DbResult<(Vec<Expr>, usize)> {
         self.expect_punct(TokenKind::LParen, "(")?;
 
         let mut values = vec![self.parse_expr(0)?];
@@ -260,10 +312,72 @@ impl<'a> Parser<'a> {
         }
 
         let end = self.expect_punct(TokenKind::RParen, ")")?.end;
+        Ok((values, end))
+    }
 
-        Ok(InsertStatement {
+    // ---- UPDATE ----
+
+    fn parse_update_statement(&mut self) -> DbResult<UpdateStatement> {
+        let start = self.expect_keyword(Keyword::Update, "UPDATE")?.start;
+        let table = self.expect_ident()?;
+        self.expect_keyword(Keyword::Set, "SET")?;
+
+        let mut assignments = vec![self.parse_assignment()?];
+        while *self.peek_kind() == TokenKind::Comma {
+            self.advance();
+            assignments.push(self.parse_assignment()?);
+        }
+        let mut end = assignments.last().expect("直前にpushしたばかり").span.end;
+
+        let where_clause = if let TokenKind::Keyword(Keyword::Where) = self.peek_kind() {
+            self.advance();
+            let expr = self.parse_expr(0)?;
+            end = expr.span().end;
+            Some(expr)
+        } else {
+            None
+        };
+
+        Ok(UpdateStatement {
             table,
-            values,
+            assignments,
+            where_clause,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_assignment(&mut self) -> DbResult<Assignment> {
+        let column = self.expect_ident()?;
+        self.expect_punct(TokenKind::Eq, "=")?;
+        let value = self.parse_expr(0)?;
+        let span = Span::new(column.span.start, value.span().end);
+        Ok(Assignment {
+            column,
+            value,
+            span,
+        })
+    }
+
+    // ---- DELETE FROM ----
+
+    fn parse_delete_statement(&mut self) -> DbResult<DeleteStatement> {
+        let start = self.expect_keyword(Keyword::Delete, "DELETE")?.start;
+        self.expect_keyword(Keyword::From, "FROM")?;
+        let table = self.expect_ident()?;
+        let mut end = table.span.end;
+
+        let where_clause = if let TokenKind::Keyword(Keyword::Where) = self.peek_kind() {
+            self.advance();
+            let expr = self.parse_expr(0)?;
+            end = expr.span().end;
+            Some(expr)
+        } else {
+            None
+        };
+
+        Ok(DeleteStatement {
+            table,
+            where_clause,
             span: Span::new(start, end),
         })
     }
@@ -470,7 +584,10 @@ mod tests {
         match parse_statement(&format!("SELECT {sql}")).unwrap() {
             Statement::Select(select) => {
                 assert_eq!(select.items.len(), 1, "式は1個だけのはず");
-                select.items.into_iter().next().unwrap().expr
+                match select.items.into_iter().next().unwrap() {
+                    SelectItem::Expr { expr, .. } => expr,
+                    SelectItem::Wildcard { .. } => panic!("式を期待したがWildcardが返った"),
+                }
             }
             other => panic!("SELECT文を期待したが{other:?}が返った"),
         }
@@ -805,9 +922,97 @@ mod tests {
         match statement {
             Statement::Insert(insert) => {
                 assert_eq!(insert.table.name, "users");
-                assert_eq!(insert.values.len(), 2);
+                assert!(insert.columns.is_none());
+                assert_eq!(insert.rows.len(), 1);
+                assert_eq!(insert.rows[0].len(), 2);
             }
             other => panic!("INSERT文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_insert_with_multiple_rows() {
+        let statement =
+            parse_statement("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
+        match statement {
+            Statement::Insert(insert) => {
+                assert_eq!(insert.rows.len(), 2);
+                assert_eq!(insert.rows[1].len(), 2);
+            }
+            other => panic!("INSERT文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_insert_with_explicit_columns() {
+        let statement =
+            parse_statement("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
+        match statement {
+            Statement::Insert(insert) => {
+                let columns = insert.columns.expect("列名を明示したはず");
+                assert_eq!(
+                    columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+                    vec!["id", "name"]
+                );
+            }
+            other => panic!("INSERT文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_update() {
+        let statement =
+            parse_statement("UPDATE users SET name = 'Bob', id = id + 1 WHERE id = 1").unwrap();
+        match statement {
+            Statement::Update(update) => {
+                assert_eq!(update.table.name, "users");
+                assert_eq!(update.assignments.len(), 2);
+                assert_eq!(update.assignments[0].column.name, "name");
+                assert!(update.where_clause.is_some());
+            }
+            other => panic!("UPDATE文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_update_without_where() {
+        let statement = parse_statement("UPDATE users SET name = 'Bob'").unwrap();
+        match statement {
+            Statement::Update(update) => assert!(update.where_clause.is_none()),
+            other => panic!("UPDATE文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_delete() {
+        let statement = parse_statement("DELETE FROM users WHERE id = 1").unwrap();
+        match statement {
+            Statement::Delete(delete) => {
+                assert_eq!(delete.table.name, "users");
+                assert!(delete.where_clause.is_some());
+            }
+            other => panic!("DELETE文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_delete_without_where() {
+        let statement = parse_statement("DELETE FROM users").unwrap();
+        match statement {
+            Statement::Delete(delete) => assert!(delete.where_clause.is_none()),
+            other => panic!("DELETE文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_select_wildcard() {
+        let statement = parse_statement("SELECT * FROM users").unwrap();
+        match statement {
+            Statement::Select(select) => {
+                assert_eq!(select.items.len(), 1);
+                assert!(matches!(select.items[0], SelectItem::Wildcard { .. }));
+            }
+            other => panic!("SELECT文を期待したが{other:?}が返った"),
         }
     }
 
@@ -842,9 +1047,7 @@ mod tests {
 
     #[test]
     fn syntax_error_on_unknown_statement_start() {
-        // `UPDATE`はLexerの予約語だが、この章のParserはまだ文の先頭として
-        // 受理しない(対応するのは第10章)。
-        let err = parse_statement("UPDATE users SET id = 1").unwrap_err();
+        let err = parse_statement("MERGE users USING x").unwrap_err();
         assert!(matches!(err, DbError::Parse { .. }));
     }
 

@@ -3,19 +3,24 @@
 //! 教材の各章はこのクレートを段階的に育てていく。現時点では
 //! エラー型、識別子のNewtype、簡易ログマクロ、関係モデルの型、
 //! SQL文字列をToken列へ変換する字句解析器(`lexer`)、Token列をASTへ変換する
-//! 構文解析器(`parser`、`ast`)、`Expr`を`Value`へ変換する式評価器(`eval`)、
-//! テーブル定義の唯一の情報源であるインメモリカタログ(`catalog`)に加えて、
-//! `SELECT`の式リストと`CREATE TABLE`・`DROP TABLE`を実行できる縦切り
-//! (`Database`)を提供する。
+//! 構文解析器(`parser`、`ast`)、行環境(`Row`)を伴って`Expr`を`Value`へ変換する
+//! 式評価器(`eval`)、テーブル定義の唯一の情報源であるインメモリカタログ
+//! (`catalog`)、テーブルの行そのものを保持するインメモリストレージ
+//! (`storage_mem`)、Sequential Scan・Filter・Projection・Insert・Update・
+//! Deleteの各演算子(`executor`)に加えて、`SELECT`・`INSERT`・`UPDATE`・
+//! `DELETE`・`CREATE TABLE`・`DROP TABLE`を実行できる縦切り(`Database`)を
+//! 提供する。
 
 pub mod ast;
 pub mod catalog;
 pub mod database;
 pub mod error;
 pub mod eval;
+pub mod executor;
 pub mod ids;
 pub mod lexer;
 pub mod parser;
+pub mod storage_mem;
 pub mod types;
 
 pub use ast::{Expr, Statement};
@@ -26,7 +31,8 @@ pub use eval::{FunctionRegistry, eval_expr};
 pub use ids::{PageId, TableId, TransactionId};
 pub use lexer::{Keyword, Span, Token, TokenKind, tokenize};
 pub use parser::parse_statement;
-pub use types::{Column, DataType, Schema, Tuple, Value};
+pub use storage_mem::{MemStorage, MemTable};
+pub use types::{Column, DataType, Row, Schema, Tuple, Value};
 
 /// 簡易ログ出力マクロ(依存追加を避けるため `eprintln!` を薄くラップするだけ)。
 ///

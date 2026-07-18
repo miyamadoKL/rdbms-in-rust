@@ -24,6 +24,10 @@ pub enum Statement {
     DropTable(DropTableStatement),
     /// `INSERT INTO`文。
     Insert(InsertStatement),
+    /// `UPDATE`文。
+    Update(UpdateStatement),
+    /// `DELETE FROM`文。
+    Delete(DeleteStatement),
 }
 
 impl Statement {
@@ -34,6 +38,8 @@ impl Statement {
             Statement::CreateTable(s) => s.span,
             Statement::DropTable(s) => s.span,
             Statement::Insert(s) => s.span,
+            Statement::Update(s) => s.span,
+            Statement::Delete(s) => s.span,
         }
     }
 }
@@ -49,25 +55,34 @@ pub struct Ident {
 }
 
 /// `SELECT`文。
-///
-/// `FROM`と`WHERE`は構文として受理するが、実行できるのは第9〜10章でカタログと
-/// インメモリ表が揃ってからになる(`Database::execute`は`NotImplemented`を返す)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStatement {
     /// `SELECT`の直後に並ぶ、カンマ区切りの式リスト。
     pub items: Vec<SelectItem>,
-    /// `FROM <table>`。第9〜10章まではカタログが無いため実行できない。
+    /// `FROM <table>`。省略した`SELECT`は式だけを評価し、行は1件だけ返す。
     pub from: Option<Ident>,
-    /// `WHERE <expr>`。`from`と同様、実行は第9〜10章以降。
+    /// `WHERE <expr>`。`from`を伴わない`SELECT`では構文としては受理するが、
+    /// 意味を持たない。
     pub where_clause: Option<Expr>,
     pub span: Span,
 }
 
 /// `SELECT`の対象式リストに並ぶ要素1個。
 #[derive(Debug, Clone, PartialEq)]
-pub struct SelectItem {
-    pub expr: Expr,
-    pub span: Span,
+pub enum SelectItem {
+    /// 通常の式。
+    Expr { expr: Expr, span: Span },
+    /// `*`。`FROM`で指定したテーブルの全列に展開される。
+    Wildcard { span: Span },
+}
+
+impl SelectItem {
+    /// この要素がソース中で占める範囲。
+    pub fn span(&self) -> Span {
+        match self {
+            SelectItem::Expr { span, .. } | SelectItem::Wildcard { span } => *span,
+        }
+    }
 }
 
 /// `CREATE TABLE`文。
@@ -101,13 +116,45 @@ pub struct DropTableStatement {
 
 /// `INSERT INTO`文。
 ///
-/// 対応するのは`INSERT INTO name VALUES (...)`という1行分の挿入のみ。
-/// 複数行の`VALUES (...), (...)`や列名の明示(`INSERT INTO name (col, ...)`)は
-/// 対象外とし、必要になった章(第10章)で拡張する。
+/// `INSERT INTO name VALUES (...), (...), ...`という複数行の挿入と、
+/// `INSERT INTO name (col, ...) VALUES (...)`という列名の明示の両方に対応する。
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertStatement {
     pub table: Ident,
-    pub values: Vec<Expr>,
+    /// 明示された列名。`None`なら位置で対応させる(`VALUES`内の各行が、
+    /// テーブルの列と同じ個数・同じ並び順であることを前提にする)。
+    pub columns: Option<Vec<Ident>>,
+    /// `VALUES`に続く行の並び。1行に満たない、あるいは超える個数の式を
+    /// 持つ行があっても構文解析の時点では検査せず、実行時に検査する。
+    pub rows: Vec<Vec<Expr>>,
+    pub span: Span,
+}
+
+/// `UPDATE`文。
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStatement {
+    pub table: Ident,
+    /// `SET`に続く、カンマ区切りの代入リスト。
+    pub assignments: Vec<Assignment>,
+    /// `WHERE <expr>`。省略した場合はテーブルの全行が対象になる。
+    pub where_clause: Option<Expr>,
+    pub span: Span,
+}
+
+/// `UPDATE`の`SET`リストに並ぶ`<column> = <expr>`1個。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assignment {
+    pub column: Ident,
+    pub value: Expr,
+    pub span: Span,
+}
+
+/// `DELETE FROM`文。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteStatement {
+    pub table: Ident,
+    /// `WHERE <expr>`。省略した場合はテーブルの全行が対象になる。
+    pub where_clause: Option<Expr>,
     pub span: Span,
 }
 

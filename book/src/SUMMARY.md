@@ -14,7 +14,7 @@
 - [第7章 構文解析器とAST](ch07-parser.md)
 - [第8章 型、NULL、式評価](ch08-expressions.md)
 - [第9章 カタログとDDL](ch09-catalog.md)
-- [第10章 インメモリ表とDML]()
+- [第10章 インメモリ表とDML](ch10-inmemory-dml.md)
 
 # 第2部 Storage: ディスクにデータを保存する
 

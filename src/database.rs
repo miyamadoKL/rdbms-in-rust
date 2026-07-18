@@ -1,40 +1,49 @@
 //! SQL文字列を受け取り、結果を返す実行の入口。
 //!
 //! `Database::execute`は、まずSQL文字列を`parser::parse_statement`でASTへ変換する。
-//! 実行できるのは、`FROM`を伴わない`SELECT`の式リストと、`CREATE TABLE`・
-//! `DROP TABLE`である。`SELECT`の式評価は`eval`モジュールに委ね、算術・比較・
-//! 三値論理・`IS NULL`・`CAST`・Scalar Function呼び出しがすべて動く。`CREATE TABLE`・
-//! `DROP TABLE`は`catalog`モジュールの`Catalog`にテーブル定義を登録・削除する。
-//! `INSERT`・`FROM`/`WHERE`付きの`SELECT`は構文解析までは通るが、実行すると
-//! インメモリ表が揃う第10章を指し示す`DbError::NotImplemented`を返す。
+//! `CREATE TABLE`・`DROP TABLE`は`catalog`モジュールの`Catalog`にテーブル定義を
+//! 登録・削除する。`SELECT`・`INSERT`・`UPDATE`・`DELETE`は、`Catalog`でテーブル
+//! 定義を引いたうえで、`executor`モジュールのSequential Scan・Filter・
+//! Projection・Insert・Update・Delete演算子を正しい順序で呼び出す。行そのものは
+//! `storage_mem`モジュールの`MemStorage`が、`TableId`ごとにプロセスのメモリ上へ
+//! 保持する。
 
-use crate::ast::{CreateTableStatement, DropTableStatement, SelectStatement, Statement};
+use crate::ast::{
+    CreateTableStatement, DeleteStatement, DropTableStatement, InsertStatement, SelectItem,
+    SelectStatement, Statement, UpdateStatement,
+};
 use crate::catalog::Catalog;
 use crate::error::{DbError, DbResult};
 use crate::eval::{self, FunctionRegistry};
+use crate::executor;
+use crate::storage_mem::MemStorage;
 use crate::types::{Column, DataType, Schema, Tuple, Value};
 
 /// minidbのデータベース1つを表す。
 ///
-/// Scalar Functionのレジストリと、テーブル定義を保持する`Catalog`を持つ。
-/// ディスクへの永続化は第2部で`Database::open`のような別のコンストラクタとして
-/// 追加する。
+/// Scalar Functionのレジストリ、テーブル定義を保持する`Catalog`、テーブルの行を
+/// 保持する`MemStorage`を持つ。テーブルは`Catalog`(定義)と`MemStorage`(中身)の
+/// 両方に、同じ`TableId`のもとで存在する。ディスクへの永続化は第2部で
+/// `Database::open`のような別のコンストラクタとして追加する。
 pub struct Database {
     functions: FunctionRegistry,
     catalog: Catalog,
+    storage: MemStorage,
 }
 
 impl Database {
     /// インメモリのDatabaseを作る。組み込みのScalar Function(`abs`、`length`)は
-    /// 最初から登録済みの状態で始まり、カタログは空の状態で始まる。
+    /// 最初から登録済みの状態で始まり、カタログとストレージはどちらも空の
+    /// 状態で始まる。
     pub fn memory() -> Self {
         Database {
             functions: FunctionRegistry::with_builtins(),
             catalog: Catalog::new(),
+            storage: MemStorage::new(),
         }
     }
 
-    /// 現在のカタログへの参照。第10章のDML実行は、この参照でテーブル定義を引く。
+    /// 現在のカタログへの参照。
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
@@ -42,22 +51,21 @@ impl Database {
     /// SQL文字列を1本実行し、結果を返す。
     ///
     /// 構文解析(`parser::parse_statement`)がまず走り、`DbError::Lex`または
-    /// `DbError::Parse`はそのまま呼び出し元に伝わる。構文解析に成功しても、
-    /// この章の時点で実行できない構文(`FROM`/`WHERE`付き`SELECT`、`INSERT`)は
-    /// `DbError::NotImplemented`を返す。
+    /// `DbError::Parse`はそのまま呼び出し元に伝わる。
     pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
         let statement = crate::parser::parse_statement(sql)?;
         match statement {
             Statement::Select(select) => self.execute_select(sql, &select),
             Statement::CreateTable(create) => self.execute_create_table(&create),
             Statement::DropTable(drop) => self.execute_drop_table(&drop),
-            Statement::Insert(_) => Err(DbError::NotImplemented(
-                "INSERTの実行(表への追加)は第10章で対応します".to_string(),
-            )),
+            Statement::Insert(insert) => self.execute_insert(&insert),
+            Statement::Update(update) => self.execute_update(&update),
+            Statement::Delete(delete) => self.execute_delete(&delete),
         }
     }
 
-    /// `CREATE TABLE`を実行し、列定義を`Schema`へ変換したうえで`Catalog`に登録する。
+    /// `CREATE TABLE`を実行し、列定義を`Schema`へ変換したうえで`Catalog`に登録し、
+    /// `MemStorage`に空のテーブルを作る。
     fn execute_create_table(&mut self, create: &CreateTableStatement) -> DbResult<QueryResult> {
         let mut columns = Vec::with_capacity(create.columns.len());
         for column_def in &create.columns {
@@ -69,35 +77,52 @@ impl Database {
         }
 
         let schema = Schema::new(columns);
-        self.catalog.create_table(&create.table.name, schema)?;
+        let id = self.catalog.create_table(&create.table.name, schema)?;
+        self.storage.create_table(id);
         Ok(QueryResult::command("CREATE TABLE"))
     }
 
-    /// `DROP TABLE`を実行し、`Catalog`からテーブル定義を削除する。
+    /// `DROP TABLE`を実行し、`Catalog`からテーブル定義を、`MemStorage`から
+    /// その行をまとめて削除する。
     fn execute_drop_table(&mut self, drop: &DropTableStatement) -> DbResult<QueryResult> {
-        self.catalog.drop_table(&drop.table.name)?;
+        let id = self.catalog.drop_table(&drop.table.name)?;
+        self.storage.drop_table(id);
         Ok(QueryResult::command("DROP TABLE"))
     }
 
     fn execute_select(&self, sql: &str, select: &SelectStatement) -> DbResult<QueryResult> {
-        if select.from.is_some() || select.where_clause.is_some() {
-            return Err(DbError::NotImplemented(
-                "FROM・WHEREを伴うSELECTの実行(表の中身を読む手段)は第10章で対応します"
-                    .to_string(),
-            ));
+        match &select.from {
+            None => self.execute_select_without_from(sql, select),
+            Some(table) => self.execute_select_with_from(sql, select, &table.name),
         }
+    }
 
+    /// `FROM`を伴わない`SELECT`。式リストをその場で評価するだけで、行は常に
+    /// ちょうど1件返る。
+    fn execute_select_without_from(
+        &self,
+        sql: &str,
+        select: &SelectStatement,
+    ) -> DbResult<QueryResult> {
         let mut columns = Vec::with_capacity(select.items.len());
         let mut values = Vec::with_capacity(select.items.len());
         for item in &select.items {
-            let value = eval::eval_expr(&item.expr, &self.functions)?;
+            let expr = match item {
+                SelectItem::Expr { expr, .. } => expr,
+                SelectItem::Wildcard { .. } => {
+                    return Err(DbError::Eval(
+                        "*はFROMを伴うSELECTでのみ使えます".to_string(),
+                    ));
+                }
+            };
+            let value = eval::eval_expr(expr, &self.functions, None)?;
             // `Value::Null`はどの`DataType`にも属さないため、結果列の表示用の型を
             // 決められない。この章ではPostgreSQLの`unknown`型のような専用の型を
             // 別途設けず、`TEXT`をプレースホルダーとして使う(値そのものは
             // `Value::Null`のままなので、表示や後続の計算がこの選択に影響されることはない)。
             let data_type = value.data_type().unwrap_or(DataType::Text);
             let nullable = value.is_null();
-            let name = sql[item.span.start..item.span.end].to_string();
+            let name = sql[item.span().start..item.span().end].to_string();
             columns.push(Column::new(name, data_type, nullable));
             values.push(value);
         }
@@ -111,18 +136,128 @@ impl Database {
             command_tag: None,
         })
     }
+
+    /// `FROM`を伴う`SELECT`。Sequential Scan→(あれば)Filter→Projectionの順に
+    /// `executor`の演算子を適用する。
+    fn execute_select_with_from(
+        &self,
+        sql: &str,
+        select: &SelectStatement,
+        table_name: &str,
+    ) -> DbResult<QueryResult> {
+        let table_info = self
+            .catalog
+            .table(table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.to_string()))?;
+        let mem_table = self
+            .storage
+            .table(table_info.id)
+            .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
+
+        let scanned = executor::seq_scan(mem_table);
+        let filtered = match &select.where_clause {
+            Some(predicate) => {
+                executor::filter(&table_info.schema, &self.functions, scanned, predicate)?
+            }
+            None => scanned,
+        };
+        let (schema, rows) = executor::project(
+            &table_info.schema,
+            &self.functions,
+            &filtered,
+            &select.items,
+            sql,
+        )?;
+
+        Ok(QueryResult {
+            schema,
+            rows,
+            command_tag: None,
+        })
+    }
+
+    /// `INSERT INTO`を実行する。`executor::insert`が、`VALUES`の評価から
+    /// `MemStorage`への書き込みまでを行う。
+    fn execute_insert(&mut self, insert: &InsertStatement) -> DbResult<QueryResult> {
+        let table_info = self
+            .catalog
+            .table(&insert.table.name)
+            .ok_or_else(|| DbError::TableNotFound(insert.table.name.clone()))?;
+        let schema = &table_info.schema;
+        let mem_table = self
+            .storage
+            .table_mut(table_info.id)
+            .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
+
+        let count = executor::insert(
+            mem_table,
+            schema,
+            &self.functions,
+            insert.columns.as_deref(),
+            &insert.rows,
+        )?;
+        Ok(QueryResult::command_with_count("INSERT", count))
+    }
+
+    /// `UPDATE`を実行する。`executor::update`が、`WHERE`に一致した行への
+    /// `SET`の適用までを行う。
+    fn execute_update(&mut self, update: &UpdateStatement) -> DbResult<QueryResult> {
+        let table_info = self
+            .catalog
+            .table(&update.table.name)
+            .ok_or_else(|| DbError::TableNotFound(update.table.name.clone()))?;
+        let schema = &table_info.schema;
+        let mem_table = self
+            .storage
+            .table_mut(table_info.id)
+            .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
+
+        let count = executor::update(
+            mem_table,
+            schema,
+            &self.functions,
+            &update.assignments,
+            update.where_clause.as_ref(),
+        )?;
+        Ok(QueryResult::command_with_count("UPDATE", count))
+    }
+
+    /// `DELETE FROM`を実行する。`executor::delete`が、`WHERE`に一致した行の
+    /// 削除までを行う。
+    fn execute_delete(&mut self, delete: &DeleteStatement) -> DbResult<QueryResult> {
+        let table_info = self
+            .catalog
+            .table(&delete.table.name)
+            .ok_or_else(|| DbError::TableNotFound(delete.table.name.clone()))?;
+        let schema = &table_info.schema;
+        let mem_table = self
+            .storage
+            .table_mut(table_info.id)
+            .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
+
+        let count = executor::delete(
+            mem_table,
+            schema,
+            &self.functions,
+            delete.where_clause.as_ref(),
+        )?;
+        Ok(QueryResult::command_with_count("DELETE", count))
+    }
 }
 
 /// `Database::execute`の結果。
 ///
 /// `SELECT`は列構成(`Schema`)と、それに従う行の並びを持つ。`CREATE TABLE`・
-/// `DROP TABLE`のようなDDL文は返す行を持たないため、`schema`は空、`rows`も
-/// 空のベクタになり、代わりに`command_tag`が完了した文の種類(`"CREATE TABLE"`など)
-/// を持つ。行を1件も返さない`SELECT`と区別するためにフィールドを分けている。
+/// `DROP TABLE`のようなDDL文と、`INSERT`・`UPDATE`・`DELETE`のようなDML文は
+/// 返す行を持たないため、`schema`は空、`rows`も空のベクタになり、代わりに
+/// `command_tag`が完了した文の種類を持つ。DDL文は`"CREATE TABLE"`のように
+/// 種類の名前だけ、DML文は`"INSERT 2"`のように影響を受けた行数を添えた形式に
+/// なる(psqlの`INSERT 0 2`のような追加情報は持たない、この教材の簡略形式)。
+/// 行を1件も返さない`SELECT`と区別するためにフィールドを分けている。
 pub struct QueryResult {
     schema: Schema,
     rows: Vec<Tuple>,
-    command_tag: Option<&'static str>,
+    command_tag: Option<String>,
 }
 
 impl QueryResult {
@@ -131,16 +266,25 @@ impl QueryResult {
         QueryResult {
             schema: Schema::new(Vec::new()),
             rows: Vec::new(),
-            command_tag: Some(tag),
+            command_tag: Some(tag.to_string()),
         }
     }
 
-    /// 結果の列構成を返す。DDL文の完了では列を持たない空の`Schema`を返す。
+    /// DML文が完了したことを表す`QueryResult`を作る。`count`は影響を受けた行数。
+    fn command_with_count(tag: &'static str, count: usize) -> Self {
+        QueryResult {
+            schema: Schema::new(Vec::new()),
+            rows: Vec::new(),
+            command_tag: Some(format!("{tag} {count}")),
+        }
+    }
+
+    /// 結果の列構成を返す。DDL・DML文の完了では列を持たない空の`Schema`を返す。
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
 
-    /// 結果の行を返す。DDL文の完了では常に空のスライスを返す。
+    /// 結果の行を返す。DDL・DML文の完了では常に空のスライスを返す。
     pub fn rows(&self) -> &[Tuple] {
         &self.rows
     }
@@ -148,7 +292,7 @@ impl QueryResult {
 
 impl std::fmt::Display for QueryResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(tag) = self.command_tag {
+        if let Some(tag) = &self.command_tag {
             return write!(f, "{tag}");
         }
 
@@ -284,10 +428,10 @@ mod tests {
     }
 
     #[test]
-    fn column_ref_is_not_implemented_yet() {
+    fn column_ref_without_from_is_an_eval_error() {
         let mut db = Database::memory();
         let result = db.execute("SELECT id;");
-        assert!(matches!(result, Err(DbError::NotImplemented(_))));
+        assert!(matches!(result, Err(DbError::Eval(_))));
     }
 
     #[test]
@@ -337,17 +481,17 @@ mod tests {
     }
 
     #[test]
-    fn select_with_from_is_not_implemented_yet() {
+    fn select_with_from_rejects_unknown_table() {
         let mut db = Database::memory();
         let result = db.execute("SELECT id FROM users");
-        assert!(matches!(result, Err(DbError::NotImplemented(_))));
+        assert!(matches!(result, Err(DbError::TableNotFound(name)) if name == "users"));
     }
 
     #[test]
-    fn insert_is_not_implemented_yet() {
+    fn insert_rejects_unknown_table() {
         let mut db = Database::memory();
         let result = db.execute("INSERT INTO users VALUES (1)");
-        assert!(matches!(result, Err(DbError::NotImplemented(_))));
+        assert!(matches!(result, Err(DbError::TableNotFound(name)) if name == "users"));
     }
 
     // ---- CREATE TABLE ----
@@ -427,5 +571,249 @@ mod tests {
         let result = db.execute("CREATE TABLE users (id BIGINT NOT NULL, name TEXT)");
         assert!(result.is_ok());
         assert_eq!(db.catalog().table("users").unwrap().schema.columns().len(), 2);
+    }
+
+    // ---- INSERT ----
+
+    fn users_db() -> Database {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE users (id BIGINT NOT NULL, name TEXT)")
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn insert_adds_a_row() {
+        let mut db = users_db();
+        let result = db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        assert_eq!(result.to_string(), "INSERT 1");
+
+        let selected = db.execute("SELECT * FROM users").unwrap();
+        assert_eq!(selected.rows().len(), 1);
+        assert_eq!(
+            selected.rows()[0].values(),
+            &[Value::BigInt(1), Value::Text("Alice".to_string())]
+        );
+    }
+
+    #[test]
+    fn insert_accepts_multiple_rows_in_one_statement() {
+        let mut db = users_db();
+        let result = db
+            .execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        assert_eq!(result.to_string(), "INSERT 2");
+        assert_eq!(db.execute("SELECT * FROM users").unwrap().rows().len(), 2);
+    }
+
+    #[test]
+    fn insert_with_explicit_columns_fills_omitted_columns_with_null() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users (id) VALUES (1)").unwrap();
+
+        let selected = db.execute("SELECT * FROM users").unwrap();
+        assert_eq!(
+            selected.rows()[0].values(),
+            &[Value::BigInt(1), Value::Null]
+        );
+    }
+
+    #[test]
+    fn insert_with_explicit_columns_in_any_order() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users (name, id) VALUES ('Alice', 1)")
+            .unwrap();
+
+        let selected = db.execute("SELECT * FROM users").unwrap();
+        assert_eq!(
+            selected.rows()[0].values(),
+            &[Value::BigInt(1), Value::Text("Alice".to_string())]
+        );
+    }
+
+    #[test]
+    fn insert_rejects_not_null_violation() {
+        let mut db = users_db();
+        let result = db.execute("INSERT INTO users (name) VALUES ('Alice')");
+        assert!(matches!(result, Err(DbError::SchemaMismatch(_))));
+        // 検査に失敗した行は1件も挿入されない。
+        assert!(db.execute("SELECT * FROM users").unwrap().rows().is_empty());
+    }
+
+    #[test]
+    fn insert_is_all_or_nothing_across_rows() {
+        let mut db = users_db();
+        // 1行目は妥当だが、2行目が`id`のNOT NULLに違反する。
+        let result = db.execute("INSERT INTO users VALUES (1, 'Alice'), (NULL, 'Bob')");
+        assert!(matches!(result, Err(DbError::SchemaMismatch(_))));
+        assert!(db.execute("SELECT * FROM users").unwrap().rows().is_empty());
+    }
+
+    // ---- SELECT (FROM/WHERE/*) ----
+
+    #[test]
+    fn select_star_returns_all_columns_in_schema_order() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        let result = db.execute("SELECT * FROM users").unwrap();
+        assert_eq!(
+            result
+                .schema()
+                .columns()
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name"]
+        );
+    }
+
+    #[test]
+    fn select_projects_a_subset_of_columns() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        let result = db.execute("SELECT name FROM users").unwrap();
+        assert_eq!(result.schema().columns().len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::Text("Alice".to_string())]);
+    }
+
+    #[test]
+    fn select_evaluates_expressions_over_columns() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        let result = db.execute("SELECT id + 1 FROM users").unwrap();
+        assert_eq!(result.rows()[0].values(), &[Value::BigInt(2)]);
+    }
+
+    #[test]
+    fn select_where_filters_rows() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        let result = db.execute("SELECT id FROM users WHERE id = 2").unwrap();
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::BigInt(2)]);
+    }
+
+    #[test]
+    fn select_where_drops_unknown_rows() {
+        // `name`が`NULL`の行は、`name = 'Alice'`がUNKNOWNになるため落ちる
+        // (FALSEになる場合と同じ扱い)。
+        let mut db = users_db();
+        db.execute("INSERT INTO users (id) VALUES (1)").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Alice')").unwrap();
+        let result = db
+            .execute("SELECT id FROM users WHERE name = 'Alice'")
+            .unwrap();
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::BigInt(2)]);
+    }
+
+    #[test]
+    fn select_from_empty_table_returns_no_rows() {
+        let mut db = users_db();
+        let result = db.execute("SELECT * FROM users").unwrap();
+        assert!(result.rows().is_empty());
+        // 行が1件も無くても、列参照の出力Schemaは`table_schema`から正確に決まる。
+        assert_eq!(result.schema().columns()[0].data_type, DataType::BigInt);
+    }
+
+    // ---- UPDATE ----
+
+    #[test]
+    fn update_changes_matching_rows() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        let result = db
+            .execute("UPDATE users SET name = 'Carol' WHERE id = 1")
+            .unwrap();
+        assert_eq!(result.to_string(), "UPDATE 1");
+
+        let selected = db.execute("SELECT id, name FROM users WHERE id = 1").unwrap();
+        assert_eq!(
+            selected.rows()[0].values(),
+            &[Value::BigInt(1), Value::Text("Carol".to_string())]
+        );
+        let unaffected = db.execute("SELECT name FROM users WHERE id = 2").unwrap();
+        assert_eq!(
+            unaffected.rows()[0].values(),
+            &[Value::Text("Bob".to_string())]
+        );
+    }
+
+    #[test]
+    fn update_without_where_changes_every_row() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        let result = db.execute("UPDATE users SET name = 'Same'").unwrap();
+        assert_eq!(result.to_string(), "UPDATE 2");
+    }
+
+    #[test]
+    fn update_set_right_hand_side_sees_the_pre_update_row() {
+        // `SET id = id + 1, name = name`のような複数代入で、後続の代入が
+        // 直前の代入結果を見ないことを確認する(更新前の行を使って評価する)。
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("UPDATE users SET id = id + 1").unwrap();
+        let result = db.execute("SELECT id FROM users").unwrap();
+        assert_eq!(result.rows()[0].values(), &[Value::BigInt(2)]);
+    }
+
+    #[test]
+    fn update_rejects_not_null_violation() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        let result = db.execute("UPDATE users SET id = NULL");
+        assert!(matches!(result, Err(DbError::SchemaMismatch(_))));
+        // 検査に失敗したら、対象行は一切書き換わらない。
+        let selected = db.execute("SELECT id FROM users").unwrap();
+        assert_eq!(selected.rows()[0].values(), &[Value::BigInt(1)]);
+    }
+
+    // ---- DELETE ----
+
+    #[test]
+    fn delete_removes_matching_rows() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        let result = db.execute("DELETE FROM users WHERE id = 1").unwrap();
+        assert_eq!(result.to_string(), "DELETE 1");
+        assert_eq!(db.execute("SELECT * FROM users").unwrap().rows().len(), 1);
+    }
+
+    #[test]
+    fn delete_without_where_removes_every_row() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        let result = db.execute("DELETE FROM users").unwrap();
+        assert_eq!(result.to_string(), "DELETE 2");
+        assert!(db.execute("SELECT * FROM users").unwrap().rows().is_empty());
+    }
+
+    #[test]
+    fn insert_select_update_delete_round_trip() {
+        // 第1部の到達点を1つのテストとして確認する: INSERT→SELECT→UPDATE→
+        // SELECT→DELETE→SELECTが、すべてこの章のコードだけで動く。
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        assert_eq!(db.execute("SELECT * FROM users").unwrap().rows().len(), 2);
+
+        db.execute("UPDATE users SET name = 'Alicia' WHERE id = 1")
+            .unwrap();
+        let updated = db.execute("SELECT name FROM users WHERE id = 1").unwrap();
+        assert_eq!(
+            updated.rows()[0].values(),
+            &[Value::Text("Alicia".to_string())]
+        );
+
+        db.execute("DELETE FROM users WHERE id = 2").unwrap();
+        let remaining = db.execute("SELECT id FROM users").unwrap();
+        assert_eq!(remaining.rows().len(), 1);
+        assert_eq!(remaining.rows()[0].values(), &[Value::BigInt(1)]);
     }
 }

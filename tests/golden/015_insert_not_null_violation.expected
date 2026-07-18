@@ -1,0 +1,3 @@
+CREATE TABLE
+
+ERROR: スキーマ不一致: 列'id'(型: BigInt, nullable: false)に値Nullを格納できません
