@@ -1,61 +1,56 @@
-//! この章の実行演算子: Values / Sequential Scan / Filter / Projection /
-//! Insert / Update / Delete。
+//! この章の実行演算子: Insert / Update / Delete。
 //!
-//! `Executor::next()`が1行ずつ引っ張り出すVolcanoモデルは第19章で導入する。
-//! この章の演算子は、表全体を`Vec<Tuple>`としてまとめて受け取り、まとめて
-//! 返す素朴な関数にとどめる。`Database::execute`は、これらの関数を文の種類
-//! ごとに正しい順序で呼び出す配線役に徹する。第18章からは、その「正しい順序」
-//! 自体が`logical_plan::LogicalPlan`という木として明示的な値になり、
-//! `Database::eval_query_plan`が木を根から葉へたどりながらこのモジュールの
-//! 演算子を呼び出す(`INSERT`・`UPDATE`・`DELETE`は、木を経由しつつも実行の
-//! 中身は変わらず、この章より前と同じ`insert`・`update`・`delete`をそのまま呼ぶ)。
+//! 第18章まではSequential Scan・Filter・Projectionもこのモジュールが
+//! `Vec<Tuple>`をまとめて受け取りまとめて返す関数(`seq_scan`・
+//! `storage_seq_scan`・`filter`・`project`)として持っていた。第19章で
+//! `Executor::next()`が1行ずつ引っ張り出すVolcanoモデルを導入し、この3つは
+//! `physical_plan`モジュールの`MemSeqScanExec`・`DiskSeqScanExec`・
+//! `FilterExec`・`ProjectionExec`に置き換わった。`INSERT`・`UPDATE`・
+//! `DELETE`だけはこのモジュールに残っている。理由は`physical_plan`モジュール
+//! 冒頭のドキュメント([`crate::physical_plan`]の「`INSERT`・`UPDATE`・
+//! `DELETE`は`Executor`にしない」節)を参照。
 //!
 //! # 第17章から: 名前解決・型検査は`binder`モジュールへ移した
 //!
 //! 第10章では、`WHERE`句や`SELECT`の対象式の型検査(`infer_type`・
 //! `check_predicate_type`)、`*`の展開(`resolve_items`)はこのモジュールが
 //! 担っていた。第17章で`Binder`(`crate::binder`)を導入し、これらをすべて
-//! `Database::execute`のBind段階へ移した。`filter`・`project`・`update`・
-//! `delete`が受け取る`predicate`・`projection`・`assignments`は、すでに
-//! `Binder`が名前解決・型検査を終えた`BoundExpr`(または、それを含む型)であり、
-//! このモジュールは`Expr`という生のASTには一切触れない。`INSERT`の`VALUES`
-//! だけは例外で、列参照を持たない式(既存の行を参照する構文が無い)なので、
-//! 引き続き生の`Expr`のまま`eval::eval_expr`で評価する。
+//! `Database::execute`のBind段階へ移した。`update`・`delete`が受け取る
+//! `predicate`・`assignments`は、すでに`Binder`が名前解決・型検査を終えた
+//! `BoundExpr`(または、それを含む型)であり、このモジュールは`Expr`という
+//! 生のASTには一切触れない。`INSERT`の`VALUES`だけは例外で、列参照を持たない
+//! 式(既存の行を参照する構文が無い)なので、引き続き生の`Expr`のまま
+//! `eval::eval_expr`で評価する。
 //!
 //! # 行の供給源が2つある
 //!
 //! 第16章から、行の供給源は`MemTable`(第10章、プロセスのメモリ上)と
-//! `Storage`(第15章、ディスク上のファイル)の2つになった。`filter`・
-//! `project`は`Vec<Tuple>`だけを受け取る関数のままなので、供給源が
-//! どちらであっても変更なく使い回せる。変更が要るのは、供給源に直接触れる
-//! 演算子(`seq_scan`・`insert`・`update`・`delete`)だけである。それぞれに
-//! `storage_`を接頭辞に持つ対の関数(`storage_seq_scan`・`storage_insert`・
-//! `storage_update`・`storage_delete`)を追加し、既存の(接頭辞の無い)関数は
-//! `MemTable`向けのまま変えていない。
+//! `Storage`(第15章、ディスク上のファイル)の2つになった。`update`・
+//! `delete`は供給源に直接触れる演算子であり、それぞれに`storage_`を接頭辞に
+//! 持つ対の関数(`storage_update`・`storage_delete`)を持つ。`insert`・
+//! `storage_insert`も同様である。
 //!
-//! 1つの関数を`enum`や`trait`で両対応させる案も検討したが、この章では見送った。
+//! 1つの関数を`enum`や`trait`で両対応させる案も検討したが、この章でも見送った。
 //! `MemTable`は行を`Vec<Tuple>`の添字で直接指すのに対し、`Storage`は
 //! `RecordId`(第13章)で指す。`update`・`delete`が「どの行を書き換えるか」を
 //! 特定する手段そのものが両者で異なるため、共通化すると分岐だらけの抽象が
-//! 必要になる。将来Volcano Executor(第19章)が演算子をtraitとして抽象化する
-//! ときには、この共通化はそちらの設計に沿った形で自然に生まれる。先取りして
-//! 今traitを導入する理由はない。
+//! 必要になる。
 
 use crate::ast::Expr;
-use crate::binder::{BoundAssignment, BoundExpr, BoundSelectItem};
+use crate::binder::{BoundAssignment, BoundExpr};
 use crate::error::{DbError, DbResult};
 use crate::eval::{FunctionRegistry, eval_bound_expr, eval_expr};
 use crate::ids::{RecordId, TableId};
 use crate::storage::Storage;
 use crate::storage_mem::MemTable;
 use crate::tuple_codec::{decode_tuple, encode_tuple};
-use crate::types::{Column, DataType, Row, Schema, Tuple, Value};
+use crate::types::{Row, Schema, Tuple, Value};
 
 /// `WHERE`・`SET`の`predicate`が評価された結果を、SQLの三値論理に従って
 /// 「その行にマッチしたかどうか」の`bool`へ変換する。
 ///
 /// `TRUE`だけがマッチで、`FALSE`と`NULL`(`UNKNOWN`)はどちらもマッチしない
-/// (`filter`・`update`・`delete`が共通して従うべき規則)。`BIGINT`や`TEXT`の
+/// (`physical_plan::FilterExec`・`update`・`delete`が共通して従うべき規則)。`BIGINT`や`TEXT`の
 /// ような`BOOLEAN`ではない値が渡された場合は、それを黙って「マッチしない」
 /// 側に丸めてしまうと`WHERE 1`のような書き誤りを見逃すことになるため、
 /// `DbError::Eval`にする。
@@ -69,7 +64,7 @@ use crate::types::{Column, DataType, Row, Schema, Tuple, Value};
 /// `Binder`側にバグがあって型検査をすり抜けた場合でも、`executor`が
 /// `BOOLEAN`でない値を暗黙に「マッチしない」側へ丸めてしまう(=誤りを
 /// 隠してしまう)ことだけは避けたい、という最終防衛線として残している。
-fn predicate_matches(value: Value) -> DbResult<bool> {
+pub(crate) fn predicate_matches(value: Value) -> DbResult<bool> {
     match value {
         Value::Boolean(true) => Ok(true),
         Value::Boolean(false) | Value::Null => Ok(false),
@@ -84,104 +79,7 @@ fn predicate_matches(value: Value) -> DbResult<bool> {
     }
 }
 
-/// Sequential Scan演算子。テーブルの全行を、格納順のまま複製して返す。
-///
-/// 索引を持たないこの章では、`WHERE`があってもなくても、まずテーブル全体を
-/// 読む以外に行へたどり着く手段が無い。
-pub fn seq_scan(table: &MemTable) -> Vec<Tuple> {
-    table.rows().to_vec()
-}
-
-/// Sequential Scan演算子の`Storage`版。`table_id`のテーブルが使う全ページを
-/// 先頭から順に読み、生きている(削除されていない)全タプルを`decode_tuple`
-/// (第13章)で復元して返す。
-///
-/// `Storage::scan`が返すのは`(RecordId, バイト列)`の組だが、ここでは
-/// `RecordId`を捨ててバイト列だけを`Tuple`へ復元する。`RecordId`は
-/// `storage_update`・`storage_delete`が書き換え・削除の対象を特定するのに
-/// 使うが、読み取るだけの`Sequential Scan`にはそもそも要らない。
-pub fn storage_seq_scan(storage: &Storage, table_id: TableId, schema: &Schema) -> DbResult<Vec<Tuple>> {
-    storage
-        .scan(table_id)?
-        .map(|entry| entry.and_then(|(_, bytes)| decode_tuple(schema, &bytes)))
-        .collect()
-}
-
-/// Filter演算子。`predicate`を各行に対して評価し、`TRUE`になった行だけを残す。
-///
-/// SQLの`WHERE`は三値論理で評価するため、`FALSE`はもちろん`UNKNOWN`(`NULL`)に
-/// なった行も、`TRUE`ではないので落ちる。`NULL`の行を「一致しなかった」側に
-/// 含めるこの規則、および`BOOLEAN`でも`NULL`でもない値(`WHERE 1`など)を
-/// エラーにする規則は、`predicate_matches`が`update`・`delete`とも共通して
-/// 適用する。
-///
-/// `predicate`が`BOOLEAN`(または型未定の`NULL`)を返す式であることは、
-/// `Binder`の`bind_predicate`がすでに検査済みである。第10章の`filter`が
-/// 行ループへ入る前に呼んでいた`check_predicate_type`は、この章では不要に
-/// なった(`rows`が空でも、Bind段階の検査がすでに`WHERE 1`のような書き誤りを
-/// 検出しているため)。
-pub fn filter(
-    schema: &Schema,
-    functions: &FunctionRegistry,
-    rows: Vec<Tuple>,
-    predicate: &BoundExpr,
-) -> DbResult<Vec<Tuple>> {
-    let mut kept = Vec::with_capacity(rows.len());
-    for tuple in rows {
-        let row = Row::new(schema, &tuple);
-        let value = eval_bound_expr(predicate, functions, Some(&row))?;
-        if predicate_matches(value)? {
-            kept.push(tuple);
-        }
-    }
-    Ok(kept)
-}
-
-/// Projection演算子。束縛済みの射影対象リスト(`projection`)を各行に適用し、
-/// 出力用の`Schema`と行の並びを組み立てる。
-///
-/// `*`の展開は`Binder`(第17章)がすでに行っているため、この関数は「列参照または
-/// 式のリスト」という1種類の形だけを見ればよい。出力列の型・nullableは、
-/// 単純な列参照であれば`table_schema`の定義をそのまま使うため常に正確である。
-/// 計算結果(`id + 1`のような式)の型は、`item.expr.data_type()`(`Binder`が
-/// 構築時に決めた型)をそのまま使う。行を実際に評価しないこの型決定の理由は
-/// `binder::Binder::bind_expr`のドキュメントコメントを参照。
-pub fn project(
-    table_schema: &Schema,
-    functions: &FunctionRegistry,
-    rows: &[Tuple],
-    projection: &[BoundSelectItem],
-) -> DbResult<(Schema, Vec<Tuple>)> {
-    let mut out_columns = Vec::with_capacity(projection.len());
-    for item in projection {
-        if let BoundExpr::ColumnRef { column_index, .. } = &item.expr {
-            let mut column = table_schema.columns()[*column_index].clone();
-            column.name = item.output_name.clone();
-            out_columns.push(column);
-            continue;
-        }
-
-        // `data_type()`が`None`(型が定まらない、`NULL`単体など)を返す式は
-        // `TEXT`で代用する。この場合の`nullable`は、行ごとに`NULL`になったり
-        // ならなかったりしうるため常に`true`にする。
-        let data_type = item.expr.data_type().unwrap_or(DataType::Text);
-        out_columns.push(Column::new(item.output_name.clone(), data_type, true));
-    }
-    let out_schema = Schema::new(out_columns);
-
-    let mut out_rows = Vec::with_capacity(rows.len());
-    for tuple in rows {
-        let row = Row::new(table_schema, tuple);
-        let mut values = Vec::with_capacity(projection.len());
-        for item in projection {
-            values.push(eval_bound_expr(&item.expr, functions, Some(&row))?);
-        }
-        out_rows.push(Tuple::new(&out_schema, values)?);
-    }
-    Ok((out_schema, out_rows))
-}
-
-/// Values演算子とInsert演算子。`VALUES`の各行を評価し、`Tuple::new`による
+/// Insert演算子。`VALUES`の各行を評価し、`Tuple::new`による
 /// スキーマ検査に通ったものだけを`table`へ追加する。
 ///
 /// 検査はテーブルへ1行も書き込む前に、全行に対して済ませる。
@@ -459,6 +357,7 @@ mod tests {
     use crate::ast::Statement;
     use crate::binder::{Binder, BoundStatement};
     use crate::catalog::Catalog;
+    use crate::types::{Column, DataType};
 
     fn users_schema() -> Schema {
         Schema::new(vec![
@@ -503,10 +402,6 @@ mod tests {
             .expect("WHEREを指定したのでpredicateがあるはず")
     }
 
-    fn bound_projection(select_sql: &str) -> Vec<BoundSelectItem> {
-        bind_select(&format!("SELECT {select_sql} FROM users")).projection
-    }
-
     fn bound_assignments(update_sql: &str) -> Vec<BoundAssignment> {
         let catalog = users_catalog();
         let functions = FunctionRegistry::with_builtins();
@@ -528,38 +423,6 @@ mod tests {
             },
             other => panic!("SELECT文を期待したが{other:?}が返った"),
         }
-    }
-
-    // ---- Sequential Scan ----
-
-    #[test]
-    fn seq_scan_clones_all_rows_in_insertion_order() {
-        let mut table = MemTable::new();
-        table.rows_mut().push(tuple(1, Some("Alice")));
-        table.rows_mut().push(tuple(2, Some("Bob")));
-
-        let scanned = seq_scan(&table);
-        assert_eq!(scanned.len(), 2);
-        assert_eq!(scanned[0].values(), tuple(1, Some("Alice")).values());
-        assert_eq!(scanned[1].values(), tuple(2, Some("Bob")).values());
-    }
-
-    // ---- Filter ----
-
-    #[test]
-    fn filter_keeps_only_true_rows() {
-        let schema = users_schema();
-        let functions = FunctionRegistry::with_builtins();
-        let rows = vec![
-            tuple(1, Some("Alice")),
-            tuple(2, None),        // `name = 'Alice'`はUNKNOWN
-            tuple(3, Some("Bob")), // `name = 'Alice'`はFALSE
-        ];
-
-        let predicate = bound_predicate("name = 'Alice'");
-        let kept = filter(&schema, &functions, rows, &predicate).unwrap();
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].values()[0], Value::BigInt(1));
     }
 
     // ---- predicate_matches ----
@@ -591,97 +454,6 @@ mod tests {
         };
         assert!(message.contains("BIGINTが渡されました"));
         assert!(!message.contains("Some("));
-    }
-
-    // ---- Projection ----
-
-    #[test]
-    fn project_expands_wildcard_to_all_columns_in_schema_order() {
-        let schema = users_schema();
-        let functions = FunctionRegistry::with_builtins();
-        let rows = vec![tuple(1, Some("Alice"))];
-        let projection = bound_projection("*");
-
-        let (out_schema, out_rows) = project(&schema, &functions, &rows, &projection).unwrap();
-        assert_eq!(
-            out_schema.columns().iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
-            vec!["id", "name"]
-        );
-        assert_eq!(out_rows[0].values(), tuple(1, Some("Alice")).values());
-    }
-
-    #[test]
-    fn project_computed_column_is_always_nullable() {
-        // 1行目の`id + 1`はNULLにならないが、出力列の`nullable`は保守的に
-        // 常に`true`にする(`project`のコメント参照)。この保守化のおかげで、
-        // 2行目以降に実際にNULLを含む行が来ても、Tuple::newのスキーマ検査に
-        // 引っかからない。
-        let schema = users_schema();
-        let functions = FunctionRegistry::with_builtins();
-        let rows = vec![tuple(1, Some("Alice")), tuple(2, None)];
-        let projection = bound_projection("id, name");
-
-        let (out_schema, out_rows) = project(&schema, &functions, &rows, &projection).unwrap();
-        assert!(out_schema.columns()[1].nullable);
-        assert_eq!(out_rows.len(), 2);
-    }
-
-    #[test]
-    fn project_infers_computed_column_type_statically_even_when_first_row_is_null() {
-        // `x`はNULLを許すBIGINT列。1行目が`abs(x)`をNULLにする値でも、出力列の
-        // 型は実際に1行評価した結果ではなく、`Binder`が式のASTと入力`Schema`
-        // だけから静的に決めるため`BigInt`のままになる。もし1行目を評価して
-        // `data_type()`(NULLは`None`)から型を決めていたら、ここが`Text`に
-        // フォールバックし、2行目の非NULLなBIGINTを`Tuple::new`のスキーマ検査が
-        // `SchemaMismatch`として拒否していた。
-        let mut catalog = Catalog::new();
-        catalog
-            .create_table("t", Schema::new(vec![Column::new("x", DataType::BigInt, true)]))
-            .unwrap();
-        let functions = FunctionRegistry::with_builtins();
-        let sql = "SELECT abs(x) FROM t";
-        let statement = crate::parser::parse_statement(sql).unwrap();
-        let select = match Binder::new(&catalog, &functions, sql).bind(statement).unwrap() {
-            BoundStatement::Select(select) => select,
-            other => panic!("Selectを期待したが{other:?}が返った"),
-        };
-
-        let schema = Schema::new(vec![Column::new("x", DataType::BigInt, true)]);
-        let rows = vec![
-            Tuple::new(&schema, vec![Value::Null]).unwrap(),
-            Tuple::new(&schema, vec![Value::BigInt(-5)]).unwrap(),
-        ];
-
-        let (out_schema, out_rows) = project(&schema, &functions, &rows, &select.projection).unwrap();
-        assert_eq!(out_schema.columns()[0].data_type, DataType::BigInt);
-        assert_eq!(out_rows[0].values()[0], Value::Null);
-        assert_eq!(out_rows[1].values()[0], Value::BigInt(5));
-    }
-
-    #[test]
-    fn project_infers_computed_column_type_on_an_empty_table() {
-        // 行が1件も無くても、`Binder`は式のASTだけから型を決められる。
-        let schema = users_schema();
-        let functions = FunctionRegistry::with_builtins();
-        let rows: Vec<Tuple> = vec![];
-        let projection = bound_projection("id + 1");
-
-        let (out_schema, out_rows) = project(&schema, &functions, &rows, &projection).unwrap();
-        assert_eq!(out_schema.columns()[0].data_type, DataType::BigInt);
-        assert!(out_rows.is_empty());
-    }
-
-    #[test]
-    fn project_scalar_function_on_non_null_rows_still_works() {
-        let schema = users_schema();
-        let functions = FunctionRegistry::with_builtins();
-        let rows = vec![tuple(1, Some("Alice")), tuple(2, Some("Bob"))];
-        let projection = bound_projection("length(name)");
-
-        let (out_schema, out_rows) = project(&schema, &functions, &rows, &projection).unwrap();
-        assert_eq!(out_schema.columns()[0].data_type, DataType::BigInt);
-        assert_eq!(out_rows[0].values()[0], Value::BigInt(5));
-        assert_eq!(out_rows[1].values()[0], Value::BigInt(3));
     }
 
     // ---- Insert ----
@@ -791,7 +563,17 @@ mod tests {
         assert!(table.rows().is_empty());
     }
 
-    // ---- Storage版(seq_scan/insert/update/delete) ----
+    // ---- Storage版(insert/update/delete) ----
+
+    /// テスト検証専用。`storage_insert`・`storage_update`・`storage_delete`が
+    /// 書き込んだ内容を確認するためだけに、`Storage::scan`を`decode_tuple`へ
+    /// 通して全行を読み戻す。かつての`executor::storage_seq_scan`はこの手順を
+    /// 演算子として公開していたが、この章からSequential Scanは
+    /// `physical_plan::DiskSeqScanExec`(Volcano型のPull実行、1件ずつ供給)に
+    /// 置き換わったため、`Vec`にまとめて返すこの形はテストの中だけに残す。
+    fn scan_all(storage: &Storage, table_id: TableId, schema: &Schema) -> DbResult<Vec<Tuple>> {
+        storage.scan(table_id)?.map(|entry| entry.and_then(|(_, bytes)| decode_tuple(schema, &bytes))).collect()
+    }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let mut path = std::env::temp_dir();
@@ -827,7 +609,7 @@ mod tests {
         let count = storage_insert(&mut storage, table_id, &schema, &functions, None, &rows).unwrap();
         assert_eq!(count, 2);
 
-        let scanned = storage_seq_scan(&storage, table_id, &schema).unwrap();
+        let scanned = scan_all(&storage, table_id, &schema).unwrap();
         assert_eq!(scanned.len(), 2);
         assert_eq!(scanned[0].values(), tuple(1, Some("Alice")).values());
         assert_eq!(scanned[1].values(), tuple(2, Some("Bob")).values());
@@ -845,7 +627,7 @@ mod tests {
         let rows = vec![vec![expr("1"), expr("'Alice'")], vec![expr("NULL"), expr("'Bob'")]];
         let result = storage_insert(&mut storage, table_id, &schema, &functions, None, &rows);
         assert!(result.is_err());
-        assert!(storage_seq_scan(&storage, table_id, &schema).unwrap().is_empty());
+        assert!(scan_all(&storage, table_id, &schema).unwrap().is_empty());
 
         std::fs::remove_file(&path).unwrap();
     }
@@ -871,7 +653,7 @@ mod tests {
             storage_update(&mut storage, table_id, &schema, &functions, &assignments, Some(&predicate)).unwrap();
         assert_eq!(count, 1);
 
-        let scanned = storage_seq_scan(&storage, table_id, &schema).unwrap();
+        let scanned = scan_all(&storage, table_id, &schema).unwrap();
         assert_eq!(scanned.len(), 2);
         assert!(scanned.contains(&tuple(1, Some("Carol"))));
         assert!(scanned.contains(&tuple(2, Some("Bob"))));
@@ -898,7 +680,7 @@ mod tests {
         let count = storage_delete(&mut storage, table_id, &schema, &functions, Some(&predicate)).unwrap();
         assert_eq!(count, 1);
 
-        let scanned = storage_seq_scan(&storage, table_id, &schema).unwrap();
+        let scanned = scan_all(&storage, table_id, &schema).unwrap();
         assert_eq!(scanned.len(), 1);
         assert_eq!(scanned[0].values()[0], Value::BigInt(2));
 

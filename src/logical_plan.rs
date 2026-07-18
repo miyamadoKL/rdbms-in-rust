@@ -347,7 +347,7 @@ pub fn build_delete(delete: BoundDelete) -> LogicalPlan {
 /// 範囲(`Span`)を経由せず、式の構造から組み立て直す。そのため、
 /// `SELECT id+1`と書いても`id + 1`のように空白の入り方が変わることがある。
 /// SQLへ逆変換する用途(prepared statementのログ出力など)には使わない。
-fn fmt_bound_expr(expr: &BoundExpr) -> String {
+pub(crate) fn fmt_bound_expr(expr: &BoundExpr) -> String {
     match expr {
         BoundExpr::IntLiteral { value, .. } => value.to_string(),
         BoundExpr::StringLiteral { value, .. } => format!("'{value}'"),

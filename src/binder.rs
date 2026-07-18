@@ -103,6 +103,11 @@ pub enum BoundStatement {
     Insert(BoundInsert),
     Update(BoundUpdate),
     Delete(BoundDelete),
+    /// `EXPLAIN`。対象の文はParser(第19章)がすでに`SELECT`・`INSERT INTO`・
+    /// `UPDATE`・`DELETE FROM`の4種類に絞っているため、この束縛先も
+    /// `CreateTable`・`DropTable`・入れ子の`Explain`にはならない
+    /// (`Database::execute_explain`はその前提で網羅する)。
+    Explain(Box<BoundStatement>),
 }
 
 /// `FROM`(または`INSERT INTO`・`UPDATE`・`DELETE FROM`)が指す1テーブル。
@@ -325,6 +330,9 @@ impl<'a> Binder<'a> {
             Statement::Insert(insert) => self.bind_insert(insert).map(BoundStatement::Insert),
             Statement::Update(update) => self.bind_update(update).map(BoundStatement::Update),
             Statement::Delete(delete) => self.bind_delete(delete).map(BoundStatement::Delete),
+            Statement::Explain(explain) => {
+                self.bind(*explain.statement).map(|inner| BoundStatement::Explain(Box::new(inner)))
+            }
         }
     }
 

@@ -36,7 +36,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 
 - [第17章 Binderと名前解決](book/src/ch17-binder.md)
 - [第18章 関係代数とLogical Plan](book/src/ch18-logical-plan.md)
-- 第19章 Physical PlanとVolcano Executor
+- [第19章 Physical PlanとVolcano Executor](book/src/ch19-volcano-executor.md)
 - 第20章 制約
 - 第21章 Sort、Limit、Distinct、Aggregate
 - 第22章 Joinアルゴリズム

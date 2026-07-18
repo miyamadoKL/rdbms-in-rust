@@ -59,6 +59,7 @@ pub enum Keyword {
     Is,
     As,
     Cast,
+    Explain,
 }
 
 impl Keyword {
@@ -86,6 +87,7 @@ impl Keyword {
             "IS" => Keyword::Is,
             "AS" => Keyword::As,
             "CAST" => Keyword::Cast,
+            "EXPLAIN" => Keyword::Explain,
             _ => return None,
         };
         Some(keyword)

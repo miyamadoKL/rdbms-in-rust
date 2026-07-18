@@ -28,6 +28,11 @@ pub enum Statement {
     Update(UpdateStatement),
     /// `DELETE FROM`文。
     Delete(DeleteStatement),
+    /// `EXPLAIN`文。`SELECT`・`INSERT INTO`・`UPDATE`・`DELETE FROM`のいずれか
+    /// 1本を対象に取れる(第19章)。`CREATE TABLE`・`DROP TABLE`はLogical
+    /// Plan/Physical Planを経由しない文であり、`EXPLAIN`する対象を持たないため
+    /// 対象に含めない。
+    Explain(ExplainStatement),
 }
 
 impl Statement {
@@ -40,6 +45,7 @@ impl Statement {
             Statement::Insert(s) => s.span,
             Statement::Update(s) => s.span,
             Statement::Delete(s) => s.span,
+            Statement::Explain(s) => s.span,
         }
     }
 }
@@ -171,6 +177,14 @@ pub struct DeleteStatement {
     pub table: Ident,
     /// `WHERE <expr>`。省略した場合はテーブルの全行が対象になる。
     pub where_clause: Option<Expr>,
+    pub span: Span,
+}
+
+/// `EXPLAIN`文。`statement`は`EXPLAIN`の直後に続く1本のSQL文。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplainStatement {
+    pub statement: Box<Statement>,
+    /// `EXPLAIN`キーワードから対象の文の末尾までを覆う範囲。
     pub span: Span,
 }
 

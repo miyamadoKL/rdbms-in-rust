@@ -1,27 +1,28 @@
 //! SQL文字列を受け取り、結果を返す実行の入口。
 //!
-//! 第18章から、`Database::execute`は4段階のパイプラインになった。
+//! 第19章から、`Database::execute`は5段階のパイプラインになった。
 //!
 //! 1. **構文解析**(`parser::parse_statement`): SQL文字列を`Statement`(AST)へ変換する。
 //! 2. **名前解決**(`binder::Binder::bind`): `Statement`をカタログと突き合わせ、
 //!    テーブル名・列名を解決し、式の型を検査した`BoundStatement`(Bound AST)へ
 //!    変換する。未知のテーブル・列、曖昧な列参照、型不一致は、この段階で
 //!    位置情報付きの`DbError::Bind`として検出される。
-//! 3. **計画**(`logical_plan::build_*`): `BoundStatement`(`Select`・`Insert`・
+//! 3. **論理計画**(`logical_plan::build_*`): `BoundStatement`(`Select`・`Insert`・
 //!    `Update`・`Delete`)を、関係代数の演算子木である[`LogicalPlan`]へ変換する。
-//!    `Database::execute_select_with_from`(第17章まで)がSequential Scan→
-//!    Filter→Projectionという順序を関数呼び出しの並びとして手続き的に決めて
-//!    いたのに対し、この段階からはその順序が`Filter`・`Projection`の親子関係
-//!    として木の形に現れる。
-//! 4. **実行**: `CREATE TABLE`・`DROP TABLE`は`LogicalPlan`を経由せず、
-//!    テーブル定義を直接登録・削除する(`CREATE TABLE`が`Binder`を素通りする
-//!    のと同じ理由。モジュール冒頭の説明は[`crate::binder`]を参照)。
-//!    `SELECT`・`INSERT`・`UPDATE`・`DELETE`は、`LogicalPlan`の木を根から葉へ
-//!    たどりながら`executor`モジュールの演算子を呼び出す(`eval_query_plan`・
-//!    `execute_insert`・`execute_update`・`execute_delete`)。演算子を`next()`
-//!    で1行ずつ引っ張り出すVolcano型の実行はまだ無く、各ノードは子の結果を
-//!    `Vec<Tuple>`としてまとめて受け取り、まとめて返す(第19章で`Executor`
-//!    traitへ分離する)。
+//! 4. **物理計画**(`physical_plan::optimize`): `LogicalPlan`を、実行アルゴリズムを
+//!    確定した[`crate::physical_plan::PhysicalPlan`]へ変換する。索引がまだ無いこの
+//!    章では`Scan`は必ず`SeqScan`になる(第25章でIndex Scanが加わると、ここが
+//!    本当の意味での選択になる)。
+//! 5. **実行**: `CREATE TABLE`・`DROP TABLE`はどちらの計画も経由せず、テーブル
+//!    定義を直接登録・削除する(`CREATE TABLE`が`Binder`を素通りするのと同じ理由。
+//!    モジュール冒頭の説明は[`crate::binder`]を参照)。`SELECT`は
+//!    `PhysicalPlan`を`Box<dyn Executor>`の木へ組み立て(`build_query_executor`)、
+//!    `next()`を1行ずつ呼ぶループで結果を集める([`crate::physical_plan`]の
+//!    Volcanoモデル)。`INSERT`・`UPDATE`・`DELETE`は`Executor`を経由せず、
+//!    第18章までと同じ`executor`モジュールの一括関数(`insert`・`update`・
+//!    `delete`等)を呼ぶ(理由は[`crate::physical_plan`]冒頭の「`INSERT`・
+//!    `UPDATE`・`DELETE`は`Executor`にしない」節を参照)。`EXPLAIN`は実行せず、
+//!    `PhysicalPlan`の木を文字列化した`QueryResult`を返す(`execute_explain`)。
 //!
 //! テーブル定義と行を実際にどこへ持つかは[`Backend`]が決める。
 //!
@@ -48,9 +49,10 @@ use crate::ast::{CreateTableStatement, DropTableStatement, Statement};
 use crate::binder::{Binder, BoundStatement};
 use crate::catalog::Catalog;
 use crate::error::{DbError, DbResult};
-use crate::eval::{self, FunctionRegistry};
+use crate::eval::FunctionRegistry;
 use crate::executor;
 use crate::logical_plan::{self, DeleteNode, InsertNode, LogicalPlan, UpdateNode};
+use crate::physical_plan::{self, DiskSeqScanExec, Executor, FilterExec, MemSeqScanExec, PhysicalPlan, ProjectionExec, ValuesExec};
 use crate::storage::Storage;
 use crate::storage_mem::MemStorage;
 use crate::types::{Column, DataType, Schema, Tuple, Value};
@@ -188,6 +190,7 @@ impl Database {
             BoundStatement::Insert(insert) => self.execute_insert(logical_plan::build_insert(insert)),
             BoundStatement::Update(update) => self.execute_update(logical_plan::build_update(update)),
             BoundStatement::Delete(delete) => self.execute_delete(logical_plan::build_delete(delete)),
+            BoundStatement::Explain(inner) => self.execute_explain(*inner),
         }
     }
 
@@ -261,72 +264,104 @@ impl Database {
 
     /// `LogicalPlan`に組み立てた`SELECT`を実行する。
     ///
-    /// `logical_plan::build_select`が返す木は、必ず根に`Projection`を持つ。
-    /// `eval_query_plan`で木全体を根から葉へたどりながら`executor`の演算子を
-    /// 適用し、その結果をそのまま`QueryResult`に詰める。
+    /// `logical_plan::build_select`が返す木を`physical_plan::optimize`で
+    /// [`PhysicalPlan`]へ変換し、`build_query_executor`で`Box<dyn Executor>`の
+    /// 木を組み立てる。`Executor::next()`を`None`が返るまで呼び続け、返った
+    /// タプルを`rows`に集める。
+    ///
+    /// 第18章までの`eval_query_plan`は、`Filter`・`Projection`の各段が子の
+    /// 結果を`Vec<Tuple>`としてまるごと受け取ってから、まるごと新しい`Vec`を
+    /// 作って返す再帰関数だった。テーブルが100,000行あり`WHERE`が1行しか
+    /// 残さない`SELECT`でも、`Filter`が返す前の中間結果は100,000行分の
+    /// `Tuple`を一度にメモリへ載せていた。この章の`next()`ループは、`Filter`・
+    /// `Projection`が子から1行ずつ引いて1行ずつ返す(`physical_plan`モジュール
+    /// 冒頭の説明を参照)ため、`rows`へ最終的に集まる行数だけがメモリに載り、
+    /// 木の中間段階に100,000行分の`Vec`が生まれることはない(`database`モジュールの
+    /// テスト`select_does_not_materialize_the_whole_table_in_a_single_vec`で
+    /// この性質を確認する)。
+    ///
+    /// `rows`という1つの`Vec`に最終結果を集めているのは、`QueryResult`が
+    /// `rows()`で`&[Tuple]`を返す型になっているためであり、この`Vec`自体は
+    /// 「最終的にクライアントへ返す結果の件数」に比例する。ストリーミング
+    /// 実行が効くのは、あくまで計画の中間段階(`Filter`を通過する前の
+    /// 候補行、`WHERE`に一致しなかった行)がメモリに残らないという点である。
     fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {
-        let (schema, rows) = self.eval_query_plan(&plan)?;
+        let physical = physical_plan::optimize(plan);
+        let schema = physical.output_schema();
+        let mut executor = self.build_query_executor(&physical)?;
+
+        let mut rows = Vec::new();
+        while let Some(tuple) = executor.next()? {
+            rows.push(tuple);
+        }
         Ok(QueryResult { schema, rows, command_tag: None })
     }
 
-    /// `LogicalPlan`の木を根から葉へたどり、各ノードに対応する`executor`の
-    /// 演算子を適用しながら`(Schema, Vec<Tuple>)`を組み立てる。
+    /// `PhysicalPlan`の木を根から葉へたどり、対応する[`Executor`]を組み立てる。
     ///
-    /// `Scan`・`Values`が行を生成する葉であり、`Filter`・`Projection`は子の
-    /// 結果を受け取って加工するだけの中間ノードである。この関数は`Filter`・
-    /// `Projection`の呼び出しのたびに自分自身を再帰呼び出しすることで、木の
-    /// 深さに関係なく同じコードで根から葉まで処理できる。第17章までの
-    /// `execute_select_with_from`が「Sequential Scan→Filter→Projection」という
-    /// 順序を1つの関数の中に手続きとして書き下ろしていたのに対し、この関数は
-    /// その順序を`LogicalPlan`の親子関係から読み取るだけであり、`WHERE`の
-    /// 有無で分岐を書き分ける必要も無い(`WHERE`が無ければ`Filter`ノード自体が
-    /// 木に現れないため)。
+    /// `SeqScan`・`Values`が行を生成する葉であり、`Filter`・`Projection`は
+    /// 子の`Executor`を`Box<dyn Executor>`として持つ中間ノードである。この
+    /// 関数自体は木を1回だけたどって`Executor`の入れ子を組み立てるだけで、
+    /// 行を実際に読みに行くのは呼び出し側が`next()`を呼んだときである(木の
+    /// 組み立てと実行が分離しているのがVolcanoモデルの特徴で、`eval_query_plan`
+    /// (第18章)が組み立てと実行を1回の再帰呼び出しで同時に行っていたのとは
+    /// 異なる)。
     ///
-    /// `FROM`を伴わない`SELECT`(`Values(1 row)`が根の`Scan`の代わりを務める)も、
-    /// この関数の中では特別扱いしない。`Values`の1件が`Filter`で0件に絞られれば、
-    /// 後続の`Projection`はその0件に対してだけ動くため、`WHERE`が`TRUE`に
-    /// ならなかった暗黙の1行に対して射影式を評価してしまうことも無い。
-    /// これは、`Filter`が先に行を絞り込んでから`Projection`が動くという
-    /// 演算子の順序そのものが持つ性質であり、`Values`だけを特別扱いする理由が
-    /// 無くなったことが、この章で`execute_select_without_from`を削れた理由でもある。
-    fn eval_query_plan(&self, plan: &LogicalPlan) -> DbResult<(Schema, Vec<Tuple>)> {
+    /// `SeqScan`だけが`&self.backend`(`Memory`か`Disk`か)を見る。`Filter`・
+    /// `Projection`は供給源を意識せず、`Box<dyn Executor>`という共通の
+    /// インターフェースだけを相手にする。`Insert`・`Update`・`Delete`は
+    /// この関数を経由しない(`crate::physical_plan`冒頭の説明を参照)ため、
+    /// ここに渡ってくることはない。
+    fn build_query_executor<'a>(&'a self, plan: &'a PhysicalPlan) -> DbResult<Box<dyn Executor + 'a>> {
         match plan {
-            LogicalPlan::Scan(scan) => {
-                let rows = match &self.backend {
+            PhysicalPlan::SeqScan(scan) => {
+                let exec: Box<dyn Executor + 'a> = match &self.backend {
                     Backend::Memory { storage, .. } => {
                         let mem_table = storage
                             .table(scan.table_id)
                             .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                        executor::seq_scan(mem_table)
+                        Box::new(MemSeqScanExec::new(&scan.schema, mem_table))
                     }
-                    Backend::Disk { storage } => executor::storage_seq_scan(storage, scan.table_id, &scan.schema)?,
+                    Backend::Disk { storage } => Box::new(DiskSeqScanExec::new(storage, scan.table_id, &scan.schema)?),
                 };
-                Ok((scan.schema.clone(), rows))
+                Ok(exec)
             }
-            LogicalPlan::Values(values) => {
-                let mut rows = Vec::with_capacity(values.rows.len());
-                for row_exprs in &values.rows {
-                    let evaluated = row_exprs
-                        .iter()
-                        .map(|expr| eval::eval_expr(expr, &self.functions, None))
-                        .collect::<DbResult<Vec<_>>>()?;
-                    rows.push(Tuple::new(&values.schema, evaluated)?);
-                }
-                Ok((values.schema.clone(), rows))
+            PhysicalPlan::Values(values) => {
+                let exec = ValuesExec::new(values.schema.clone(), &self.functions, &values.rows)?;
+                Ok(Box::new(exec))
             }
-            LogicalPlan::Filter(filter) => {
-                let (schema, rows) = self.eval_query_plan(&filter.input)?;
-                let filtered = executor::filter(&schema, &self.functions, rows, &filter.predicate)?;
-                Ok((schema, filtered))
+            PhysicalPlan::Filter(filter) => {
+                let input = self.build_query_executor(&filter.input)?;
+                Ok(Box::new(FilterExec::new(input, &filter.predicate, &self.functions)))
             }
-            LogicalPlan::Projection(projection) => {
-                let (schema, rows) = self.eval_query_plan(&projection.input)?;
-                executor::project(&schema, &self.functions, &rows, &projection.projection)
+            PhysicalPlan::Projection(projection) => {
+                let input = self.build_query_executor(&projection.input)?;
+                Ok(Box::new(ProjectionExec::new(input, &projection.projection, &self.functions)))
             }
-            LogicalPlan::Insert(_) | LogicalPlan::Update(_) | LogicalPlan::Delete(_) => {
+            PhysicalPlan::Insert(_) | PhysicalPlan::Update(_) | PhysicalPlan::Delete(_) => {
                 unreachable!("Insert/Update/DeleteはSELECTの計画に現れない(logical_plan::build_selectは作らない)")
             }
         }
+    }
+
+    /// `EXPLAIN`を実行する。対象の文を`LogicalPlan`・`PhysicalPlan`へ変換し、
+    /// その木を文字列化しただけの`QueryResult`を返す(実際には何も実行しない)。
+    ///
+    /// `inner`は`Parser`(第19章)がすでに`SELECT`・`INSERT INTO`・`UPDATE`・
+    /// `DELETE FROM`の4種類に絞っているため、`CreateTable`・`DropTable`・
+    /// 入れ子の`Explain`はここに渡ってこない。
+    fn execute_explain(&self, inner: BoundStatement) -> DbResult<QueryResult> {
+        let logical = match inner {
+            BoundStatement::Select(select) => logical_plan::build_select(select),
+            BoundStatement::Insert(insert) => logical_plan::build_insert(insert),
+            BoundStatement::Update(update) => logical_plan::build_update(update),
+            BoundStatement::Delete(delete) => logical_plan::build_delete(delete),
+            BoundStatement::CreateTable(_) | BoundStatement::DropTable(_) | BoundStatement::Explain(_) => {
+                unreachable!("ParserがEXPLAINの対象をSELECT・INSERT INTO・UPDATE・DELETE FROMに制限している")
+            }
+        };
+        let physical = physical_plan::optimize(logical);
+        Ok(QueryResult::explain(physical.to_string()))
     }
 
     /// `INSERT INTO`を実行する。`executor::insert`(または`executor::storage_insert`)
@@ -448,6 +483,24 @@ impl QueryResult {
             rows: Vec::new(),
             command_tag: Some(format!("{tag} {count}")),
         }
+    }
+
+    /// `EXPLAIN`が完了したことを表す`QueryResult`を作る。`plan_text`は
+    /// `PhysicalPlan`の`Display`実装(木を表示した複数行の文字列)。
+    ///
+    /// PostgreSQLの`EXPLAIN`にならい、`QUERY PLAN`という1列の結果として返す
+    /// (`SELECT`の結果と同じ形で表示できるようにするため、`command_tag`は
+    /// 使わない)。木の1行が結果の1行になる。
+    fn explain(plan_text: String) -> Self {
+        let schema = Schema::new(vec![Column::new("QUERY PLAN", DataType::Text, false)]);
+        let rows = plan_text
+            .lines()
+            .map(|line| {
+                Tuple::new(&schema, vec![Value::Text(line.to_string())])
+                    .expect("QUERY PLAN列はTEXTなので必ず成功する")
+            })
+            .collect();
+        QueryResult { schema, rows, command_tag: None }
     }
 
     /// 結果の列構成を返す。DDL・DML文の完了では列を持たない空の`Schema`を返す。
@@ -1341,6 +1394,130 @@ mod tests {
         let remaining = db.execute("SELECT id FROM users").unwrap();
         assert_eq!(remaining.rows().len(), 1);
         assert_eq!(remaining.rows()[0].values(), &[Value::BigInt(1)]);
+    }
+
+    // ---- EXPLAIN ----
+
+    /// `EXPLAIN`の結果(`QUERY PLAN`列)を、木を表示した文字列と同じ形の
+    /// 複数行の`Vec<String>`として取り出す。
+    fn explain_lines(db: &mut Database, sql: &str) -> Vec<String> {
+        let result = db.execute(sql).unwrap();
+        assert_eq!(result.schema().columns().len(), 1);
+        assert_eq!(result.schema().columns()[0].name, "QUERY PLAN");
+        result
+            .rows()
+            .iter()
+            .map(|tuple| match &tuple.values()[0] {
+                Value::Text(s) => s.clone(),
+                other => panic!("QUERY PLAN列はTEXTのはずが{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn explain_select_shows_projection_over_filter_over_seq_scan() {
+        let mut db = users_db();
+        let lines = explain_lines(&mut db, "EXPLAIN SELECT name FROM users WHERE id = 42");
+        assert_eq!(lines, vec!["Projection(name)", "  └─ Filter(id = 42)", "    └─ SeqScan(users)"]);
+    }
+
+    #[test]
+    fn explain_select_without_where_has_no_filter_node() {
+        let mut db = users_db();
+        let lines = explain_lines(&mut db, "EXPLAIN SELECT id FROM users");
+        assert_eq!(lines, vec!["Projection(id)", "  └─ SeqScan(users)"]);
+    }
+
+    #[test]
+    fn explain_insert_shows_insert_over_values() {
+        let mut db = users_db();
+        let lines = explain_lines(&mut db, "EXPLAIN INSERT INTO users VALUES (1, 'Alice')");
+        assert_eq!(lines, vec!["Insert(users)", "  └─ Values(1 row)"]);
+    }
+
+    #[test]
+    fn explain_update_shows_update_over_seq_scan() {
+        let mut db = users_db();
+        let lines = explain_lines(&mut db, "EXPLAIN UPDATE users SET name = 'x' WHERE id = 1");
+        assert_eq!(lines, vec!["Update(users)", "  └─ SeqScan(users)"]);
+    }
+
+    #[test]
+    fn explain_delete_shows_delete_over_seq_scan() {
+        let mut db = users_db();
+        let lines = explain_lines(&mut db, "EXPLAIN DELETE FROM users WHERE id = 1");
+        assert_eq!(lines, vec!["Delete(users)", "  └─ SeqScan(users)"]);
+    }
+
+    #[test]
+    fn explain_does_not_execute_the_statement() {
+        // `EXPLAIN INSERT`は行を書き込まない。木を見せるだけで実行はしない。
+        let mut db = users_db();
+        db.execute("EXPLAIN INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        assert!(db.execute("SELECT * FROM users").unwrap().rows().is_empty());
+    }
+
+    #[test]
+    fn explain_rejects_create_table_as_a_syntax_error() {
+        // `EXPLAIN`の対象は`SELECT`・`INSERT INTO`・`UPDATE`・`DELETE FROM`の
+        // 4種類に限る(Logical Plan/Physical Planを経由しない`CREATE TABLE`は
+        // 対象に含まれない)。この制約はParserの文法として表現されているため、
+        // 構文エラー(`DbError::Parse`)になる。
+        let mut db = users_db();
+        let result = db.execute("EXPLAIN CREATE TABLE t (id BIGINT)");
+        assert!(matches!(result, Err(DbError::Parse { .. })));
+    }
+
+    #[test]
+    fn explain_rejects_nested_explain_as_a_syntax_error() {
+        let mut db = users_db();
+        let result = db.execute("EXPLAIN EXPLAIN SELECT id FROM users");
+        assert!(matches!(result, Err(DbError::Parse { .. })));
+    }
+
+    // ---- Volcano実行: 中間結果を全件バッファしない ----
+
+    #[test]
+    fn select_streams_rows_without_materializing_the_whole_table_at_once() {
+        // 10,000行のテーブルに対し、最後の1行だけに一致する`WHERE`を実行する。
+        // 第18章までの`eval_query_plan`なら、`Filter`が返す前の中間結果として
+        // 10,000行分の`Tuple`を1つの`Vec`にまとめて保持していた。この章の
+        // `next()`ループでは、`Filter`・`Projection`のどちらも子から1行ずつ
+        // 引いて1行ずつ返すため、最終結果(1行)より大きな`Vec`はどの段階にも
+        // 生まれない(この性質そのものは`physical_plan`モジュールの
+        // `CountingExecutor`を使ったテストで、子が実際に何回`next()`されたかを
+        // 数えて確認している。ここではその上で、10,000行規模でも結果が正しい
+        // ことをend-to-endに確認する)。
+        const N: i64 = 10_000;
+        let mut db = users_db();
+        let values: Vec<String> = (1..=N).map(|i| format!("({i}, 'user{i}')")).collect();
+        db.execute(&format!("INSERT INTO users VALUES {}", values.join(", "))).unwrap();
+
+        let result = db.execute(&format!("SELECT name FROM users WHERE id = {N}")).unwrap();
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::Text(format!("user{N}"))]);
+    }
+
+    #[test]
+    fn select_streams_rows_on_the_disk_backend_too() {
+        // 永続モードは、テーブルが使うページ番号の一覧をCatalogページ1枚に
+        // 収める設計(第15章)であるため、行数を無制限には増やせない
+        // (`storage::tests::catalog_too_large_is_rejected_instead_of_corrupting_the_file`
+        // 参照)。ここではストリーミング実行の確認が目的であり、ページを
+        // またぐ規模(第14章の`BufferPool`が全ページを同時にキャッシュしきれない
+        // 規模)であれば十分なので、`Database::open`が扱える範囲に収まる件数にする。
+        const N: i64 = 500;
+        let path = temp_db_path("streaming-disk-backend");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE users (id BIGINT NOT NULL, name TEXT)").unwrap();
+        let values: Vec<String> = (1..=N).map(|i| format!("({i}, 'user{i}')")).collect();
+        db.execute(&format!("INSERT INTO users VALUES {}", values.join(", "))).unwrap();
+
+        let result = db.execute(&format!("SELECT name FROM users WHERE id = {N}")).unwrap();
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::Text(format!("user{N}"))]);
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     // ---- Database::open(永続モード) ----

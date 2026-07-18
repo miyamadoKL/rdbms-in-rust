@@ -25,7 +25,12 @@
 //! 実行経路は構文解析(`parser`)→名前解決(`binder`)→実行(`executor`)という
 //! 3段階になる。第18章では、`BoundStatement`を関係代数の演算子木
 //! (`LogicalPlan`)へ変換する`logical_plan`が加わり、`database`の実行経路は
-//! 構文解析→名前解決→計画(`logical_plan`)→実行という4段階になる。
+//! 構文解析→名前解決→計画(`logical_plan`)→実行という4段階になる。第19章では、
+//! `LogicalPlan`から実行アルゴリズムを確定した`PhysicalPlan`を作り、
+//! `Executor::next()`で1行ずつ引っ張り出すVolcano型のPull実行を行う
+//! `physical_plan`が加わる。`database`の実行経路は構文解析→名前解決→
+//! 論理計画→物理計画→実行という5段階になり、`EXPLAIN`で`PhysicalPlan`の
+//! 木を確認できるようになる。
 
 pub mod ast;
 pub mod binder;
@@ -43,6 +48,7 @@ pub mod lexer;
 pub mod logical_plan;
 pub mod page;
 pub mod parser;
+pub mod physical_plan;
 pub mod slotted_page;
 pub mod storage;
 pub mod storage_mem;
@@ -67,6 +73,7 @@ pub use page::{
     FileHeader, Page, PageType,
 };
 pub use parser::parse_statement;
+pub use physical_plan::{Executor, PhysicalPlan};
 pub use slotted_page::{SLOT_ENTRY_SIZE, SLOTTED_HEADER_SIZE, SlotStatus, SlottedPage, SlottedPageRef};
 pub use storage::Storage;
 pub use storage_mem::{MemStorage, MemTable};

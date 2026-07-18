@@ -11,6 +11,7 @@
 //! - `INSERT INTO <table> [(<col>, ...)] VALUES (<式>, ...), ...`
 //! - `UPDATE <table> SET <col> = <式> [, ...] [WHERE <式>]`
 //! - `DELETE FROM <table> [WHERE <式>]`
+//! - `EXPLAIN <SELECT|INSERT INTO|UPDATE|DELETE FROM>`(第19章)
 //! - 式: リテラル(整数・文字列・真偽値・`NULL`)、列参照、二項演算(`+ - * /`、
 //!   比較、`AND` `OR`)、単項演算(`-` `NOT`)、`IS [NOT] NULL`、関数呼び出し、
 //!   `CAST(expr AS type)`、括弧
@@ -19,8 +20,8 @@
 
 use crate::ast::{
     Assignment, BinaryOperator, ColumnDef, CreateTableStatement, DeleteStatement,
-    DropTableStatement, Expr, FromClause, Ident, InsertStatement, SelectItem, SelectStatement,
-    Statement, UnaryOperator, UpdateStatement,
+    DropTableStatement, ExplainStatement, Expr, FromClause, Ident, InsertStatement, SelectItem,
+    SelectStatement, Statement, UnaryOperator, UpdateStatement,
 };
 use crate::error::{DbError, DbResult};
 use crate::lexer::{self, Keyword, Span, Token, TokenKind};
@@ -147,10 +148,38 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Delete) => {
                 self.parse_delete_statement().map(Statement::Delete)
             }
+            TokenKind::Keyword(Keyword::Explain) => {
+                self.parse_explain_statement().map(Statement::Explain)
+            }
             _ => Err(self.unexpected(
-                "SELECT・CREATE TABLE・DROP TABLE・INSERT INTO・UPDATE・DELETE FROMのいずれか",
+                "SELECT・CREATE TABLE・DROP TABLE・INSERT INTO・UPDATE・DELETE FROM・EXPLAINのいずれか",
             )),
         }
+    }
+
+    // ---- EXPLAIN ----
+
+    /// `EXPLAIN <SELECT|INSERT INTO|UPDATE|DELETE FROM>`を解析する。
+    ///
+    /// 対象を`SELECT`・`INSERT INTO`・`UPDATE`・`DELETE FROM`の4種類に限るのは、
+    /// `EXPLAIN`が見せるのはLogical Plan/Physical Planに変換できる文だけだから
+    /// である(第19章)。`CREATE TABLE`・`DROP TABLE`はどちらの計画も経由しない
+    /// (`Database::execute_create_table`等を直接呼ぶ)ため対象に含めない。
+    /// `EXPLAIN EXPLAIN ...`のような入れ子も、この関数が生の`parse_statement`
+    /// ではなく`SELECT`等4種の解析関数だけを呼ぶことで、構文の時点で拒否される。
+    fn parse_explain_statement(&mut self) -> DbResult<ExplainStatement> {
+        let start = self.expect_keyword(Keyword::Explain, "EXPLAIN")?.start;
+
+        let statement = match self.peek_kind() {
+            TokenKind::Keyword(Keyword::Select) => self.parse_select_statement().map(Statement::Select)?,
+            TokenKind::Keyword(Keyword::Insert) => self.parse_insert_statement().map(Statement::Insert)?,
+            TokenKind::Keyword(Keyword::Update) => self.parse_update_statement().map(Statement::Update)?,
+            TokenKind::Keyword(Keyword::Delete) => self.parse_delete_statement().map(Statement::Delete)?,
+            _ => return Err(self.unexpected("SELECT・INSERT INTO・UPDATE・DELETE FROMのいずれか")),
+        };
+
+        let end = statement.span().end;
+        Ok(ExplainStatement { statement: Box::new(statement), span: Span { start, end } })
     }
 
     // ---- SELECT ----
@@ -1125,6 +1154,66 @@ mod tests {
             Statement::Delete(delete) => assert!(delete.where_clause.is_none()),
             other => panic!("DELETE文を期待したが{other:?}が返った"),
         }
+    }
+
+    // ---- EXPLAIN ----
+
+    #[test]
+    fn parses_explain_select() {
+        let statement = parse_statement("EXPLAIN SELECT id FROM users").unwrap();
+        match statement {
+            Statement::Explain(explain) => assert!(matches!(*explain.statement, Statement::Select(_))),
+            other => panic!("EXPLAIN文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_explain_insert() {
+        let statement = parse_statement("EXPLAIN INSERT INTO users VALUES (1)").unwrap();
+        match statement {
+            Statement::Explain(explain) => assert!(matches!(*explain.statement, Statement::Insert(_))),
+            other => panic!("EXPLAIN文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_explain_update() {
+        let statement = parse_statement("EXPLAIN UPDATE users SET id = 1").unwrap();
+        match statement {
+            Statement::Explain(explain) => assert!(matches!(*explain.statement, Statement::Update(_))),
+            other => panic!("EXPLAIN文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_explain_delete() {
+        let statement = parse_statement("EXPLAIN DELETE FROM users").unwrap();
+        match statement {
+            Statement::Explain(explain) => assert!(matches!(*explain.statement, Statement::Delete(_))),
+            other => panic!("EXPLAIN文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn explain_span_covers_the_keyword_through_the_inner_statement() {
+        let statement = parse_statement("EXPLAIN SELECT id FROM users").unwrap();
+        let Statement::Explain(explain) = statement else {
+            panic!("EXPLAIN文を期待した");
+        };
+        assert_eq!(explain.span.start, 0);
+        assert_eq!(explain.span.end, "EXPLAIN SELECT id FROM users".len());
+    }
+
+    #[test]
+    fn explain_rejects_create_table() {
+        let err = parse_statement("EXPLAIN CREATE TABLE t (id BIGINT)").unwrap_err();
+        assert!(matches!(err, DbError::Parse { .. }));
+    }
+
+    #[test]
+    fn explain_rejects_nested_explain() {
+        let err = parse_statement("EXPLAIN EXPLAIN SELECT id FROM users").unwrap_err();
+        assert!(matches!(err, DbError::Parse { .. }));
     }
 
     #[test]
