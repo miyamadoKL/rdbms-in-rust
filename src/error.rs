@@ -60,6 +60,54 @@ pub enum DbError {
         /// 発生位置の列番号(1始まり)。
         column: usize,
     },
+
+    /// File HeaderまたはPageのバイト列が壊れているエラー(Magic Number不一致、
+    /// Format Version不一致、checksum不一致、バイト数不一致、未知のPage Typeなど)。
+    #[error("破損したページです: {0}")]
+    CorruptPage(String),
+
+    /// Tupleのバイト列が、渡された`Schema`のもとで復元できないエラー
+    /// (バイト列がNULLビットマップや値の途中で尽きている、`TEXT`の長さプレフィックス
+    /// が実際の残りバイト数を超えているなど)。
+    #[error("破損したタプルです: {0}")]
+    CorruptTuple(String),
+
+    /// `DiskManager`に、まだ`allocate_page`されていない(または`page_count`の
+    /// 範囲外の)`PageId`を渡したエラー。
+    #[error("ページ範囲外です: {0}")]
+    PageOutOfRange(String),
+
+    /// `HeapFile::insert`に渡したバイト列が、空の1ページにも収まらないほど
+    /// 大きいエラー。
+    #[error("挿入するデータがページに収まりません: {0}バイト")]
+    TupleTooLarge(usize),
+
+    /// `BufferPool`が新しいページを読み込もうとしたが、既存の全フレームがpin中で
+    /// evictできる候補が1つもないエラー。
+    #[error("バッファプールの全フレームがpin中です: {0}")]
+    BufferPoolFull(String),
+
+    /// 永続カタログ(Catalogページ)のバイト列から`Storage`の状態を復元できない
+    /// エラー(宣言されたテーブル数・列数・ページ数が実際のバイト列と矛盾している、
+    /// 未知の`DataType`コードが書かれている、名前が妥当なUTF-8でないなど)。
+    #[error("破損したカタログです: {0}")]
+    CorruptCatalog(String),
+
+    /// `Storage`のカタログ(テーブル定義・Free Page List)をエンコードした結果が
+    /// Catalogページ1枚(`PAGE_PAYLOAD_SIZE`バイト)に収まらないエラー。
+    #[error("カタログがページに収まりません: {0}バイト(上限{1}バイト)")]
+    CatalogTooLarge(usize, usize),
+
+    /// `Storage::get`・`update`・`delete`に渡した`RecordId`が、指定した
+    /// `TableId`のページ一覧に属していない(別のテーブルのRID、または
+    /// Meta/Catalogページを指すRID)エラー。
+    #[error("不正なRecordIdです: {0}")]
+    InvalidRecordId(String),
+
+    /// `Storage::create_table`が新しい`TableId`を割り当てようとしたが、
+    /// `next_table_id`がすでに`u64::MAX`で、これ以上安全に加算できないエラー。
+    #[error("これ以上テーブルを作成できません: TableIdの上限(u64::MAX)に達しました")]
+    TableIdSpaceExhausted,
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

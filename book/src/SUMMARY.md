@@ -18,12 +18,12 @@
 
 # 第2部 Storage: ディスクにデータを保存する
 
-- [第11章 データベースファイルとページ]()
-- [第12章 Slotted Page、Tuple、RID]()
-- [第13章 Disk ManagerとHeap File]()
-- [第14章 Buffer Pool]()
-- [第15章 永続カタログと空き領域管理]()
-- [第16章 SQL経路の永続化]()
+- [第11章 データベースファイルとページ](ch11-database-file.md)
+- [第12章 Slotted Page、Tuple、RID](ch12-slotted-page.md)
+- [第13章 Disk ManagerとHeap File](ch13-disk-manager.md)
+- [第14章 Buffer Pool](ch14-buffer-pool.md)
+- [第15章 永続カタログと空き領域管理](ch15-persistent-catalog.md)
+- [第16章 SQL経路の永続化](ch16-sql-persistence.md)
 
 # 第3部 Query Execution: SQLを実行計画へ変換する
 
