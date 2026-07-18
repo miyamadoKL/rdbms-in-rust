@@ -1,12 +1,29 @@
 //! 複数の`Page`(第11章)をまとめて1つのテーブルとして扱うHeap File。
 //!
-//! `SlottedPage`(第12章)は1ページの中だけを扱い、`DiskManager`(この章の前半)は
+//! `SlottedPage`(第12章)は1ページの中だけを扱い、`DiskManager`(第13章)は
 //! 1ページを指定した番号で読み書きするだけで、どのページの集まりが1つのテーブルを
 //! なすかを知らない。`HeapFile`が、その「ページの集まりとしてのテーブル」を表す。
 //!
+//! # ページへのアクセスは`BufferPool`経由
+//!
+//! 第13章の`HeapFile`は`DiskManager`を直接叩いていたが、この章では
+//! `BufferPool`(第14章)を経由する。`disk.read_page(id)? -> Page`のように
+//! ページを値として受け取ってから`disk.write_page(&page)`で書き戻す代わりに、
+//! `pool.write_page(id)? -> PageWriteGuard`が返す`&mut [u8]`を直接書き換え、
+//! 書き戻しはGuardの`Drop`に任せる。この置き換えにともない、`insert`・
+//! `update`・`delete`の内部から明示的な`write_page`呼び出しが消えている。
+//! 呼び出し側に見える公開シグネチャ(`open`が`DiskManager`ではなく
+//! `BufferPool`を受け取る点を除く)は変えていない。
+//!
+//! 読み取りだけで済む`get`・`scan`は`pool.read_page(id)? -> PageReadGuard`を
+//! 使う。`PageReadGuard::data()`が返すのは`&[u8]`(不変参照)で、`SlottedPage`
+//! (第12章)を開くための`&mut [u8]`は要求しない。代わりに、読み取り専用の
+//! `SlottedPageRef`(第14章で追加)を`SlottedPageRef::open(guard.data())`の
+//! 形で使う。
+//!
 //! # 1つのファイルは1つのHeap File
 //!
-//! この章の`HeapFile`は、1つの`DiskManager`(1つのファイル)を丸ごと1個の
+//! この章の`HeapFile`は、1つの`BufferPool`(1つのファイル)を丸ごと1個の
 //! テーブルとして占有する。`HeapFile::open`は、ページ0(Metaページ)を除く
 //! 全ページを、そのテーブルが持つデータページとみなして走査対象に加える。
 //!
@@ -15,7 +32,10 @@
 //! カタログとFree Space Mapは第15章で導入する。この章の時点で「プロセスを
 //! 再起動してもテーブルのデータが残る」ことを確認するテストは、
 //! `HeapFile::open`が毎回ファイル全体を走査してページ一覧を作り直すという
-//! この章の設計にそのまま乗っている。
+//! この章の設計にそのまま乗っている。ただし、`BufferPool`はdirtyなページを
+//! 明示的に`flush`するまでディスクへ書き戻さないため、再起動を確認するテストは
+//! `HeapFile::flush`を呼んでからファイルを閉じる必要がある(モジュール末尾の
+//! テストを参照)。
 //!
 //! # ページ探索は線形探索
 //!
@@ -36,32 +56,43 @@
 //! 元の場所に残す」といった仕組み)は導入しない。呼び出し側は、`update`が返す
 //! `RecordId`を以後のアクセスに使う必要がある。
 
-use crate::disk_manager::DiskManager;
+use crate::buffer_pool::BufferPool;
 use crate::error::{DbError, DbResult};
 use crate::ids::{PageId, RecordId, SlotId};
-use crate::page::{Page, PageType};
-use crate::slotted_page::{SlotStatus, SlottedPage};
+use crate::page::PageType;
+use crate::slotted_page::{SlotStatus, SlottedPage, SlottedPageRef};
 
 /// 複数ページにまたがる1つのテーブルを表す。
 pub struct HeapFile {
-    disk: DiskManager,
+    pool: BufferPool,
     /// このテーブルが使っているデータページの一覧(挿入順ではなく、
     /// ファイル中のページ番号順)。
     page_ids: Vec<PageId>,
 }
 
 impl HeapFile {
-    /// `disk`が管理するファイル全体を1つのHeap Fileとして開く。
+    /// `pool`が管理するファイル全体を1つのHeap Fileとして開く。
     ///
     /// ページ0(Meta)を除く全ページをデータページとみなし、`page_ids`に登録する。
-    pub fn open(disk: DiskManager) -> Self {
-        let page_ids = (1..disk.page_count()).map(PageId).collect();
-        HeapFile { disk, page_ids }
+    pub fn open(pool: BufferPool) -> Self {
+        let page_ids = (1..pool.page_count()).map(PageId).collect();
+        HeapFile { pool, page_ids }
     }
 
     /// このテーブルが使っているデータページの一覧。
     pub fn page_ids(&self) -> &[PageId] {
         &self.page_ids
+    }
+
+    /// このテーブルの`BufferPool`にキャッシュされているdirtyなページを
+    /// すべてディスクへ書き戻す。
+    ///
+    /// `BufferPool::flush_all`をそのまま呼ぶだけの薄いラッパーで、
+    /// `DiskManager::sync`(ページキャッシュから物理ディスクへの同期)までは
+    /// 行わない。プロセスの再起動をまたいでデータを残したい場合、呼び出し側は
+    /// この後で`DiskManager::sync`も別途呼ぶ必要がある。
+    pub fn flush(&self) -> DbResult<()> {
+        self.pool.flush_all()
     }
 
     /// `bytes`を新しいタプルとして挿入し、それを指す`RecordId`を返す。
@@ -73,19 +104,18 @@ impl HeapFile {
     /// 大きすぎるということなので`DbError::TupleTooLarge`を返す。
     pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
         for &page_id in &self.page_ids {
-            let mut page = self.disk.read_page(page_id)?;
-            if let Some(slot) = SlottedPage::open(page.payload_mut()).insert(bytes) {
-                self.disk.write_page(&page)?;
+            let mut guard = self.pool.write_page(page_id)?;
+            if let Some(slot) = SlottedPage::open(guard.data_mut()).insert(bytes) {
                 return Ok(RecordId::new(page_id, slot));
             }
         }
 
-        let page_id = self.disk.allocate_page(PageType::Data)?;
-        let mut page = self.disk.read_page(page_id)?;
-        let slot = SlottedPage::init(page.payload_mut())
+        let page_id = self.pool.allocate_page(PageType::Data)?;
+        let mut guard = self.pool.write_page(page_id)?;
+        let slot = SlottedPage::init(guard.data_mut())
             .insert(bytes)
             .ok_or(DbError::TupleTooLarge(bytes.len()))?;
-        self.disk.write_page(&page)?;
+        drop(guard);
         self.page_ids.push(page_id);
         Ok(RecordId::new(page_id, slot))
     }
@@ -93,8 +123,8 @@ impl HeapFile {
     /// `rid`が指すタプルのバイト列を返す。削除済み、またはそもそも挿入されて
     /// いなければ`None`を返す。
     pub fn get(&self, rid: RecordId) -> DbResult<Option<Vec<u8>>> {
-        let mut page = self.disk.read_page(rid.page_id)?;
-        Ok(SlottedPage::open(page.payload_mut())
+        let guard = self.pool.read_page(rid.page_id)?;
+        Ok(SlottedPageRef::open(guard.data())
             .get(rid.slot_id)
             .map(|bytes| bytes.to_vec()))
     }
@@ -102,12 +132,8 @@ impl HeapFile {
     /// `rid`が指すタプルを削除する。削除できたら`true`、対象がすでに存在しない
     /// (未挿入、または削除済み)なら`false`を返す。
     pub fn delete(&mut self, rid: RecordId) -> DbResult<bool> {
-        let mut page = self.disk.read_page(rid.page_id)?;
-        let deleted = SlottedPage::open(page.payload_mut()).delete(rid.slot_id);
-        if deleted {
-            self.disk.write_page(&page)?;
-        }
-        Ok(deleted)
+        let mut guard = self.pool.write_page(rid.page_id)?;
+        Ok(SlottedPage::open(guard.data_mut()).delete(rid.slot_id))
     }
 
     /// `rid`が指すタプルを`bytes`へ置き換える。
@@ -117,23 +143,26 @@ impl HeapFile {
     /// 場合は引数の`rid`と同じだが、ページをまたぐ移動が起きた場合は新しい値になる
     /// (モジュールの説明を参照)。
     pub fn update(&mut self, rid: RecordId, bytes: &[u8]) -> DbResult<Option<RecordId>> {
-        let mut page = self.disk.read_page(rid.page_id)?;
-
-        let occupied =
-            SlottedPage::open(page.payload_mut()).status(rid.slot_id) == Some(SlotStatus::Occupied);
+        // 対象が存在するかどうかは読み取り専用のGuardで確かめる。存在しない
+        // 場合にまで`write_page`でpinしてdirty扱いにしてしまうと、evict時の
+        // 無駄な書き戻しが増える。
+        let occupied = {
+            let guard = self.pool.read_page(rid.page_id)?;
+            SlottedPageRef::open(guard.data()).status(rid.slot_id) == Some(SlotStatus::Occupied)
+        };
         if !occupied {
             return Ok(None);
         }
 
-        if SlottedPage::open(page.payload_mut()).update(rid.slot_id, bytes) {
-            self.disk.write_page(&page)?;
-            return Ok(Some(rid));
+        {
+            let mut guard = self.pool.write_page(rid.page_id)?;
+            if SlottedPage::open(guard.data_mut()).update(rid.slot_id, bytes) {
+                return Ok(Some(rid));
+            }
+            // このページの中には(コンパクションしても)収まらないので、
+            // このページからは削除し、別のページへ挿入し直す。
+            SlottedPage::open(guard.data_mut()).delete(rid.slot_id);
         }
-
-        // このページの中には(コンパクションしても)収まらないので、
-        // このページからは削除し、別のページへ挿入し直す。
-        SlottedPage::open(page.payload_mut()).delete(rid.slot_id);
-        self.disk.write_page(&page)?;
         let new_rid = self.insert(bytes)?;
         Ok(Some(new_rid))
     }
@@ -142,7 +171,7 @@ impl HeapFile {
     /// `(RecordId, タプルのバイト列)`として返すイテレータ。
     pub fn scan(&self) -> Scan<'_> {
         Scan {
-            disk: &self.disk,
+            pool: &self.pool,
             page_ids: self.page_ids.iter(),
             current: None,
         }
@@ -152,13 +181,13 @@ impl HeapFile {
 /// [`HeapFile::scan`]が返すイテレータ。
 ///
 /// 現在読み込み中のページとその中の走査位置(`slot_idx`)だけを保持し、ページ内の
-/// 全スロットを見終えたら次のページを`DiskManager`から読み込む。この章の実装は
+/// 全スロットを見終えたら次のページを`BufferPool`から読み込む。この章の実装は
 /// ページ単位でしかバッファリングせず、`HeapFile`全体の内容を一度にメモリへ
 /// 読み込むことはしない。
 pub struct Scan<'a> {
-    disk: &'a DiskManager,
+    pool: &'a BufferPool,
     page_ids: std::slice::Iter<'a, PageId>,
-    current: Option<(Page, u16)>,
+    current: Option<(crate::buffer_pool::PageReadGuard<'a>, u16)>,
 }
 
 impl Iterator for Scan<'_> {
@@ -166,13 +195,13 @@ impl Iterator for Scan<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some((page, slot_idx)) = self.current.as_mut() {
-                let page_id = page.page_id;
-                let slot_count = SlottedPage::open(page.payload_mut()).slot_count() as u16;
+            if let Some((guard, slot_idx)) = self.current.as_mut() {
+                let page_id = guard.page_id();
+                let slot_count = SlottedPageRef::open(guard.data()).slot_count() as u16;
                 while *slot_idx < slot_count {
                     let slot = SlotId(*slot_idx);
                     *slot_idx += 1;
-                    if let Some(bytes) = SlottedPage::open(page.payload_mut()).get(slot) {
+                    if let Some(bytes) = SlottedPageRef::open(guard.data()).get(slot) {
                         let rid = RecordId::new(page_id, slot);
                         return Some(Ok((rid, bytes.to_vec())));
                     }
@@ -182,8 +211,8 @@ impl Iterator for Scan<'_> {
             }
 
             let next_page_id = *self.page_ids.next()?;
-            match self.disk.read_page(next_page_id) {
-                Ok(page) => self.current = Some((page, 0)),
+            match self.pool.read_page(next_page_id) {
+                Ok(guard) => self.current = Some((guard, 0)),
                 Err(err) => return Some(Err(err)),
             }
         }
@@ -193,6 +222,7 @@ impl Iterator for Scan<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk_manager::DiskManager;
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let mut path = std::env::temp_dir();
@@ -208,11 +238,18 @@ mod tests {
         path
     }
 
+    /// 容量16フレームのBufferPoolでHeap Fileを開く。テストで十分に余裕のある
+    /// 容量にしておき、Buffer Pool自体のeviction挙動は`buffer_pool`モジュール
+    /// 側のテストで確認する。
+    fn open_heap(path: &std::path::Path) -> HeapFile {
+        let disk = DiskManager::open(path).unwrap();
+        HeapFile::open(BufferPool::new(disk, 16))
+    }
+
     #[test]
     fn insert_then_get_round_trips() {
         let path = temp_path("insert-get");
-        let disk = DiskManager::open(&path).unwrap();
-        let mut heap = HeapFile::open(disk);
+        let mut heap = open_heap(&path);
 
         let rid = heap.insert(b"alice").unwrap();
         assert_eq!(heap.get(rid).unwrap(), Some(b"alice".to_vec()));
@@ -223,8 +260,7 @@ mod tests {
     #[test]
     fn delete_hides_the_tuple_from_get_and_scan() {
         let path = temp_path("delete");
-        let disk = DiskManager::open(&path).unwrap();
-        let mut heap = HeapFile::open(disk);
+        let mut heap = open_heap(&path);
 
         let rid = heap.insert(b"gone soon").unwrap();
         assert!(heap.delete(rid).unwrap());
@@ -239,8 +275,7 @@ mod tests {
     #[test]
     fn update_in_place_keeps_the_record_id() {
         let path = temp_path("update-in-place");
-        let disk = DiskManager::open(&path).unwrap();
-        let mut heap = HeapFile::open(disk);
+        let mut heap = open_heap(&path);
 
         let rid = heap.insert(b"aaaaa").unwrap();
         let new_rid = heap.update(rid, b"bbbbb").unwrap().unwrap();
@@ -254,8 +289,7 @@ mod tests {
     #[test]
     fn update_that_does_not_fit_moves_to_another_page_and_changes_the_record_id() {
         let path = temp_path("update-move");
-        let disk = DiskManager::open(&path).unwrap();
-        let mut heap = HeapFile::open(disk);
+        let mut heap = open_heap(&path);
 
         // 1ページ目に2件を隙間なく詰める。どちらも生きているので、
         // 片方を削除してコンパクションしても、もう片方の分だけ空きは
@@ -281,8 +315,7 @@ mod tests {
     #[test]
     fn update_on_missing_record_returns_none() {
         let path = temp_path("update-missing");
-        let disk = DiskManager::open(&path).unwrap();
-        let mut heap = HeapFile::open(disk);
+        let mut heap = open_heap(&path);
 
         let rid = heap.insert(b"x").unwrap();
         heap.delete(rid).unwrap();
@@ -294,8 +327,7 @@ mod tests {
     #[test]
     fn insert_across_multiple_pages_and_scan_returns_them_all() {
         let path = temp_path("multi-page-scan");
-        let disk = DiskManager::open(&path).unwrap();
-        let mut heap = HeapFile::open(disk);
+        let mut heap = open_heap(&path);
 
         // 1ページに収まらない件数を入れ、複数ページへまたがらせる。
         let mut inserted = Vec::new();
@@ -322,19 +354,48 @@ mod tests {
         let mut inserted = Vec::new();
         {
             let disk = DiskManager::open(&path).unwrap();
-            let mut heap = HeapFile::open(disk);
+            // page_ids::pushで容量を使い切らないよう、十分な容量を確保する。
+            let mut heap = HeapFile::open(BufferPool::new(disk, 8));
             for i in 0..300u32 {
                 let bytes = format!("row-{i:04}").into_bytes();
                 let rid = heap.insert(&bytes).unwrap();
                 inserted.push((rid, bytes));
             }
-            // heapのDiskManagerはここでスコープを抜けてdropされる(closeに相当)。
+            // BufferPoolはdirtyなページを明示的にflushするまで書き戻さない。
+            // 第13章のDiskManager::syncと同様、書き戻し自体はheap(と、その中の
+            // BufferPool)がスコープを抜けてdropされる前に呼んでおく必要がある。
+            heap.flush().unwrap();
+            // heapはここでスコープを抜けてdropされる(closeに相当)。
         }
 
         let disk = DiskManager::open(&path).unwrap();
-        let heap = HeapFile::open(disk);
+        let heap = HeapFile::open(BufferPool::new(disk, 8));
         let scanned: Vec<_> = heap.scan().collect::<DbResult<Vec<_>>>().unwrap();
         assert_eq!(scanned.len(), inserted.len());
+        for (rid, bytes) in &inserted {
+            assert_eq!(heap.get(*rid).unwrap(), Some(bytes.clone()));
+        }
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn heap_file_works_with_a_buffer_pool_smaller_than_the_page_count() {
+        // BufferPoolの容量がテーブルのページ数より小さくても、eviction
+        // 経由で正しく動作することを確認する(HeapFile自体はBufferPoolの
+        // 容量を意識しない)。
+        let path = temp_path("small-pool");
+        let disk = DiskManager::open(&path).unwrap();
+        let mut heap = HeapFile::open(BufferPool::new(disk, 2));
+
+        let mut inserted = Vec::new();
+        for i in 0..500u32 {
+            let bytes = format!("row-{i:04}").into_bytes();
+            let rid = heap.insert(&bytes).unwrap();
+            inserted.push((rid, bytes));
+        }
+        assert!(heap.page_ids().len() > 1);
+
         for (rid, bytes) in &inserted {
             assert_eq!(heap.get(*rid).unwrap(), Some(bytes.clone()));
         }

@@ -81,6 +81,11 @@ pub enum DbError {
     /// 大きいエラー。
     #[error("挿入するデータがページに収まりません: {0}バイト")]
     TupleTooLarge(usize),
+
+    /// `BufferPool`が新しいページを読み込もうとしたが、既存の全フレームがpin中で
+    /// evictできる候補が1つもないエラー。
+    #[error("バッファプールの全フレームがpin中です: {0}")]
+    BufferPoolFull(String),
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

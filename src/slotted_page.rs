@@ -252,13 +252,11 @@ impl<'a> SlottedPage<'a> {
     }
 
     fn directory_end(&self, slot_count: u16) -> usize {
-        SLOTTED_HEADER_SIZE + slot_count as usize * SLOT_ENTRY_SIZE
+        directory_end(slot_count)
     }
 
     fn header(&self) -> (u16, u16) {
-        let slot_count = u16::from_le_bytes(self.payload[0..2].try_into().unwrap());
-        let tuple_data_start = u16::from_le_bytes(self.payload[2..4].try_into().unwrap());
-        (slot_count, tuple_data_start)
+        read_header(self.payload)
     }
 
     fn set_header(&mut self, slot_count: u16, tuple_data_start: u16) {
@@ -267,15 +265,7 @@ impl<'a> SlottedPage<'a> {
     }
 
     fn slot_entry(&self, slot: SlotId) -> Option<(u16, u16, u8)> {
-        let (slot_count, _) = self.header();
-        if slot.0 >= slot_count {
-            return None;
-        }
-        let base = SLOTTED_HEADER_SIZE + slot.0 as usize * SLOT_ENTRY_SIZE;
-        let offset = u16::from_le_bytes(self.payload[base..base + 2].try_into().unwrap());
-        let length = u16::from_le_bytes(self.payload[base + 2..base + 4].try_into().unwrap());
-        let status = self.payload[base + 4];
-        Some((offset, length, status))
+        read_slot_entry(self.payload, slot)
     }
 
     fn set_slot_entry(&mut self, slot: SlotId, offset: u16, length: u16, status: u8) {
@@ -283,6 +273,95 @@ impl<'a> SlottedPage<'a> {
         self.payload[base..base + 2].copy_from_slice(&offset.to_le_bytes());
         self.payload[base + 2..base + 4].copy_from_slice(&length.to_le_bytes());
         self.payload[base + 4] = status;
+    }
+}
+
+/// Slot DirectoryとTuple Dataの境界(`payload`先頭からのバイト数)。
+///
+/// `SlottedPage`と`SlottedPageRef`の両方から、`payload`が可変か不変かに
+/// 関係なく呼べるよう、`payload`を受け取らない自由関数にしてある。
+fn directory_end(slot_count: u16) -> usize {
+    SLOTTED_HEADER_SIZE + slot_count as usize * SLOT_ENTRY_SIZE
+}
+
+/// `payload`先頭のヘッダー(`slot_count`、`tuple_data_start`)を読む。
+///
+/// `SlottedPage`と`SlottedPageRef`の両方が使う共通ロジックで、読み取りだけで
+/// 完結するため`&[u8]`を受け取る自由関数として`impl`の外に出してある。
+fn read_header(payload: &[u8]) -> (u16, u16) {
+    let slot_count = u16::from_le_bytes(payload[0..2].try_into().unwrap());
+    let tuple_data_start = u16::from_le_bytes(payload[2..4].try_into().unwrap());
+    (slot_count, tuple_data_start)
+}
+
+/// `slot`が指すSlot Directoryの1エントリ(`offset`、`length`、`status`)を読む。
+///
+/// `read_header`と同じ理由で`&[u8]`を受け取る自由関数にしてあり、
+/// `SlottedPage`と`SlottedPageRef`の両方の`get`・`status`から呼ばれる。
+fn read_slot_entry(payload: &[u8], slot: SlotId) -> Option<(u16, u16, u8)> {
+    let (slot_count, _) = read_header(payload);
+    if slot.0 >= slot_count {
+        return None;
+    }
+    let base = SLOTTED_HEADER_SIZE + slot.0 as usize * SLOT_ENTRY_SIZE;
+    let offset = u16::from_le_bytes(payload[base..base + 2].try_into().unwrap());
+    let length = u16::from_le_bytes(payload[base + 2..base + 4].try_into().unwrap());
+    let status = payload[base + 4];
+    Some((offset, length, status))
+}
+
+/// `Page`の`payload`を読み取り専用で借用し、Slotted Pageとして読むだけのビュー。
+///
+/// `SlottedPage`との違いは、`&'a [u8]`だけから構築できる点と、`insert`・
+/// `delete`・`update`・`compact`のような書き込み系のメソッドを一切持たない点
+/// である。第14章の`BufferPool`が`PageReadGuard`(読み取り専用のRAII Guard)を
+/// 返すようになったことで、書き込みを一切行わない`get`・`scan`のような経路でも
+/// `&mut [u8]`を要求する`SlottedPage::open`を呼べない場面が生まれた。この
+/// `SlottedPageRef`はその場面のために追加した、読み取り専用の入口である。
+pub struct SlottedPageRef<'a> {
+    payload: &'a [u8],
+}
+
+impl<'a> SlottedPageRef<'a> {
+    /// すでにSlotted Pageとして初期化済みの`payload`を読み取り専用で開く。
+    ///
+    /// `SlottedPage::open`と同様、ヘッダーやスロットの内容は解釈するだけで
+    /// 書き換えない。
+    pub fn open(payload: &'a [u8]) -> Self {
+        SlottedPageRef { payload }
+    }
+
+    /// 現在のスロット数(Occupied・Tombstoneの両方を含む)。
+    pub fn slot_count(&self) -> usize {
+        read_header(self.payload).0 as usize
+    }
+
+    /// Slot DirectoryとTuple Dataの間に残っている空きバイト数。
+    pub fn free_space(&self) -> usize {
+        let (slot_count, tuple_data_start) = read_header(self.payload);
+        tuple_data_start as usize - directory_end(slot_count)
+    }
+
+    /// 指定したスロットの状態を返す。スロットが存在しなければ`None`。
+    pub fn status(&self, slot: SlotId) -> Option<SlotStatus> {
+        let (_, _, status) = read_slot_entry(self.payload, slot)?;
+        Some(match status {
+            STATUS_OCCUPIED => SlotStatus::Occupied,
+            STATUS_TOMBSTONE => SlotStatus::Tombstone,
+            other => unreachable!("未知のslot status: {other}"),
+        })
+    }
+
+    /// スロットが指すタプルのバイト列を返す。
+    ///
+    /// スロットが存在しない、または`Tombstone`(削除済み)の場合は`None`。
+    pub fn get(&self, slot: SlotId) -> Option<&[u8]> {
+        let (offset, length, status) = read_slot_entry(self.payload, slot)?;
+        if status != STATUS_OCCUPIED {
+            return None;
+        }
+        let start = offset as usize;
+        Some(&self.payload[start..start + length as usize])
     }
 }
 
@@ -303,6 +382,23 @@ mod tests {
         let slot = page.insert(b"hello").unwrap();
         assert_eq!(page.get(slot), Some(&b"hello"[..]));
         assert_eq!(page.slot_count(), 1);
+    }
+
+    #[test]
+    fn slotted_page_ref_reads_the_same_bytes_as_slotted_page() {
+        let mut payload = fresh_payload();
+        let mut page = SlottedPage::init(&mut payload);
+        let slot = page.insert(b"hello").unwrap();
+        let gone = page.insert(b"gone").unwrap();
+        page.delete(gone);
+        let free_space_via_mut = page.free_space();
+
+        // 同じ`payload`を、書き込みを一切行わない`SlottedPageRef`から読む。
+        let view = SlottedPageRef::open(&payload);
+        assert_eq!(view.get(slot), Some(&b"hello"[..]));
+        assert_eq!(view.slot_count(), 2);
+        assert_eq!(view.status(slot), Some(SlotStatus::Occupied));
+        assert_eq!(view.free_space(), free_space_via_mut);
     }
 
     #[test]

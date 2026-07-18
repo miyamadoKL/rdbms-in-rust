@@ -21,7 +21,7 @@
 - [第11章 データベースファイルとページ](ch11-database-file.md)
 - [第12章 Slotted Page、Tuple、RID](ch12-slotted-page.md)
 - [第13章 Disk ManagerとHeap File](ch13-disk-manager.md)
-- [第14章 Buffer Pool]()
+- [第14章 Buffer Pool](ch14-buffer-pool.md)
 - [第15章 永続カタログと空き領域管理]()
 - [第16章 SQL経路の永続化]()
 

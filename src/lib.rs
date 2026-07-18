@@ -13,9 +13,11 @@
 //! Page、Checksum)を扱う`page`、Pageの`payload`内に可変長レコードを詰める
 //! Slotted Page(`slotted_page`)と、`Tuple`をそのバイト列との間でencode/decode
 //! する`tuple_codec`、`Page`を実ファイルへ読み書きする`disk_manager`、複数の
-//! ページをまとめて1つのテーブルとして扱う`heap_file`が加わる。
+//! ページをまとめて1つのテーブルとして扱う`heap_file`、`disk_manager`の上に
+//! 固定容量のページキャッシュを置く`buffer_pool`が加わる。
 
 pub mod ast;
+pub mod buffer_pool;
 pub mod catalog;
 pub mod database;
 pub mod disk_manager;
@@ -33,6 +35,7 @@ pub mod tuple_codec;
 pub mod types;
 
 pub use ast::{Expr, Statement};
+pub use buffer_pool::{BufferPool, BufferPoolStats, PageReadGuard, PageWriteGuard};
 pub use catalog::{Catalog, TableInfo};
 pub use database::{Database, QueryResult};
 pub use disk_manager::DiskManager;
@@ -46,7 +49,7 @@ pub use page::{
     FileHeader, Page, PageType,
 };
 pub use parser::parse_statement;
-pub use slotted_page::{SLOT_ENTRY_SIZE, SLOTTED_HEADER_SIZE, SlotStatus, SlottedPage};
+pub use slotted_page::{SLOT_ENTRY_SIZE, SLOTTED_HEADER_SIZE, SlotStatus, SlottedPage, SlottedPageRef};
 pub use storage_mem::{MemStorage, MemTable};
 pub use tuple_codec::{decode_tuple, encode_tuple};
 pub use types::{Column, DataType, Row, Schema, Tuple, Value};

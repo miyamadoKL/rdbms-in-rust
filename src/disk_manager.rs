@@ -65,6 +65,12 @@ struct Inner {
     /// `FileHeader::page_count`と常に一致する値をメモリ上にも保持しておき、
     /// `read_page`・`allocate_page`のたびにMetaページを読み直さずに済ませる。
     page_count: u64,
+    /// `read_page`・`write_page`を呼び出した回数の累計。
+    ///
+    /// ページの中身には影響しない、純粋な観測用のカウンタである。第14章の
+    /// Buffer Poolが、キャッシュを挟まずにこの`DiskManager`へ直接タプル参照の
+    /// たびにアクセスすると、この値がアクセス回数に比例して増え続けることを示す。
+    io_count: u64,
 }
 
 /// 1つのファイルへのページ単位の読み書きを担う。
@@ -100,7 +106,11 @@ impl DiskManager {
         };
 
         Ok(DiskManager {
-            inner: Mutex::new(Inner { file, page_count }),
+            inner: Mutex::new(Inner {
+                file,
+                page_count,
+                io_count: 0,
+            }),
         })
     }
 
@@ -162,6 +172,7 @@ impl DiskManager {
         let mut buf = [0u8; PAGE_SIZE];
         inner.file.seek(SeekFrom::Start(Self::offset(id)))?;
         inner.file.read_exact(&mut buf)?;
+        inner.io_count += 1;
         Page::decode(&buf)
     }
 
@@ -177,6 +188,7 @@ impl DiskManager {
 
         inner.file.seek(SeekFrom::Start(Self::offset(page.page_id)))?;
         inner.file.write_all(&page.encode())?;
+        inner.io_count += 1;
         Ok(())
     }
 
@@ -209,6 +221,16 @@ impl DiskManager {
     /// 現在のページ数(Metaページを含む)。
     pub fn page_count(&self) -> u64 {
         self.lock().page_count
+    }
+
+    /// `read_page`・`write_page`を呼び出した累計回数。
+    ///
+    /// この`DiskManager`を直接叩く(キャッシュを挟まない)アクセスパターンでは、
+    /// 同じページへ何度アクセスしてもこの値は毎回増える。第14章の`BufferPool`を
+    /// 経由すると、2回目以降の参照はキャッシュヒットとしてこの値を増やさずに
+    /// 済むようになる。
+    pub fn io_count(&self) -> u64 {
+        self.lock().io_count
     }
 
     /// これまでの`write_page`・`allocate_page`による変更を、OSのページキャッシュから

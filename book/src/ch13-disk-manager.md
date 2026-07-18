@@ -54,6 +54,12 @@ struct Inner {
     /// `FileHeader::page_count`と常に一致する値をメモリ上にも保持しておき、
     /// `read_page`・`allocate_page`のたびにMetaページを読み直さずに済ませる。
     page_count: u64,
+    /// `read_page`・`write_page`を呼び出した回数の累計。
+    ///
+    /// ページの中身には影響しない、純粋な観測用のカウンタである。第14章の
+    /// Buffer Poolが、キャッシュを挟まずにこの`DiskManager`へ直接タプル参照の
+    /// たびにアクセスすると、この値がアクセス回数に比例して増え続けることを示す。
+    io_count: u64,
 }
 ```
 
