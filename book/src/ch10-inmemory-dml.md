@@ -409,8 +409,8 @@ minidb> SELECT id FROM users WHERE 1;
 一方、同じ式に`FROM`を付けた`SELECT NULL + 'x' FROM users`は、`executor::project`がすでに`infer_type`で拒否します。
 
 さらに、`WHERE`句そのものの扱いにも見落としがありました。
-第7章で`WHERE`の構文を受理したときは「`from`を伴わない`SELECT`では構文として受理するが、意味を持たない」という約束にしていましたが、これはSQL標準の挙動とは違います。
-標準的なSQLエンジンは、`FROM`が無い`SELECT`を「列を持たない空のテーブルに対する、値も持たないちょうど1行」を暗黙に読み取る`SELECT`とみなし、`WHERE`はその1行を通常どおり絞り込みます。
+第7章で`WHERE`の構文を受理したときは「`from`を伴わない`SELECT`では構文として受理するが、意味を持たない」という約束にしていましたが、これはPostgreSQLやSQLiteなどの実装が採用している挙動とは違います(`FROM`の省略はSQL標準そのものではなく、これらの実装が備える拡張です)。
+PostgreSQLやSQLiteは、`FROM`が無い`SELECT`を、0列1行の暗黙の入力に対する`SELECT`とみなし、`WHERE`はその1行を通常どおり絞り込みます。
 `SELECT 1 WHERE FALSE`は0行、`SELECT 1 WHERE TRUE`は1行になるべきで、`WHERE`を無視して常に1行返す実装は誤りです。
 
 これらをまとめて直すため、`execute_select_without_from`を次のように書き直しました。
