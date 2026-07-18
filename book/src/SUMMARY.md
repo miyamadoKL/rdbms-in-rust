@@ -12,7 +12,7 @@
 - [第5章 `SELECT 1`を実行する](ch05-select-one.md)
 - [第6章 字句解析器](ch06-lexer.md)
 - [第7章 構文解析器とAST](ch07-parser.md)
-- [第8章 型、NULL、式評価]()
+- [第8章 型、NULL、式評価](ch08-expressions.md)
 - [第9章 カタログとDDL]()
 - [第10章 インメモリ表とDML]()
 

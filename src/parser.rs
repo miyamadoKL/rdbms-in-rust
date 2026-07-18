@@ -9,7 +9,8 @@
 //! - `CREATE TABLE <table> (<col> <type> [NOT NULL], ...)`
 //! - `INSERT INTO <table> VALUES (<式>, ...)`
 //! - 式: リテラル(整数・文字列・真偽値・`NULL`)、列参照、二項演算(`+ - * /`、
-//!   比較、`AND` `OR`)、単項演算(`-` `NOT`)、`IS [NOT] NULL`、関数呼び出し、括弧
+//!   比較、`AND` `OR`)、単項演算(`-` `NOT`)、`IS [NOT] NULL`、関数呼び出し、
+//!   `CAST(expr AS type)`、括弧
 //!
 //! 優先順位は低い順に`OR` < `AND` < `NOT` < 比較 < `+` `-` < `*` `/` < 単項`-`。
 
@@ -372,8 +373,25 @@ impl<'a> Parser<'a> {
                     span: Span::new(start, end),
                 })
             }
+            TokenKind::Keyword(Keyword::Cast) => self.parse_cast(),
             _ => Err(self.unexpected("式")),
         }
+    }
+
+    /// `CAST(expr AS type_name)`を読む。`type_name`は`CREATE TABLE`の列定義と
+    /// 同じく、型名の一覧と突き合わせずに`Ident`のまま保持する。
+    fn parse_cast(&mut self) -> DbResult<Expr> {
+        let start = self.expect_keyword(Keyword::Cast, "CAST")?.start;
+        self.expect_punct(TokenKind::LParen, "(")?;
+        let expr = self.parse_expr(0)?;
+        self.expect_keyword(Keyword::As, "AS")?;
+        let type_name = self.expect_ident()?;
+        let end = self.expect_punct(TokenKind::RParen, ")")?.end;
+        Ok(Expr::Cast {
+            expr: Box::new(expr),
+            type_name,
+            span: Span::new(start, end),
+        })
     }
 
     fn parse_function_call(&mut self, name: String, name_span: Span) -> DbResult<Expr> {
@@ -480,6 +498,14 @@ mod tests {
             },
             Expr::Paren { expr, .. } => Expr::Paren {
                 expr: Box::new(strip_spans(*expr)),
+                span: dummy,
+            },
+            Expr::Cast { expr, type_name, .. } => Expr::Cast {
+                expr: Box::new(strip_spans(*expr)),
+                type_name: Ident {
+                    name: type_name.name,
+                    span: dummy,
+                },
                 span: dummy,
             },
         }
@@ -676,6 +702,21 @@ mod tests {
             Expr::FunctionCall {
                 name: "f".to_string(),
                 args: vec![],
+                span: Span::new(0, 0),
+            },
+        );
+    }
+
+    #[test]
+    fn parses_cast() {
+        assert_expr_eq(
+            "CAST(1 AS TEXT)",
+            Expr::Cast {
+                expr: int(1),
+                type_name: Ident {
+                    name: "TEXT".to_string(),
+                    span: Span::new(0, 0),
+                },
                 span: Span::new(0, 0),
             },
         );

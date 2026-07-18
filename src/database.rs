@@ -1,25 +1,32 @@
 //! SQL文字列を受け取り、結果を返す実行の入口。
 //!
 //! `Database::execute`は、まずSQL文字列を`parser::parse_statement`でASTへ変換する。
-//! 実際に実行できるのは、`FROM`を伴わない`SELECT`の式リストのうち、リテラルと
-//! 整数の加算だけである。`CREATE TABLE`・`INSERT`・`FROM`/`WHERE`付きの`SELECT`は
-//! 構文解析までは通るが、実行するとカタログや式評価が揃う章(第8〜10章)を指し示す
-//! `DbError::NotImplemented`を返す。
+//! 実際に実行できるのは、`FROM`を伴わない`SELECT`の式リストである。式の評価は
+//! `eval`モジュールに委ね、算術・比較・三値論理・`IS NULL`・`CAST`・Scalar Function
+//! 呼び出しがすべて動く。`CREATE TABLE`・`INSERT`・`FROM`/`WHERE`付きの`SELECT`は
+//! 構文解析までは通るが、実行するとカタログとインメモリ表が揃う章(第9〜10章)を
+//! 指し示す`DbError::NotImplemented`を返す。
 
-use crate::ast::{BinaryOperator, Expr, SelectStatement, Statement};
+use crate::ast::{SelectStatement, Statement};
 use crate::error::{DbError, DbResult};
-use crate::types::{Column, Schema, Tuple, Value};
+use crate::eval::{self, FunctionRegistry};
+use crate::types::{Column, DataType, Schema, Tuple, Value};
 
 /// minidbのデータベース1つを表す。
 ///
-/// 現時点ではインメモリの状態しか持たない。ディスクへの永続化は第2部で
-/// `Database::open`のような別のコンストラクタとして追加する。
-pub struct Database;
+/// 現時点ではScalar Functionのレジストリしか状態を持たない。ディスクへの永続化は
+/// 第2部で`Database::open`のような別のコンストラクタとして追加する。
+pub struct Database {
+    functions: FunctionRegistry,
+}
 
 impl Database {
-    /// インメモリのDatabaseを作る。
+    /// インメモリのDatabaseを作る。組み込みのScalar Function(`abs`、`length`)は
+    /// 最初から登録済みの状態で始まる。
     pub fn memory() -> Self {
-        Database
+        Database {
+            functions: FunctionRegistry::with_builtins(),
+        }
     }
 
     /// SQL文字列を1本実行し、結果を返す。
@@ -52,12 +59,15 @@ impl Database {
         let mut columns = Vec::with_capacity(select.items.len());
         let mut values = Vec::with_capacity(select.items.len());
         for item in &select.items {
-            let value = eval_expr(&item.expr)?;
-            let data_type = value.data_type().expect(
-                "eval_exprがこの章で返すのはリテラルの評価結果だけであり、NULLにはならない",
-            );
+            let value = eval::eval_expr(&item.expr, &self.functions)?;
+            // `Value::Null`はどの`DataType`にも属さないため、結果列の表示用の型を
+            // 決められない。この章ではPostgreSQLの`unknown`型のような専用の型を
+            // 別途設けず、`TEXT`をプレースホルダーとして使う(値そのものは
+            // `Value::Null`のままなので、表示や後続の計算がこの選択に影響されることはない)。
+            let data_type = value.data_type().unwrap_or(DataType::Text);
+            let nullable = value.is_null();
             let name = sql[item.span.start..item.span.end].to_string();
-            columns.push(Column::new(name, data_type, false));
+            columns.push(Column::new(name, data_type, nullable));
             values.push(value);
         }
 
@@ -68,36 +78,6 @@ impl Database {
             schema,
             rows: vec![tuple],
         })
-    }
-}
-
-/// 式を評価して`Value`を返す。
-///
-/// この章で評価できるのは、リテラルと整数どうしの加算(`+`)だけである。
-/// それ以外の構文(減算・乗除・比較・論理演算・`IS NULL`・列参照・関数呼び出し)は、
-/// 構文解析はこの章で完成しているが、評価の意味づけ(型変換、三値論理、NULL伝播)は
-/// 第8章の役目なので、ここでは`DbError::NotImplemented`を返す。
-fn eval_expr(expr: &Expr) -> DbResult<Value> {
-    match expr {
-        Expr::IntLiteral { value, .. } => Ok(Value::BigInt(*value)),
-        Expr::StringLiteral { value, .. } => Ok(Value::Text(value.clone())),
-        Expr::BoolLiteral { value, .. } => Ok(Value::Boolean(*value)),
-        Expr::NullLiteral { .. } => Ok(Value::Null),
-        Expr::Paren { expr, .. } => eval_expr(expr),
-        Expr::BinaryOp {
-            op: BinaryOperator::Add,
-            lhs,
-            rhs,
-            ..
-        } => match (eval_expr(lhs)?, eval_expr(rhs)?) {
-            (Value::BigInt(l), Value::BigInt(r)) => Ok(Value::BigInt(l + r)),
-            _ => Err(DbError::NotImplemented(
-                "整数以外の加算・型変換は第8章の式評価で対応します".to_string(),
-            )),
-        },
-        _ => Err(DbError::NotImplemented(
-            "この式の評価は第8章の式評価で対応します".to_string(),
-        )),
     }
 }
 
@@ -192,12 +172,70 @@ mod tests {
     }
 
     #[test]
-    fn multiplication_parses_but_is_not_evaluated_yet() {
+    fn multiplication_now_evaluates() {
         // `parser`は`1 + 2 * 3`を`1 + (2 * 3)`という正しい木に組み立てる
-        // (`parser`のテストで確認済み)。ただし乗算の評価自体は第8章の対象なので、
-        // `execute`はこの式を解析はできても評価できず`NotImplemented`を返す。
+        // (`parser`のテストで確認済み)。前章まではこの木の乗算部分を評価できず
+        // `NotImplemented`になっていたが、`eval`モジュールが揃ったこの章からは
+        // 最後まで評価できる。
         let mut db = Database::memory();
-        let result = db.execute("SELECT 1 + 2 * 3;");
+        let result = db.execute("SELECT 1 + 2 * 3;").unwrap();
+        assert_eq!(result.rows()[0].values(), &[Value::BigInt(7)]);
+    }
+
+    #[test]
+    fn executes_comparison() {
+        let mut db = Database::memory();
+        let result = db.execute("SELECT 1 = 1;").unwrap();
+        assert_eq!(result.rows()[0].values(), &[Value::Boolean(true)]);
+    }
+
+    #[test]
+    fn executes_three_valued_logic() {
+        let mut db = Database::memory();
+        let result = db.execute("SELECT NULL AND FALSE;").unwrap();
+        assert_eq!(result.rows()[0].values(), &[Value::Boolean(false)]);
+    }
+
+    #[test]
+    fn executes_cast() {
+        let mut db = Database::memory();
+        let result = db.execute("SELECT CAST(42 AS TEXT);").unwrap();
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Text("42".to_string())]
+        );
+    }
+
+    #[test]
+    fn select_null_literal_is_a_nullable_text_column() {
+        // `Value::Null`はどの`DataType`にも属さないため、結果列の型は
+        // プレースホルダーとして`TEXT`を選ぶ(`execute_select`のコメント参照)。
+        // 値そのものは`Value::Null`のままである。
+        let mut db = Database::memory();
+        let result = db.execute("SELECT NULL;").unwrap();
+        assert_eq!(result.rows()[0].values(), &[Value::Null]);
+        assert_eq!(result.schema().columns()[0].data_type, DataType::Text);
+        assert!(result.schema().columns()[0].nullable);
+    }
+
+    #[test]
+    fn division_by_zero_is_an_eval_error() {
+        let mut db = Database::memory();
+        let result = db.execute("SELECT 1 / 0;");
+        assert!(matches!(result, Err(DbError::Eval(_))));
+    }
+
+    #[test]
+    fn calls_builtin_function() {
+        let mut db = Database::memory();
+        let result = db.execute("SELECT abs(-5);").unwrap();
+        assert_eq!(result.rows()[0].values(), &[Value::BigInt(5)]);
+    }
+
+    #[test]
+    fn column_ref_is_not_implemented_yet() {
+        let mut db = Database::memory();
+        let result = db.execute("SELECT id;");
         assert!(matches!(result, Err(DbError::NotImplemented(_))));
     }
 

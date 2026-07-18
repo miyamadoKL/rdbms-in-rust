@@ -182,6 +182,14 @@ pub enum Expr {
         expr: Box<Expr>,
         span: Span,
     },
+    /// `CAST(expr AS type_name)`。`type_name`はColumnDefの`type_name`と同様、
+    /// 型名の一覧を知らないParserがテキストのまま保持する。`crate::types::DataType`
+    /// への解決は評価器(第8章の`eval`モジュール)の仕事にする。
+    Cast {
+        expr: Box<Expr>,
+        type_name: Ident,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -197,7 +205,8 @@ impl Expr {
             | Expr::BinaryOp { span, .. }
             | Expr::IsNull { span, .. }
             | Expr::FunctionCall { span, .. }
-            | Expr::Paren { span, .. } => *span,
+            | Expr::Paren { span, .. }
+            | Expr::Cast { span, .. } => *span,
         }
     }
 }
