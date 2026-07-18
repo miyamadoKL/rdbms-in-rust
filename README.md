@@ -71,7 +71,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 ## 読み方とビルド方法
 
 執筆済みの章は上の目次からGitHub上でそのまま読めます。
-より読みやすいmdBook形式で読みたい場合や、未執筆章も含めた完全な目次(`book/src/SUMMARY.md`)を確認したい場合は、ローカルで以下を実行してください。
+より読みやすいmdBook形式で読みたい場合は、ローカルで以下を実行してください。
 
 ```sh
 cargo install mdbook
@@ -87,11 +87,14 @@ mdbook serve book
 ```sh
 cargo build
 cargo test
+cargo clippy --all-targets -- -D warnings
 ```
 
-Markdown(本文と本README)のlintと、本文中のMermaid図のレンダリング検証は以下で行います。
+ドキュメントはCIと同じ3つの検査をローカルでも実行できます。
+順に、Markdown(本文と本README)のlint、日本語文章規範(中黒、ダッシュ、常体接続など)の検査、本文中のMermaid図のレンダリング検証です。
 
 ```sh
 npx --yes markdownlint-cli2@0.22.1
+.github/scripts/check-ja-style.sh
 .github/scripts/check-mermaid.sh
 ```

@@ -1,0 +1,32 @@
+name: ja-style
+
+# 日本語文章規範(中黒・ダッシュ・である調・次章予告など)を機械検査する。
+# 検査ロジックは .github/scripts/check-ja-style.sh に置き、ローカルでも同じスクリプトで実行できる。
+#
+# ローカル実行方法:
+#   bash .github/scripts/check-ja-style.sh                 # README.md と book/src/ 全体を検査
+#   bash .github/scripts/check-ja-style.sh book/src/ch01-goals.md  # 1ファイルだけ検査
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/*.md"
+      - ".github/workflows/ja-style.yml"
+      - ".github/scripts/check-ja-style.sh"
+  pull_request:
+    paths:
+      - "**/*.md"
+      - ".github/workflows/ja-style.yml"
+      - ".github/scripts/check-ja-style.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  ja-style:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate Japanese writing style
+        run: bash .github/scripts/check-ja-style.sh
