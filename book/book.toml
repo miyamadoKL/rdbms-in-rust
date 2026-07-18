@@ -1,0 +1,8 @@
+[book]
+title = "Rustでリレーショナル・データベースを自作する"
+authors = []
+language = "ja"
+src = "src"
+
+[build]
+build-dir = "book"
