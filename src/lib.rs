@@ -34,9 +34,15 @@
 //! KEY`・`UNIQUE`が加わり、その一意性を走査ベースで検査する`constraints`が
 //! 加わる。`INSERT`・`UPDATE`は、対象行すべての検査を終えるまで書き込みを
 //! 一切始めないStatement Rollbackの対象に、この一意性検査も含めるようになる。
+//! 第23章では、キーから`RecordId`を`O(log n)`で引くディスク上のB+Tree
+//! (`btree`、ページ内レイアウトを扱う`btree_page`)が加わる。この章の
+//! `BTree`はまだ`Storage`とは結線されておらず、`Storage`と同じ`BufferPool`の
+//! 上で動く独立したデータ構造として、Point Lookup・Insert・各種Splitを提供する。
 
 pub mod ast;
 pub mod binder;
+pub mod btree;
+pub mod btree_page;
 pub mod buffer_pool;
 pub mod catalog;
 pub mod constraints;
@@ -61,6 +67,7 @@ pub mod types;
 
 pub use ast::{Expr, Statement};
 pub use binder::{Binder, BoundExpr, BoundStatement, CatalogLookup};
+pub use btree::BTree;
 pub use buffer_pool::{BufferPool, BufferPoolStats, PageReadGuard, PageWriteGuard};
 pub use catalog::{Catalog, TableInfo};
 pub use database::{Database, QueryResult};

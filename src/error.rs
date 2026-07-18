@@ -150,6 +150,32 @@ pub enum DbError {
         /// 重複していた値の表示(`Value`の利用者向け表示形式)。
         value: String,
     },
+
+    /// `crate::btree`(第23章)の`insert`・`lookup`に`Value::Null`をキーとして
+    /// 渡したエラー。B+Treeは`NULL`をキーとして保持しない(モジュールの
+    /// ドキュメント参照)。`NULL`を持つ行をインデックスへ入れない判断は、
+    /// 呼び出し側(第24章の`CREATE INDEX`・Index Maintenance)の責務であり、
+    /// このエラーはその呼び出し側が誤って`NULL`を渡した場合の防御である。
+    #[error("NULLはB+Treeのキーにできません")]
+    NullKeyNotAllowed,
+
+    /// `crate::btree`(第23章)の`BTree::create`で決めたキー型と異なる型の
+    /// `Value`を`insert`・`lookup`に渡したエラー。
+    #[error("B+Treeのキー型が一致しません: {expected}型のツリーに{actual}型の値を渡しました")]
+    BTreeKeyTypeMismatch {
+        /// `BTree::create`で決めたキー型。
+        expected: String,
+        /// 実際に渡された値の型。
+        actual: String,
+    },
+
+    /// `crate::btree`(第23章)の`insert`に渡したキー(またはLeaf Split・
+    /// Internal Splitが親へ押し上げようとした区切りキー)1件だけでも、
+    /// 空のLeaf PageまたはInternal Pageに収まらないほど大きいエラー。
+    /// `HeapFile::insert`(第13章)の`DbError::TupleTooLarge`と同じ理由で、
+    /// これ以上分割してもページに収まらない場合の割り切りとして返す。
+    #[error("B+Treeのキーがページに収まりません: {0}バイト")]
+    BTreeKeyTooLarge(usize),
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

@@ -123,10 +123,10 @@ impl FileHeader {
 /// ページの種類。
 ///
 /// この章で登録するのは、File Header専用ページ(`Meta`)と、それ以外の一般データ
-/// ページ(`Data`)の2種類だけである。Slotted Pageとしての内部構造(第12章)や、
-/// B+Treeの内部・葉ページの区別(第23章)は、この列挙型にあとから足していく。
-/// 第15章では、テーブル定義とFree Page Listを持つCatalogページ(`Catalog`)を
-/// 追加する。
+/// ページ(`Data`)の2種類だけである。Slotted Pageとしての内部構造(第12章)は
+/// この列挙型にあとから足していく。第15章では、テーブル定義とFree Page Listを
+/// 持つCatalogページ(`Catalog`)を追加する。第23章では、B+Tree(`crate::btree`)の
+/// 葉ページ(`BTreeLeaf`)と内部ページ(`BTreeInternal`)を追加する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageType {
     /// File Header専用ページ。
@@ -135,6 +135,12 @@ pub enum PageType {
     Data,
     /// `Storage`(第15章)が使う、テーブル定義とFree Page Listを保持するページ。
     Catalog,
+    /// `crate::btree`(第23章)が使う、B+Treeの葉ページ。キーと`RecordId`の
+    /// ペアを整列保持する。
+    BTreeLeaf,
+    /// `crate::btree`(第23章)が使う、B+Treeの内部ページ。区切りキーと
+    /// 子ページへの`PageId`を保持する。
+    BTreeInternal,
 }
 
 impl PageType {
@@ -143,6 +149,8 @@ impl PageType {
             PageType::Meta => 0,
             PageType::Data => 1,
             PageType::Catalog => 2,
+            PageType::BTreeLeaf => 3,
+            PageType::BTreeInternal => 4,
         }
     }
 
@@ -151,6 +159,8 @@ impl PageType {
             0 => Ok(PageType::Meta),
             1 => Ok(PageType::Data),
             2 => Ok(PageType::Catalog),
+            3 => Ok(PageType::BTreeLeaf),
+            4 => Ok(PageType::BTreeInternal),
             other => Err(DbError::CorruptPage(format!(
                 "未知のPage Typeです: {other}"
             ))),
