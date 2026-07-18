@@ -12,14 +12,17 @@
 //! 提供する。第2部からは、データベースファイルのオンディスク形式(File Header、
 //! Page、Checksum)を扱う`page`、Pageの`payload`内に可変長レコードを詰める
 //! Slotted Page(`slotted_page`)と、`Tuple`をそのバイト列との間でencode/decode
-//! する`tuple_codec`が加わる。
+//! する`tuple_codec`、`Page`を実ファイルへ読み書きする`disk_manager`、複数の
+//! ページをまとめて1つのテーブルとして扱う`heap_file`が加わる。
 
 pub mod ast;
 pub mod catalog;
 pub mod database;
+pub mod disk_manager;
 pub mod error;
 pub mod eval;
 pub mod executor;
+pub mod heap_file;
 pub mod ids;
 pub mod lexer;
 pub mod page;
@@ -32,8 +35,10 @@ pub mod types;
 pub use ast::{Expr, Statement};
 pub use catalog::{Catalog, TableInfo};
 pub use database::{Database, QueryResult};
+pub use disk_manager::DiskManager;
 pub use error::{DbError, DbResult};
 pub use eval::{FunctionRegistry, eval_expr};
+pub use heap_file::{HeapFile, Scan};
 pub use ids::{PageId, RecordId, SlotId, TableId, TransactionId};
 pub use lexer::{Keyword, Span, Token, TokenKind, tokenize};
 pub use page::{

@@ -5,7 +5,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 
 ## 目次
 
-現在執筆済みなのは[はじめに](book/src/index.md)と第1〜12章のみで、第13章以降は準備中です。
+現在執筆済みなのは[はじめに](book/src/index.md)と第1〜13章のみで、第14章以降は準備中です。
 
 ### 第0部 設計と開発環境
 
@@ -27,7 +27,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 
 - [第11章 データベースファイルとページ](book/src/ch11-database-file.md)
 - [第12章 Slotted Page、Tuple、RID](book/src/ch12-slotted-page.md)
-- 第13章 Disk ManagerとHeap File
+- [第13章 Disk ManagerとHeap File](book/src/ch13-disk-manager.md)
 - 第14章 Buffer Pool
 - 第15章 永続カタログと空き領域管理
 - 第16章 SQL経路の永続化

@@ -71,6 +71,16 @@ pub enum DbError {
     /// が実際の残りバイト数を超えているなど)。
     #[error("破損したタプルです: {0}")]
     CorruptTuple(String),
+
+    /// `DiskManager`に、まだ`allocate_page`されていない(または`page_count`の
+    /// 範囲外の)`PageId`を渡したエラー。
+    #[error("ページ範囲外です: {0}")]
+    PageOutOfRange(String),
+
+    /// `HeapFile::insert`に渡したバイト列が、空の1ページにも収まらないほど
+    /// 大きいエラー。
+    #[error("挿入するデータがページに収まりません: {0}バイト")]
+    TupleTooLarge(usize),
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。
