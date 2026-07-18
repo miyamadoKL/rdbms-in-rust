@@ -22,6 +22,17 @@ pub enum DbError {
     /// SQL文字列を構文解析できなかったエラー。
     #[error("構文エラー: {0}")]
     Parse(String),
+
+    /// SQL文字列をToken列へ変換できなかったエラー。発生位置の行・列を持つ。
+    #[error("行{line}列{column}: 字句エラー: {message}")]
+    Lex {
+        /// エラーの内容。
+        message: String,
+        /// 発生位置の行番号(1始まり)。
+        line: usize,
+        /// 発生位置の列番号(1始まり)。
+        column: usize,
+    },
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

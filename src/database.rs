@@ -131,6 +131,17 @@ mod tests {
     }
 
     #[test]
+    fn propagates_lex_error_with_position() {
+        let mut db = Database::memory();
+        let result = db.execute("SELECT 'abc");
+        match result {
+            Err(DbError::Lex { line, column, .. }) => assert_eq!((line, column), (1, 8)),
+            Err(e) => panic!("DbError::Lexを期待したがDbError::Parse等が返った: {e}"),
+            Ok(_) => panic!("DbError::Lexを期待したがOkが返った"),
+        }
+    }
+
+    #[test]
     fn each_execute_call_is_independent() {
         let mut db = Database::memory();
         let first = db.execute("SELECT 1;").unwrap();

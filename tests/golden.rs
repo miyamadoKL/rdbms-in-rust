@@ -57,7 +57,8 @@ fn golden_tests_pass() {
 
         let actual = run_sql(&sql);
         assert_eq!(
-            actual, expected,
+            actual,
+            expected,
             "golden test 不一致: {:?}",
             sql_path.file_name().unwrap()
         );
