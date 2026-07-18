@@ -22,9 +22,17 @@
 //!
 //! **不変条件**: 常に`SLOTTED_HEADER_SIZE + slot_count * SLOT_ENTRY_SIZE <=
 //! tuple_data_start`が成り立つ。すなわちSlot DirectoryとTuple Dataは
-//! 互いに侵食しない。この章のすべての操作(`insert`・`update`・`compact`)は、
-//! 書き込み前にこの条件を満たせるかを確認し、満たせない場合は失敗を返す。
+//! 互いに侵食しない。`init`は空のSlotted Pageとしてこの条件を満たす状態から
+//! 始め、`insert`・`update`はいずれも書き込み前にこの条件を保てるかを確認し、
+//! 保てない場合は書き込みを行わずに失敗を返す(`compact`は既存のスロットを
+//! 動かすだけで新たに確保しないため、そもそも失敗しうる操作ではない)。
+//! `open`は、すでにこの条件を満たしている`payload`を読み書きする入口であり、
+//! 妥当な初期状態から始めて`insert`・`update`だけを経由してきたバイト列で
+//! あればこの条件は常に保たれる。`open`自身もヘッダーがこの条件と`payload`の
+//! 大きさに対して妥当かどうかを検証し、破損した(あるいは別のPageTypeの)
+//! バイト列を渡された場合は`DbError::CorruptPage`を返す。
 
+use crate::error::{DbError, DbResult};
 use crate::ids::SlotId;
 
 /// payload先頭に置くヘッダーのバイト数(`slot_count` 2 + `tuple_data_start` 2)。
@@ -82,12 +90,17 @@ impl<'a> SlottedPage<'a> {
 
     /// すでにSlotted Pageとして初期化済みの`payload`をそのまま読み書きする。
     ///
-    /// ヘッダーやスロットの内容はいっさい書き換えない。`init`していない
-    /// スライス(全バイト0を含む)に対して呼ぶと、ヘッダーが
-    /// `slot_count = 0, tuple_data_start = 0`と解釈され、以後の`insert`が
-    /// 常に空き領域不足で失敗する。
-    pub fn open(payload: &'a mut [u8]) -> Self {
-        SlottedPage { payload }
+    /// ヘッダーの`slot_count`・`tuple_data_start`が、この`payload`の大きさに
+    /// 対して妥当な範囲(不変条件`SLOTTED_HEADER_SIZE + slot_count *
+    /// SLOT_ENTRY_SIZE <= tuple_data_start <= payload.len()`)に収まっているかを
+    /// 確認し、収まっていなければ`DbError::CorruptPage`を返す。それ以外の
+    /// スロットの中身(各エントリの`offset`・`length`・`status`)はいっさい
+    /// 解釈も書き換えもしない。`init`していないスライス(全バイト0を含む)に
+    /// 対して呼ぶと、ヘッダーが`slot_count = 0, tuple_data_start = 0`と
+    /// 解釈され、この検証は通る(以後の`insert`が常に空き領域不足で失敗する)。
+    pub fn open(payload: &'a mut [u8]) -> DbResult<Self> {
+        validate_header(payload)?;
+        Ok(SlottedPage { payload })
     }
 
     /// 現在のスロット数(Occupied・Tombstoneの両方を含む)。
@@ -294,6 +307,31 @@ fn read_header(payload: &[u8]) -> (u16, u16) {
     (slot_count, tuple_data_start)
 }
 
+/// `payload`のヘッダー(`slot_count`、`tuple_data_start`)が、この章の不変条件
+/// (`SLOTTED_HEADER_SIZE + slot_count * SLOT_ENTRY_SIZE <= tuple_data_start
+/// <= payload.len()`)を満たしているかを検証する。
+///
+/// `SlottedPage::open`と`SlottedPageRef::open`の両方が使う共通ロジックで、
+/// 破損した(あるいは他のPageTypeの)バイト列を`payload`としてそのまま渡された
+/// 場合に、以後のスライス添字アクセスでpanicする代わりに`DbError::CorruptPage`
+/// を返せるようにする。
+fn validate_header(payload: &[u8]) -> DbResult<()> {
+    let (slot_count, tuple_data_start) = read_header(payload);
+    if tuple_data_start as usize > payload.len() {
+        return Err(DbError::CorruptPage(format!(
+            "tuple_data_start({tuple_data_start})がpayloadの大きさ({})を超えています",
+            payload.len()
+        )));
+    }
+    if directory_end(slot_count) > tuple_data_start as usize {
+        return Err(DbError::CorruptPage(format!(
+            "Slot Directoryの終端({})がtuple_data_start({tuple_data_start})を超えています",
+            directory_end(slot_count)
+        )));
+    }
+    Ok(())
+}
+
 /// `slot`が指すSlot Directoryの1エントリ(`offset`、`length`、`status`)を読む。
 ///
 /// `read_header`と同じ理由で`&[u8]`を受け取る自由関数にしてあり、
@@ -325,10 +363,12 @@ pub struct SlottedPageRef<'a> {
 impl<'a> SlottedPageRef<'a> {
     /// すでにSlotted Pageとして初期化済みの`payload`を読み取り専用で開く。
     ///
-    /// `SlottedPage::open`と同様、ヘッダーやスロットの内容は解釈するだけで
+    /// `SlottedPage::open`と同様にヘッダーの妥当性を検証し、範囲を外れていれば
+    /// `DbError::CorruptPage`を返す。それ以外のスロットの内容は解釈するだけで
     /// 書き換えない。
-    pub fn open(payload: &'a [u8]) -> Self {
-        SlottedPageRef { payload }
+    pub fn open(payload: &'a [u8]) -> DbResult<Self> {
+        validate_header(payload)?;
+        Ok(SlottedPageRef { payload })
     }
 
     /// 現在のスロット数(Occupied・Tombstoneの両方を含む)。
@@ -375,6 +415,35 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_a_corrupt_header_instead_of_panicking() {
+        // tuple_data_startがpayload自体の大きさを超えている(壊れた)ヘッダー。
+        let mut payload = fresh_payload();
+        payload[0..2].copy_from_slice(&0u16.to_le_bytes()); // slot_count
+        payload[2..4].copy_from_slice(&u16::MAX.to_le_bytes()); // tuple_data_start
+        assert!(matches!(
+            SlottedPage::open(&mut payload),
+            Err(DbError::CorruptPage(_))
+        ));
+        assert!(matches!(
+            SlottedPageRef::open(&payload),
+            Err(DbError::CorruptPage(_))
+        ));
+    }
+
+    #[test]
+    fn open_rejects_a_slot_directory_that_overruns_tuple_data_start() {
+        // slot_countが大きすぎて、Slot Directoryの終端がtuple_data_startを
+        // 超えている(構造としては読めるが意味をなさない)ヘッダー。
+        let mut payload = fresh_payload();
+        payload[0..2].copy_from_slice(&u16::MAX.to_le_bytes()); // slot_count
+        payload[2..4].copy_from_slice(&0u16.to_le_bytes()); // tuple_data_start
+        assert!(matches!(
+            SlottedPage::open(&mut payload),
+            Err(DbError::CorruptPage(_))
+        ));
+    }
+
+    #[test]
     fn insert_then_get_round_trips() {
         let mut payload = fresh_payload();
         let mut page = SlottedPage::init(&mut payload);
@@ -394,7 +463,7 @@ mod tests {
         let free_space_via_mut = page.free_space();
 
         // 同じ`payload`を、書き込みを一切行わない`SlottedPageRef`から読む。
-        let view = SlottedPageRef::open(&payload);
+        let view = SlottedPageRef::open(&payload).unwrap();
         assert_eq!(view.get(slot), Some(&b"hello"[..]));
         assert_eq!(view.slot_count(), 2);
         assert_eq!(view.status(slot), Some(SlotStatus::Occupied));

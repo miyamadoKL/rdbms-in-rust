@@ -269,9 +269,10 @@ mod tests {
 
     #[test]
     fn crc32_matches_known_vector() {
-        // "123456789"に対するCRC-32(IEEE 802.3)の既知の値。
-        // <https://www.rfc-editor.org/rfc/rfc3720> Appendix B.4などで確認できる、
-        // CRC-32の実装検証によく使われる定番の入力。
+        // "123456789"に対するCRC-32/ISO-HDLC(IEEE 802.3で使われる多項式)の
+        // 既知のcheck value。CRC実装の相互検証によく使われる定番の入力・
+        // 出力の組で、CRC RevEng(<https://reveng.sourceforge.io/crc-catalogue/>)
+        // の"CRC-32/ISO-HDLC"エントリなどで確認できる。
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
     }
 

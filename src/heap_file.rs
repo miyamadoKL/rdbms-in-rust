@@ -87,10 +87,11 @@ impl HeapFile {
     /// このテーブルの`BufferPool`にキャッシュされているdirtyなページを
     /// すべてディスクへ書き戻す。
     ///
-    /// `BufferPool::flush_all`をそのまま呼ぶだけの薄いラッパーで、
-    /// `DiskManager::sync`(ページキャッシュから物理ディスクへの同期)までは
-    /// 行わない。プロセスの再起動をまたいでデータを残したい場合、呼び出し側は
-    /// この後で`DiskManager::sync`も別途呼ぶ必要がある。
+    /// `BufferPool::flush_all`をそのまま呼ぶだけの薄いラッパーで、実ディスクへの
+    /// 同期(`DiskManager::sync`)までは行わない。`HeapFile`は`BufferPool`を
+    /// privateフィールドとして所有しており、呼び出し側が`DiskManager`へ
+    /// 直接触れる経路はこの章にはまだない。実ディスクへの同期まで呼び出し側が
+    /// 明示的に行えるようにする層は第15章の`Storage::sync`で追加する。
     pub fn flush(&self) -> DbResult<()> {
         self.pool.flush_all()
     }
@@ -105,7 +106,7 @@ impl HeapFile {
     pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
         for &page_id in &self.page_ids {
             let mut guard = self.pool.write_page(page_id)?;
-            if let Some(slot) = SlottedPage::open(guard.data_mut()).insert(bytes) {
+            if let Some(slot) = SlottedPage::open(guard.data_mut())?.insert(bytes) {
                 return Ok(RecordId::new(page_id, slot));
             }
         }
@@ -124,7 +125,7 @@ impl HeapFile {
     /// いなければ`None`を返す。
     pub fn get(&self, rid: RecordId) -> DbResult<Option<Vec<u8>>> {
         let guard = self.pool.read_page(rid.page_id)?;
-        Ok(SlottedPageRef::open(guard.data())
+        Ok(SlottedPageRef::open(guard.data())?
             .get(rid.slot_id)
             .map(|bytes| bytes.to_vec()))
     }
@@ -133,7 +134,7 @@ impl HeapFile {
     /// (未挿入、または削除済み)なら`false`を返す。
     pub fn delete(&mut self, rid: RecordId) -> DbResult<bool> {
         let mut guard = self.pool.write_page(rid.page_id)?;
-        Ok(SlottedPage::open(guard.data_mut()).delete(rid.slot_id))
+        Ok(SlottedPage::open(guard.data_mut())?.delete(rid.slot_id))
     }
 
     /// `rid`が指すタプルを`bytes`へ置き換える。
@@ -142,13 +143,23 @@ impl HeapFile {
     /// `RecordId`を`Ok(Some(rid))`で返す。この`RecordId`は、ページ内で更新できた
     /// 場合は引数の`rid`と同じだが、ページをまたぐ移動が起きた場合は新しい値になる
     /// (モジュールの説明を参照)。
+    ///
+    /// # ページをまたぐ移動は「挿入してから削除する」
+    ///
+    /// 元のページに(コンパクションしても)収まらない場合、新しい場所へ`insert`
+    /// してから、それが成功したときに限って元の行を`delete`する。逆の順序
+    /// (先に削除してから挿入する)を選ぶと、挿入が`DbError::TupleTooLarge`などで
+    /// 失敗したときに元の行がすでに消えてしまい、`UPDATE`の失敗が行の消失に
+    /// つながる。`SlottedPage::update`自身は収まらないときに対象を書き換えずに
+    /// `false`を返す(該当箇所のドキュメントを参照)ため、ページ内更新の失敗では
+    /// この問題は起きない。問題が起きうるのはページをまたぐ移動のときだけである。
     pub fn update(&mut self, rid: RecordId, bytes: &[u8]) -> DbResult<Option<RecordId>> {
         // 対象が存在するかどうかは読み取り専用のGuardで確かめる。存在しない
         // 場合にまで`write_page`でpinしてdirty扱いにしてしまうと、evict時の
         // 無駄な書き戻しが増える。
         let occupied = {
             let guard = self.pool.read_page(rid.page_id)?;
-            SlottedPageRef::open(guard.data()).status(rid.slot_id) == Some(SlotStatus::Occupied)
+            SlottedPageRef::open(guard.data())?.status(rid.slot_id) == Some(SlotStatus::Occupied)
         };
         if !occupied {
             return Ok(None);
@@ -156,15 +167,30 @@ impl HeapFile {
 
         {
             let mut guard = self.pool.write_page(rid.page_id)?;
-            if SlottedPage::open(guard.data_mut()).update(rid.slot_id, bytes) {
+            if SlottedPage::open(guard.data_mut())?.update(rid.slot_id, bytes) {
                 return Ok(Some(rid));
             }
-            // このページの中には(コンパクションしても)収まらないので、
-            // このページからは削除し、別のページへ挿入し直す。
-            SlottedPage::open(guard.data_mut()).delete(rid.slot_id);
+            // このページの中には(コンパクションしても)収まらない。ここでは
+            // まだ元の行を削除しない(モジュールのドキュメントを参照)。
         }
+
         let new_rid = self.insert(bytes)?;
-        Ok(Some(new_rid))
+        match self.delete(rid) {
+            Ok(true) => Ok(Some(new_rid)),
+            Ok(false) => {
+                // 直前にoccupiedを確認済みで、この章はシングルスレッド前提
+                // なので通常は起こらない。万一起きた場合は、すでに書き込んだ
+                // 新しい行をロールバックしてから異常として報告する。
+                let _ = self.delete(new_rid);
+                Err(DbError::CorruptPage(format!(
+                    "update: 元のRecordId({rid:?})の削除に失敗しました(想定外)"
+                )))
+            }
+            Err(err) => {
+                let _ = self.delete(new_rid);
+                Err(err)
+            }
+        }
     }
 
     /// 全ページを先頭から順に走査し、生きている(削除されていない)全タプルを
@@ -211,11 +237,15 @@ impl Iterator for Scan<'_> {
         loop {
             if let Some((guard, slot_idx)) = self.current.as_mut() {
                 let page_id = guard.page_id();
-                let slot_count = SlottedPageRef::open(guard.data()).slot_count() as u16;
+                let view = match SlottedPageRef::open(guard.data()) {
+                    Ok(view) => view,
+                    Err(err) => return Some(Err(err)),
+                };
+                let slot_count = view.slot_count() as u16;
                 while *slot_idx < slot_count {
                     let slot = SlotId(*slot_idx);
                     *slot_idx += 1;
-                    if let Some(bytes) = SlottedPageRef::open(guard.data()).get(slot) {
+                    if let Some(bytes) = view.get(slot) {
                         let rid = RecordId::new(page_id, slot);
                         return Some(Ok((rid, bytes.to_vec())));
                     }
@@ -322,6 +352,26 @@ mod tests {
         assert_eq!(heap.get(rid_b).unwrap(), None);
         assert_eq!(heap.get(new_rid).unwrap(), Some(bigger));
         assert_eq!(heap.get(_rid_a).unwrap(), Some(a));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn update_that_fails_to_insert_leaves_the_original_row_intact() {
+        let path = temp_path("update-insert-fails");
+        let mut heap = open_heap(&path);
+
+        let rid = heap.insert(b"original").unwrap();
+
+        // 空の1ページにも収まらないほど大きい値へのupdateは、まず新しい場所への
+        // insertを試み、それがTupleTooLargeで失敗する。旧行を先に消していれば
+        // この時点でデータが失われるが、insertを先に試す実装ではrid経由の
+        // 元の行がそのまま読める。
+        let too_big = vec![b'x'; crate::page::PAGE_PAYLOAD_SIZE + 1];
+        let err = heap.update(rid, &too_big).unwrap_err();
+        assert!(matches!(err, DbError::TupleTooLarge(_)));
+
+        assert_eq!(heap.get(rid).unwrap(), Some(b"original".to_vec()));
 
         std::fs::remove_file(&path).unwrap();
     }

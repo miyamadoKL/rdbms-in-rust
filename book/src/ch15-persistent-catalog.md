@@ -237,7 +237,7 @@ Free Page Listから取り出したページにも、`BufferPool::allocate_page`
 ```rust
 for &page_id in &self.page_ids {
     let mut guard = self.pool.write_page(page_id)?;
-    if let Some(slot) = SlottedPage::open(guard.data_mut()).insert(bytes) {
+    if let Some(slot) = SlottedPage::open(guard.data_mut())?.insert(bytes) {
         return Ok(RecordId::new(page_id, slot));
     }
 }
@@ -283,8 +283,8 @@ PostgreSQLのFree Space Mapは、1バイトを256段階に量子化した近似�
 
 ```rust
 let mut guard = self.pool.write_page(page_id)?;
-let slot = SlottedPage::open(guard.data_mut()).insert(bytes);
-let free = SlottedPage::open(guard.data_mut()).free_space();
+let slot = SlottedPage::open(guard.data_mut())?.insert(bytes);
+let free = SlottedPage::open(guard.data_mut())?.free_space();
 drop(guard);
 match slot {
     Some(slot) => {
@@ -544,8 +544,29 @@ assert!(matches!(err, DbError::CorruptCatalog(_)));
 ```
 
 `name_len`として宣言された値ぶんのバイト数がもう残っていないので、`take`がその場で`DbError::CorruptCatalog`を返します。
-1つ目の実験がバイト列そのものの整合性(checksum)を、2つ目の実験がバイト列の**意味**の整合性(宣言された長さと実際の残りバイト数の対応)を、それぞれ別の層で検証しているとわかります。
-Catalogページというたった1枚のページの安全性は、この2段の検査が両方揃って初めて成り立っています。
+
+3つ目は、`decode_catalog`自身は正しく読み終えるのに、読み終えた**中身**が意味をなさない壊し方です。
+`free_pages`(Free Page List)に、Metaページ(`PageId(0)`)を紛れ込ませたカタログを直接書き込んでみます。
+
+```rust
+let tables = single_table_entry(TableId(0), "a", Vec::new());
+let bytes = encode_catalog(1, &tables, &[PageId(0)]);
+write_catalog_payload(&path, &bytes);
+
+let err = expect_err(Storage::open(&path));
+assert!(matches!(err, DbError::CorruptCatalog(_)));
+```
+
+このバイト列は、`next_table_id`、`table_count`、`free_page_count`、各フィールドの宣言と実際の残りバイト数がすべて矛盾なく揃っており、`decode_catalog`の境界検査は何も引っかかりません。
+それでも意味はおかしいままです。
+`PageId(0)`は File Header(第11章)が占有しているMetaページであり、`Storage`が「空いていて再利用してよい」ページの一覧に加えてよい番号ではありません。
+この矛盾を素通りさせると、次の`insert`が`free_pages`からこの番号を取り出し、`SlottedPage::init`でMetaページの中身をまるごと上書きしてしまいます。
+そうなったファイルは、以後`DiskManager::open`のMagic Number検証にすら通らなくなり、二度と開けません。
+
+`Storage::open`は、`decode_catalog`が返した状態を`fsm`へ組み立てる前に、この種の矛盾をまとめて検証します。
+確認するのは、参照している`PageId`が実際のページ数の範囲内にあること、Meta(`PageId(0)`)とCatalog(`PageId(1)`)という予約ページを指していないこと、あるページが複数のテーブル(または`free_pages`)に同時に属していないこと、そのページが実際に`PageType::Data`であること、テーブル定義の側では`TableId`とテーブル名が重複しておらず`next_table_id`より小さいこと、の5点です。
+1つ目の実験がバイト列そのものの整合性(checksum)を、2つ目の実験がバイト列の**構造**の整合性(宣言された長さと実際の残りバイト数の対応)を、3つ目の実験がバイト列の**意味**の整合性(参照しているページとテーブル定義が矛盾なく成り立つこと)を、それぞれ別の層で検証しているとわかります。
+Catalogページというたった1枚のページの安全性は、この3段の検査が揃って初めて成り立っています。
 
 ## 演習問題
 

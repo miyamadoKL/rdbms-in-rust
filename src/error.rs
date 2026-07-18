@@ -97,6 +97,12 @@ pub enum DbError {
     /// Catalogページ1枚(`PAGE_PAYLOAD_SIZE`バイト)に収まらないエラー。
     #[error("カタログがページに収まりません: {0}バイト(上限{1}バイト)")]
     CatalogTooLarge(usize, usize),
+
+    /// `Storage::get`・`update`・`delete`に渡した`RecordId`が、指定した
+    /// `TableId`のページ一覧に属していない(別のテーブルのRID、または
+    /// Meta/Catalogページを指すRID)エラー。
+    #[error("不正なRecordIdです: {0}")]
+    InvalidRecordId(String),
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

@@ -102,18 +102,27 @@ impl Database {
         })
     }
 
-    /// キャッシュされているdirtyなページをすべてディスクへ書き戻す。
+    /// キャッシュされている変更をすべてディスクへ書き戻し、実ディスクへ同期する。
     ///
     /// インメモリのDatabase(`Database::memory`)に対しては何もしない(書き戻す
     /// 先となるファイルがそもそも無い)。永続モードのDatabase(`Database::open`)
-    /// に対しては`Storage::flush`をそのまま呼ぶ。`Database`自体は`Drop`で
-    /// 自動的にflushしない。`HeapFile`(第13章)・`Storage`(第15章)がすでに
-    /// 採っている、書き戻しのタイミングを呼び出し側の`unwrap`可能な操作として
-    /// 明示させる設計をここでも踏襲する。
+    /// に対しては`Storage::flush`(`BufferPool`のキャッシュをOSへ書き渡す)に
+    /// 続けて`Storage::sync`(OSに実ディスクへの反映を要求する)を呼ぶ。
+    ///
+    /// `BufferPool`は`DiskManager`をprivateフィールドとして所有しており、
+    /// 呼び出し側が`sync`だけを別途呼べる経路はない。この章では「`flush`を
+    /// 呼べば耐久化まで完了する」という単純な契約に揃え、`flush`と`sync`を
+    /// 呼び分ける余地(グループコミットなど)は第33章のWALに譲る。`Database`
+    /// 自体は`Drop`で自動的にflushしない。`HeapFile`(第13章)・`Storage`
+    /// (第15章)がすでに採っている、書き戻しのタイミングを呼び出し側の
+    /// `unwrap`可能な操作として明示させる設計をここでも踏襲する。
     pub fn flush(&self) -> DbResult<()> {
         match &self.backend {
             Backend::Memory { .. } => Ok(()),
-            Backend::Disk { storage } => storage.flush(),
+            Backend::Disk { storage } => {
+                storage.flush()?;
+                storage.sync()
+            }
         }
     }
 

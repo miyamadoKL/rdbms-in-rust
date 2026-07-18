@@ -305,8 +305,10 @@ fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
 ```
 
 この章の`minidb`はまだシングルスレッドで動いており、並行アクセスは第35章のLatchまで登場しません。
-それでも`&self`を選んでいるのは、第14章のBuffer Poolが`DiskManager`を`Arc`で複数のフレームから共有できるようにしておきたいからです。
-`&mut self`のままでは、呼び出し側がその排他参照を1箇所でしか持てず、Buffer Poolの設計そのものを窮屈にしてしまいます。
+それでも`&self`を選んでいるのは、`DiskManager`を`&mut`で専有させないためです。
+第14章の`BufferPool`は`DiskManager`を単独で所有するだけで、この章の時点で`Arc`による共有は行いません。
+それでも`&self`にしておけば、複数の実行主体から`DiskManager`を共有したくなったとき(たとえば`Arc<DiskManager>`として複数のBuffer Poolへ渡すような構成)に、`&mut self`という専有の前提そのものを後から崩さずに済みます。
+`&mut self`のままでは、呼び出し側がその排他参照を1箇所でしか持てず、そうした構成を選ぶ余地そのものが最初から窮屈になってしまいます。
 `Mutex`によるロックは、全てのページI/Oを1本のロックで直列化するだけの素朴な実装であり、ページ単位の細かい並行性は持ちません。
 シングルスレッドの間はロックの取り合いも起きないので、この単純さで困ることはありません。
 
@@ -354,7 +356,7 @@ pub fn open(disk: DiskManager) -> Self {
 pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
     for &page_id in &self.page_ids {
         let mut page = self.disk.read_page(page_id)?;
-        if let Some(slot) = SlottedPage::open(page.payload_mut()).insert(bytes) {
+        if let Some(slot) = SlottedPage::open(page.payload_mut())?.insert(bytes) {
             self.disk.write_page(&page)?;
             return Ok(RecordId::new(page_id, slot));
         }
@@ -383,7 +385,7 @@ pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
 ```rust
 pub fn get(&self, rid: RecordId) -> DbResult<Option<Vec<u8>>> {
     let mut page = self.disk.read_page(rid.page_id)?;
-    Ok(SlottedPage::open(page.payload_mut())
+    Ok(SlottedPage::open(page.payload_mut())?
         .get(rid.slot_id)
         .map(|bytes| bytes.to_vec()))
 }
@@ -396,28 +398,45 @@ pub fn update(&mut self, rid: RecordId, bytes: &[u8]) -> DbResult<Option<RecordI
     let mut page = self.disk.read_page(rid.page_id)?;
 
     let occupied =
-        SlottedPage::open(page.payload_mut()).status(rid.slot_id) == Some(SlotStatus::Occupied);
+        SlottedPage::open(page.payload_mut())?.status(rid.slot_id) == Some(SlotStatus::Occupied);
     if !occupied {
         return Ok(None);
     }
 
-    if SlottedPage::open(page.payload_mut()).update(rid.slot_id, bytes) {
+    if SlottedPage::open(page.payload_mut())?.update(rid.slot_id, bytes) {
         self.disk.write_page(&page)?;
         return Ok(Some(rid));
     }
 
-    // このページの中には(コンパクションしても)収まらないので、
-    // このページからは削除し、別のページへ挿入し直す。
-    SlottedPage::open(page.payload_mut()).delete(rid.slot_id);
-    self.disk.write_page(&page)?;
+    // このページの中には(コンパクションしても)収まらない。ここではまだ
+    // 元のスロットを削除しない(このあとの説明を参照)。
     let new_rid = self.insert(bytes)?;
-    Ok(Some(new_rid))
+    match self.delete(rid) {
+        Ok(true) => Ok(Some(new_rid)),
+        Ok(false) => {
+            let _ = self.delete(new_rid);
+            Err(DbError::CorruptPage(format!(
+                "update: 元のRecordId({rid:?})の削除に失敗しました(想定外)"
+            )))
+        }
+        Err(err) => {
+            let _ = self.delete(new_rid);
+            Err(err)
+        }
+    }
 }
 ```
 
 第12章の`SlottedPage::update`は、1ページの中でコンパクションを試みてもなお新しいバイト列が収まらなければ`false`を返すだけで、そこから先の面倒は見ません。
 `HeapFile::update`は、その`false`を受け取ったときに初めて動きます。
-元のスロットを削除し、あらためて`self.insert(bytes)`を呼んで、空きのある(あるいは新しく確保する)別のページへ挿入し直します。
+空きのある(あるいは新しく確保する)別のページへ`self.insert(bytes)`で挿入し、それが成功したときに限って元のスロットを`self.delete(rid)`で削除します。
+
+この順序には理由があります。
+先に元のスロットを削除してから`insert`する順序を選んでいたら、`insert`が`DbError::TupleTooLarge`(`bytes`自体がどのページにも収まらないほど大きい)で失敗したときに、元の行はすでに削除済みという状態になってしまいます。
+`UPDATE`が失敗として呼び出し元へ`Err`を返しているのに、対象の行は消えている。
+これは受け入れられない振る舞いです。
+挿入を先に試すことで、挿入が失敗した時点では元の行がまだ手つかずのまま残ります。
+挿入が成功したあとの削除がもし失敗したとき(この章の設計ではシングルスレッド前提のため通常は起こりませんが)は、直前に挿入した新しい行を削除してロールバックしたうえで異常として報告します。
 
 この移動が起きると、返される`RecordId`は元の`rid`とは別の値になります。
 `HeapFile::update`は、`RecordId`を移動後も固定するための間接参照(たとえば「移動先を指すポインタを元の場所に残す」といった仕組み)を導入しないという設計を選んでいます。
@@ -447,11 +466,15 @@ impl Iterator for Scan<'_> {
         loop {
             if let Some((page, slot_idx)) = self.current.as_mut() {
                 let page_id = page.page_id;
-                let slot_count = SlottedPage::open(page.payload_mut()).slot_count() as u16;
+                let view = match SlottedPage::open(page.payload_mut()) {
+                    Ok(view) => view,
+                    Err(err) => return Some(Err(err)),
+                };
+                let slot_count = view.slot_count() as u16;
                 while *slot_idx < slot_count {
                     let slot = SlotId(*slot_idx);
                     *slot_idx += 1;
-                    if let Some(bytes) = SlottedPage::open(page.payload_mut()).get(slot) {
+                    if let Some(bytes) = view.get(slot) {
                         let rid = RecordId::new(page_id, slot);
                         return Some(Ok((rid, bytes.to_vec())));
                     }
@@ -700,5 +723,5 @@ fn update_that_does_not_fit_moves_to_another_page_and_changes_the_record_id() {
 ### 発展課題
 
 1. `HeapFile::insert`は、空きのあるページを`page_ids`の先頭から線形探索します。テーブルが数百から数千ページに育った場合、この探索コストがどう効いてくるか、そしてどのような追加のデータ構造(この章の本文が触れているFree Space Mapのようなもの)があれば線形探索を避けられるかを、実装せずに設計だけ考えてください。
-2. `DiskManager`は、複数のスレッドから`Arc<DiskManager>`として共有されることを見越して`&self`でページI/Oを提供していますが、内部の`Mutex<Inner>`は全てのページへのアクセスを1本のロックで直列化しています。異なるページへの`read_page`同士が互いを待たされない設計にするとしたら、`Inner`の持ち方をどう変える必要があるか考えてみてください。
+2. `DiskManager`は、将来`Arc<DiskManager>`として複数の実行主体から共有できる余地を残すために`&self`でページI/Oを提供していますが、内部の`Mutex<Inner>`は全てのページへのアクセスを1本のロックで直列化しています。異なるページへの`read_page`同士が互いを待たされない設計にするとしたら、`Inner`の持ち方をどう変える必要があるか考えてみてください。
 3. `DiskManager::allocate_page`は、データページの書き込みとMetaページの書き直しという2回の書き込みを行います。この2回の書き込みの間でプロセスが強制終了した場合、次に`DiskManager::open`したときにファイルの状態がどうなるか(`page_count`と実際のページ数の関係を含めて)を考え、実際にテストコードで再現できるか試してください。

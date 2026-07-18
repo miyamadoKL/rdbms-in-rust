@@ -68,6 +68,30 @@ fn update_and_delete_over_sql_persist_across_reopen() {
 }
 
 #[test]
+fn a_failed_update_over_sql_leaves_the_original_row_readable() {
+    // UPDATEがexecutor::storage_update(第13章のHeap Fileの仕組みの上)を
+    // 通る際、新しい値がページに収まらず`storage::Storage::insert`が
+    // `DbError::TupleTooLarge`で失敗しても、SQLレベルで見た元の行が
+    // 消えていないことを確認する回帰テスト。
+    let path = temp_db_path("update-fails-keeps-original");
+    let mut db = Database::open(&path).unwrap();
+    db.execute("CREATE TABLE users (id BIGINT NOT NULL, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+
+    // 空の1ページにも収まらないほど長いTEXTへのUPDATEはTupleTooLargeで失敗する。
+    let too_long = "x".repeat(minidb::PAGE_PAYLOAD_SIZE + 1);
+    let result = db.execute(&format!("UPDATE users SET name = '{too_long}' WHERE id = 1"));
+    assert!(result.is_err());
+
+    let alice = db.execute("SELECT name FROM users WHERE id = 1").unwrap();
+    assert_eq!(alice.rows().len(), 1);
+    assert_eq!(alice.rows()[0].values(), &[Value::Text("Alice".to_string())]);
+
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
 fn drop_table_over_sql_persists_across_reopen_and_the_name_can_be_reused() {
     let path = temp_db_path("restart-drop-table");
     {

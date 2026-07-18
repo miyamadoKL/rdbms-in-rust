@@ -1,12 +1,18 @@
 # 第14章 Buffer Pool
 
-前章の`insert_across_multiple_pages_and_scan_returns_them_all`テストは、500件のタプルを挿入してから`scan`で全件を読み直していました。
-このとき`DiskManager::read_page`は何回呼ばれていたでしょうか。
+`HeapFile::get`は、`RecordId`を1つ渡されるたびに`disk.read_page(rid.page_id)`を呼び、そのページをディスクから読み直します。
+`WHERE id = 42`のような1行だけを引く問い合わせを同じテーブルに何度も投げれば、`get`はそのたびにディスクへ行きます。
+`scan`も無関係ではありません。
+1回の`scan`はページをまたぐたびに1回だけ`disk.read_page`を呼ぶので、その内部だけを見れば無駄はありませんが、同じテーブルを対象にした`scan`をもう一度呼べば、前回読んだのと同じページをもう一度最初から読み直します。
+前章の`insert_across_multiple_pages_and_scan_returns_them_all`テストのように、1回`scan`するだけなら気づきにくい話です。
+けれども`SELECT`を伴う問い合わせを繰り返し実行する、あるいはインデックスの無い結合が外側テーブルの行ごとに内側テーブルを丸ごと`scan`し直すような場面では、同じページへの`disk.read_page`が呼び出しの回数だけ積み重なります。
+`HeapFile`はページの中身をどこにも留めておかないので、直前に読んだのと同じページであっても、`DiskManager`まで律儀に問い合わせてしまうのです。
+このとき`DiskManager::read_page`は何回呼ばれているでしょうか。
 
 ## 同じページに触れるたびディスクへ行っている回数を数える
 
-`HeapFile::get`も`scan`も、`SlottedPage`ごしにタプルを1件読むたびに`disk.read_page(rid.page_id)`を呼びます。
-同じページに複数のタプルが入っていても、そのページへ2回目にアクセスした瞬間、`DiskManager`はもう1度ファイルへ`seek`して`read`し直します。
+`HeapFile`は、`get`と`scan`のどちらも、必要になったページを`SlottedPage`ごしに読むたびに`disk.read_page(page_id)`を呼びます。
+同じページが再び必要になっても、`HeapFile`自身はそのページの中身をどこにも覚えていないので、`DiskManager`はそのたびにもう1度ファイルへ`seek`して`read`し直します。
 前章の時点では、これを確かめる手段そのものがありませんでした。
 
 この章ではまず、`DiskManager`にI/O回数を数える`io_count`を1つ加えます。
@@ -328,7 +334,7 @@ pub struct HeapFile {
 pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
     for &page_id in &self.page_ids {
         let mut guard = self.pool.write_page(page_id)?;
-        if let Some(slot) = SlottedPage::open(guard.data_mut()).insert(bytes) {
+        if let Some(slot) = SlottedPage::open(guard.data_mut())?.insert(bytes) {
             return Ok(RecordId::new(page_id, slot));
         }
     }
@@ -383,7 +389,7 @@ pub fn get(&self, slot: SlotId) -> Option<&[u8]> {
 ```rust
 pub fn get(&self, rid: RecordId) -> DbResult<Option<Vec<u8>>> {
     let guard = self.pool.read_page(rid.page_id)?;
-    Ok(SlottedPageRef::open(guard.data())
+    Ok(SlottedPageRef::open(guard.data())?
         .get(rid.slot_id)
         .map(|bytes| bytes.to_vec()))
 }
@@ -400,7 +406,7 @@ pub fn update(&mut self, rid: RecordId, bytes: &[u8]) -> DbResult<Option<RecordI
     // 無駄な書き戻しが増える。
     let occupied = {
         let guard = self.pool.read_page(rid.page_id)?;
-        SlottedPageRef::open(guard.data()).status(rid.slot_id) == Some(SlotStatus::Occupied)
+        SlottedPageRef::open(guard.data())?.status(rid.slot_id) == Some(SlotStatus::Occupied)
     };
     if !occupied {
         return Ok(None);
@@ -408,17 +414,42 @@ pub fn update(&mut self, rid: RecordId, bytes: &[u8]) -> DbResult<Option<RecordI
 
     {
         let mut guard = self.pool.write_page(rid.page_id)?;
-        if SlottedPage::open(guard.data_mut()).update(rid.slot_id, bytes) {
+        if SlottedPage::open(guard.data_mut())?.update(rid.slot_id, bytes) {
             return Ok(Some(rid));
         }
-        // このページの中には(コンパクションしても)収まらないので、
-        // このページからは削除し、別のページへ挿入し直す。
-        SlottedPage::open(guard.data_mut()).delete(rid.slot_id);
+        // このページの中には(コンパクションしても)収まらない。ここでは
+        // まだ元の行を削除しない(モジュールのドキュメントを参照)。
     }
+
     let new_rid = self.insert(bytes)?;
-    Ok(Some(new_rid))
+    match self.delete(rid) {
+        Ok(true) => Ok(Some(new_rid)),
+        Ok(false) => {
+            // 直前にoccupiedを確認済みで、この章はシングルスレッド前提
+            // なので通常は起こらない。万一起きた場合は、すでに書き込んだ
+            // 新しい行をロールバックしてから異常として報告する。
+            let _ = self.delete(new_rid);
+            Err(DbError::CorruptPage(format!(
+                "update: 元のRecordId({rid:?})の削除に失敗しました(想定外)"
+            )))
+        }
+        Err(err) => {
+            let _ = self.delete(new_rid);
+            Err(err)
+        }
+    }
 }
 ```
+
+`SlottedPage::open`と`SlottedPageRef::open`の戻り値が`DbResult<Self>`である(第12章)ため、ここでも`?`で受けています。
+
+もう1つ、第13章で見た版(このページに収まらないと分かった時点で、その場で元のスロットを`delete`してから`insert`し直す版)との違いにも気づいたかもしれません。
+この章の実装は、このページに収まらないと分かった時点ではまだ元の行を削除しません。
+先に削除してから`self.insert(bytes)`する順序を選んでいたら、その`insert`が`DbError::TupleTooLarge`(`bytes`自体がどのページにも収まらないほど大きい)で失敗したときに、元の行はすでに削除済みという状態になってしまいます。
+`UPDATE`が失敗として呼び出し元へ`Err`を返しているのに、対象の行は消えている。
+これは受け入れられない振る舞いです。
+挿入を先に試すことで、挿入が失敗した時点では元の行がまだ手つかずのまま残ります。
+挿入が成功したあとの`self.delete(rid)`がもし失敗したとき(この章の設計ではシングルスレッド前提のため通常は起こりませんが)は、直前に挿入した新しい行を削除してロールバックしたうえで異常として報告します。
 
 対象のスロットが存在するかどうかは`read_page`で確かめ、実際に書き換える段になって初めて`write_page`に切り替えます。
 存在しない`rid`を渡された`update`のたびに`write_page`を呼んでいたら、何も書き換えていないページまでdirtyになり、evictのたびに無駄な書き戻しが発生するところでした。

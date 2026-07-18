@@ -452,7 +452,7 @@ pub fn insert(
 }
 
 /// Insert演算子の`Storage`版。`plan_insert_rows`で全行を検証してから、
-/// 1件ずつ`encode_tuple`(第13章)でバイト列へ変換し、`Storage::insert`
+/// 1件ずつ`encode_tuple`(第12章)でバイト列へ変換し、`Storage::insert`
 /// (第15章)へ渡す。
 ///
 /// `plan_insert_rows`が全行を検証し終えるまでは`storage`に一切触れないため、

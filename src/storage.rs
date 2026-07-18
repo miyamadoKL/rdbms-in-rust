@@ -163,8 +163,18 @@ impl Storage {
     /// 検証する(第13章)。この章ではさらに、`page_count >= 2`(Catalogページを
     /// 持つ)ことと、ページ1が実際に`PageType::Catalog`であることを確認したうえで、
     /// そのページの中身をカタログとして復元する。いずれかの検証に失敗した場合は
-    /// `DbError::CorruptPage`、カタログのバイト列自体は読めるが内容が矛盾している
-    /// 場合は`DbError::CorruptCatalog`を返す。
+    /// `DbError::CorruptPage`を返す。
+    ///
+    /// カタログのバイト列自体は`decode_catalog`で読めても、その中身が意味を
+    /// なさない場合がある。範囲外の`PageId`、Meta/Catalogという予約ページへの
+    /// 参照、あるページが複数のテーブル(またはFree Page List)に同時に属している、
+    /// テーブルが実際には`PageType::Data`ではないページを指している、といった
+    /// 矛盾はどれもバイト列としては正しく読めてしまうため、`decode_catalog`の
+    /// 構造検査だけでは捕まらない。`open`はこれらを`fsm`を組み立てる前に検証し、
+    /// 見つかった場合は`DbError::CorruptCatalog`を返す。この検証がないと、
+    /// たとえば`free_pages`にMetaページ(`PageId(0)`)が紛れ込んだカタログを
+    /// そのまま受理してしまい、次の`insert`がそのページを「空きページ」として
+    /// 再利用してFile Headerを上書きし、以後`open`できないファイルを作ってしまう。
     pub fn open<P: AsRef<Path>>(path: P) -> DbResult<Self> {
         let disk = DiskManager::open(path)?;
         if disk.page_count() < 2 {
@@ -187,14 +197,40 @@ impl Storage {
         let decoded = decode_catalog(guard.data())?;
         drop(guard);
 
-        // Free Space Mapは永続化しない(モジュール冒頭の説明を参照)。
-        // カタログから復元した各テーブルのpage_idsを1回ずつ読み、実測の
-        // free_space()から作り直す。
+        validate_table_metadata(&decoded)?;
+
+        // Free Space Mapは永続化しない(モジュール冒頭の説明を参照)。カタログから
+        // 復元した各ページを1回ずつ読み、意味検証(範囲・予約ページ・共有・
+        // PageType)を行いながら、実測の free_space() から fsm を作り直す。
+        let page_count = pool.page_count();
+        let mut claimed_pages: std::collections::HashSet<PageId> = std::collections::HashSet::new();
         let mut fsm = FreeSpaceMap::new();
+
+        for &page_id in &decoded.free_pages {
+            claim_page(page_id, page_count, &mut claimed_pages)?;
+            let guard = pool.read_page(page_id)?;
+            if guard.page_type() != PageType::Data {
+                return Err(DbError::CorruptCatalog(format!(
+                    "Free Page List中のPageId({})はPageType::Dataである必要がありますが{:?}でした",
+                    page_id.0,
+                    guard.page_type()
+                )));
+            }
+        }
+
         for entry in decoded.tables.values() {
             for &page_id in &entry.page_ids {
+                claim_page(page_id, page_count, &mut claimed_pages)?;
                 let guard = pool.read_page(page_id)?;
-                let free = SlottedPageRef::open(guard.data()).free_space();
+                if guard.page_type() != PageType::Data {
+                    return Err(DbError::CorruptCatalog(format!(
+                        "TableId({})のPageId({})はPageType::Dataである必要がありますが{:?}でした",
+                        entry.info.id.0,
+                        page_id.0,
+                        guard.page_type()
+                    )));
+                }
+                let free = SlottedPageRef::open(guard.data())?.free_space();
                 fsm.update(page_id, free);
             }
         }
@@ -211,11 +247,25 @@ impl Storage {
     /// キャッシュされているdirtyなページをすべてディスクへ書き戻す。
     ///
     /// `HeapFile::flush`(第14章)と同じく、`BufferPool::flush_all`をそのまま
-    /// 呼ぶだけの薄いラッパーである。`DiskManager::sync`までは行わないため、
-    /// プロセスの再起動をまたいでデータを残したい呼び出し側は、この後で
-    /// 別途`sync`が必要になる場面がありうる。
+    /// 呼ぶだけの薄いラッパーである。OSへの書き渡しまでで、実ディスクへの
+    /// 同期([`Storage::sync`])までは行わない。
     pub fn flush(&self) -> DbResult<()> {
         self.pool.flush_all()
+    }
+
+    /// 保持している`BufferPool`(の`DiskManager`)に対して`sync`を呼び、OSに
+    /// ディスクへの実際の反映を要求する。
+    ///
+    /// `flush`で書き渡した内容をプロセスの再起動をまたいで確実に残すには、
+    /// この`sync`まで呼ぶ必要がある。`Database::flush`(第16章)は`flush`と
+    /// この`sync`をこの順で両方呼ぶことで「呼び出し側からは`flush`ひとつで
+    /// 耐久化が完了する」という単純な契約にしている。`flush`と`sync`を
+    /// 分けているのは、`flush_all`(キャッシュの書き渡し)と`sync`(実ディスクへの
+    /// 同期)がコストの異なる別の操作であり、両者を分けて呼べる余地を`Storage`の
+    /// 層にも残しておくためである。fsyncのタイミングをより細かく制御する
+    /// 話題(グループコミットなど)は第33章のWALで扱う。
+    pub fn sync(&self) -> DbResult<()> {
+        self.pool.sync()
     }
 
     /// テーブル名から`TableInfo`を引く。見つからなければ`None`を返す。
@@ -340,9 +390,9 @@ impl Storage {
     /// `rid`が指すタプルのバイト列を返す。削除済み、またはそもそも挿入されて
     /// いなければ`None`を返す。
     pub fn get(&self, table_id: TableId, rid: RecordId) -> DbResult<Option<Vec<u8>>> {
-        self.table_entry(table_id)?;
+        self.validate_rid(table_id, rid)?;
         let guard = self.pool.read_page(rid.page_id)?;
-        Ok(SlottedPageRef::open(guard.data())
+        Ok(SlottedPageRef::open(guard.data())?
             .get(rid.slot_id)
             .map(|bytes| bytes.to_vec()))
     }
@@ -350,20 +400,26 @@ impl Storage {
     /// `rid`が指すタプルを`bytes`へ置き換える。
     ///
     /// `HeapFile::update`(第13章)と同じく、同じページに(コンパクション後も)
-    /// 収まる限り同じ`RecordId`を保つ。収まらない場合は、このページからは
-    /// 削除し、`insert`と同じ経路(Free Space Map→Free Page List→新規ページ)で
-    /// 別の場所へ挿入し直す。対象が存在しなければ`Ok(None)`を返す。
+    /// 収まる限り同じ`RecordId`を保つ。収まらない場合は、`insert`と同じ経路
+    /// (Free Space Map→Free Page List→新規ページ)で別の場所へ挿入し、それが
+    /// 成功したときに限って元の行をこのページから削除する。対象が存在しなければ
+    /// `Ok(None)`を返す。
+    ///
+    /// 「挿入してから削除する」順序は`HeapFile::update`(第13章)から引き継いだ
+    /// 判断である。逆に「削除してから挿入する」順序だと、挿入が
+    /// `DbError::TupleTooLarge`や`DbError::CatalogTooLarge`で失敗したときに
+    /// 元の行がすでに消えてしまい、失敗した`UPDATE`が行の消失につながる。
     pub fn update(
         &mut self,
         table_id: TableId,
         rid: RecordId,
         bytes: &[u8],
     ) -> DbResult<Option<RecordId>> {
-        self.table_entry(table_id)?;
+        self.validate_rid(table_id, rid)?;
 
         let occupied = {
             let guard = self.pool.read_page(rid.page_id)?;
-            SlottedPageRef::open(guard.data()).status(rid.slot_id) == Some(SlotStatus::Occupied)
+            SlottedPageRef::open(guard.data())?.status(rid.slot_id) == Some(SlotStatus::Occupied)
         };
         if !occupied {
             return Ok(None);
@@ -371,35 +427,75 @@ impl Storage {
 
         {
             let mut guard = self.pool.write_page(rid.page_id)?;
-            if SlottedPage::open(guard.data_mut()).update(rid.slot_id, bytes) {
-                let free = SlottedPage::open(guard.data_mut()).free_space();
+            if SlottedPage::open(guard.data_mut())?.update(rid.slot_id, bytes) {
+                let free = SlottedPage::open(guard.data_mut())?.free_space();
                 drop(guard);
                 self.fsm.update(rid.page_id, free);
                 return Ok(Some(rid));
             }
-            // このページの中には(コンパクションしても)収まらないので、
-            // このページからは削除し、別のページへ挿入し直す。
-            SlottedPage::open(guard.data_mut()).delete(rid.slot_id);
-            let free = SlottedPage::open(guard.data_mut()).free_space();
-            drop(guard);
-            self.fsm.update(rid.page_id, free);
+            // このページの中には(コンパクションしても)収まらない。ここでは
+            // まだ元の行を削除しない(このメソッドのドキュメントを参照)。
         }
+
         let new_rid = self.insert(table_id, bytes)?;
-        Ok(Some(new_rid))
+        match self.delete(table_id, rid) {
+            Ok(true) => Ok(Some(new_rid)),
+            Ok(false) => {
+                // 直前にoccupiedを確認済みで、この章はシングルスレッド前提
+                // なので通常は起こらない。万一起きた場合は、すでに書き込んだ
+                // 新しい行をロールバックしてから異常として報告する。
+                let _ = self.delete(table_id, new_rid);
+                Err(DbError::CorruptPage(format!(
+                    "update: 元のRecordId({rid:?})の削除に失敗しました(想定外)"
+                )))
+            }
+            Err(err) => {
+                let _ = self.delete(table_id, new_rid);
+                Err(err)
+            }
+        }
     }
 
     /// `rid`が指すタプルを削除する。削除できたら`true`、対象がすでに存在しない
     /// (未挿入、または削除済み)なら`false`を返す。
     pub fn delete(&mut self, table_id: TableId, rid: RecordId) -> DbResult<bool> {
-        self.table_entry(table_id)?;
+        self.validate_rid(table_id, rid)?;
         let mut guard = self.pool.write_page(rid.page_id)?;
-        let deleted = SlottedPage::open(guard.data_mut()).delete(rid.slot_id);
+        let deleted = SlottedPage::open(guard.data_mut())?.delete(rid.slot_id);
         if deleted {
-            let free = SlottedPage::open(guard.data_mut()).free_space();
+            let free = SlottedPage::open(guard.data_mut())?.free_space();
             drop(guard);
             self.fsm.update(rid.page_id, free);
         }
         Ok(deleted)
+    }
+
+    /// `rid.page_id`が`table_id`のテーブルが所有するページであり、かつ
+    /// `PageType::Data`であることを検証する。
+    ///
+    /// `get`・`update`・`delete`はすべて`rid.page_id`をそのままバッファプールへ
+    /// 渡す前にこのチェックを通す。検証がなければ、別のテーブルの`RecordId`を
+    /// 使い回して他テーブルの行を読む・書き換える・消す、あるいはMeta/Catalog
+    /// ページの`PageId`を直接指定してその中身をタプルとして読み書きすることが
+    /// できてしまう。前者は`TableEntry.page_ids`との突き合わせで、後者は
+    /// `PageType`の確認で防ぐ。
+    fn validate_rid(&self, table_id: TableId, rid: RecordId) -> DbResult<()> {
+        let entry = self.table_entry(table_id)?;
+        if !entry.page_ids.contains(&rid.page_id) {
+            return Err(DbError::InvalidRecordId(format!(
+                "PageId({})はTableId({})が所有するページではありません",
+                rid.page_id.0, table_id.0
+            )));
+        }
+        let guard = self.pool.read_page(rid.page_id)?;
+        if guard.page_type() != PageType::Data {
+            return Err(DbError::InvalidRecordId(format!(
+                "PageId({})はPageType::Dataである必要がありますが{:?}でした",
+                rid.page_id.0,
+                guard.page_type()
+            )));
+        }
+        Ok(())
     }
 
     /// `table_id`のテーブルの全ページを先頭から順に走査し、生きている全タプルを
@@ -423,8 +519,8 @@ impl Storage {
         bytes: &[u8],
     ) -> DbResult<Option<RecordId>> {
         let mut guard = self.pool.write_page(page_id)?;
-        let slot = SlottedPage::open(guard.data_mut()).insert(bytes);
-        let free = SlottedPage::open(guard.data_mut()).free_space();
+        let slot = SlottedPage::open(guard.data_mut())?.insert(bytes);
+        let free = SlottedPage::open(guard.data_mut())?.free_space();
         drop(guard);
         match slot {
             Some(slot) => {
@@ -445,7 +541,7 @@ impl Storage {
     ) -> DbResult<Option<RecordId>> {
         let mut guard = self.pool.write_page(page_id)?;
         let slot = SlottedPage::init(guard.data_mut()).insert(bytes);
-        let free = SlottedPage::open(guard.data_mut()).free_space();
+        let free = SlottedPage::open(guard.data_mut())?.free_space();
         drop(guard);
         match slot {
             Some(slot) => {
@@ -488,6 +584,70 @@ impl Storage {
         data[bytes.len()..].fill(0);
         Ok(())
     }
+}
+
+/// `decoded`のテーブル定義が意味的に矛盾していないかを検証する。
+///
+/// ページを読まずに済む(I/O不要の)検査だけをここへ集める。ページを読む必要が
+/// ある検査(範囲・予約ページ・共有・`PageType`)は`Storage::open`側の
+/// `claim_page`が担う。
+///
+/// - 各テーブルの`TableId`が`next_table_id`未満であること(そうでなければ、
+///   次に`create_table`したテーブルが同じ`TableId`を再利用してしまう)。
+/// - テーブル名が重複していないこと(`TableId`自体の重複は`decode_catalog`が
+///   デコードの時点で検出済み)。
+fn validate_table_metadata(decoded: &DecodedCatalog) -> DbResult<()> {
+    let mut seen_names = std::collections::HashSet::new();
+    for entry in decoded.tables.values() {
+        if entry.info.id.0 >= decoded.next_table_id {
+            return Err(DbError::CorruptCatalog(format!(
+                "TableId({})がnext_table_id({})以上です",
+                entry.info.id.0, decoded.next_table_id
+            )));
+        }
+        if !seen_names.insert(entry.info.name.as_str()) {
+            return Err(DbError::CorruptCatalog(format!(
+                "テーブル名'{}'が複数のTableIdに割り当てられています",
+                entry.info.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `page_id`が有効な(範囲内かつ予約ページでない)データページであり、まだ
+/// どのテーブル・Free Page Listにも属していないことを確認したうえで、
+/// `claimed`へ登録する。
+///
+/// `page_id`がすでに`claimed`に含まれている場合は、あるページが複数の
+/// テーブル(またはFree Page List)に同時に属していることになるため、
+/// `DbError::CorruptCatalog`を返す。
+fn claim_page(
+    page_id: PageId,
+    page_count: u64,
+    claimed: &mut std::collections::HashSet<PageId>,
+) -> DbResult<()> {
+    if page_id.0 >= page_count {
+        return Err(DbError::CorruptCatalog(format!(
+            "PageId({})がページ数({page_count})の範囲外です",
+            page_id.0
+        )));
+    }
+    if page_id.0 <= CATALOG_PAGE_ID.0 {
+        // PageId(0)はMetaページ、CATALOG_PAGE_ID(PageId(1))はCatalogページの
+        // 定位置であり、どちらもテーブルのデータページにはなりえない。
+        return Err(DbError::CorruptCatalog(format!(
+            "PageId({})は予約ページ(Meta/Catalog)です",
+            page_id.0
+        )));
+    }
+    if !claimed.insert(page_id) {
+        return Err(DbError::CorruptCatalog(format!(
+            "PageId({})が複数のテーブル、またはFree Page Listと共有されています",
+            page_id.0
+        )));
+    }
+    Ok(())
 }
 
 /// `decode_catalog`が返す、Catalogページから復元した状態。
@@ -592,7 +752,7 @@ fn decode_catalog(bytes: &[u8]) -> DbResult<DecodedCatalog> {
             page_ids.push(PageId(take_u64(&mut cursor, "page_ids")?));
         }
 
-        tables.insert(
+        let previous = tables.insert(
             table_id,
             TableEntry {
                 info: TableInfo {
@@ -603,6 +763,15 @@ fn decode_catalog(bytes: &[u8]) -> DbResult<DecodedCatalog> {
                 page_ids,
             },
         );
+        if previous.is_some() {
+            // HashMapへそのままinsertすると後勝ちで上書きされ、重複が
+            // 静かに消えてしまう。ここで検出しておかないと、同じTableIdを
+            // 持つ2つのテーブル定義のうち片方が理由もなく失われる。
+            return Err(DbError::CorruptCatalog(format!(
+                "TableId({})が複数回出現しています",
+                table_id.0
+            )));
+        }
     }
 
     Ok(DecodedCatalog {
@@ -817,6 +986,208 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// `bytes`(`encode_catalog`の出力、または手書きのバイト列)をCatalogページの
+    /// `payload`としてそのまま`path`へ書き込む。checksumは`Page::encode`が
+    /// 正しく計算し直すため、以下の意味検証テストはどれも「構造としては
+    /// 正しく読めるが、中身が意味をなさない」状態を作る。
+    fn write_catalog_payload(path: &std::path::Path, bytes: &[u8]) {
+        let mut payload = vec![0u8; PAGE_PAYLOAD_SIZE];
+        payload[..bytes.len()].copy_from_slice(bytes);
+
+        let mut page = Page::new(CATALOG_PAGE_ID, PageType::Catalog);
+        page.payload_mut().copy_from_slice(&payload);
+        let encoded = page.encode();
+
+        let mut file = OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        file.write_all(&encoded).unwrap();
+    }
+
+    fn single_table_entry(id: TableId, name: &str, page_ids: Vec<PageId>) -> HashMap<TableId, TableEntry> {
+        let mut tables = HashMap::new();
+        tables.insert(
+            id,
+            TableEntry {
+                info: TableInfo {
+                    id,
+                    name: name.to_string(),
+                    schema: users_schema(),
+                },
+                page_ids,
+            },
+        );
+        tables
+    }
+
+    #[test]
+    fn open_rejects_free_pages_that_reference_the_meta_page() {
+        // 再現ケース: free_pagesにMetaページ(PageId(0))が紛れ込んだカタログは
+        // checksumも構造も正しく読めてしまう。意味検証がなければこれはopenに
+        // 成功し、次のinsertがFree Page Listから0を取り出してMetaページを
+        // 「空きページ」として上書きし、以後そのファイルをopenできなくなる。
+        let path = temp_path("free-pages-include-meta");
+        Storage::create(&path).unwrap();
+
+        let tables = single_table_entry(TableId(0), "a", Vec::new());
+        let bytes = encode_catalog(1, &tables, &[PageId(0)]);
+        write_catalog_payload(&path, &bytes);
+
+        let err = expect_err(Storage::open(&path));
+        assert!(matches!(err, DbError::CorruptCatalog(_)));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn open_rejects_a_table_page_id_out_of_range() {
+        let path = temp_path("page-id-out-of-range");
+        Storage::create(&path).unwrap();
+
+        let tables = single_table_entry(TableId(0), "a", vec![PageId(999)]);
+        let bytes = encode_catalog(1, &tables, &[]);
+        write_catalog_payload(&path, &bytes);
+
+        let err = expect_err(Storage::open(&path));
+        assert!(matches!(err, DbError::CorruptCatalog(_)));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn open_rejects_a_table_page_that_is_not_page_type_data() {
+        let path = temp_path("table-page-not-data");
+        {
+            let disk = DiskManager::open(&path).unwrap();
+            let pool = BufferPool::new(disk, 8);
+            let catalog_page_id = pool.allocate_page(PageType::Catalog).unwrap();
+            assert_eq!(catalog_page_id, CATALOG_PAGE_ID);
+            // 本来テーブルのデータページに使わないPageType(ここでは2枚目の
+            // Catalogページ)を、テーブルのpage_idsへ直接登録する。
+            let bogus_data_page = pool.allocate_page(PageType::Catalog).unwrap();
+
+            let tables = single_table_entry(TableId(0), "a", vec![bogus_data_page]);
+            let bytes = encode_catalog(1, &tables, &[]);
+            let mut guard = pool.write_page(CATALOG_PAGE_ID).unwrap();
+            let data = guard.data_mut();
+            data[..bytes.len()].copy_from_slice(&bytes);
+            data[bytes.len()..].fill(0);
+            drop(guard);
+            pool.flush_all().unwrap();
+        }
+
+        let err = expect_err(Storage::open(&path));
+        assert!(matches!(err, DbError::CorruptCatalog(_)));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn open_rejects_a_page_shared_between_two_tables() {
+        let path = temp_path("shared-page");
+        let (a, b, shared_page) = {
+            let mut storage = Storage::create(&path).unwrap();
+            let a = storage.create_table("a", users_schema()).unwrap();
+            storage.insert(a, b"x").unwrap();
+            let b = storage.create_table("b", users_schema()).unwrap();
+            let shared_page = storage.tables.get(&a).unwrap().page_ids[0];
+            storage.flush().unwrap();
+            (a, b, shared_page)
+        };
+
+        // aが実際に使っているページを、bのpage_idsとしても登録する。
+        let mut tables = single_table_entry(a, "a", vec![shared_page]);
+        tables.insert(
+            b,
+            TableEntry {
+                info: TableInfo {
+                    id: b,
+                    name: "b".to_string(),
+                    schema: users_schema(),
+                },
+                page_ids: vec![shared_page],
+            },
+        );
+        let bytes = encode_catalog(2, &tables, &[]);
+        write_catalog_payload(&path, &bytes);
+
+        let err = expect_err(Storage::open(&path));
+        assert!(matches!(err, DbError::CorruptCatalog(_)));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn open_rejects_a_table_id_that_is_not_less_than_next_table_id() {
+        let path = temp_path("table-id-not-less-than-next");
+        Storage::create(&path).unwrap();
+
+        // TableId(0)が存在するのにnext_table_idも0のまま、というカタログ。
+        // 次のcreate_tableがTableId(0)を再利用してしまう矛盾がある。
+        let tables = single_table_entry(TableId(0), "a", Vec::new());
+        let bytes = encode_catalog(0, &tables, &[]);
+        write_catalog_payload(&path, &bytes);
+
+        let err = expect_err(Storage::open(&path));
+        assert!(matches!(err, DbError::CorruptCatalog(_)));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn open_rejects_duplicate_table_names() {
+        let path = temp_path("duplicate-table-name");
+        Storage::create(&path).unwrap();
+
+        let mut tables = single_table_entry(TableId(0), "dup", Vec::new());
+        tables.insert(
+            TableId(1),
+            TableEntry {
+                info: TableInfo {
+                    id: TableId(1),
+                    name: "dup".to_string(),
+                    schema: users_schema(),
+                },
+                page_ids: Vec::new(),
+            },
+        );
+        let bytes = encode_catalog(2, &tables, &[]);
+        write_catalog_payload(&path, &bytes);
+
+        let err = expect_err(Storage::open(&path));
+        assert!(matches!(err, DbError::CorruptCatalog(_)));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn open_rejects_a_catalog_with_a_duplicate_table_id() {
+        // encode_catalogはHashMapを介するため、同じTableIdを2回持つカタログを
+        // 正規の経路では作れない。decode_catalog自身の重複検出を確認するため、
+        // ここだけはバイト列を手で組み立てる。
+        let path = temp_path("duplicate-table-id");
+        Storage::create(&path).unwrap();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u64.to_le_bytes()); // next_table_id
+        payload.extend_from_slice(&2u32.to_le_bytes()); // table_count = 2
+        payload.extend_from_slice(&0u32.to_le_bytes()); // free_page_count
+
+        for name in ["a", "b"] {
+            payload.extend_from_slice(&0u64.to_le_bytes()); // table_id (両方とも0)
+            payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            payload.extend_from_slice(name.as_bytes());
+            payload.extend_from_slice(&0u16.to_le_bytes()); // column_count = 0
+            payload.extend_from_slice(&0u32.to_le_bytes()); // page_count = 0
+        }
+
+        write_catalog_payload(&path, &payload);
+
+        let err = expect_err(Storage::open(&path));
+        assert!(matches!(err, DbError::CorruptCatalog(_)));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
     #[test]
     fn reopening_preserves_tables_and_rows() {
         let path = temp_path("reopen");
@@ -1008,6 +1379,80 @@ mod tests {
         assert!(storage.delete(a, rid).unwrap());
         assert_eq!(storage.get(a, rid).unwrap(), None);
         assert_eq!(storage.scan(a).unwrap().count(), 0);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn update_that_fails_to_insert_leaves_the_original_row_intact() {
+        let path = temp_path("update-insert-fails");
+        let mut storage = Storage::create(&path).unwrap();
+        let a = storage.create_table("a", users_schema()).unwrap();
+
+        let rid = storage.insert(a, b"original").unwrap();
+
+        // 空の1ページにも収まらないほど大きい値へのupdateは、まず新しい場所への
+        // insertを試み、それがTupleTooLargeで失敗する。旧行を先に消していれば
+        // この時点でデータが失われるが、insertを先に試す実装ではrid経由の
+        // 元の行がそのまま読める。
+        let too_big = vec![b'x'; PAGE_PAYLOAD_SIZE + 1];
+        let err = expect_err(storage.update(a, rid, &too_big));
+        assert!(matches!(err, DbError::TupleTooLarge(_)));
+
+        assert_eq!(storage.get(a, rid).unwrap(), Some(b"original".to_vec()));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn get_update_delete_reject_a_record_id_from_another_table() {
+        let path = temp_path("cross-table-rid");
+        let mut storage = Storage::create(&path).unwrap();
+        let a = storage.create_table("a", users_schema()).unwrap();
+        let b = storage.create_table("b", users_schema()).unwrap();
+
+        let rid_in_a = storage.insert(a, b"a-row").unwrap();
+        // rid_in_aのpage_idはテーブルaのものだが、bのTableIdで参照する。
+        assert!(matches!(
+            storage.get(b, rid_in_a),
+            Err(DbError::InvalidRecordId(_))
+        ));
+        assert!(matches!(
+            storage.update(b, rid_in_a, b"x"),
+            Err(DbError::InvalidRecordId(_))
+        ));
+        assert!(matches!(
+            storage.delete(b, rid_in_a),
+            Err(DbError::InvalidRecordId(_))
+        ));
+
+        // aからは正しく読めたままである(bからの誤った操作の影響を受けていない)。
+        assert_eq!(storage.get(a, rid_in_a).unwrap(), Some(b"a-row".to_vec()));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn get_update_delete_reject_a_record_id_pointing_at_the_catalog_page() {
+        let path = temp_path("catalog-rid");
+        let mut storage = Storage::create(&path).unwrap();
+        let a = storage.create_table("a", users_schema()).unwrap();
+
+        // Catalogページ(PageId(1))を指す、テーブルaには属さないRecordIdを
+        // 直接組み立てる。
+        let bogus_rid = RecordId::new(CATALOG_PAGE_ID, crate::ids::SlotId(0));
+        assert!(matches!(
+            storage.get(a, bogus_rid),
+            Err(DbError::InvalidRecordId(_))
+        ));
+        assert!(matches!(
+            storage.update(a, bogus_rid, b"x"),
+            Err(DbError::InvalidRecordId(_))
+        ));
+        assert!(matches!(
+            storage.delete(a, bogus_rid),
+            Err(DbError::InvalidRecordId(_))
+        ));
 
         std::fs::remove_file(&path).unwrap();
     }

@@ -114,7 +114,16 @@ pub fn decode_tuple(schema: &Schema, bytes: &[u8]) -> DbResult<Tuple> {
                     ))
                 })?;
                 cursor += 1;
-                Value::Boolean(byte != 0)
+                match byte {
+                    0 => Value::Boolean(false),
+                    1 => Value::Boolean(true),
+                    other => {
+                        return Err(DbError::CorruptTuple(format!(
+                            "列'{}'(BOOLEAN)は0か1である必要がありますが{other}でした",
+                            column.name
+                        )));
+                    }
+                }
             }
             DataType::BigInt => {
                 let end = cursor + 8;
@@ -314,6 +323,14 @@ mod tests {
         let bitmap_len = null_bitmap_len(schema.len());
         let len_start = bitmap_len + 8;
         bytes[len_start..len_start + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = decode_tuple(&schema, &bytes).unwrap_err();
+        assert!(matches!(err, DbError::CorruptTuple(_)));
+    }
+
+    #[test]
+    fn decode_rejects_a_boolean_byte_that_is_neither_0_nor_1() {
+        let schema = Schema::new(vec![Column::new("b", DataType::Boolean, false)]);
+        let bytes = vec![0u8, 2u8]; // 1列分のビットマップ(NULLではない)、続けてBOOLEANの値2。
         let err = decode_tuple(&schema, &bytes).unwrap_err();
         assert!(matches!(err, DbError::CorruptTuple(_)));
     }

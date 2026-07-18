@@ -107,7 +107,7 @@ let scanned = match &self.backend {
 ```
 
 `executor::seq_scan(table: &MemTable) -> Vec<Tuple>`は`MemTable`が持つ`Tuple`をそのまま複製するだけでした。
-新しく加えた`executor::storage_seq_scan`は、`Storage::scan`(第15章)が返す`(RecordId, バイト列)`から`RecordId`を捨て、バイト列だけを`decode_tuple`(第13章)で`Tuple`へ復元します。
+新しく加えた`executor::storage_seq_scan`は、`Storage::scan`(第15章)が返す`(RecordId, バイト列)`から`RecordId`を捨て、バイト列だけを`decode_tuple`(第12章)で`Tuple`へ復元します。
 
 ```rust
 pub fn storage_seq_scan(storage: &Storage, table_id: TableId, schema: &Schema) -> DbResult<Vec<Tuple>> {
@@ -215,10 +215,19 @@ pub fn open<P: AsRef<Path>>(path: P) -> DbResult<Self> {
 pub fn flush(&self) -> DbResult<()> {
     match &self.backend {
         Backend::Memory { .. } => Ok(()),
-        Backend::Disk { storage } => storage.flush(),
+        Backend::Disk { storage } => {
+            storage.flush()?;
+            storage.sync()
+        }
     }
 }
 ```
+
+`Storage::flush`は`BufferPool::flush_all`(第14章)をそのまま呼ぶ薄いラッパーで、dirtyなページをOSへ書き渡すところまでしか行いません。
+プロセスの再起動をまたいでデータを確実に残すには、そのあとで`DiskManager::sync`(第13章)まで呼ぶ必要があります。
+`BufferPool`は`DiskManager`をprivateフィールドとして所有しているため、呼び出し側が`sync`だけを直接呼べる経路はありません。
+そこで`BufferPool::sync`と`Storage::sync`という薄いラッパーをそれぞれの層に用意し、`Database::flush`が両方(`flush`→`sync`)を呼ぶことで、呼び出し側からは「`db.flush()`を呼べば耐久化まで完了する」という1つの単純な契約にまとめています。
+`flush`と`sync`を呼び分けたい(たとえば複数の変更をまとめて1回だけ`sync`する)場面は当面想定せず、そのための制御は第33章のWALに譲ります。
 
 `Database`に`Drop`を実装して、スコープを抜けるときに自動で`flush`する案も考えられます。
 採らなかった理由は、`flush`が`DbResult`を返す(失敗しうる)操作だからです。

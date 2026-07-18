@@ -214,7 +214,9 @@ impl BufferPool {
     ///
     /// 第13章の`DiskManager::sync`と同様、この呼び出し自体は`DiskManager`に
     /// 対する`sync`までは行わない。実際にディスクへ確実に届けるには、この後で
-    /// `DiskManager::sync`を別途呼ぶ必要がある。
+    /// [`BufferPool::sync`]を別途呼ぶ必要がある。`disk`はこの`BufferPool`が
+    /// privateフィールドとして所有しているため、呼び出し側が`DiskManager`へ
+    /// 直接触れる経路はなく、`sync`まで行いたい場合は必ずこのメソッドを経由する。
     pub fn flush_all(&self) -> DbResult<()> {
         let dirty_frames: Vec<usize> = {
             let inner = self.lock_inner();
@@ -226,6 +228,18 @@ impl BufferPool {
             self.flush_frame(frame_id)?;
         }
         Ok(())
+    }
+
+    /// 保持している`DiskManager`に対して`sync`を呼び、OSにディスクへの実際の
+    /// 反映を要求する。
+    ///
+    /// `flush_all`はキャッシュされたページをOSへ書き渡すところまでしか行わない
+    /// ため、プロセスの再起動をまたいでデータを残すにはこの`sync`まで呼ぶ必要が
+    /// ある(`DiskManager::sync`のドキュメントを参照)。`disk`はこの`BufferPool`
+    /// が単独で所有しており外部から触れられないため、この`sync`が
+    /// `DiskManager::sync`を呼べる唯一の経路になる。
+    pub fn sync(&self) -> DbResult<()> {
+        self.disk.sync()
     }
 
     /// ヒット/ミス回数の累計。
