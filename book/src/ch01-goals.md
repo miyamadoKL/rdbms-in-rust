@@ -123,12 +123,12 @@ EXPLAIN ANALYZE
 | 部 | 到達点 | 対応する章 |
 | --- | --- | --- |
 | 第0部 設計と開発環境 | 開発の土台(エラー型、テスト基盤)が揃う | 第1〜3章 |
-| 第1部 Bare Bones | インメモリSQLデータベースが動く | 第4〜10章(到達点は第10章) |
-| 第2部 Storage | 再起動可能なディスクRDBMSがSQLレベルで動作する | 第11〜16章(到達点は第16章) |
-| 第3部 Query Execution | Join、Aggregate、Index Scanに対応する | 第17〜25章(到達点は第25章) |
-| 第4部 Query Optimizer | コストベース最適化に対応する | 第26〜29章(到達点は第29章) |
-| 第5部 Transaction | 並行実行・WAL・Crash Recoveryに対応する | 第30〜35章(到達点は第35章) |
-| 第6部 Server、運用、品質保証 | Client/Server型の小規模RDBMSが完成する | 第36〜40章(到達点は第40章) |
+| 第1部 Bare Bones | インメモリSQLデータベースが動く | 第4〜10章 |
+| 第2部 Storage | 再起動可能なディスクRDBMSがSQLレベルで動作する | 第11〜16章 |
+| 第3部 Query Execution | Join、Aggregate、Index Scanに対応する | 第17〜25章 |
+| 第4部 Query Optimizer | コストベース最適化に対応する | 第26〜29章 |
+| 第5部 Transaction | 並行実行・WAL・Crash Recoveryに対応する | 第30〜35章 |
+| 第6部 Server、運用、品質保証 | Client/Server型の小規模RDBMSが完成する | 第36〜40章 |
 
 途中の主な到達点は次の通りです。
 
