@@ -8,6 +8,8 @@
 //! - `SELECT <式|*> [, <式|*> ...] [FROM <table>] [WHERE <式>]`
 //! - `CREATE TABLE <table> (<col> <type> [NOT NULL], ...)`
 //! - `DROP TABLE <table>`
+//! - `CREATE [UNIQUE] INDEX <index> ON <table> (<col>)`(第24章)
+//! - `DROP INDEX <index>`(第24章)
 //! - `INSERT INTO <table> [(<col>, ...)] VALUES (<式>, ...), ...`
 //! - `UPDATE <table> SET <col> = <式> [, ...] [WHERE <式>]`
 //! - `DELETE FROM <table> [WHERE <式>]`
@@ -19,9 +21,10 @@
 //! 優先順位は低い順に`OR` < `AND` < `NOT` < 比較 < `+` `-` < `*` `/` < 単項`-`。
 
 use crate::ast::{
-    AggregateFunc, Assignment, BinaryOperator, ColumnDef, CreateTableStatement, DeleteStatement,
-    DropTableStatement, ExplainStatement, Expr, FromClause, Ident, InsertStatement, JoinClause,
-    JoinKind, OrderByItem, SelectItem, SelectStatement, Statement, UnaryOperator, UpdateStatement,
+    AggregateFunc, Assignment, BinaryOperator, ColumnDef, CreateIndexStatement, CreateTableStatement,
+    DeleteStatement, DropIndexStatement, DropTableStatement, ExplainStatement, Expr, FromClause, Ident,
+    InsertStatement, JoinClause, JoinKind, OrderByItem, SelectItem, SelectStatement, Statement, UnaryOperator,
+    UpdateStatement,
 };
 use crate::error::{DbError, DbResult};
 use crate::lexer::{self, Keyword, Span, Token, TokenKind};
@@ -58,6 +61,16 @@ impl<'a> Parser<'a> {
 
     fn peek_kind(&self) -> &TokenKind {
         &self.peek().kind
+    }
+
+    /// `n`個先(`n == 0`は`peek_kind`と同じ)のトークンの種類を覗き見る。配列の
+    /// 末尾を超える場合は最後のトークン(常に`Eof`)を返す。`CREATE TABLE`と
+    /// `CREATE INDEX`・`CREATE UNIQUE INDEX`(第24章)、`DROP TABLE`と
+    /// `DROP INDEX`(第24章)は、どちらも1個目のキーワード(`CREATE`・`DROP`)が
+    /// 共通のため、2個目のトークンを覗いてから分岐する。
+    fn peek_nth_kind(&self, n: usize) -> &TokenKind {
+        let idx = (self.pos + n).min(self.tokens.len() - 1);
+        &self.tokens[idx].kind
     }
 
     fn advance(&mut self) -> Token {
@@ -133,12 +146,8 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Select) => {
                 self.parse_select_statement().map(|s| Statement::Select(Box::new(s)))
             }
-            TokenKind::Keyword(Keyword::Create) => self
-                .parse_create_table_statement()
-                .map(Statement::CreateTable),
-            TokenKind::Keyword(Keyword::Drop) => {
-                self.parse_drop_table_statement().map(Statement::DropTable)
-            }
+            TokenKind::Keyword(Keyword::Create) => self.parse_create_statement(),
+            TokenKind::Keyword(Keyword::Drop) => self.parse_drop_statement(),
             TokenKind::Keyword(Keyword::Insert) => {
                 self.parse_insert_statement().map(Statement::Insert)
             }
@@ -152,8 +161,29 @@ impl<'a> Parser<'a> {
                 self.parse_explain_statement().map(Statement::Explain)
             }
             _ => Err(self.unexpected(
-                "SELECT・CREATE TABLE・DROP TABLE・INSERT INTO・UPDATE・DELETE FROM・EXPLAINのいずれか",
+                "SELECT・CREATE TABLE・DROP TABLE・CREATE INDEX・DROP INDEX・INSERT INTO・UPDATE・\
+                 DELETE FROM・EXPLAINのいずれか",
             )),
+        }
+    }
+
+    /// `CREATE`の直後を覗き見て、`CREATE TABLE`と`CREATE [UNIQUE] INDEX`(第24章)を
+    /// 振り分ける。
+    fn parse_create_statement(&mut self) -> DbResult<Statement> {
+        match self.peek_nth_kind(1) {
+            TokenKind::Keyword(Keyword::Table) => self.parse_create_table_statement().map(Statement::CreateTable),
+            TokenKind::Keyword(Keyword::Index) => self.parse_create_index_statement(false).map(Statement::CreateIndex),
+            TokenKind::Keyword(Keyword::Unique) => self.parse_create_index_statement(true).map(Statement::CreateIndex),
+            _ => Err(self.unexpected("TABLE・INDEX・UNIQUE INDEXのいずれか")),
+        }
+    }
+
+    /// `DROP`の直後を覗き見て、`DROP TABLE`と`DROP INDEX`(第24章)を振り分ける。
+    fn parse_drop_statement(&mut self) -> DbResult<Statement> {
+        match self.peek_nth_kind(1) {
+            TokenKind::Keyword(Keyword::Table) => self.parse_drop_table_statement().map(Statement::DropTable),
+            TokenKind::Keyword(Keyword::Index) => self.parse_drop_index_statement().map(Statement::DropIndex),
+            _ => Err(self.unexpected("TABLE・INDEXのいずれか")),
         }
     }
 
@@ -459,6 +489,45 @@ impl<'a> Parser<'a> {
 
         Ok(DropTableStatement {
             table,
+            span: Span::new(start, end),
+        })
+    }
+
+    // ---- CREATE INDEX / DROP INDEX(第24章) ----
+
+    /// `CREATE [UNIQUE] INDEX <index> ON <table> (<column>)`を解析する。
+    /// `unique`は`parse_create_statement`が`CREATE`の2個先を覗いて渡す
+    /// (`UNIQUE`キーワードを読んでいるかどうか)。
+    fn parse_create_index_statement(&mut self, unique: bool) -> DbResult<CreateIndexStatement> {
+        let start = self.expect_keyword(Keyword::Create, "CREATE")?.start;
+        if unique {
+            self.expect_keyword(Keyword::Unique, "UNIQUE")?;
+        }
+        self.expect_keyword(Keyword::Index, "INDEX")?;
+        let index = self.expect_ident()?;
+        self.expect_keyword(Keyword::On, "ON")?;
+        let table = self.expect_ident()?;
+        self.expect_punct(TokenKind::LParen, "(")?;
+        let column = self.expect_ident()?;
+        let end = self.expect_punct(TokenKind::RParen, ")")?.end;
+
+        Ok(CreateIndexStatement {
+            unique,
+            index,
+            table,
+            column,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_drop_index_statement(&mut self) -> DbResult<DropIndexStatement> {
+        let start = self.expect_keyword(Keyword::Drop, "DROP")?.start;
+        self.expect_keyword(Keyword::Index, "INDEX")?;
+        let index = self.expect_ident()?;
+        let end = index.span.end;
+
+        Ok(DropIndexStatement {
+            index,
             span: Span::new(start, end),
         })
     }
@@ -1369,6 +1438,38 @@ mod tests {
         match statement {
             Statement::DropTable(drop) => assert_eq!(drop.table.name, "users"),
             other => panic!("DROP TABLE文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_create_index() {
+        let statement = parse_statement("CREATE INDEX idx_users_id ON users (id)").unwrap();
+        match statement {
+            Statement::CreateIndex(create) => {
+                assert!(!create.unique);
+                assert_eq!(create.index.name, "idx_users_id");
+                assert_eq!(create.table.name, "users");
+                assert_eq!(create.column.name, "id");
+            }
+            other => panic!("CREATE INDEX文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_create_unique_index() {
+        let statement = parse_statement("CREATE UNIQUE INDEX idx_users_email ON users (email)").unwrap();
+        match statement {
+            Statement::CreateIndex(create) => assert!(create.unique),
+            other => panic!("CREATE UNIQUE INDEX文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_drop_index() {
+        let statement = parse_statement("DROP INDEX idx_users_id").unwrap();
+        match statement {
+            Statement::DropIndex(drop) => assert_eq!(drop.index.name, "idx_users_id"),
+            other => panic!("DROP INDEX文を期待したが{other:?}が返った"),
         }
     }
 

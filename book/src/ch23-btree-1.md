@@ -108,9 +108,9 @@ fn key_encoding_round_trips() {
 }
 ```
 
-逆変換の`decode_key`も用意していますが、この章の探索経路(`lookup`と`insert`)は一度もこの関数を呼びません。
-バイト列のまま比較が完結する設計にした結果、キーをいちいち`Value`へ戻すコストは、この索引のどの操作にもかかりません。
-`decode_key`はテストと、将来のRange Scan(第24章)のために残してあります。
+逆変換の`decode_key`も用意していますが、キーとキーを比較するだけの`find_leaf`、`insert_into_leaf`、`insert_into_internal`の探索経路は一度もこの関数を呼びません。
+バイト列のまま比較が完結する設計にした結果、キーをいちいち`Value`へ戻すコストは、木を降りる操作にもエントリを差し込む操作にもかかりません。
+`decode_key`はテストのために残してあり、第24章で追加するRange Scanが、見つかったキーのバイト列を`Value`へ戻す(呼び出し側へ返す)ためにも使うようになります。
 
 `NULL`キーの扱いも、この時点で決めておきます。
 `insert`と`lookup`に`Value::Null`を渡すと`DbError::NullKeyNotAllowed`を返します。
@@ -133,19 +133,26 @@ B+Treeのページはこの設計をそのまま使えません。
 Leaf Pageのレイアウトは次のとおりです。
 
 ```text
-offset 0                 2                    2+4n
-+------------------------+--------------------+-----------------+
-| entry_count (2バイト)  | Directory (4n バイト) |   Entry Data   |
-+------------------------+--------------------+-----------------+
+offset 0        2                10                   10+4n
++---------------+-----------------+--------------------+-----------------+
+| entry_count   | next_leaf       | Directory (4n バイト)|   Entry Data   |
+| (2バイト)     | (8バイト)       |                      |                |
++---------------+-----------------+--------------------+-----------------+
 ```
 
 | フィールド | バイト数 | 内容 |
 | --- | --- | --- |
 | `entry_count` | 2 | エントリ数`n`(LE) |
+| `next_leaf` | 8 | 右隣のLeaf Pageを指す`PageId`(LE)。無ければ`0` |
 | Directory | `4 * n` | `n`個の`(key_offset: u16, key_len: u16)`の並び(LE) |
 
 Directoryの`i`番目のエントリが指す`key_offset`から`key_len`バイトのキー、続けて`RecordId`(`page_id: u64` 8バイト + `slot_id: u16` 2バイト、計10バイト)が置かれています。
 エントリはDirectoryの直後から隙間なく、Directoryと同じキー昇順で並びます。
+
+`next_leaf`は、右隣のLeaf Pageへのポインタです。
+この章では常に`0`(右隣が無いことを表す番兵)のまま埋まっており、参照する`insert`も`lookup`もまだありません。
+葉同士を横方向につないでおくと、あるキー以上の範囲を求める検索は、最初の葉さえRootから降りて見つければ、あとはこのリンクをたどるだけで済みます。
+このフィールドを実際に使うRange Scanと、`insert`のLeaf Splitがこのリンクを繋ぎ直す処理は第24章で実装します。
 
 Internal Pageは、`n`本の区切りキーに対して`n + 1`本の子ページポインタを持つという非対称な形をしています。
 0番目の子だけをヘッダーに固定で持たせ、残り`n`本の子は「`i`番目の区切りキーの右側にある子」として、区切りキーとセットでDirectoryに乗せます。
@@ -190,8 +197,10 @@ pub fn write_entries(&mut self, entries: &[(Vec<u8>, RecordId)]) -> bool {
         return false;
     }
 
+    let next_leaf = self.as_ref().next_leaf();
     self.payload.fill(0);
     self.payload[0..2].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+    self.payload[2..10].copy_from_slice(&next_leaf.0.to_le_bytes());
 
     let dir_end = LEAF_HEADER_SIZE + entries.len() * DIR_ENTRY_SIZE;
     let mut cursor = dir_end;
@@ -213,6 +222,10 @@ pub fn write_entries(&mut self, entries: &[(Vec<u8>, RecordId)]) -> bool {
 
 必要バイト数を先に計算してから書き込むという順序が、`HeapFile::insert`(第13章)が`max_len_for_fresh_page`で事前にサイズを見積もっていたのと同じ理由で重要です。
 書き込み始めてから足りないと分かる実装では、途中まで書きかけたページを元に戻す処理が要りますが、この順序ならその処理自体が不要になります。
+
+`next_leaf`を`self.payload.fill(0)`の直前に読み出し、書き直した`payload`へそのまま書き戻している点に注目してください。
+`write_entries`はエントリの並び替え(挿入)のたびに`payload`全体を作り直しますが、右隣のLeaf Pageへのリンクはエントリの中身とは無関係な「このページ自身がどこにあるか」という情報なので、書き換えのたびに失われては困ります。
+この章では`next_leaf`が常に`0`(前節の番兵)のまま素通りするだけですが、リンク自体を繋ぎ直す操作は第24章のLeaf Splitで使います。
 
 `open`(検証つきで開く経路)は、`SlottedPage::open`(第12章)と同じ理由でバイト範囲を検証しますが、もう1つ`SlottedPage`には無い検証を加えています。
 キーが昇順に並んでいるかどうかです。
@@ -258,7 +271,7 @@ pub fn find(&self, key: &[u8]) -> Result<usize, usize> {
 Metaページが持つ情報は「Rootの`PageId`(8バイト)」と「キー型(1バイト)」の2値だけで、複数テーブルの定義という可変長のコレクションを持っていたCatalogページとは事情が異なるからです。
 
 ```rust
-pub fn create(pool: BufferPool, key_type: DataType) -> DbResult<Self> {
+pub fn create(pool: BufferPool, key_type: DataType, unique: bool) -> DbResult<Self> {
     let meta_id = pool.allocate_page(PageType::Data)?;
     debug_assert_eq!(
         meta_id, META_PAGE_ID,
@@ -272,11 +285,14 @@ pub fn create(pool: BufferPool, key_type: DataType) -> DbResult<Self> {
         LeafPage::init(guard.data_mut());
     }
 
-    let btree = BTree { pool, root: root_id, key_type };
+    let btree = BTree { pool, root: root_id, key_type, unique };
     btree.write_meta()?;
     Ok(btree)
 }
 ```
+
+`unique`は、キーの重複を`insert`自身が拒否するかどうかを決める第24章のフラグで、この章のテストはすべて`false`(重複を許す)を渡します。
+`unique`の使い道が分かるまでは読み飛ばして構いません。
 
 作りたての`BTree`は、空のLeaf Page1枚だけを持つ、高さ1の木です。
 検索(`lookup`)は、Rootから葉までの経路を`find_leaf`で下ります。
@@ -319,39 +335,21 @@ pub fn child_for(&self, key: &[u8]) -> PageId {
 ```
 
 葉に着いたら、その葉の中を`LeafPageRef::find`で二分探索します。
-重複キーが許されている(次の節で決めます)ため、一致した1件の前後にも同じキーが続いていないかを線形に確認してから、一致した全件をまとめて返します。
+重複キーが許されている(次の節で決めます)ため、一致した1件の前後にも同じキーが続いていないかを確認してから、一致した全件をまとめて返す必要があります。
 
 ```rust
 pub fn lookup(&self, key: &Value) -> DbResult<Vec<RecordId>> {
-    self.check_key_type(key)?;
-    let key_bytes = encode_key(key)?;
-
-    let leaf_id = self.find_leaf(&key_bytes)?;
-    let guard = self.pool.read_page(leaf_id)?;
-    let view = LeafPageRef::open(guard.data())?;
-
-    let mut result = Vec::new();
-    if let Ok(i) = view.find(&key_bytes) {
-        let mut lo = i;
-        while lo > 0 && view.key(lo - 1) == key_bytes.as_slice() {
-            lo -= 1;
-        }
-        let mut hi = i;
-        while hi + 1 < view.entry_count() && view.key(hi + 1) == key_bytes.as_slice() {
-            hi += 1;
-        }
-        for j in lo..=hi {
-            result.push(view.record_id(j));
-        }
-    }
-    Ok(result)
+    self.range(Bound::Included(key), Bound::Included(key))?.map(|entry| entry.map(|(_, rid)| rid)).collect()
 }
 ```
 
-前後の走査は、あくまで**同じ葉の中**に限られます。
-同じキーを持つエントリが多すぎてLeaf Splitによって複数のページへ分かれてしまった場合、この節の`lookup`は分割後にたどり着いた1ページの中の一致だけを返し、隣のページにはみ出した分は取りこぼします。
+`lookup`の実体は`range`(下限と上限のどちらにも`key`を指定した範囲検索)への委譲です。
+`LeafPageRef::find`で一致を1件見つけたあと、その前後に同じキーが続いていないか`lo`と`hi`で走査する処理自体は、`range`の内部(開始位置を決める部分)にあります。
+
+この前後の走査には、同じキーを持つエントリがLeaf Splitによって複数ページへ分かれてしまうと、`find_leaf`で降りた1ページの外にまで手が届かないという限界があります。
 この章のLeaf Pageはまだ横方向のリンクを持たないため、「隣のページも見に行く」という動作を実装できないからです。
-第24章でLeaf間リンクとRange Scanが揃えば、この取りこぼしは解消されます。
+この節で触れた`next_leaf`(まだ`0`で埋まっているだけの、右隣のLeaf Pageへのポインタ)を使って隣のページへ渡り歩けば、この取りこぼしは解消されます。
+その仕組み(Range Scan)自体は第24章で実装します。
 
 ## 挿入とSplit: 木を成長させる
 
@@ -422,24 +420,31 @@ fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbR
     let (left, right) = entries.split_at(mid);
     let separator = right[0].0.clone();
 
-    {
+    let new_id = self.pool.allocate_page(PageType::BTreeLeaf)?;
+    let old_next = {
         let mut guard = self.pool.write_page(current_id)?;
         let mut page = LeafPage::open(guard.data_mut())?;
+        let old_next = page.as_ref().next_leaf();
         if !page.write_entries(left) {
             return Err(DbError::BTreeKeyTooLarge(separator.len()));
         }
-    }
-    let new_id = self.pool.allocate_page(PageType::BTreeLeaf)?;
+        page.set_next_leaf(new_id);
+        old_next
+    };
     {
         let mut guard = self.pool.write_page(new_id)?;
         let mut page = LeafPage::init(guard.data_mut());
         if !page.write_entries(right) {
             return Err(DbError::BTreeKeyTooLarge(separator.len()));
         }
+        page.set_next_leaf(old_next);
     }
     Ok((separator, new_id))
 }
 ```
+
+`old_next`(元の`current_id`が指していた右隣)を新しいページ(`new_id`)へ引き継ぎ、`current_id`自身は`new_id`を指すよう`next_leaf`を書き換えている点が、`next_leaf`を持たなかった場合との違いです。
+分割によって2枚に増えたページの間にも、分割前と同じ「キー順に並んだ横のリンク」を保ちます。
 
 親へ押し上げる区切りキーには、後半の先頭キー(`right[0]`)をそのまま使います。
 このキーは新しいLeaf Pageにも物理的にコピーされたまま残ります。
@@ -671,7 +676,7 @@ fn lookup_time_grows_much_slower_than_table_size() {
     for &n in &[1_000i64, 2_000, 4_000, 8_000, 16_000] {
         let path = temp_path(&format!("lookup-bench-{n}"));
         let disk = DiskManager::open(&path).unwrap();
-        let mut btree = BTree::create(BufferPool::new(disk, 256), DataType::BigInt).unwrap();
+        let mut btree = BTree::create(BufferPool::new(disk, 256), DataType::BigInt, false).unwrap();
         for i in 0..n {
             btree.insert(&Value::BigInt(i), rid(1, 0)).unwrap();
         }

@@ -11,22 +11,21 @@
 //! `HeapFile`)が保持し、`BTree::lookup`が返した`RecordId`を使って読みに行く。
 //! この形の索引をSecondary Indexと呼ぶ。
 //!
-//! # スコープ: この章で実装するもの、しないもの
+//! # スコープ: この章(第24章)で実装するもの、しないもの
 //!
-//! 実装するのは、`BTree::create`・`BTree::open`という入口と、Point Lookup
+//! 第23章は`BTree::create`・`BTree::open`という入口と、Point Lookup
 //! (`lookup`)、Insert(`insert`)、そしてInsertが引き起こすLeaf Split・
-//! Internal Split・Root Splitである。
+//! Internal Split・Root Splitまでを実装した。この章ではそこへ、Leaf間リンク、
+//! Range Scan(`range`)、Delete(`delete`)、キーの重複を索引自身が拒否する
+//! `unique`フラグを追加する。`CREATE INDEX`・Index Maintenanceといった
+//! `Storage`・`Database`との結線は`crate::storage`・`crate::index`が担い、
+//! この`BTree`自身はそれらを知らない(独立したデータ構造のまま)。
 //!
-//! 次の機能はこの章の範囲外とし、第24章(B+Tree II)に譲る。
-//!
-//! - **Range Scan**: `key >= x AND key <= y`のような範囲検索。この章のLeaf
-//!   Pageはまだ隣接する葉への横方向のリンクを持たない。
-//! - **Delete**: この章はRoot Splitまで(木が成長する方向)しか実装しない。
-//!   縮小方向の操作(Redistribution、Merge、Root縮小)は行わない。
-//! - **`CREATE INDEX`とIndex Maintenance**: 既存の行から索引を作る、
-//!   `INSERT`・`UPDATE`・`DELETE`のたびに索引を追従させる、といった
-//!   `Storage`・`Database`との結線はまだ無い。この章の`BTree`は、
-//!   `Storage`と同じ`BufferPool`の上で動く独立したデータ構造にとどまる。
+//! Delete は**Lazy Delete**にとどめる。エントリをLeaf Pageから取り除くだけで、
+//! ページの占有率が下がってもRedistribution(隣接ページ間でエントリを
+//! 融通し合う)やMerge(隣接ページ同士を1枚にまとめる)、それに伴うRoot縮小は
+//! 行わない。削除を繰り返すと、空に近いLeaf Pageが木の中に残り続ける
+//! (詳しい設計上の理由は本文(book)を参照)。
 //!
 //! # キーのエンコーディング
 //!
@@ -68,21 +67,18 @@
 //! (第24章のIndex Maintenance)の責務である。この章の`BTree`は、
 //! 呼び出し側がうっかり`NULL`を渡した場合の防御としてこのエラーを返す。
 //!
-//! # 重複キーの扱い
+//! # `lookup`はLeaf間リンクを使う(第24章で解消した第23章の限界)
 //!
-//! `insert`は、同じキーを持つエントリを何度でも受け付ける。`PRIMARY KEY`・
-//! `UNIQUE`の一意性検査(第20章の`crate::constraints`と同じ役割のもの)を
-//! この索引自身が行うようにする変更は、第24章でIndex Maintenanceを実装する
-//! ときに扱う。この章の`BTree`はキーの一意性に一切関知しない、ただの
-//! 「キー→`RecordId`」の多重写像である。
+//! 第23章の`lookup`は、一致したキーが1ページ(Leaf Page)の中に収まっている
+//! 限りでしか全件を返せなかった。同じキーを持つエントリが多すぎてLeaf Split
+//! によって複数のLeaf Pageへ分かれてしまうと、分割後にたどり着いた1ページの
+//! 中の一致だけを返し、隣接するページにはみ出した分を取りこぼしていた
+//! (当時のLeaf Pageがまだ横方向のリンクを持たなかったため)。
 //!
-//! `lookup`は、一致したキーが1ページ(Leaf Page)の中に収まっている限り、
-//! そのキーを持つ全エントリを返す。ただし、同じキーを持つエントリが多すぎて
-//! Leaf Splitによって複数のLeaf Pageへ分かれてしまった場合、この章の`lookup`は
-//! 分割後にたどり着いた1ページの中の一致だけを返し、隣接するページにはみ出した
-//! 分を取りこぼす。この章のLeaf Pageはまだ横方向のリンクを持たないため、
-//! 「隣のページも見に行く」という動作を実装できない。第24章でLeaf間リンクと
-//! Range Scanが揃えば、この取りこぼしは解消される。
+//! この章では`lookup`自身を書き換えず、[`BTree::range`](Range Scan)を
+//! 呼ぶ薄いラッパーへ置き換える。`range`はLeaf間リンクを使って葉から葉へ
+//! 横移動するため、一致したキーが何ページにまたがっていても取りこぼさない
+//! (詳しくは本文(book)を参照)。
 //!
 //! # ページへのアクセスと並行性
 //!
@@ -106,20 +102,41 @@
 //! 対照的に、この章では新しいPage Typeを追加せず、既存の`PageType::Data`を
 //! 転用する。`Storage`のCatalogページは複数のテーブル定義という可変長の
 //! コレクションを保持する必要があったが、この章のMetaページが持つ情報は
-//! 「Rootの`PageId`(8バイト)」と「キー型(1バイト)」という固定長の2値だけで
-//! あり、`Data`ページと区別する構造的な理由が無い。
+//! 固定長の値だけであり、`Data`ページと区別する構造的な理由が無い。
+//!
+//! 第24章で、`unique`(1バイト)を末尾に追加した。
 //!
 //! ```text
-//! offset 0        8         9
-//! +----------------+---------+
-//! | root_page_id   | key_type|
-//! | (8バイト、LE)   | (1バイト)|
-//! +----------------+---------+
+//! offset 0        8         9        10
+//! +----------------+---------+---------+
+//! | root_page_id   | key_type| unique  |
+//! | (8バイト、LE)   | (1バイト)| (1バイト)|
+//! +----------------+---------+---------+
 //! ```
 //!
 //! `key_type`は`0`(`BOOLEAN`)・`1`(`BIGINT`)・`2`(`TEXT`)のいずれかで、
 //! `Storage`のCatalogページが列の型を符号化するのに使ったコード(モジュール
-//! `crate::storage`のドキュメント参照)と同じ割り当てにしてある。
+//! `crate::storage`のドキュメント参照)と同じ割り当てにしてある。`unique`は
+//! `0`または`1`で、[`BTree::insert`]がキーの重複を拒否するかどうかを表す
+//! (次節「重複キーの扱い」を参照)。この章より前(第23章)に作られたファイルは
+//! この1バイトを持たないため、この章のコードで`BTree::open`しようとすると
+//! `unique`を読む前にバイト列が尽き、`DbError::CorruptPage`になる
+//! (`crate::storage`本文が第20章から採っている、章をまたいだファイル互換性を
+//! 約束しない方針を参照)。
+//!
+//! # 重複キーの扱い(第24章で確定)
+//!
+//! 第23章の時点では、`insert`は常に同じキーを何度でも受け付ける多重写像
+//! だった。この章では、`BTree::create`の`unique`引数が`true`のとき、
+//! `insert`は既存のキーと重複する`insert`を`DbError::BTreeUniqueViolation`
+//! として拒否するようになる。`PRIMARY KEY`・`UNIQUE`列に対応する索引
+//! (`crate::storage::Storage::create_index`)は必ず`unique = true`で作る。
+//! この索引自身は列名を知らないため、`DbError::BTreeUniqueViolation`には
+//! 列名が入らない。呼び出し側([`crate::index::check_uniqueness_with_index`])が、
+//! 第20章の`DbError::PrimaryKeyViolation`・`DbError::UniqueViolation`
+//! (列名つき)へ翻訳してから利用者へ返す。
+
+use std::ops::Bound;
 
 use crate::buffer_pool::BufferPool;
 use crate::error::{DbError, DbResult};
@@ -127,7 +144,7 @@ use crate::ids::{PageId, RecordId};
 use crate::page::PageType;
 use crate::types::{DataType, Value};
 
-use crate::btree_page::{InternalPage, InternalPageRef, LeafPage, LeafPageRef};
+use crate::btree_page::{InternalPage, InternalPageRef, LeafPage, LeafPageRef, NO_NEXT_LEAF};
 
 /// Metaページ(Rootの`PageId`とキー型)の定位置。ページ0はDiskManagerのFile
 /// Headerが占有しているため、空いている最初の番号を使う(`crate::storage`の
@@ -139,14 +156,20 @@ pub struct BTree {
     pool: BufferPool,
     root: PageId,
     key_type: DataType,
+    /// 第24章で追加。`true`なら`insert`が既存のキーとの重複を
+    /// `DbError::BTreeUniqueViolation`として拒否する(モジュールドキュメントの
+    /// 「重複キーの扱い」を参照)。
+    unique: bool,
 }
 
 impl BTree {
     /// `pool`が管理する新しいファイルの上に、空の`BTree`を作る。
     ///
-    /// `key_type`が、以後この`BTree`が受け付けるキーの型を固定する。
+    /// `key_type`が、以後この`BTree`が受け付けるキーの型を固定する。`unique`が
+    /// `true`のツリーは、`insert`が既存のキーとの重複を拒否する索引になる
+    /// (`PRIMARY KEY`・`UNIQUE`列に対応する索引は必ず`true`で作る)。
     /// Metaページ(ページ1)と、空のLeaf Page1枚(初期状態のRoot)を割り当てる。
-    pub fn create(pool: BufferPool, key_type: DataType) -> DbResult<Self> {
+    pub fn create(pool: BufferPool, key_type: DataType, unique: bool) -> DbResult<Self> {
         let meta_id = pool.allocate_page(PageType::Data)?;
         debug_assert_eq!(
             meta_id, META_PAGE_ID,
@@ -160,22 +183,32 @@ impl BTree {
             LeafPage::init(guard.data_mut());
         }
 
-        let btree = BTree { pool, root: root_id, key_type };
+        let btree = BTree { pool, root: root_id, key_type, unique };
         btree.write_meta()?;
         Ok(btree)
     }
 
     /// `pool`が管理する既存のファイルから`BTree`を復元する。
     ///
-    /// Metaページ(ページ1)を読み、直近に永続化されたRootの`PageId`と
-    /// キー型を復元する。
+    /// Metaページ(ページ1)を読み、直近に永続化されたRootの`PageId`・キー型・
+    /// `unique`フラグを復元する。
     pub fn open(pool: BufferPool) -> DbResult<Self> {
         let guard = pool.read_page(META_PAGE_ID)?;
         let data = guard.data();
         let root = PageId(u64::from_le_bytes(data[0..8].try_into().unwrap()));
         let key_type = data_type_from_u8(data[8])?;
+        let unique = match data[9] {
+            0 => false,
+            1 => true,
+            other => return Err(DbError::CorruptPage(format!("B+Treeのuniqueフラグが不正です: {other}"))),
+        };
         drop(guard);
-        Ok(BTree { pool, root, key_type })
+        Ok(BTree { pool, root, key_type, unique })
+    }
+
+    /// このツリーがキーの重複を拒否するかどうか。
+    pub fn is_unique(&self) -> bool {
+        self.unique
     }
 
     /// このツリーが受け付けるキーの型。
@@ -217,32 +250,143 @@ impl BTree {
     ///
     /// `key`が`Value::Null`なら`DbError::NullKeyNotAllowed`、このツリーの
     /// `key_type()`と異なる型なら`DbError::BTreeKeyTypeMismatch`を返す。
-    /// 同じキーを持つエントリがLeaf Splitによって複数ページへ分かれている
-    /// 場合の取りこぼしについては、モジュールのドキュメント(重複キーの扱い)
-    /// を参照。
+    ///
+    /// 実装は[`Self::range`]の`Included(key)..=Included(key)`という薄い
+    /// ラッパーである。Leaf間リンクを使うため、一致したキーが複数のLeaf
+    /// Pageへまたがっていても取りこぼさない(モジュールドキュメントを参照)。
     pub fn lookup(&self, key: &Value) -> DbResult<Vec<RecordId>> {
+        self.range(Bound::Included(key), Bound::Included(key))?.map(|entry| entry.map(|(_, rid)| rid)).collect()
+    }
+
+    /// `lower`(下限)から`upper`(上限)までの範囲に含まれるキーを、昇順に
+    /// `(Value, RecordId)`として返すイテレータを作る。
+    ///
+    /// `Bound::Included`・`Bound::Excluded`(境界の開閉)・`Bound::Unbounded`
+    /// (その側に制限を課さない)は`std::ops::Bound`をそのまま使う。
+    /// `Bound::Included(&Value::Null)`・`Bound::Excluded(&Value::Null)`は
+    /// `DbError::NullKeyNotAllowed`、境界の値がこのツリーの`key_type()`と
+    /// 異なる型なら`DbError::BTreeKeyTypeMismatch`を返す(`Bound::Unbounded`は
+    /// 値を持たないためどちらの検査も受けない)。
+    ///
+    /// 開始位置となる葉をRootから1回だけ`find_leaf`(または、下限が
+    /// `Unbounded`なら[`Self::leftmost_leaf`])で探し、以後は
+    /// [`crate::btree_page::LeafPageRef::next_leaf`]が指す右隣の葉を
+    /// たどるだけで進む。Rootへ戻る必要が無いのは、B+Treeの全データが
+    /// 葉に、かつキー順に並んでいるという性質(第23章)による。
+    pub fn range<'a>(&'a self, lower: Bound<&Value>, upper: Bound<&Value>) -> DbResult<RangeScan<'a>> {
+        let lower_bytes = self.encode_bound(lower)?;
+        let upper_bytes = self.encode_bound(upper)?;
+
+        // `Included`は一致の最初の葉から出発する必要がある(同じキーが複数の
+        // 葉にまたがる場合、それより左を取りこぼさないため)。`Excluded`は
+        // `key`そのものより後ろへ進みたいだけなので、一致の最後の葉
+        // (`find_leaf`、点検索と同じ探索)から出発し、そのページ内で`key`を
+        // 追い越す位置まで前進すれば足りる(下の`start_index`を参照)。
+        let start_leaf = match &lower_bytes {
+            Bound::Unbounded => self.leftmost_leaf()?,
+            Bound::Included(k) => self.find_leaf_for_lower_bound(k)?,
+            Bound::Excluded(k) => self.find_leaf(k)?,
+        };
+        let start_index = {
+            let guard = self.pool.read_page(start_leaf)?;
+            let view = LeafPageRef::open(guard.data())?;
+            match &lower_bytes {
+                Bound::Unbounded => 0,
+                Bound::Included(k) => match view.find(k) {
+                    Ok(mut i) => {
+                        while i > 0 && view.key(i - 1) == k.as_slice() {
+                            i -= 1;
+                        }
+                        i
+                    }
+                    Err(i) => i,
+                },
+                Bound::Excluded(k) => match view.find(k) {
+                    Ok(mut hi) => {
+                        while hi + 1 < view.entry_count() && view.key(hi + 1) == k.as_slice() {
+                            hi += 1;
+                        }
+                        hi + 1
+                    }
+                    Err(i) => i,
+                },
+            }
+        };
+
+        Ok(RangeScan { pool: &self.pool, key_type: self.key_type, upper: upper_bytes, current: Some((start_leaf, start_index)) })
+    }
+
+    /// `bound`(境界の値)をキーのバイト列へエンコードする。`Bound::Unbounded`は
+    /// 値を持たないため`check_key_type`・`encode_key`のどちらも呼ばない。
+    fn encode_bound(&self, bound: Bound<&Value>) -> DbResult<Bound<Vec<u8>>> {
+        match bound {
+            Bound::Unbounded => Ok(Bound::Unbounded),
+            Bound::Included(v) => {
+                self.check_key_type(v)?;
+                Ok(Bound::Included(encode_key(v)?))
+            }
+            Bound::Excluded(v) => {
+                self.check_key_type(v)?;
+                Ok(Bound::Excluded(encode_key(v)?))
+            }
+        }
+    }
+
+    /// Rootから常に`leftmost_child`をたどり、木の中で最も左のLeaf Pageに
+    /// たどり着く。[`Self::height`]と同じ経路だが、葉のPageIdそのものが
+    /// 欲しい`range`(下限が`Unbounded`の場合)から使う。
+    fn leftmost_leaf(&self) -> DbResult<PageId> {
+        let mut current = self.root;
+        loop {
+            let guard = self.pool.read_page(current)?;
+            match guard.page_type() {
+                PageType::BTreeLeaf => return Ok(current),
+                PageType::BTreeInternal => {
+                    let view = InternalPageRef::open(guard.data())?;
+                    let next = view.leftmost_child();
+                    drop(guard);
+                    current = next;
+                }
+                other => return Err(unexpected_page_type(current, other)),
+            }
+        }
+    }
+
+    /// `key`と`rid`の対応を1件削除する(Lazy Delete)。
+    ///
+    /// `find_leaf`でたどり着いた1枚のLeaf Pageから、`key`と`rid`の両方が
+    /// 一致するエントリを取り除いて書き戻す。一致する`(key, rid)`が
+    /// 見つかって削除できたら`true`、そもそも存在しなければ`false`を返す。
+    /// 同じキーに複数の`RecordId`が対応している場合、削除するのは`rid`が
+    /// 一致する1件だけである。
+    ///
+    /// **Redistribution・Merge・Root縮小は行わない**。エントリを取り除いた
+    /// 結果、Leaf Pageの占有率がどれだけ下がっても、隣接するページと
+    /// 融通し合ったり1枚にまとめたりしない(モジュールドキュメントの
+    /// 「スコープ」を参照)。木の形(高さ、ページ数)は`delete`によって
+    /// 縮む方向には変化しない。
+    ///
+    /// `key`が`Value::Null`なら`DbError::NullKeyNotAllowed`、このツリーの
+    /// `key_type()`と異なる型なら`DbError::BTreeKeyTypeMismatch`を返す。
+    pub fn delete(&mut self, key: &Value, rid: RecordId) -> DbResult<bool> {
         self.check_key_type(key)?;
         let key_bytes = encode_key(key)?;
 
         let leaf_id = self.find_leaf(&key_bytes)?;
-        let guard = self.pool.read_page(leaf_id)?;
-        let view = LeafPageRef::open(guard.data())?;
+        let mut entries = {
+            let guard = self.pool.read_page(leaf_id)?;
+            LeafPageRef::open(guard.data())?.entries()
+        };
+        let Some(pos) = entries.iter().position(|(k, r)| k.as_slice() == key_bytes.as_slice() && *r == rid) else {
+            return Ok(false);
+        };
+        entries.remove(pos);
 
-        let mut result = Vec::new();
-        if let Ok(i) = view.find(&key_bytes) {
-            let mut lo = i;
-            while lo > 0 && view.key(lo - 1) == key_bytes.as_slice() {
-                lo -= 1;
-            }
-            let mut hi = i;
-            while hi + 1 < view.entry_count() && view.key(hi + 1) == key_bytes.as_slice() {
-                hi += 1;
-            }
-            for j in lo..=hi {
-                result.push(view.record_id(j));
-            }
-        }
-        Ok(result)
+        let mut guard = self.pool.write_page(leaf_id)?;
+        let mut page = LeafPage::open(guard.data_mut())?;
+        let fits = page.write_entries(&entries);
+        debug_assert!(fits, "エントリを取り除くだけの書き込みが収まらないのは、write_entriesの実装が壊れている場合に限る");
+        Ok(true)
     }
 
     /// `key`と`rid`の対応を1件挿入する。
@@ -255,9 +399,14 @@ impl BTree {
     /// `key`が`Value::Null`なら`DbError::NullKeyNotAllowed`、このツリーの
     /// `key_type()`と異なる型なら`DbError::BTreeKeyTypeMismatch`を返す。
     /// キー1件(またはキー1本の区切りキー)だけでも空のページに収まらない
-    /// ほど大きい場合は`DbError::BTreeKeyTooLarge`を返す。
+    /// ほど大きい場合は`DbError::BTreeKeyTooLarge`を返す。このツリーが
+    /// `unique`(第24章)なら、`key`がすでに存在する場合に
+    /// `DbError::BTreeUniqueViolation`を返す。
     pub fn insert(&mut self, key: &Value, rid: RecordId) -> DbResult<()> {
         self.check_key_type(key)?;
+        if self.unique && !self.lookup(key)?.is_empty() {
+            return Err(DbError::BTreeUniqueViolation);
+        }
         let key_bytes = encode_key(key)?;
 
         // Rootから葉まで下りながら、通過したInternal Pageの`PageId`を
@@ -364,6 +513,13 @@ impl BTree {
     /// 新しいLeaf Pageにも物理的にコピーされたまま残る点が、後述の
     /// [`Self::split_internal`]との非対称性である(モジュール冒頭のドキュメント
     /// 「分割の不変条件」は本文(book)で扱う)。
+    ///
+    /// 第24章で、Leaf間リンク(`next_leaf`)の繋ぎ直しが加わった。`current_id`が
+    /// 元々指していた右隣(`old_next`)を新しいページ(`new_id`)へ引き継ぎ、
+    /// `current_id`自身の`next_leaf`は`new_id`を指すよう書き換える。この2行を
+    /// 忘れると、分割の前後で「`current_id`の次は`old_next`」というリンクが
+    /// 新しいページを飛び越したまま残り、`new_id`に移ったエントリへRange Scan
+    /// (`range`)がたどり着けなくなる。
     fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbResult<(Vec<u8>, PageId)> {
         if entries.len() < 2 {
             let max_len = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -373,20 +529,24 @@ impl BTree {
         let (left, right) = entries.split_at(mid);
         let separator = right[0].0.clone();
 
-        {
+        let new_id = self.pool.allocate_page(PageType::BTreeLeaf)?;
+        let old_next = {
             let mut guard = self.pool.write_page(current_id)?;
             let mut page = LeafPage::open(guard.data_mut())?;
+            let old_next = page.as_ref().next_leaf();
             if !page.write_entries(left) {
                 return Err(DbError::BTreeKeyTooLarge(separator.len()));
             }
-        }
-        let new_id = self.pool.allocate_page(PageType::BTreeLeaf)?;
+            page.set_next_leaf(new_id);
+            old_next
+        };
         {
             let mut guard = self.pool.write_page(new_id)?;
             let mut page = LeafPage::init(guard.data_mut());
             if !page.write_entries(right) {
                 return Err(DbError::BTreeKeyTooLarge(separator.len()));
             }
+            page.set_next_leaf(old_next);
         }
         Ok((separator, new_id))
     }
@@ -445,6 +605,33 @@ impl BTree {
         }
     }
 
+    /// `key_bytes`を含みうる**最も左側**のLeaf Pageを、Rootから下って探す。
+    /// [`Self::find_leaf`]との違いは
+    /// [`InternalPageRef::child_for_lower_bound`]のドキュメントを参照。
+    ///
+    /// [`Self::range`]が下限(`Bound::Included`)の開始位置を決めるために使う。
+    /// 同じキーを持つエントリが複数のLeaf Pageにまたがっている場合、
+    /// `find_leaf`(既存の探索、`insert`・`lookup`の点検索が使う)は一致の
+    /// 最後の葉を返すため、そこから[`crate::btree_page::LeafPageRef::next_leaf`]
+    /// で右方向にしか進めないRange Scanの出発点には使えない
+    /// (それより左の葉に残っている同じキーのエントリを取りこぼす)。
+    fn find_leaf_for_lower_bound(&self, key_bytes: &[u8]) -> DbResult<PageId> {
+        let mut current = self.root;
+        loop {
+            let guard = self.pool.read_page(current)?;
+            match guard.page_type() {
+                PageType::BTreeLeaf => return Ok(current),
+                PageType::BTreeInternal => {
+                    let view = InternalPageRef::open(guard.data())?;
+                    let next = view.child_for_lower_bound(key_bytes);
+                    drop(guard);
+                    current = next;
+                }
+                other => return Err(unexpected_page_type(current, other)),
+            }
+        }
+    }
+
     /// Rootを`new_root`へ切り替え、Metaページへ永続化する。
     fn set_root(&mut self, new_root: PageId) -> DbResult<()> {
         self.root = new_root;
@@ -457,6 +644,7 @@ impl BTree {
         let data = guard.data_mut();
         data[0..8].copy_from_slice(&self.root.0.to_le_bytes());
         data[8] = data_type_to_u8(self.key_type);
+        data[9] = u8::from(self.unique);
         Ok(())
     }
 
@@ -483,6 +671,78 @@ impl BTree {
     /// 直近の`flush`までの変更を、OSに対して実ディスクへ同期するよう要求する。
     pub fn sync(&self) -> DbResult<()> {
         self.pool.sync()
+    }
+}
+
+/// [`BTree::range`]が返すイテレータ。
+///
+/// 現在読んでいるLeaf Pageの`PageId`とページ内の添字(`current`)だけを保持し、
+/// ページ内のエントリを読み尽くしたら`next_leaf`(第24章)が指す右隣の葉を
+/// 読み込む。[`crate::heap_file::Scan`](第13章)が「現在のページと走査位置」
+/// だけを持ってテーブル全体を読み進めるのと同じ設計であり、`BTree`全体を
+/// 一度にメモリへ読み込むことはしない。
+pub struct RangeScan<'a> {
+    pool: &'a BufferPool,
+    key_type: DataType,
+    /// 上限。`Bound::Unbounded`ならどのキーも上限を超えない。
+    upper: Bound<Vec<u8>>,
+    /// 次に読むべき`(Leaf PageのId, そのページ内での添字)`。読み終えたら`None`。
+    current: Option<(PageId, usize)>,
+}
+
+impl RangeScan<'_> {
+    /// `key`が上限を超えているかどうか。
+    fn exceeds_upper(&self, key: &[u8]) -> bool {
+        match &self.upper {
+            Bound::Unbounded => false,
+            Bound::Included(k) => key > k.as_slice(),
+            Bound::Excluded(k) => key >= k.as_slice(),
+        }
+    }
+}
+
+impl Iterator for RangeScan<'_> {
+    type Item = DbResult<(Value, RecordId)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (leaf_id, index) = self.current?;
+            let guard = match self.pool.read_page(leaf_id) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    self.current = None;
+                    return Some(Err(err));
+                }
+            };
+            let view = match LeafPageRef::open(guard.data()) {
+                Ok(view) => view,
+                Err(err) => {
+                    self.current = None;
+                    return Some(Err(err));
+                }
+            };
+
+            if index < view.entry_count() {
+                let key_bytes = view.key(index);
+                if self.exceeds_upper(key_bytes) {
+                    self.current = None;
+                    return None;
+                }
+                let rid = view.record_id(index);
+                let key_owned = key_bytes.to_vec();
+                self.current = Some((leaf_id, index + 1));
+                drop(guard);
+                return Some(decode_key(self.key_type, &key_owned).map(|value| (value, rid)));
+            }
+
+            let next_leaf = view.next_leaf();
+            drop(guard);
+            if next_leaf == NO_NEXT_LEAF {
+                self.current = None;
+                return None;
+            }
+            self.current = Some((next_leaf, 0));
+        }
     }
 }
 
@@ -548,10 +808,11 @@ fn decode_bigint(bytes: [u8; 8]) -> i64 {
     (u64::from_be_bytes(bytes) ^ 0x8000_0000_0000_0000) as i64
 }
 
-/// `encode_key`が生成したバイト列を`Value`へ復元する。この章の探索経路
-/// (`lookup`・`insert`)はこの関数を一度も呼ばない(モジュールドキュメント
-/// 参照)。テストと、将来のRange Scan(第24章)向けに用意してある。
-#[cfg_attr(not(test), allow(dead_code))]
+/// `encode_key`が生成したバイト列を`Value`へ復元する。第23章の時点では
+/// テストのためだけに存在したが、この章の[`RangeScan`]が返す`(Value,
+/// RecordId)`の`Value`側を組み立てるのに使う(`lookup`・`insert`の探索経路
+/// 自体は引き続きこの関数を呼ばない。バイト列のまま比較が完結するという
+/// 設計は変えていない)。
 fn decode_key(key_type: DataType, bytes: &[u8]) -> DbResult<Value> {
     match key_type {
         DataType::Boolean => match bytes {
@@ -610,7 +871,7 @@ mod tests {
 
     fn open_btree(path: &std::path::Path, key_type: DataType) -> BTree {
         let disk = DiskManager::open(path).unwrap();
-        BTree::create(BufferPool::new(disk, 64), key_type).unwrap()
+        BTree::create(BufferPool::new(disk, 64), key_type, false).unwrap()
     }
 
     fn rid(page: u64, slot: u16) -> RecordId {
@@ -856,7 +1117,7 @@ mod tests {
         let mut inserted = Vec::new();
         {
             let disk = DiskManager::open(&path).unwrap();
-            let mut btree = BTree::create(BufferPool::new(disk, 32), DataType::BigInt).unwrap();
+            let mut btree = BTree::create(BufferPool::new(disk, 32), DataType::BigInt, false).unwrap();
             for i in 0..800i64 {
                 let record = rid(1, (i % 1000) as u16);
                 btree.insert(&Value::BigInt(i), record).unwrap();
@@ -898,7 +1159,7 @@ mod tests {
         for &n in &[1_000i64, 2_000, 4_000, 8_000, 16_000] {
             let path = temp_path(&format!("lookup-bench-{n}"));
             let disk = DiskManager::open(&path).unwrap();
-            let mut btree = BTree::create(BufferPool::new(disk, 256), DataType::BigInt).unwrap();
+            let mut btree = BTree::create(BufferPool::new(disk, 256), DataType::BigInt, false).unwrap();
             for i in 0..n {
                 btree.insert(&Value::BigInt(i), rid(1, 0)).unwrap();
             }
@@ -911,5 +1172,299 @@ mod tests {
 
             std::fs::remove_file(&path).unwrap();
         }
+    }
+
+    // ---- 第24章: Range Scan ----
+
+    fn collect_range(btree: &BTree, lower: Bound<&Value>, upper: Bound<&Value>) -> Vec<(i64, RecordId)> {
+        btree
+            .range(lower, upper)
+            .unwrap()
+            .map(|entry| {
+                let (value, rid) = entry.unwrap();
+                let Value::BigInt(n) = value else { panic!("BIGINTキーのはず") };
+                (n, rid)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn range_with_both_bounds_included() {
+        let path = temp_path("range-included");
+        let mut btree = open_btree(&path, DataType::BigInt);
+        for i in 0..20i64 {
+            btree.insert(&Value::BigInt(i), rid(1, i as u16)).unwrap();
+        }
+        let found = collect_range(&btree, Bound::Included(&Value::BigInt(5)), Bound::Included(&Value::BigInt(10)));
+        assert_eq!(found.iter().map(|(n, _)| *n).collect::<Vec<_>>(), (5..=10).collect::<Vec<_>>());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn range_with_excluded_bounds() {
+        let path = temp_path("range-excluded");
+        let mut btree = open_btree(&path, DataType::BigInt);
+        for i in 0..20i64 {
+            btree.insert(&Value::BigInt(i), rid(1, i as u16)).unwrap();
+        }
+        let found = collect_range(&btree, Bound::Excluded(&Value::BigInt(5)), Bound::Excluded(&Value::BigInt(10)));
+        assert_eq!(found.iter().map(|(n, _)| *n).collect::<Vec<_>>(), (6..=9).collect::<Vec<_>>());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn range_unbounded_on_both_sides_returns_everything_in_order() {
+        let path = temp_path("range-unbounded");
+        let mut btree = open_btree(&path, DataType::BigInt);
+        let order = shuffled(500, 0x1111_2222_3333_4444);
+        for &i in &order {
+            btree.insert(&Value::BigInt(i), rid(1, (i % 1000) as u16)).unwrap();
+        }
+        let found = collect_range(&btree, Bound::Unbounded, Bound::Unbounded);
+        assert_eq!(found.iter().map(|(n, _)| *n).collect::<Vec<_>>(), (0..500).collect::<Vec<_>>());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn range_one_sided_bounds() {
+        let path = temp_path("range-one-sided");
+        let mut btree = open_btree(&path, DataType::BigInt);
+        for i in 0..20i64 {
+            btree.insert(&Value::BigInt(i), rid(1, i as u16)).unwrap();
+        }
+        let lower_only = collect_range(&btree, Bound::Included(&Value::BigInt(15)), Bound::Unbounded);
+        assert_eq!(lower_only.iter().map(|(n, _)| *n).collect::<Vec<_>>(), (15..20).collect::<Vec<_>>());
+
+        let upper_only = collect_range(&btree, Bound::Unbounded, Bound::Excluded(&Value::BigInt(3)));
+        assert_eq!(upper_only.iter().map(|(n, _)| *n).collect::<Vec<_>>(), (0..3).collect::<Vec<_>>());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn range_that_matches_nothing_is_empty() {
+        let path = temp_path("range-empty");
+        let mut btree = open_btree(&path, DataType::BigInt);
+        for i in 0..20i64 {
+            btree.insert(&Value::BigInt(i), rid(1, i as u16)).unwrap();
+        }
+        // 下限が上限を上回る範囲。
+        let found = collect_range(&btree, Bound::Included(&Value::BigInt(100)), Bound::Included(&Value::BigInt(200)));
+        assert!(found.is_empty());
+
+        // 空の木に対する範囲検索。
+        let empty_path = temp_path("range-empty-tree");
+        let empty = open_btree(&empty_path, DataType::BigInt);
+        assert!(collect_range(&empty, Bound::Unbounded, Bound::Unbounded).is_empty());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&empty_path).unwrap();
+    }
+
+    /// 第23章が明示していた限界(「同じキーを持つエントリがLeaf Splitに
+    /// よって複数ページへ分かれると、lookupは取りこぼす」)が、Leaf間リンクを
+    /// 使う`range`(と、それを呼ぶ`lookup`)によって解消されていることを
+    /// 確認する回帰テスト。幅の広い`TEXT`キーで1ページに収まるエントリ数を
+    /// 減らし、同じキーを大量に挿入してLeaf Splitを強制的に起こす。
+    #[test]
+    fn duplicate_keys_spanning_multiple_leaves_are_no_longer_dropped() {
+        let path = temp_path("dup-spanning-leaves");
+        let mut btree = open_btree(&path, DataType::Text);
+        let wide_value = "x".repeat(120);
+        let n = 400usize;
+        for i in 0..n {
+            btree.insert(&Value::Text(wide_value.clone()), rid(1, (i % 1000) as u16)).unwrap();
+        }
+        assert!(btree.height().unwrap() >= 2, "幅の広いキーを400件挿入すればLeaf Splitが起きているはず");
+
+        let found = btree.lookup(&Value::Text(wide_value)).unwrap();
+        assert_eq!(found.len(), n, "全ページにまたがる重複キーを取りこぼさずに返すはず");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// `std::collections::BTreeMap`をモデルとして、`range`の結果がモデルの
+    /// 範囲検索(`BTreeMap::range`)と一致することを確認する。
+    #[test]
+    fn range_matches_a_btreemap_model() {
+        let path = temp_path("range-model");
+        let mut btree = open_btree(&path, DataType::BigInt);
+        let n = 3_000usize;
+        let order = shuffled(n, 0x5a5a_1234_9876_5432);
+
+        let mut model: BTreeMap<i64, RecordId> = BTreeMap::new();
+        for &i in &order {
+            let record = rid((i as u64 / 100) + 1, (i as u16) % 100);
+            btree.insert(&Value::BigInt(i), record).unwrap();
+            model.insert(i, record);
+        }
+
+        let lower = 700i64;
+        let upper = 2_400i64;
+        let expected: Vec<(i64, RecordId)> =
+            model.range(lower..=upper).map(|(&key, &record)| (key, record)).collect();
+        let actual = collect_range(&btree, Bound::Included(&Value::BigInt(lower)), Bound::Included(&Value::BigInt(upper)));
+        assert_eq!(actual, expected);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    // ---- 第24章: unique フラグ ----
+
+    #[test]
+    fn unique_tree_rejects_a_duplicate_key() {
+        let path = temp_path("unique-reject");
+        let disk = DiskManager::open(&path).unwrap();
+        let mut btree = BTree::create(BufferPool::new(disk, 64), DataType::BigInt, true).unwrap();
+        btree.insert(&Value::BigInt(1), rid(1, 0)).unwrap();
+        let err = btree.insert(&Value::BigInt(1), rid(1, 1)).unwrap_err();
+        assert!(matches!(err, DbError::BTreeUniqueViolation));
+        // 拒否された挿入は反映されない。
+        assert_eq!(btree.lookup(&Value::BigInt(1)).unwrap(), vec![rid(1, 0)]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn non_unique_tree_still_accepts_duplicates() {
+        let path = temp_path("non-unique-accept");
+        let mut btree = open_btree(&path, DataType::BigInt);
+        assert!(!btree.is_unique());
+        btree.insert(&Value::BigInt(1), rid(1, 0)).unwrap();
+        btree.insert(&Value::BigInt(1), rid(1, 1)).unwrap();
+        assert_eq!(btree.lookup(&Value::BigInt(1)).unwrap().len(), 2);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn unique_flag_survives_reopen() {
+        let path = temp_path("unique-reopen");
+        {
+            let disk = DiskManager::open(&path).unwrap();
+            let mut btree = BTree::create(BufferPool::new(disk, 64), DataType::BigInt, true).unwrap();
+            btree.insert(&Value::BigInt(1), rid(1, 0)).unwrap();
+            btree.flush().unwrap();
+            btree.sync().unwrap();
+        }
+        let disk = DiskManager::open(&path).unwrap();
+        let mut reopened = BTree::open(BufferPool::new(disk, 64)).unwrap();
+        assert!(reopened.is_unique());
+        let err = reopened.insert(&Value::BigInt(1), rid(1, 9)).unwrap_err();
+        assert!(matches!(err, DbError::BTreeUniqueViolation));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    // ---- 第24章: Delete(Lazy Delete) ----
+
+    #[test]
+    fn delete_removes_the_matching_entry_and_lookup_no_longer_finds_it() {
+        let path = temp_path("delete-basic");
+        let mut btree = open_btree(&path, DataType::BigInt);
+        btree.insert(&Value::BigInt(1), rid(1, 0)).unwrap();
+        btree.insert(&Value::BigInt(2), rid(1, 1)).unwrap();
+
+        assert!(btree.delete(&Value::BigInt(1), rid(1, 0)).unwrap());
+        assert_eq!(btree.lookup(&Value::BigInt(1)).unwrap(), Vec::new());
+        assert_eq!(btree.lookup(&Value::BigInt(2)).unwrap(), vec![rid(1, 1)]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn delete_of_a_missing_entry_returns_false_and_changes_nothing() {
+        let path = temp_path("delete-missing");
+        let mut btree = open_btree(&path, DataType::BigInt);
+        btree.insert(&Value::BigInt(1), rid(1, 0)).unwrap();
+
+        assert!(!btree.delete(&Value::BigInt(1), rid(9, 9)).unwrap(), "キーは一致するがridが違う");
+        assert!(!btree.delete(&Value::BigInt(42), rid(1, 0)).unwrap(), "キー自体が存在しない");
+        assert_eq!(btree.lookup(&Value::BigInt(1)).unwrap(), vec![rid(1, 0)]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn delete_removes_only_the_matching_rid_among_duplicate_keys() {
+        let path = temp_path("delete-duplicate-key");
+        let mut btree = open_btree(&path, DataType::BigInt);
+        btree.insert(&Value::BigInt(5), rid(1, 0)).unwrap();
+        btree.insert(&Value::BigInt(5), rid(1, 1)).unwrap();
+        btree.insert(&Value::BigInt(5), rid(2, 0)).unwrap();
+
+        assert!(btree.delete(&Value::BigInt(5), rid(1, 1)).unwrap());
+        let mut remaining = btree.lookup(&Value::BigInt(5)).unwrap();
+        remaining.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        assert_eq!(remaining, vec![rid(1, 0), rid(2, 0)]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Lazy Delete: エントリが減ってもRedistribution・Mergeが起きないため、
+    /// 一度大きく育った木の高さは、削除しても縮まない(モジュールドキュメント
+    /// 「スコープ」を参照)。
+    #[test]
+    fn delete_does_not_shrink_the_tree_height() {
+        let path = temp_path("delete-lazy");
+        let mut btree = open_btree(&path, DataType::Text);
+        let wide_key = |i: usize| format!("{i:0>8}-{}", "x".repeat(120));
+        let n = 1_000usize;
+        for i in 0..n {
+            btree.insert(&Value::Text(wide_key(i)), rid(1, (i % 1000) as u16)).unwrap();
+        }
+        let height_before = btree.height().unwrap();
+        assert!(height_before >= 2);
+
+        for i in 0..n - 1 {
+            assert!(btree.delete(&Value::Text(wide_key(i)), rid(1, (i % 1000) as u16)).unwrap());
+        }
+        // Lazy Deleteなので、ほぼ全件削除しても高さは縮まない。
+        assert_eq!(btree.height().unwrap(), height_before);
+        // 削除しなかった最後の1件は、削除で空になった葉が木の中に残っていても
+        // 正しく引ける。
+        assert_eq!(btree.lookup(&Value::Text(wide_key(n - 1))).unwrap(), vec![rid(1, ((n - 1) % 1000) as u16)]);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn delete_then_lookup_and_range_agree_after_a_seeded_random_workload() {
+        let path = temp_path("delete-model");
+        let mut btree = open_btree(&path, DataType::BigInt);
+        let n = 2_000usize;
+        let order = shuffled(n, 0x2468_1357_ace0_bdf1);
+
+        let mut model: BTreeMap<i64, RecordId> = BTreeMap::new();
+        for &i in &order {
+            let record = rid(1, (i % 1000) as u16);
+            btree.insert(&Value::BigInt(i), record).unwrap();
+            model.insert(i, record);
+        }
+
+        // 半分をシャッフル順のまま削除する。
+        for &i in &order[..n / 2] {
+            let record = *model.get(&i).unwrap();
+            assert!(btree.delete(&Value::BigInt(i), record).unwrap());
+            model.remove(&i);
+        }
+
+        for (&key, &expected) in &model {
+            assert_eq!(btree.lookup(&Value::BigInt(key)).unwrap(), vec![expected], "key={key}");
+        }
+        for &i in &order[..n / 2] {
+            assert_eq!(btree.lookup(&Value::BigInt(i)).unwrap(), Vec::new(), "削除済みのkey={i}が残っている");
+        }
+
+        let all_via_range = collect_range(&btree, Bound::Unbounded, Bound::Unbounded);
+        let expected_via_model: Vec<(i64, RecordId)> = model.iter().map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(all_via_range, expected_via_model);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn delete_rejects_null_and_wrong_type() {
+        let path = temp_path("delete-validation");
+        let mut btree = open_btree(&path, DataType::BigInt);
+        assert!(matches!(btree.delete(&Value::Null, rid(1, 0)), Err(DbError::NullKeyNotAllowed)));
+        assert!(matches!(
+            btree.delete(&Value::Text("x".to_string()), rid(1, 0)),
+            Err(DbError::BTreeKeyTypeMismatch { .. })
+        ));
+        std::fs::remove_file(&path).unwrap();
     }
 }

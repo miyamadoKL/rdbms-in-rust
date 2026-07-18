@@ -45,8 +45,8 @@
 
 use std::path::Path;
 
-use crate::ast::{CreateTableStatement, DropTableStatement, Statement};
-use crate::binder::{Binder, BoundStatement};
+use crate::ast::{CreateTableStatement, DropIndexStatement, DropTableStatement, Statement};
+use crate::binder::{Binder, BoundCreateIndex, BoundStatement};
 use crate::catalog::Catalog;
 use crate::error::{DbError, DbResult};
 use crate::eval::FunctionRegistry;
@@ -66,9 +66,17 @@ use crate::types::{Column, DataType, Schema, Tuple, Value};
 /// プロセスのメモリ上だけの2つの部品に分けて持つ。`Disk`は両方を1つの
 /// `Storage`(第15章)にまとめて持ち、ファイルへ永続化する。モジュール冒頭の
 /// 説明も参照。
+///
+/// `Disk`の`storage`は`Box<Storage>`にしてある。第24章で`Storage`が索引の
+/// メタデータ・ファイルパス(`path: PathBuf`、`indexes: HashMap<...>`)を
+/// 追加で持つようになり、`Memory`variant(`Catalog` + `MemStorage`)より
+/// かなり大きくなった。`Backend`全体のサイズは一番大きいvariantに合わせて
+/// 確保されるため、`Box`で間接化しないと`Memory`を使うとき(インメモリDBの
+/// テストなど、この教材で最も頻繁な使い方)にも`Disk`分の大きさを毎回
+/// スタックに載せることになる。
 enum Backend {
     Memory { catalog: Catalog, storage: MemStorage },
-    Disk { storage: Storage },
+    Disk { storage: Box<Storage> },
 }
 
 /// minidbのデータベース1つを表す。
@@ -120,7 +128,7 @@ impl Database {
         };
         Ok(Database {
             functions: FunctionRegistry::with_builtins(),
-            backend: Backend::Disk { storage },
+            backend: Backend::Disk { storage: Box::new(storage) },
         })
     }
 
@@ -171,7 +179,7 @@ impl Database {
     fn bind(&self, statement: Statement, sql: &str) -> DbResult<BoundStatement> {
         match &self.backend {
             Backend::Memory { catalog, .. } => Binder::new(catalog, &self.functions, sql).bind(statement),
-            Backend::Disk { storage } => Binder::new(storage, &self.functions, sql).bind(statement),
+            Backend::Disk { storage } => Binder::new(storage.as_ref(), &self.functions, sql).bind(statement),
         }
     }
 
@@ -190,6 +198,8 @@ impl Database {
             BoundStatement::Select(select) => self.execute_select(logical_plan::build_select(*select)),
             BoundStatement::CreateTable(create) => self.execute_create_table(&create),
             BoundStatement::DropTable(drop) => self.execute_drop_table(&drop),
+            BoundStatement::CreateIndex(create) => self.execute_create_index(create),
+            BoundStatement::DropIndex(drop) => self.execute_drop_index(&drop),
             BoundStatement::Insert(insert) => self.execute_insert(logical_plan::build_insert(insert)),
             BoundStatement::Update(update) => self.execute_update(logical_plan::build_update(update)),
             BoundStatement::Delete(delete) => self.execute_delete(logical_plan::build_delete(delete)),
@@ -243,6 +253,16 @@ impl Database {
         }
 
         let schema = Schema::new(columns);
+        // 第24章: `PRIMARY KEY`・`UNIQUE`列に対応するUNIQUE索引を自動生成する
+        // ために、`Schema`(この後`storage.create_table`へ`move`する)から
+        // 先に必要な情報だけを複製しておく。
+        let constraint_columns: Vec<(String, bool)> = schema
+            .columns()
+            .iter()
+            .filter(|c| c.primary_key || c.unique)
+            .map(|c| (c.name.clone(), c.primary_key))
+            .collect();
+
         match &mut self.backend {
             Backend::Memory { catalog, storage } => {
                 let id = catalog.create_table(&create.table.name, schema)?;
@@ -250,9 +270,53 @@ impl Database {
             }
             Backend::Disk { storage } => {
                 storage.create_table(&create.table.name, schema)?;
+                // Index Build: この時点でテーブルは空なので、`create_constraint_index`
+                // が行うIndex Buildは実質何もしない(将来、この後に続けて
+                // `INSERT`が並ぶSQLスクリプトを一括実行するようになっても、
+                // この設計は変わらない)。
+                for (column_name, primary_key) in &constraint_columns {
+                    let index_name = format!("{}_{}_idx", create.table.name, column_name);
+                    storage.create_constraint_index(&index_name, &create.table.name, column_name, *primary_key)?;
+                }
             }
         }
         Ok(QueryResult::command("CREATE TABLE"))
+    }
+
+    /// `CREATE INDEX` / `CREATE UNIQUE INDEX`を実行する(第24章)。
+    ///
+    /// メモリバックエンド(`Database::memory`)は`crate::storage::Storage`を
+    /// 持たず、索引を作る先が無いため`DbError::NotImplemented`を返す。
+    /// `Binder`の`bind_create_index`は、`CatalogLookup::index_exists`が
+    /// メモリバックエンドで常に`false`を返すために索引名の重複を検出できず、
+    /// ここまで束縛が素通りしてくる(モジュール`crate::binder`のドキュメント
+    /// を参照)。
+    fn execute_create_index(&mut self, create: BoundCreateIndex) -> DbResult<QueryResult> {
+        match &mut self.backend {
+            Backend::Memory { .. } => Err(DbError::NotImplemented(
+                "CREATE INDEXはDatabase::open(ディスクバックエンド)でのみサポートされています".to_string(),
+            )),
+            Backend::Disk { storage } => {
+                storage.create_index(&create.index_name, &create.table_name, &create.column_name, create.unique)?;
+                Ok(QueryResult::command("CREATE INDEX"))
+            }
+        }
+    }
+
+    /// `DROP INDEX`を実行する(第24章)。`execute_create_index`と同じ理由で、
+    /// メモリバックエンドでは`DbError::NotImplemented`を返す(実際には
+    /// `bind_drop_index`が「索引が見つかりません」で先に拒むため、通常の
+    /// `Database::execute`経由ではここに到達しない)。
+    fn execute_drop_index(&mut self, drop: &DropIndexStatement) -> DbResult<QueryResult> {
+        match &mut self.backend {
+            Backend::Memory { .. } => Err(DbError::NotImplemented(
+                "DROP INDEXはDatabase::open(ディスクバックエンド)でのみサポートされています".to_string(),
+            )),
+            Backend::Disk { storage } => {
+                storage.drop_index(&drop.index.name)?;
+                Ok(QueryResult::command("DROP INDEX"))
+            }
+        }
     }
 
     /// `DROP TABLE`を実行し、テーブル定義とその行をまとめて削除する。
@@ -399,15 +463,21 @@ impl Database {
     ///
     /// `inner`は`Parser`(第19章)がすでに`SELECT`・`INSERT INTO`・`UPDATE`・
     /// `DELETE FROM`の4種類に絞っているため、`CreateTable`・`DropTable`・
-    /// 入れ子の`Explain`はここに渡ってこない。
+    /// `CreateIndex`・`DropIndex`(第24章)・入れ子の`Explain`はここに渡ってこない。
     fn execute_explain(&self, inner: BoundStatement) -> DbResult<QueryResult> {
         let logical = match inner {
             BoundStatement::Select(select) => logical_plan::build_select(*select),
             BoundStatement::Insert(insert) => logical_plan::build_insert(insert),
             BoundStatement::Update(update) => logical_plan::build_update(update),
             BoundStatement::Delete(delete) => logical_plan::build_delete(delete),
-            BoundStatement::CreateTable(_) | BoundStatement::DropTable(_) | BoundStatement::Explain(_) => {
-                unreachable!("ParserがEXPLAINの対象をSELECT・INSERT INTO・UPDATE・DELETE FROMに制限している")
+            BoundStatement::CreateTable(_)
+            | BoundStatement::DropTable(_)
+            | BoundStatement::CreateIndex(_)
+            | BoundStatement::DropIndex(_)
+            | BoundStatement::Explain(_) => {
+                unreachable!(
+                    "ParserがEXPLAINの対象をSELECT・INSERT INTO・UPDATE・DELETE FROMに制限している"
+                )
             }
         };
         let physical = physical_plan::optimize(logical);
@@ -2143,6 +2213,277 @@ mod tests {
             assert_eq!(hash_result.rows().len(), n);
             assert_eq!(nlj_result.rows().len(), n);
             eprintln!("n={n:>5}  HashJoin={hash_elapsed:>10?}  NestedLoopJoin={nlj_elapsed:>10?}");
+        }
+    }
+
+    // ---- CREATE INDEX / DROP INDEX / Index Maintenance(第24章) ----
+
+    /// `QueryResult`は`Debug`を実装していない(第5章から変わっていない)ため、
+    /// `unwrap_err`はそのまま使えない。`storage`モジュールの`expect_err`と
+    /// 同じ理由の小さなヘルパー。
+    fn expect_error(result: DbResult<QueryResult>) -> DbError {
+        match result {
+            Ok(_) => panic!("エラーを期待しましたが成功しました"),
+            Err(err) => err,
+        }
+    }
+
+    fn users_pk_unique_disk_db(path: &std::path::Path) -> Database {
+        let mut db = Database::open(path).unwrap();
+        db.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT UNIQUE, name TEXT)").unwrap();
+        db
+    }
+
+    #[test]
+    fn create_table_with_primary_key_auto_creates_a_unique_index() {
+        let path = temp_db_path("auto-index-pk");
+        let mut db = users_pk_unique_disk_db(&path);
+        // 自動生成された索引名(`{table}_{column}_idx`)へ、同じ名前の
+        // CREATE INDEXをぶつけると「すでに存在します」で拒否される。これが、
+        // PRIMARY KEY・UNIQUE列に対応する索引がすでに登録されている
+        // 間接証拠になる。
+        let err = expect_error(db.execute("CREATE INDEX users_id_idx ON users (id)"));
+        assert!(matches!(err, DbError::Bind { .. }));
+        let err = expect_error(db.execute("CREATE INDEX users_email_idx ON users (email)"));
+        assert!(matches!(err, DbError::Bind { .. }));
+
+        std::fs::remove_file(&path).unwrap();
+        for suffix in ["users_id_idx", "users_email_idx"] {
+            let _ = std::fs::remove_file(format!("{}.idx.{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn create_index_and_drop_index_round_trip() {
+        let path = temp_db_path("create-drop-index");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE users (id BIGINT NOT NULL, name TEXT)").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
+
+        assert_eq!(db.execute("CREATE INDEX idx_name ON users (name)").unwrap().to_string(), "CREATE INDEX");
+        // 同じ索引名は二重に作れない。
+        let err = expect_error(db.execute("CREATE INDEX idx_name ON users (name)"));
+        assert!(matches!(err, DbError::Bind { .. }));
+
+        assert_eq!(db.execute("DROP INDEX idx_name").unwrap().to_string(), "DROP INDEX");
+        // 削除済みの索引名はもう指定できない。
+        let err = expect_error(db.execute("DROP INDEX idx_name"));
+        assert!(matches!(err, DbError::Bind { .. }));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn create_index_on_unknown_table_or_column_is_a_bind_error() {
+        let path = temp_db_path("create-index-unknown");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE users (id BIGINT NOT NULL)").unwrap();
+
+        let err = expect_error(db.execute("CREATE INDEX idx ON ghosts (id)"));
+        assert!(matches!(err, DbError::Bind { .. }));
+        let err = expect_error(db.execute("CREATE INDEX idx ON users (ghost_column)"));
+        assert!(matches!(err, DbError::Bind { .. }));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn create_index_and_drop_index_are_rejected_on_the_memory_backend() {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE users (id BIGINT NOT NULL)").unwrap();
+        let err = expect_error(db.execute("CREATE INDEX idx ON users (id)"));
+        assert!(matches!(err, DbError::NotImplemented(_)));
+    }
+
+    #[test]
+    fn create_index_builds_from_rows_inserted_before_it_existed() {
+        let path = temp_db_path("index-build-from-existing");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE users (id BIGINT NOT NULL, name TEXT)").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')").unwrap();
+
+        db.execute("CREATE UNIQUE INDEX idx_name ON users (name)").unwrap();
+        // Index Buildが既存の重複を見逃していないことを、後から同じ値を
+        // 挿入して確認する。
+        let err = expect_error(db.execute("INSERT INTO users VALUES (4, 'Alice')"));
+        assert!(matches!(err, DbError::UniqueViolation { .. }));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn create_unique_index_on_a_table_with_existing_duplicates_is_rejected() {
+        let path = temp_db_path("index-build-rejects-existing-dup");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE users (id BIGINT NOT NULL, name TEXT)").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Alice')").unwrap();
+
+        let err = expect_error(db.execute("CREATE UNIQUE INDEX idx_name ON users (name)"));
+        assert!(matches!(err, DbError::UniqueViolation { .. }));
+        // 索引は作られていないので、後からのINSERTも制約されない。
+        db.execute("INSERT INTO users VALUES (3, 'Alice')").unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// 第20章の走査ベース検査(メモリバックエンド)と、第24章の索引ベース検査
+    /// (ディスクバックエンド)が、同じ違反に対して同じ種類のエラーを返すことを
+    /// 確認する。
+    #[test]
+    fn index_based_uniqueness_check_matches_the_scan_based_check() {
+        let mem_err = {
+            let mut db = Database::memory();
+            db.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT UNIQUE)").unwrap();
+            db.execute("INSERT INTO users VALUES (1, 'a@example.com')").unwrap();
+            expect_error(db.execute("INSERT INTO users VALUES (1, 'b@example.com')"))
+        };
+        assert!(matches!(mem_err, DbError::PrimaryKeyViolation { ref column, .. } if column == "id"));
+
+        let path = temp_db_path("index-matches-scan-pk");
+        let disk_err = {
+            let mut db = users_pk_unique_disk_db(&path);
+            db.execute("INSERT INTO users VALUES (1, 'a@example.com', 'Alice')").unwrap();
+            expect_error(db.execute("INSERT INTO users VALUES (1, 'b@example.com', 'Bob')"))
+        };
+        assert!(matches!(disk_err, DbError::PrimaryKeyViolation { ref column, .. } if column == "id"));
+        assert_eq!(mem_err.to_string(), disk_err.to_string());
+
+        let mem_unique_err = {
+            let mut db = Database::memory();
+            db.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT UNIQUE)").unwrap();
+            db.execute("INSERT INTO users VALUES (1, 'a@example.com')").unwrap();
+            expect_error(db.execute("INSERT INTO users VALUES (2, 'a@example.com')"))
+        };
+        let path2 = temp_db_path("index-matches-scan-unique");
+        let disk_unique_err = {
+            let mut db = users_pk_unique_disk_db(&path2);
+            db.execute("INSERT INTO users VALUES (1, 'a@example.com', 'Alice')").unwrap();
+            expect_error(db.execute("INSERT INTO users VALUES (2, 'a@example.com', 'Bob')"))
+        };
+        assert!(matches!(mem_unique_err, DbError::UniqueViolation { ref column, .. } if column == "email"));
+        assert_eq!(mem_unique_err.to_string(), disk_unique_err.to_string());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&path2).unwrap();
+    }
+
+    #[test]
+    fn insert_select_within_the_same_statement_is_still_checked_against_candidates() {
+        // 索引にはまだ無い値同士(同じINSERT文の中の2行)の重複は、索引への
+        // lookupだけでは検出できない(crate::index::check_uniqueness_with_indexの
+        // ドキュメント参照)。constraints::check_uniquenessのcandidates同士の
+        // 検査が引き続きこれを捕まえることを確認する。
+        let path = temp_db_path("candidates-within-statement");
+        let mut db = users_pk_unique_disk_db(&path);
+        let err = expect_error(
+            db.execute("INSERT INTO users VALUES (1, 'a@example.com', 'Alice'), (2, 'a@example.com', 'Bob')"),
+        );
+        assert!(matches!(err, DbError::UniqueViolation { .. }));
+        assert_eq!(db.execute("SELECT * FROM users").unwrap().rows().len(), 0, "All-or-Nothingで1行も入らない");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn update_maintains_the_index_including_when_the_record_id_moves() {
+        let path = temp_db_path("update-maintenance");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
+
+        // 十分大きな値へ更新し、同じページに収まらずRecordIdが変わる
+        // (ページをまたぐ移動が起きる)状況を作る。
+        let long_name = "x".repeat(3000);
+        db.execute(&format!("UPDATE users SET name = '{long_name}' WHERE id = 1")).unwrap();
+
+        // 索引(idのPRIMARY KEY索引)は、移動後のRecordIdを指したまま
+        // 一意性検査に使えなければならない。id=1と重複するINSERTはやはり拒否される。
+        let err = expect_error(db.execute("INSERT INTO users VALUES (1, 'Carol')"));
+        assert!(matches!(err, DbError::PrimaryKeyViolation { .. }));
+
+        // id自体を書き換えるUPDATEも、索引を通じて重複を検出する。
+        let err = expect_error(db.execute("UPDATE users SET id = 2 WHERE id = 1"));
+        assert!(matches!(err, DbError::PrimaryKeyViolation { .. }));
+
+        // 値を変えないUPDATE(自分自身との比較)は誤検出しない。
+        db.execute("UPDATE users SET id = 1 WHERE id = 1").unwrap();
+
+        // 2行が互いの値を交換するUPDATEも、索引ベースの検査で正しく許される。
+        db.execute("UPDATE users SET id = 3 WHERE id = 1").unwrap();
+        db.execute("UPDATE users SET id = 1 WHERE id = 2").unwrap();
+        db.execute("UPDATE users SET id = 2 WHERE id = 3").unwrap();
+        let mut ids: Vec<i64> = db
+            .execute("SELECT id FROM users")
+            .unwrap()
+            .rows()
+            .iter()
+            .map(|t| match t.values()[0] {
+                Value::BigInt(n) => n,
+                _ => panic!("BIGINTのはず"),
+            })
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2]);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn delete_then_reinsert_the_same_unique_value_succeeds() {
+        let path = temp_db_path("delete-then-reinsert");
+        let mut db = users_pk_unique_disk_db(&path);
+        db.execute("INSERT INTO users VALUES (1, 'a@example.com', 'Alice')").unwrap();
+
+        db.execute("DELETE FROM users WHERE id = 1").unwrap();
+        // 索引からもエントリが取り除かれていなければ、次のINSERTが
+        // (実際には存在しない行との)重複として誤って拒否されてしまう。
+        db.execute("INSERT INTO users VALUES (1, 'a@example.com', 'Alice')").unwrap();
+        assert_eq!(db.execute("SELECT * FROM users").unwrap().rows().len(), 1);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn indexed_table_survives_a_reopen_and_keeps_enforcing_constraints() {
+        let path = temp_db_path("indexed-table-reopen");
+        {
+            let mut db = users_pk_unique_disk_db(&path);
+            db.execute("INSERT INTO users VALUES (1, 'a@example.com', 'Alice')").unwrap();
+            db.execute("CREATE INDEX idx_name ON users (name)").unwrap();
+            db.flush().unwrap();
+        }
+
+        let mut db = Database::open(&path).unwrap();
+        // PRIMARY KEY・UNIQUE経由の索引も、明示的なCREATE INDEXの索引も、
+        // 再オープン後に引き続き機能する。
+        let err = expect_error(db.execute("INSERT INTO users VALUES (1, 'b@example.com', 'Bob')"));
+        assert!(matches!(err, DbError::PrimaryKeyViolation { .. }));
+        let err = expect_error(db.execute("CREATE INDEX idx_name ON users (name)"));
+        assert!(matches!(err, DbError::Bind { .. }), "idx_nameはreopen後も存在するはず");
+
+        db.execute("INSERT INTO users VALUES (2, 'b@example.com', 'Bob')").unwrap();
+        assert_eq!(db.execute("SELECT * FROM users").unwrap().rows().len(), 2);
+
+        std::fs::remove_file(&path).unwrap();
+        for suffix in ["users_id_idx", "users_email_idx", "idx_name"] {
+            let _ = std::fs::remove_file(format!("{}.idx.{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn drop_table_removes_its_auto_created_indexes_too() {
+        let path = temp_db_path("drop-table-removes-indexes");
+        let mut db = users_pk_unique_disk_db(&path);
+        db.execute("DROP TABLE users").unwrap();
+        // テーブルが無くなったので、同名の索引をもう一度自動生成できる
+        // (=以前の索引がカタログに残っていない)ことを、テーブルの再作成が
+        // 成功することで確認する。
+        db.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT UNIQUE, name TEXT)").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'a@example.com', 'Alice')").unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        for suffix in ["users_id_idx", "users_email_idx"] {
+            let _ = std::fs::remove_file(format!("{}.idx.{suffix}", path.display()));
         }
     }
 }

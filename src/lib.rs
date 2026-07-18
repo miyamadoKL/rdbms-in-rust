@@ -54,6 +54,7 @@ pub mod executor;
 pub mod free_space_map;
 pub mod heap_file;
 pub mod ids;
+pub mod index;
 pub mod lexer;
 pub mod logical_plan;
 pub mod page;
@@ -77,6 +78,7 @@ pub use eval::{FunctionRegistry, eval_expr};
 pub use free_space_map::FreeSpaceMap;
 pub use heap_file::{HeapFile, Scan};
 pub use ids::{PageId, RecordId, SlotId, TableId, TransactionId};
+pub use index::IndexInfo;
 pub use lexer::{Keyword, Span, Token, TokenKind, tokenize};
 pub use logical_plan::LogicalPlan;
 pub use page::{

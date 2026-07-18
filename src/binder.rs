@@ -51,8 +51,8 @@
 use std::collections::HashSet;
 
 use crate::ast::{
-    AggregateFunc, Assignment, BinaryOperator, CreateTableStatement, DeleteStatement,
-    DropTableStatement, Expr, FromClause, Ident, InsertStatement, JoinKind, SelectItem,
+    AggregateFunc, Assignment, BinaryOperator, CreateIndexStatement, CreateTableStatement, DeleteStatement,
+    DropIndexStatement, DropTableStatement, Expr, FromClause, Ident, InsertStatement, JoinKind, SelectItem,
     SelectStatement, Statement, UnaryOperator, UpdateStatement,
 };
 use crate::catalog::{Catalog, TableInfo};
@@ -74,6 +74,15 @@ use crate::types::{Column, DataType, Schema};
 pub trait CatalogLookup {
     /// テーブル名から`TableInfo`を引く。見つからなければ`None`を返す。
     fn table(&self, name: &str) -> Option<&TableInfo>;
+
+    /// 索引名がすでに登録されているかどうか(第24章、`CREATE INDEX`・
+    /// `DROP INDEX`の名前解決が使う)。既定は常に`false`であり、これは
+    /// `Catalog`(メモリバックエンド、`Database::memory`)がそもそも索引という
+    /// 概念を持たないことに対応する。索引を持つ`Storage`だけがこれを
+    /// override する。
+    fn index_exists(&self, _name: &str) -> bool {
+        false
+    }
 }
 
 impl CatalogLookup for Catalog {
@@ -85,6 +94,10 @@ impl CatalogLookup for Catalog {
 impl CatalogLookup for Storage {
     fn table(&self, name: &str) -> Option<&TableInfo> {
         Storage::table(self, name)
+    }
+
+    fn index_exists(&self, name: &str) -> bool {
+        Storage::index(self, name).is_some()
     }
 }
 
@@ -104,6 +117,13 @@ pub enum BoundStatement {
     Select(Box<BoundSelect>),
     CreateTable(CreateTableStatement),
     DropTable(DropTableStatement),
+    /// `CREATE INDEX` / `CREATE UNIQUE INDEX`(第24章)。`CreateTable`とは違い、
+    /// テーブル名・列名は既存のカタログエントリを指すため、`Binder`が
+    /// `table_id`・`column_index`まで解決する。
+    CreateIndex(BoundCreateIndex),
+    /// `DROP INDEX`(第24章)。`DropTable`と同じく、索引の存在をここで確認し、
+    /// 実行(カタログからの削除)は名前ベースのままでよいためASTをそのまま返す。
+    DropIndex(DropIndexStatement),
     Insert(BoundInsert),
     Update(BoundUpdate),
     Delete(BoundDelete),
@@ -112,6 +132,24 @@ pub enum BoundStatement {
     /// `CreateTable`・`DropTable`・入れ子の`Explain`にはならない
     /// (`Database::execute_explain`はその前提で網羅する)。
     Explain(Box<BoundStatement>),
+}
+
+/// 束縛済みの`CREATE INDEX`(第24章)。
+///
+/// `table_name`・`index_name`・`column_name`は表示用(エラーメッセージ・
+/// `Storage::create_index`の引数)に文字列のまま持つ。`table_id`・
+/// `column_index`は`Database::execute_create_index`が直接使わない
+/// (`Storage::create_index`は名前で引き直す、`CREATE TABLE`と同じ設計)が、
+/// `Binder`が名前解決に成功した証拠として残してある。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundCreateIndex {
+    pub index_name: String,
+    pub table_name: String,
+    pub table_id: TableId,
+    pub column_name: String,
+    pub column_index: usize,
+    pub unique: bool,
+    pub span: Span,
 }
 
 /// `FROM`(または`INSERT INTO`・`UPDATE`・`DELETE FROM`)が指す1テーブル。
@@ -438,6 +476,8 @@ impl<'a> Binder<'a> {
             Statement::Select(select) => self.bind_select(*select).map(|select| BoundStatement::Select(Box::new(select))),
             Statement::CreateTable(create) => Ok(BoundStatement::CreateTable(create)),
             Statement::DropTable(drop) => self.bind_drop_table(drop),
+            Statement::CreateIndex(create) => self.bind_create_index(create),
+            Statement::DropIndex(drop) => self.bind_drop_index(drop),
             Statement::Insert(insert) => self.bind_insert(insert).map(BoundStatement::Insert),
             Statement::Update(update) => self.bind_update(update).map(BoundStatement::Update),
             Statement::Delete(delete) => self.bind_delete(delete).map(BoundStatement::Delete),
@@ -476,6 +516,47 @@ impl<'a> Binder<'a> {
             .table(&drop.table.name)
             .ok_or_else(|| self.error_at(drop.table.span, format!("テーブルが見つかりません: {}", drop.table.name)))?;
         Ok(BoundStatement::DropTable(drop))
+    }
+
+    /// `CREATE INDEX`のテーブル名・列名を解決する(第24章)。
+    ///
+    /// テーブルが存在しない、または`table`にその名前の列が無ければ位置情報つきの
+    /// `DbError::Bind`にする。索引名がすでに使われているかどうかもここで検査する
+    /// (`Storage::create_index`自身も`DbError::DuplicateIndex`として検出するが、
+    /// `bind_drop_table`が採る方針と同じく、ここでは位置情報を持たせるために
+    /// 先に検査する)。実行(`Database::execute_create_index`)は名前で
+    /// `Storage::create_index`を呼び直す(`CREATE TABLE`と同じ設計)。
+    fn bind_create_index(&self, create: CreateIndexStatement) -> DbResult<BoundStatement> {
+        if self.catalog.index_exists(&create.index.name) {
+            return Err(self.error_at(create.index.span, format!("索引はすでに存在します: {}", create.index.name)));
+        }
+        let info = self
+            .catalog
+            .table(&create.table.name)
+            .ok_or_else(|| self.error_at(create.table.span, format!("テーブルが見つかりません: {}", create.table.name)))?;
+        let column_index = info.schema.index_of(&create.column.name).ok_or_else(|| {
+            self.error_at(create.column.span, format!("列が見つかりません: {}", create.column.name))
+        })?;
+
+        Ok(BoundStatement::CreateIndex(BoundCreateIndex {
+            index_name: create.index.name,
+            table_name: info.name.clone(),
+            table_id: info.id,
+            column_name: create.column.name,
+            column_index,
+            unique: create.unique,
+            span: create.span,
+        }))
+    }
+
+    /// `DROP INDEX`の索引名を解決する(第24章)。`bind_drop_table`と同じ理由で、
+    /// 存在確認だけをここで行い、実行は名前ベースのまま`DropIndexStatement`を
+    /// 素通りさせる。
+    fn bind_drop_index(&self, drop: DropIndexStatement) -> DbResult<BoundStatement> {
+        if !self.catalog.index_exists(&drop.index.name) {
+            return Err(self.error_at(drop.index.span, format!("索引が見つかりません: {}", drop.index.name)));
+        }
+        Ok(BoundStatement::DropIndex(drop))
     }
 
     fn bind_select(&self, select: SelectStatement) -> DbResult<BoundSelect> {

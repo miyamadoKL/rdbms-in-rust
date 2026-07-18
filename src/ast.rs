@@ -24,6 +24,10 @@ pub enum Statement {
     CreateTable(CreateTableStatement),
     /// `DROP TABLE`文。
     DropTable(DropTableStatement),
+    /// `CREATE INDEX` / `CREATE UNIQUE INDEX`文(第24章)。
+    CreateIndex(CreateIndexStatement),
+    /// `DROP INDEX`文(第24章)。
+    DropIndex(DropIndexStatement),
     /// `INSERT INTO`文。
     Insert(InsertStatement),
     /// `UPDATE`文。
@@ -44,6 +48,8 @@ impl Statement {
             Statement::Select(s) => s.span,
             Statement::CreateTable(s) => s.span,
             Statement::DropTable(s) => s.span,
+            Statement::CreateIndex(s) => s.span,
+            Statement::DropIndex(s) => s.span,
             Statement::Insert(s) => s.span,
             Statement::Update(s) => s.span,
             Statement::Delete(s) => s.span,
@@ -229,6 +235,28 @@ pub struct ColumnDef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropTableStatement {
     pub table: Ident,
+    pub span: Span,
+}
+
+/// `CREATE INDEX <index> ON <table> (<column>)`文(第24章)。
+///
+/// このSQLサブセットの索引キーは単一列に限る(`crate::btree`と同じ制約)ため、
+/// `(<column>)`の中は列名を1個だけ持つ。`UNIQUE`が指定されていれば`unique`が
+/// `true`になり、`PRIMARY KEY`・`UNIQUE`列に自動で作られる索引(`Database::execute_create_table`)と
+/// 同じ、キーの重複を`crate::btree::BTree`自身が拒否する索引になる。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndexStatement {
+    pub unique: bool,
+    pub index: Ident,
+    pub table: Ident,
+    pub column: Ident,
+    pub span: Span,
+}
+
+/// `DROP INDEX`文(第24章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropIndexStatement {
+    pub index: Ident,
     pub span: Span,
 }
 

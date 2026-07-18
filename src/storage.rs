@@ -110,10 +110,50 @@
 //! `insert`が空きのあるページを探す部分は、[`crate::free_space_map`]の
 //! `FreeSpaceMap`が担う。この章のFree Space Mapの粒度・更新タイミングの設計は
 //! そのモジュールのドキュメントを参照。
+//!
+//! # 第24章での変更: 索引メタデータをCatalogページへ追加する
+//!
+//! `CREATE INDEX`(第24章)が作る索引の一覧を、テーブル定義と同じCatalogページ
+//! へ追記する。列ごとの制約バイト(第20章)と同じ考え方で、既存のレイアウトの
+//! 末尾に新しいセクションを足すだけであり、既存のフィールドは1つも動かさない。
+//!
+//! ```text
+//! index_count: u32
+//! indexes × index_count:
+//!     name_len:        u16
+//!     name:            u8 × name_len
+//!     table_id:        u64
+//!     column_index:    u16
+//!     column_name_len: u16
+//!     column_name:     u8 × column_name_len
+//!     unique:          u8 (0 または 1)
+//!     primary_key:     u8 (0 または 1)
+//!     key_type:        u8 (0=BOOLEAN, 1=BIGINT, 2=TEXT)
+//! ```
+//!
+//! この章より前(第23章以前)に`Storage::create`で作られたファイルはこの
+//! セクションを持たないため、この章のコードで開こうとすると`index_count`を
+//! 読む前にバイト列が尽き、`DbError::CorruptCatalog`になる(モジュール冒頭の
+//! 「第20章での変更」節と同じ、章をまたいだファイル互換性を約束しない方針)。
+//!
+//! 索引の実データ(`crate::btree::BTree`が持つB+Tree本体)は、この
+//! Catalogページと同じファイルには置かない。**索引ごとに専用のファイル**
+//! (`<データベースファイルのパス>.idx.<索引名>`)を持たせ、その中では
+//! `crate::btree::BTree`が第23章から変わらない前提(Metaページはページ1)で
+//! 動く。この設計を選んだ理由は、`crate::btree::BTree`のMetaページが
+//! ページ1固定という前提(第23章)を、複数の索引を同じファイルに同居させる
+//! ために書き換えずに済むからである。テーブルのデータページを1つのファイルへ
+//! まとめた`Storage`自身の設計(モジュール冒頭)とは対照的だが、`HeapFile`
+//! (第13章)がテーブルごとに専用ファイルを持っていた設計をそのまま索引にも
+//! 転用したと捉えられる。したがって、この節の`index_count`のセクションが
+//! 持つのは索引の**メタデータ**(名前・テーブル・列・`unique`・キー型)だけで、
+//! B+Treeの`Root`の`PageId`はここには現れない(索引ごとのファイルの中で
+//! `BTree`自身が管理する)。
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::btree::BTree;
 use crate::buffer_pool::BufferPool;
 use crate::catalog::TableInfo;
 use crate::disk_manager::DiskManager;
@@ -121,9 +161,11 @@ use crate::error::{DbError, DbResult};
 use crate::free_space_map::FreeSpaceMap;
 use crate::heap_file::Scan;
 use crate::ids::{PageId, RecordId, TableId};
+use crate::index::IndexInfo;
 use crate::page::{PAGE_PAYLOAD_SIZE, PageType};
 use crate::slotted_page::{SlotStatus, SlottedPage, SlottedPageRef, max_len_for_fresh_page};
-use crate::types::{Column, DataType, Schema};
+use crate::tuple_codec::decode_tuple;
+use crate::types::{Column, DataType, Schema, Tuple};
 
 /// Catalogページの定位置。ページ0はFile Header(第11章)が占有しているため、
 /// 空いている最初の番号を使う。
@@ -144,14 +186,37 @@ struct TableEntry {
     page_ids: Vec<PageId>,
 }
 
+/// カタログに登録された1つの索引の定義と、その実データ(`BTree`)の組
+/// (第24章)。`crate::index::IndexInfo`はメタデータだけの値型で、`BTree`本体は
+/// `Storage`だけが所有する(モジュール冒頭の「索引ごとに専用のファイル」を参照)。
+struct IndexEntry {
+    info: IndexInfo,
+    btree: BTree,
+}
+
+/// `db_path`の索引`index_name`が使う専用ファイルのパスを組み立てる
+/// (第24章)。`<db_path>.idx.<index_name>`という命名で、`db_path`本体
+/// (テーブル定義・データページ)とは別のファイルにする(モジュール冒頭を参照)。
+fn index_file_path(db_path: &Path, index_name: &str) -> PathBuf {
+    let mut os_string = db_path.as_os_str().to_os_string();
+    os_string.push(".idx.");
+    os_string.push(index_name);
+    PathBuf::from(os_string)
+}
+
 /// テーブル定義とデータページの両方を1つのファイルへ永続化するストレージエンジン。
 pub struct Storage {
+    /// このストレージ本体(テーブル定義・データページ)のファイルパス。
+    /// 索引ファイル([`index_file_path`])を組み立てるために保持する(第24章)。
+    path: PathBuf,
     pool: BufferPool,
     next_table_id: u64,
     tables: HashMap<TableId, TableEntry>,
     /// `DROP TABLE`によって空いた、再利用待ちのページの一覧。
     free_pages: Vec<PageId>,
     fsm: FreeSpaceMap,
+    /// `CREATE INDEX`で登録された索引(第24章)。キーは索引名。
+    indexes: HashMap<String, IndexEntry>,
 }
 
 impl Storage {
@@ -163,6 +228,7 @@ impl Storage {
     /// 既存の内容を壊して初期化してしまわないよう`DbError::CorruptPage`を返す。
     /// 既存のファイルを開きたい場合は[`Storage::open`]を使う。
     pub fn create<P: AsRef<Path>>(path: P) -> DbResult<Self> {
+        let path_buf = path.as_ref().to_path_buf();
         let disk = DiskManager::open(path)?;
         if disk.page_count() > 1 {
             return Err(DbError::CorruptPage(
@@ -179,11 +245,13 @@ impl Storage {
         );
 
         let storage = Storage {
+            path: path_buf,
             pool,
             next_table_id: 0,
             tables: HashMap::new(),
             free_pages: Vec::new(),
             fsm: FreeSpaceMap::new(),
+            indexes: HashMap::new(),
         };
         storage.persist_catalog()?;
         Ok(storage)
@@ -208,6 +276,7 @@ impl Storage {
     /// そのまま受理してしまい、次の`insert`がそのページを「空きページ」として
     /// 再利用してFile Headerを上書きし、以後`open`できないファイルを作ってしまう。
     pub fn open<P: AsRef<Path>>(path: P) -> DbResult<Self> {
+        let path_buf = path.as_ref().to_path_buf();
         let disk = DiskManager::open(path)?;
         if disk.page_count() < 2 {
             return Err(DbError::CorruptPage(
@@ -267,12 +336,26 @@ impl Storage {
             }
         }
 
+        // 索引メタデータから、索引ごとの専用ファイル(モジュール冒頭を参照)を
+        // 開き直す。索引の実データ(BTree本体)はCatalogページには無く、
+        // それぞれのファイルの中にMetaページとして永続化されている
+        // (`crate::btree::BTree::open`)。
+        let mut indexes = HashMap::new();
+        for info in decoded.indexes {
+            let index_path = index_file_path(&path_buf, &info.name);
+            let index_disk = DiskManager::open(&index_path)?;
+            let btree = BTree::open(BufferPool::new(index_disk, DEFAULT_BUFFER_POOL_CAPACITY))?;
+            indexes.insert(info.name.clone(), IndexEntry { info, btree });
+        }
+
         Ok(Storage {
+            path: path_buf,
             pool,
             next_table_id: decoded.next_table_id,
             tables: decoded.tables,
             free_pages: decoded.free_pages,
             fsm,
+            indexes,
         })
     }
 
@@ -281,8 +364,18 @@ impl Storage {
     /// `HeapFile::flush`(第14章)と同じく、`BufferPool::flush_all`をそのまま
     /// 呼ぶだけの薄いラッパーである。OSへの書き渡しまでで、実ディスクへの
     /// 同期([`Storage::sync`])までは行わない。
+    ///
+    /// 第24章から、索引は本体とは別ファイル(モジュール冒頭を参照)なので、
+    /// 索引ごとに`BTree::flush`も呼ぶ。本体の`self.pool`だけをflushして
+    /// 索引側を忘れると、索引に加えた変更(`CREATE INDEX`のIndex Build、
+    /// Index Maintenance)がキャッシュに残ったまま、プロセスの再起動で
+    /// 失われてしまう。
     pub fn flush(&self) -> DbResult<()> {
-        self.pool.flush_all()
+        self.pool.flush_all()?;
+        for entry in self.indexes.values() {
+            entry.btree.flush()?;
+        }
+        Ok(())
     }
 
     /// 保持している`BufferPool`(の`DiskManager`)に対して`sync`を呼び、OSに
@@ -295,9 +388,14 @@ impl Storage {
     /// 分けているのは、`flush_all`(キャッシュの書き渡し)と`sync`(実ディスクへの
     /// 同期)がコストの異なる別の操作であり、両者を分けて呼べる余地を`Storage`の
     /// 層にも残しておくためである。fsyncのタイミングをより細かく制御する
-    /// 話題(グループコミットなど)は第33章のWALで扱う。
+    /// 話題(グループコミットなど)は第33章のWALで扱う。[`Self::flush`]と同じ理由で、
+    /// 索引ごとに`BTree::sync`も呼ぶ(第24章)。
     pub fn sync(&self) -> DbResult<()> {
-        self.pool.sync()
+        self.pool.sync()?;
+        for entry in self.indexes.values() {
+            entry.btree.sync()?;
+        }
+        Ok(())
     }
 
     /// テーブル名から`TableInfo`を引く。見つからなければ`None`を返す。
@@ -359,6 +457,11 @@ impl Storage {
     /// ページの中身自体はこの時点では書き換えない。次にそのページが
     /// (別のテーブルの`insert`によって)再利用されるとき、`SlottedPage::init`が
     /// 中身を作り直す。
+    ///
+    /// 第24章から、このテーブルに対応する索引(`CREATE INDEX`で作られたもの、
+    /// `PRIMARY KEY`・`UNIQUE`列に自動で作られたものの両方)も[`Self::drop_index`]
+    /// と同じ手順でまとめて削除する。索引だけをテーブルの削除後に取り残すと、
+    /// もう存在しないテーブルを指す索引メタデータがカタログに残ってしまう。
     pub fn drop_table(&mut self, name: &str) -> DbResult<TableId> {
         let id = self
             .tables
@@ -373,8 +476,188 @@ impl Storage {
             self.free_pages.push(page_id);
         }
 
+        let index_names: Vec<String> =
+            self.indexes.values().filter(|e| e.info.table_id == id).map(|e| e.info.name.clone()).collect();
+        for index_name in index_names {
+            self.drop_index(&index_name)?;
+        }
+
         self.persist_catalog()?;
         Ok(id)
+    }
+
+    /// 索引名から[`IndexInfo`]を引く。見つからなければ`None`を返す。
+    pub fn index(&self, name: &str) -> Option<&IndexInfo> {
+        self.indexes.get(name).map(|e| &e.info)
+    }
+
+    /// `table_id`のテーブルに対応する全索引の[`IndexInfo`]を返す(第24章)。
+    /// `crate::executor::storage_insert`等のIndex Maintenanceが、挿入・更新・
+    /// 削除された行についてどの索引を更新すべきかを求めるために使う。
+    pub fn indexes_for_table(&self, table_id: TableId) -> impl Iterator<Item = &IndexInfo> {
+        self.indexes.values().filter(move |e| e.info.table_id == table_id).map(|e| &e.info)
+    }
+
+    /// `table_id`のテーブルの`column_index`番目の列に対応する`UNIQUE`索引の
+    /// `BTree`を引く(第24章)。`crate::index::check_uniqueness_with_index`が、
+    /// 第20章の走査ベース一意性検査の代わりにこの索引へ`lookup`するために使う。
+    pub(crate) fn unique_index_for_column(&self, table_id: TableId, column_index: usize) -> Option<&BTree> {
+        self.indexes
+            .values()
+            .find(|e| e.info.table_id == table_id && e.info.column_index == column_index && e.info.unique)
+            .map(|e| &e.btree)
+    }
+
+    /// `index_name`という名前で、`table_name`の`column_name`列を索引化した
+    /// B+Tree索引を新しく作る(`CREATE INDEX`、第24章)。`unique`は
+    /// `CREATE UNIQUE INDEX`かどうかで、この経路(SQL構文)から作る索引は常に
+    /// [`IndexInfo::primary_key`]が`false`になる。`PRIMARY KEY`列に対応する
+    /// 索引は[`Self::create_constraint_index`]を使う。
+    pub fn create_index(&mut self, index_name: &str, table_name: &str, column_name: &str, unique: bool) -> DbResult<()> {
+        self.create_index_impl(index_name, table_name, column_name, unique, false)
+    }
+
+    /// `PRIMARY KEY`・`UNIQUE`列に自動でユニーク索引を作る(第24章、
+    /// `Database::execute_create_table`が呼ぶ)。`primary_key`が`true`なら、
+    /// この索引で検出した重複は`DbError::PrimaryKeyViolation`として報告される
+    /// ([`IndexInfo::primary_key`]を参照)。この索引は常に`unique = true`である。
+    pub(crate) fn create_constraint_index(
+        &mut self,
+        index_name: &str,
+        table_name: &str,
+        column_name: &str,
+        primary_key: bool,
+    ) -> DbResult<()> {
+        self.create_index_impl(index_name, table_name, column_name, true, primary_key)
+    }
+
+    /// [`Self::create_index`]・[`Self::create_constraint_index`]の共通実装。
+    ///
+    /// 索引名がすでに使われている場合は`DbError::DuplicateIndex`、テーブルまたは
+    /// 列が存在しない場合は`DbError::TableNotFound`・`DbError::CorruptCatalog`
+    /// (どちらも通常は`Binder`がすでに検査済みで到達しない)を返す。
+    ///
+    /// **Index Build**: 索引ごとに専用のファイル(`index_file_path`)を新しく
+    /// 作り、`table_name`の既存の全行を`scan`しながら、対象列が`NULL`でない
+    /// 行だけを`BTree::insert`する。`unique`が`true`で、既存行の中にすでに
+    /// 重複するキーがあった場合は、`crate::btree::DbError::BTreeUniqueViolation`を
+    /// `primary_key`に応じて第20章と同じ`DbError::PrimaryKeyViolation`・
+    /// `DbError::UniqueViolation`(列名つき)へ翻訳して返し、作りかけの
+    /// 索引ファイルを削除する。
+    fn create_index_impl(
+        &mut self,
+        index_name: &str,
+        table_name: &str,
+        column_name: &str,
+        unique: bool,
+        primary_key: bool,
+    ) -> DbResult<()> {
+        if self.indexes.contains_key(index_name) {
+            return Err(DbError::DuplicateIndex(index_name.to_string()));
+        }
+        let table_info = self.table(table_name).ok_or_else(|| DbError::TableNotFound(table_name.to_string()))?.clone();
+        let column_index = table_info
+            .schema
+            .index_of(column_name)
+            .ok_or_else(|| DbError::CorruptCatalog(format!("列が見つかりません: {column_name}")))?;
+        let key_type = table_info.schema.columns()[column_index].data_type;
+
+        let index_path = index_file_path(&self.path, index_name);
+        let disk = DiskManager::open(&index_path)?;
+        let mut btree = BTree::create(BufferPool::new(disk, DEFAULT_BUFFER_POOL_CAPACITY), key_type, unique)?;
+
+        // Index Build: 既存の全行を読み、対象列がNULLでない行だけを挿入する。
+        let mut pairs: Vec<(crate::types::Value, RecordId)> = Vec::new();
+        for entry in self.scan(table_info.id)? {
+            let (rid, bytes) = entry?;
+            let tuple = decode_tuple(&table_info.schema, &bytes)?;
+            let value = tuple.get(column_index).expect("tupleはschemaと同じ列数を持つ").clone();
+            if !value.is_null() {
+                pairs.push((value, rid));
+            }
+        }
+        for (value, rid) in &pairs {
+            if let Err(err) = btree.insert(value, *rid) {
+                drop(btree);
+                let _ = std::fs::remove_file(&index_path);
+                return Err(translate_btree_error(err, primary_key, column_name, value));
+            }
+        }
+
+        let info = IndexInfo {
+            name: index_name.to_string(),
+            table_id: table_info.id,
+            column_index,
+            column_name: column_name.to_string(),
+            unique,
+            primary_key,
+            key_type,
+        };
+        self.indexes.insert(index_name.to_string(), IndexEntry { info, btree });
+
+        if let Err(err) = self.persist_catalog() {
+            self.indexes.remove(index_name);
+            let _ = std::fs::remove_file(&index_path);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// `index_name`の索引を削除する(`DROP INDEX`、第24章)。
+    ///
+    /// 索引が存在しない場合は`DbError::IndexNotFound`を返す。カタログからの
+    /// 削除に成功したら、その索引専用のファイル([`index_file_path`])を
+    /// 削除する。ファイルの削除は`drop_table`(第15章)がテーブルのページを
+    /// 即座にはファイルから取り除かない(Free Page Listへ積むだけ)のとは違い、
+    /// 索引は他のどのテーブル・索引ともページを共有しない専用ファイルなので、
+    /// そのまま`std::fs::remove_file`できる。
+    pub fn drop_index(&mut self, index_name: &str) -> DbResult<()> {
+        if self.indexes.remove(index_name).is_none() {
+            return Err(DbError::IndexNotFound(index_name.to_string()));
+        }
+        self.persist_catalog()?;
+        let index_path = index_file_path(&self.path, index_name);
+        std::fs::remove_file(&index_path)?;
+        Ok(())
+    }
+
+    /// 新しく挿入(または`UPDATE`で書き直され)た行`tuple`(`RecordId`は`rid`)に
+    /// ついて、`table_id`の全索引(`UNIQUE`・非`UNIQUE`の両方)を更新する
+    /// (Index Maintenance、第24章)。
+    ///
+    /// 索引化された列の値が`NULL`の行はどの索引にも登録しない
+    /// (`crate::btree::BTree`のモジュールドキュメント「`NULL`はキーにしない」を
+    /// 参照)。`UNIQUE`索引で重複が見つかった場合は`DbError::PrimaryKeyViolation`・
+    /// `DbError::UniqueViolation`を返す。呼び出し側(`crate::executor`)は、
+    /// この関数を呼ぶ前に`crate::index::check_uniqueness_with_index`で
+    /// 検査を終えている前提のため、通常はここで初めて違反が見つかることはない。
+    pub fn index_insert_row(&mut self, table_id: TableId, tuple: &Tuple, rid: RecordId) -> DbResult<()> {
+        for entry in self.indexes.values_mut().filter(|e| e.info.table_id == table_id) {
+            let Some(value) = tuple.get(entry.info.column_index) else { continue };
+            if value.is_null() {
+                continue;
+            }
+            entry
+                .btree
+                .insert(value, rid)
+                .map_err(|err| translate_btree_error(err, entry.info.primary_key, &entry.info.column_name, value))?;
+        }
+        Ok(())
+    }
+
+    /// 削除(または`UPDATE`で書き直される前)の行`tuple`(`RecordId`は`rid`)に
+    /// ついて、`table_id`の全索引からエントリを取り除く(Index Maintenance、
+    /// 第24章)。`crate::btree::BTree::delete`と同じくLazy Deleteであり、
+    /// 索引側のページの占有率が下がってもMergeはしない。
+    pub fn index_delete_row(&mut self, table_id: TableId, tuple: &Tuple, rid: RecordId) -> DbResult<()> {
+        for entry in self.indexes.values_mut().filter(|e| e.info.table_id == table_id) {
+            let Some(value) = tuple.get(entry.info.column_index) else { continue };
+            if value.is_null() {
+                continue;
+            }
+            entry.btree.delete(value, rid)?;
+        }
+        Ok(())
     }
 
     /// `bytes`を`table_id`のテーブルへ新しいタプルとして挿入し、それを指す
@@ -637,13 +920,14 @@ impl Storage {
         Ok(())
     }
 
-    /// 現在のテーブル定義・Free Page Listを`encode_catalog`でバイト列へ変換し、
-    /// Catalogページへ書き込む。
+    /// 現在のテーブル定義・Free Page List・索引メタデータ(第24章)を
+    /// `encode_catalog`でバイト列へ変換し、Catalogページへ書き込む。
     ///
     /// エンコード結果がCatalogページ1枚(`PAGE_PAYLOAD_SIZE`バイト)を超える場合は
     /// `DbError::CatalogTooLarge`を返す(モジュール冒頭の説明を参照)。
     fn persist_catalog(&self) -> DbResult<()> {
-        let bytes = encode_catalog(self.next_table_id, &self.tables, &self.free_pages);
+        let index_infos: Vec<&IndexInfo> = self.indexes.values().map(|e| &e.info).collect();
+        let bytes = encode_catalog(self.next_table_id, &self.tables, &self.free_pages, &index_infos);
         if bytes.len() > PAGE_PAYLOAD_SIZE {
             return Err(DbError::CatalogTooLarge(bytes.len(), PAGE_PAYLOAD_SIZE));
         }
@@ -699,6 +983,21 @@ fn validate_table_metadata(decoded: &DecodedCatalog) -> DbResult<()> {
     Ok(())
 }
 
+/// `crate::btree::DbError::BTreeUniqueViolation`(列名を持たない、B+Tree自身の
+/// エラー)を、`primary_key`に応じて第20章の`DbError::PrimaryKeyViolation`・
+/// `DbError::UniqueViolation`(列名・値つき)へ翻訳する(第24章)。
+/// `BTreeUniqueViolation`以外のエラーはそのまま素通しする(`NullKeyNotAllowed`
+/// はここまでに`value.is_null()`で弾いてあるため、通常は起こらない)。
+fn translate_btree_error(err: DbError, primary_key: bool, column_name: &str, value: &crate::types::Value) -> DbError {
+    match err {
+        DbError::BTreeUniqueViolation if primary_key => {
+            DbError::PrimaryKeyViolation { column: column_name.to_string(), value: value.to_string() }
+        }
+        DbError::BTreeUniqueViolation => DbError::UniqueViolation { column: column_name.to_string(), value: value.to_string() },
+        other => other,
+    }
+}
+
 /// `page_id`が有効な(範囲内かつ予約ページでない)データページであり、まだ
 /// どのテーブル・Free Page Listにも属していないことを確認したうえで、
 /// `claimed`へ登録する。
@@ -739,17 +1038,24 @@ struct DecodedCatalog {
     next_table_id: u64,
     tables: HashMap<TableId, TableEntry>,
     free_pages: Vec<PageId>,
+    /// 索引メタデータ(第24章)。索引名の重複が無いことは`decode_catalog`が
+    /// `Vec`へ積む時点で検査済み。
+    indexes: Vec<IndexInfo>,
 }
 
-/// 現在のテーブル定義・Free Page Listをバイト列へエンコードする。
+/// 現在のテーブル定義・Free Page List・索引メタデータ(第24章)をバイト列へ
+/// エンコードする。
 ///
-/// テーブルは`TableId`の昇順で書き出す。`tables`は`HashMap`であり反復順が
-/// 実行のたびに変わりうるため、書き出す順序を固定しておかないと、論理的には
-/// 同じ状態でもエンコード結果のバイト列が実行のたびに変わってしまう。
+/// テーブルは`TableId`の昇順、索引は索引名の昇順で書き出す。`tables`は
+/// `HashMap`であり反復順が実行のたびに変わりうるため、書き出す順序を
+/// 固定しておかないと、論理的には同じ状態でもエンコード結果のバイト列が
+/// 実行のたびに変わってしまう(`indexes`は`Storage`側で`HashMap`から
+/// `Vec<&IndexInfo>`へ変換済みで渡ってくるため、ここで並び順を確定させる)。
 fn encode_catalog(
     next_table_id: u64,
     tables: &HashMap<TableId, TableEntry>,
     free_pages: &[PageId],
+    indexes: &[&IndexInfo],
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&next_table_id.to_le_bytes());
@@ -784,6 +1090,23 @@ fn encode_catalog(
         for &page_id in &entry.page_ids {
             out.extend_from_slice(&page_id.0.to_le_bytes());
         }
+    }
+
+    let mut sorted_indexes: Vec<&&IndexInfo> = indexes.iter().collect();
+    sorted_indexes.sort_by(|a, b| a.name.cmp(&b.name));
+    out.extend_from_slice(&(sorted_indexes.len() as u32).to_le_bytes());
+    for info in sorted_indexes {
+        let name_bytes = info.name.as_bytes();
+        out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(name_bytes);
+        out.extend_from_slice(&info.table_id.0.to_le_bytes());
+        out.extend_from_slice(&(info.column_index as u16).to_le_bytes());
+        let column_name_bytes = info.column_name.as_bytes();
+        out.extend_from_slice(&(column_name_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(column_name_bytes);
+        out.push(u8::from(info.unique));
+        out.push(u8::from(info.primary_key));
+        out.push(data_type_to_u8(info.key_type));
     }
 
     out
@@ -861,10 +1184,34 @@ fn decode_catalog(bytes: &[u8]) -> DbResult<DecodedCatalog> {
         }
     }
 
+    let index_count = take_u32(&mut cursor, "index_count")? as usize;
+    let mut indexes = Vec::new();
+    let mut seen_index_names = std::collections::HashSet::new();
+    for _ in 0..index_count {
+        let name_len = take_u16(&mut cursor, "索引名の長さ")? as usize;
+        let name = take_string(&mut cursor, name_len, "索引名")?;
+        let table_id = TableId(take_u64(&mut cursor, "索引のtable_id")?);
+        let column_index = take_u16(&mut cursor, "索引のcolumn_index")? as usize;
+        let column_name_len = take_u16(&mut cursor, "索引の列名の長さ")? as usize;
+        let column_name = take_string(&mut cursor, column_name_len, "索引の列名")?;
+        let unique = take_bool(&mut cursor, "索引のunique")?;
+        let primary_key = take_bool(&mut cursor, "索引のprimary_key")?;
+        let key_type = data_type_from_u8(take_u8(&mut cursor, "索引のkey_type")?)?;
+
+        if !seen_index_names.insert(name.clone()) {
+            // encode_catalogが索引名の一意性を保証しているHashMap<String, _>を
+            // 経由していれば起こらないが、`decode_catalog`は入力を信用しない
+            // (テーブル名の重複検出=`TableId`の重複検出と同じ理由)。
+            return Err(DbError::CorruptCatalog(format!("索引名'{name}'が複数回出現しています")));
+        }
+        indexes.push(IndexInfo { name, table_id, column_index, column_name, unique, primary_key, key_type });
+    }
+
     Ok(DecodedCatalog {
         next_table_id,
         tables,
         free_pages,
+        indexes,
     })
 }
 
@@ -941,6 +1288,7 @@ fn data_type_from_u8(byte: u8) -> DbResult<DataType> {
 mod tests {
     use super::*;
     use crate::page::{PAGE_SIZE, Page};
+    use crate::types::Value;
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -1129,7 +1477,7 @@ mod tests {
         Storage::create(&path).unwrap();
 
         let tables = single_table_entry(TableId(0), "a", Vec::new());
-        let bytes = encode_catalog(1, &tables, &[PageId(0)]);
+        let bytes = encode_catalog(1, &tables, &[PageId(0)], &[]);
         write_catalog_payload(&path, &bytes);
 
         let err = expect_err(Storage::open(&path));
@@ -1144,7 +1492,7 @@ mod tests {
         Storage::create(&path).unwrap();
 
         let tables = single_table_entry(TableId(0), "a", vec![PageId(999)]);
-        let bytes = encode_catalog(1, &tables, &[]);
+        let bytes = encode_catalog(1, &tables, &[], &[]);
         write_catalog_payload(&path, &bytes);
 
         let err = expect_err(Storage::open(&path));
@@ -1166,7 +1514,7 @@ mod tests {
             let bogus_data_page = pool.allocate_page(PageType::Catalog).unwrap();
 
             let tables = single_table_entry(TableId(0), "a", vec![bogus_data_page]);
-            let bytes = encode_catalog(1, &tables, &[]);
+            let bytes = encode_catalog(1, &tables, &[], &[]);
             let mut guard = pool.write_page(CATALOG_PAGE_ID).unwrap();
             let data = guard.data_mut();
             data[..bytes.len()].copy_from_slice(&bytes);
@@ -1207,7 +1555,7 @@ mod tests {
                 page_ids: vec![shared_page],
             },
         );
-        let bytes = encode_catalog(2, &tables, &[]);
+        let bytes = encode_catalog(2, &tables, &[], &[]);
         write_catalog_payload(&path, &bytes);
 
         let err = expect_err(Storage::open(&path));
@@ -1224,7 +1572,7 @@ mod tests {
         // TableId(0)が存在するのにnext_table_idも0のまま、というカタログ。
         // 次のcreate_tableがTableId(0)を再利用してしまう矛盾がある。
         let tables = single_table_entry(TableId(0), "a", Vec::new());
-        let bytes = encode_catalog(0, &tables, &[]);
+        let bytes = encode_catalog(0, &tables, &[], &[]);
         write_catalog_payload(&path, &bytes);
 
         let err = expect_err(Storage::open(&path));
@@ -1244,7 +1592,7 @@ mod tests {
         Storage::create(&path).unwrap();
 
         let tables: HashMap<TableId, TableEntry> = HashMap::new();
-        let bytes = encode_catalog(u64::MAX, &tables, &[]);
+        let bytes = encode_catalog(u64::MAX, &tables, &[], &[]);
         write_catalog_payload(&path, &bytes);
 
         let mut storage = Storage::open(&path).unwrap();
@@ -1319,7 +1667,7 @@ mod tests {
                 page_ids: Vec::new(),
             },
         );
-        let bytes = encode_catalog(2, &tables, &[]);
+        let bytes = encode_catalog(2, &tables, &[], &[]);
         write_catalog_payload(&path, &bytes);
 
         let err = expect_err(Storage::open(&path));
@@ -1727,5 +2075,190 @@ mod tests {
         ));
         assert!(matches!(storage.scan(bogus), Err(DbError::TableNotFound(_))));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    // ---- 第24章: CREATE INDEX / DROP INDEX / Index Maintenance ----
+
+    fn index_test_paths(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let db_path = temp_path(name);
+        let idx_path = index_file_path(&db_path, "idx");
+        (db_path, idx_path)
+    }
+
+    /// `users_schema()`(`id: BIGINT`, `name: TEXT`)の1行を、`Storage::insert`が
+    /// 期待する`crate::tuple_codec::encode_tuple`済みのバイト列として書き込む。
+    /// (テストの中で`storage.insert(table_id, b"alice")`のように生の文字列
+    /// バイト列を渡すのは`get`だけを確認するテストでは問題ないが、
+    /// `Storage::create_index`のIndex Buildは`decode_tuple`で読み戻すため、
+    /// 正しくエンコードされたタプルが必要になる。)
+    fn insert_user_row(storage: &mut Storage, table_id: TableId, id: i64, name: &str) -> RecordId {
+        let schema = users_schema();
+        let tuple = Tuple::new(&schema, vec![Value::BigInt(id), Value::Text(name.to_string())]).unwrap();
+        let bytes = crate::tuple_codec::encode_tuple(&schema, &tuple);
+        storage.insert(table_id, &bytes).unwrap()
+    }
+
+    #[test]
+    fn create_index_builds_from_existing_rows() {
+        let (path, idx_path) = index_test_paths("create-index-build");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("users", users_schema()).unwrap();
+        insert_user_row(&mut storage, table_id, 1, "alice");
+        insert_user_row(&mut storage, table_id, 2, "bob");
+
+        storage.create_index("idx", "users", "name", false).unwrap();
+        let info = storage.index("idx").unwrap();
+        assert_eq!(info.table_id, table_id);
+        assert_eq!(info.column_name, "name");
+        assert!(!info.unique);
+
+        let index = storage.unique_index_for_column(table_id, 1);
+        assert!(index.is_none(), "unique=falseで作った索引はunique_index_for_columnに現れない");
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&idx_path);
+    }
+
+    #[test]
+    fn create_index_rejects_a_duplicate_name() {
+        let (path, idx_path) = index_test_paths("create-index-dup-name");
+        let mut storage = Storage::create(&path).unwrap();
+        storage.create_table("users", users_schema()).unwrap();
+        storage.create_index("idx", "users", "name", false).unwrap();
+        let err = expect_err(storage.create_index("idx", "users", "id", false));
+        assert!(matches!(err, DbError::DuplicateIndex(name) if name == "idx"));
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&idx_path);
+    }
+
+    #[test]
+    fn create_unique_index_rejects_existing_duplicate_values() {
+        let (path, idx_path) = index_test_paths("create-unique-index-existing-dup");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("users", users_schema()).unwrap();
+        insert_user_row(&mut storage, table_id, 1, "alice");
+        insert_user_row(&mut storage, table_id, 2, "alice");
+
+        let err = expect_err(storage.create_index("idx", "users", "name", true));
+        assert!(matches!(err, DbError::UniqueViolation { .. }));
+        // 失敗した索引はカタログにも残らず、専用ファイルも残らない。
+        assert!(storage.index("idx").is_none());
+        assert!(!idx_path.exists());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn drop_index_removes_metadata_and_file() {
+        let (path, idx_path) = index_test_paths("drop-index");
+        let mut storage = Storage::create(&path).unwrap();
+        storage.create_table("users", users_schema()).unwrap();
+        storage.create_index("idx", "users", "name", false).unwrap();
+        assert!(idx_path.exists());
+
+        storage.drop_index("idx").unwrap();
+        assert!(storage.index("idx").is_none());
+        assert!(!idx_path.exists());
+
+        let err = expect_err(storage.drop_index("idx"));
+        assert!(matches!(err, DbError::IndexNotFound(name) if name == "idx"));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn drop_table_also_drops_its_indexes() {
+        let (path, idx_path) = index_test_paths("drop-table-drops-index");
+        let mut storage = Storage::create(&path).unwrap();
+        storage.create_table("users", users_schema()).unwrap();
+        storage.create_index("idx", "users", "name", false).unwrap();
+
+        storage.drop_table("users").unwrap();
+        assert!(storage.index("idx").is_none());
+        assert!(!idx_path.exists());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn index_insert_and_delete_row_maintain_a_unique_index() {
+        let (path, idx_path) = index_test_paths("index-maintenance");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("users", users_schema()).unwrap();
+        storage.create_index("idx", "users", "name", true).unwrap();
+
+        let schema = users_schema();
+        let tuple = Tuple::new(&schema, vec![Value::BigInt(1), Value::Text("alice".to_string())]).unwrap();
+        let rid = insert_user_row(&mut storage, table_id, 1, "alice");
+        storage.index_insert_row(table_id, &tuple, rid).unwrap();
+
+        // 同じ値をもう一度挿入しようとするとunique違反になる。
+        let dup_rid = insert_user_row(&mut storage, table_id, 2, "alice-2");
+        let err = expect_err(storage.index_insert_row(table_id, &tuple, dup_rid));
+        assert!(matches!(err, DbError::UniqueViolation { column, .. } if column == "name"));
+
+        // 削除すれば、同じ値を再び挿入できるようになる。
+        storage.index_delete_row(table_id, &tuple, rid).unwrap();
+        storage.index_insert_row(table_id, &tuple, dup_rid).unwrap();
+
+        assert_eq!(
+            storage.unique_index_for_column(table_id, 1).unwrap().lookup(&Value::Text("alice".to_string())).unwrap(),
+            vec![dup_rid]
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&idx_path);
+    }
+
+    #[test]
+    fn index_maintenance_skips_null_values() {
+        let (path, idx_path) = index_test_paths("index-maintenance-null");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("users", users_schema()).unwrap();
+        storage.create_index("idx", "users", "name", true).unwrap();
+
+        let schema = users_schema();
+        let null_tuple = Tuple::new(&schema, vec![Value::BigInt(1), Value::Null]).unwrap();
+        let bytes = crate::tuple_codec::encode_tuple(&schema, &null_tuple);
+        let rid1 = storage.insert(table_id, &bytes).unwrap();
+        let rid2 = storage.insert(table_id, &bytes).unwrap();
+        // NULLはunique索引にとって重複とみなされない(第20章と同じ規則)。
+        storage.index_insert_row(table_id, &null_tuple, rid1).unwrap();
+        storage.index_insert_row(table_id, &null_tuple, rid2).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&idx_path);
+    }
+
+    #[test]
+    fn indexes_survive_a_reopen_and_keep_enforcing_uniqueness() {
+        let (path, idx_path) = index_test_paths("index-reopen");
+        {
+            let mut storage = Storage::create(&path).unwrap();
+            let table_id = storage.create_table("users", users_schema()).unwrap();
+            assert_eq!(table_id, TableId(0));
+            storage.create_index("idx", "users", "name", true).unwrap();
+            let schema = users_schema();
+            let tuple = Tuple::new(&schema, vec![Value::BigInt(1), Value::Text("alice".to_string())]).unwrap();
+            let rid = insert_user_row(&mut storage, table_id, 1, "alice");
+            storage.index_insert_row(table_id, &tuple, rid).unwrap();
+            storage.flush().unwrap();
+            storage.sync().unwrap();
+        }
+
+        let mut storage = Storage::open(&path).unwrap();
+        let info = storage.index("idx").unwrap();
+        assert!(info.unique);
+        assert_eq!(info.column_name, "name");
+
+        let schema = users_schema();
+        let dup = Tuple::new(&schema, vec![Value::BigInt(2), Value::Text("alice".to_string())]).unwrap();
+        let dup_rid = insert_user_row(&mut storage, TableId(0), 2, "alice-2");
+        let err = expect_err(storage.index_insert_row(TableId(0), &dup, dup_rid));
+        assert!(matches!(err, DbError::UniqueViolation { .. }));
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&idx_path);
     }
 }

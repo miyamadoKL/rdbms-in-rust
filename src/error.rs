@@ -176,6 +176,24 @@ pub enum DbError {
     /// これ以上分割してもページに収まらない場合の割り切りとして返す。
     #[error("B+Treeのキーがページに収まりません: {0}バイト")]
     BTreeKeyTooLarge(usize),
+
+    /// `crate::btree`(第24章)が`unique`フラグを立てて作られた索引に対して、
+    /// すでに存在するキーを`insert`しようとしたエラー。この索引自身は
+    /// どの列がPRIMARY KEY・UNIQUEかを知らないため、列名を含まない。
+    /// 呼び出し側(`crate::index::check_uniqueness_with_index`、または
+    /// `crate::storage::Storage`のIndex Maintenance)が、この章の
+    /// `DbError::PrimaryKeyViolation`・`DbError::UniqueViolation`(列名つき)へ
+    /// 翻訳してから利用者へ返す。
+    #[error("B+Tree索引のunique制約に違反しています")]
+    BTreeUniqueViolation,
+
+    /// `CREATE INDEX`が、すでにカタログへ登録済みの索引名を指定したエラー(第24章)。
+    #[error("索引はすでに存在します: {0}")]
+    DuplicateIndex(String),
+
+    /// `DROP INDEX`が、カタログに登録されていない索引名を指定したエラー(第24章)。
+    #[error("索引が存在しません: {0}")]
+    IndexNotFound(String),
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

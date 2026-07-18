@@ -75,6 +75,8 @@ pub enum Keyword {
     Inner,
     Join,
     On,
+    /// `CREATE INDEX` / `DROP INDEX`(第24章)。
+    Index,
 }
 
 impl Keyword {
@@ -118,6 +120,7 @@ impl Keyword {
             "INNER" => Keyword::Inner,
             "JOIN" => Keyword::Join,
             "ON" => Keyword::On,
+            "INDEX" => Keyword::Index,
             _ => return None,
         };
         Some(keyword)

@@ -28,16 +28,24 @@
 //!
 //! # Leaf Pageのレイアウト
 //!
+//! `next_leaf`(第24章)は、右隣のLeaf Pageを指す`PageId`である
+//! (右隣が無ければ[`NO_NEXT_LEAF`])。第23章の時点ではこのフィールドは無く、
+//! `entry_count`の直後がすぐDirectoryだった。Range Scan(`crate::btree`の
+//! `BTree::range`)が、Rootへ戻らず葉同士を横方向にたどれるようにするための
+//! 追加であり、詳しい理由は`crate::btree`本文(第24章)を参照。
+//!
 //! ```text
-//! offset 0                 2                    2+4n
-//! +------------------------+--------------------+-----------------+
-//! | entry_count (2バイト)  | Directory (4n バイト) |   Entry Data   |
-//! +------------------------+--------------------+-----------------+
+//! offset 0        2                10                   10+4n
+//! +---------------+-----------------+--------------------+-----------------+
+//! | entry_count   | next_leaf       | Directory (4n バイト)|   Entry Data   |
+//! | (2バイト)     | (8バイト)       |                      |                |
+//! +---------------+-----------------+--------------------+-----------------+
 //! ```
 //!
 //! | フィールド | バイト数 | 内容 |
 //! | --- | --- | --- |
 //! | `entry_count` | 2 | エントリ数`n`(LE) |
+//! | `next_leaf` | 8 | 右隣のLeaf Pageを指す`PageId`(LE)。無ければ`0`(第24章) |
 //! | Directory | `4 * n` | `n`個の`(key_offset: u16, key_len: u16)`の並び(LE) |
 //!
 //! Directoryの`i`番目のエントリが指す`key_offset`から、`key_len`バイトの
@@ -82,11 +90,17 @@
 use crate::error::{DbError, DbResult};
 use crate::ids::{PageId, RecordId, SlotId};
 
-const LEAF_HEADER_SIZE: usize = 2;
+/// `entry_count`(2バイト) + `next_leaf`(8バイト、第24章)。
+const LEAF_HEADER_SIZE: usize = 2 + 8;
 const INTERNAL_HEADER_SIZE: usize = 2 + 8;
 const DIR_ENTRY_SIZE: usize = 4;
 const RECORD_ID_SIZE: usize = 8 + 2;
 const CHILD_ID_SIZE: usize = 8;
+
+/// `next_leaf`に「右隣の葉が無い」ことを表す番兵値(第24章)。`PageId(0)`は
+/// `DiskManager`のFile Headerが常に占有する予約ページであり、Leaf Pageの
+/// `next_leaf`として現れることは無いため、番兵として安全に使える。
+pub const NO_NEXT_LEAF: PageId = PageId(0);
 
 fn read_u16(payload: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(payload[offset..offset + 2].try_into().unwrap())
@@ -180,6 +194,15 @@ impl<'a> LeafPageRef<'a> {
         read_u16(self.payload, 0) as usize
     }
 
+    /// 右隣のLeaf Pageを指す`PageId`(第24章)。右隣が無ければ[`NO_NEXT_LEAF`]。
+    ///
+    /// キー順に整列した葉同士をこのポインタで繋いでおくと、Range Scan
+    /// (`crate::btree`の`BTree::range`)はRootから毎回降りる代わりに、
+    /// 開始位置の葉さえ見つければあとはこのリンクをたどるだけで済む。
+    pub fn next_leaf(&self) -> PageId {
+        PageId(read_u64(self.payload, 2))
+    }
+
     /// `index`番目(0始まり、キー昇順)のキーのバイト列。
     pub fn key(&self, index: usize) -> &[u8] {
         let (offset, len) = dir_entry(self.payload, LEAF_HEADER_SIZE, index);
@@ -234,6 +257,10 @@ pub struct LeafPage<'a> {
 
 impl<'a> LeafPage<'a> {
     /// `payload`を空のLeaf Page(エントリ0件)として初期化する。
+    ///
+    /// `next_leaf`(第24章)は`fill(0)`によって[`NO_NEXT_LEAF`]のまま始まる。
+    /// このページを既存の葉の隣に差し込む場合(Leaf Split)は、呼び出し側が
+    /// [`LeafPage::set_next_leaf`]で明示的に繋ぎ直す。
     pub fn init(payload: &'a mut [u8]) -> Self {
         payload.fill(0);
         payload[0..2].copy_from_slice(&0u16.to_le_bytes());
@@ -257,16 +284,33 @@ impl<'a> LeafPage<'a> {
         self.as_ref().entry_count()
     }
 
+    /// 右隣のLeaf Pageを`next`へ書き換える(第24章)。エントリ本体は一切
+    /// 変更しない。Leaf Split(`crate::btree::BTree::split_leaf`)が、分割で
+    /// 生まれた2枚のページを正しく繋ぎ直すために使う。
+    pub fn set_next_leaf(&mut self, next: PageId) {
+        self.payload[2..10].copy_from_slice(&next.0.to_le_bytes());
+    }
+
     /// `entries`(キー昇順である必要がある)でページの中身を丸ごと置き換える。
     /// `payload`に収まりきらない場合は何も書き換えず`false`を返す。
+    ///
+    /// `next_leaf`(第24章)は、書き換え前にこのページが持っていた値をそのまま
+    /// 引き継ぐ。`write_entries`はエントリの並び替え(挿入・削除)のたびに
+    /// `payload`全体を`fill(0)`で作り直すが、右隣のLeaf Pageへのリンクは
+    /// エントリの中身とは無関係な「このページ自身がどこにあるか」という
+    /// 情報であり、書き換えのたびに失われては困る。分割(Leaf Split)のように
+    /// リンク自体を変える必要がある場合は、この後[`Self::set_next_leaf`]で
+    /// 明示的に上書きする(`crate::btree`のドキュメント参照)。
     pub fn write_entries(&mut self, entries: &[(Vec<u8>, RecordId)]) -> bool {
         let needed = required_len(LEAF_HEADER_SIZE, entries.iter().map(|(k, _)| k.len()), RECORD_ID_SIZE);
         if needed > self.payload.len() {
             return false;
         }
 
+        let next_leaf = self.as_ref().next_leaf();
         self.payload.fill(0);
         self.payload[0..2].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+        self.payload[2..10].copy_from_slice(&next_leaf.0.to_le_bytes());
 
         let dir_end = LEAF_HEADER_SIZE + entries.len() * DIR_ENTRY_SIZE;
         let mut cursor = dir_end;
@@ -337,6 +381,36 @@ impl<'a> InternalPageRef<'a> {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             if self.key(mid) <= key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 { self.leftmost_child() } else { self.child_after(lo - 1) }
+    }
+
+    /// `key`を含みうる**最も左側**の子ページを返す(第24章、Range Scanが使う)。
+    ///
+    /// `child_for`との違いは、区切りキーと`key`が等しい場合の分岐だけである。
+    /// 同じキーを持つエントリがLeaf Splitによって複数のLeaf Pageへ分かれると、
+    /// 内部ページの区切りキーにも同じ値が複数回現れうる(`crate::btree`の
+    /// モジュールドキュメント「重複キーの扱い」を参照)。`child_for`は
+    /// 「`key`以下の区切りキーの本数」を数えて最後の一致を選ぶため、同じ
+    /// `key`を持つエントリが複数の葉にまたがっている場合、その**最後**の葉
+    /// (`insert`が新しい重複キーを追記していく先)を返す。
+    ///
+    /// Range Scanが範囲の下限として`key`を渡すときは、これでは足りない。
+    /// `key`を含む一致の**最初**の葉から出発しないと、それより左の葉に
+    /// 残っている同じ`key`のエントリを取りこぼす(Leaf Pageは`next_leaf`で
+    /// 右方向にしかリンクしていないため、後から左へ戻れない)。この関数は
+    /// 「`key`より真に小さい区切りキーの本数」を数えることで、`key`と等しい
+    /// 区切りキーがあれば必ずその左側の子を選び、一致の最初の葉へたどり着く。
+    pub fn child_for_lower_bound(&self, key: &[u8]) -> PageId {
+        let mut lo = 0usize;
+        let mut hi = self.entry_count();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.key(mid) < key {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -469,10 +543,27 @@ mod tests {
     fn leaf_open_rejects_an_entry_whose_range_overruns_the_payload() {
         let mut payload = fresh_payload();
         payload[0..2].copy_from_slice(&1u16.to_le_bytes());
-        // key_offsetをpayloadの外へ出す。
-        payload[2..4].copy_from_slice(&(PAGE_PAYLOAD_SIZE as u16 - 1).to_le_bytes());
-        payload[4..6].copy_from_slice(&10u16.to_le_bytes());
+        // Directory(LEAF_HEADER_SIZE = entry_count(2) + next_leaf(8) = 10バイト
+        // 目から始まる)の1件目が指すkey_offsetをpayloadの外へ出す。
+        payload[10..12].copy_from_slice(&(PAGE_PAYLOAD_SIZE as u16 - 1).to_le_bytes());
+        payload[12..14].copy_from_slice(&10u16.to_le_bytes());
         assert!(matches!(LeafPageRef::open(&payload), Err(DbError::CorruptPage(_))));
+    }
+
+    #[test]
+    fn leaf_next_leaf_defaults_to_none_and_survives_write_entries() {
+        let mut payload = fresh_payload();
+        let mut page = LeafPage::init(&mut payload);
+        assert_eq!(page.as_ref().next_leaf(), NO_NEXT_LEAF);
+
+        page.set_next_leaf(PageId(7));
+        assert!(page.write_entries(&[(b"a".to_vec(), rid(1, 0))]));
+        // write_entriesはエントリを丸ごと書き直すが、next_leafは書き換え前の
+        // 値を引き継ぐ。
+        assert_eq!(page.as_ref().next_leaf(), PageId(7));
+
+        page.set_next_leaf(NO_NEXT_LEAF);
+        assert_eq!(LeafPageRef::open(&payload).unwrap().next_leaf(), NO_NEXT_LEAF);
     }
 
     #[test]

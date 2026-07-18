@@ -5,7 +5,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 
 ## 目次
 
-現在執筆済みなのは[はじめに](book/src/index.md)と第1〜23章のみで、第24章以降は準備中です。
+現在執筆済みなのは[はじめに](book/src/index.md)と第1〜24章のみで、第25章以降は準備中です。
 
 ### 第0部 設計と開発環境
 
@@ -41,7 +41,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 - [第21章 Sort、Limit、Distinct、Aggregate](book/src/ch21-sort-aggregate.md)
 - [第22章 Joinアルゴリズム](book/src/ch22-join.md)
 - [第23章 B+Tree I: 検索、挿入、分割](book/src/ch23-btree-1.md)
-- 第24章 B+Tree II: 範囲検索、削除、CREATE INDEX
+- [第24章 B+Tree II: 範囲検索、削除、CREATE INDEX](book/src/ch24-btree-2.md)
 - 第25章 Index Scanとアクセスパス
 
 ### 第4部 Query Optimizer: よりよい実行計画を選ぶ

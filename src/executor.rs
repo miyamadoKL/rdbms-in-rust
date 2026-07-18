@@ -121,6 +121,21 @@ pub fn insert(
 /// `DbError::CatalogTooLarge`)は、その手前まで挿入済みの行を巻き戻さない。
 /// これは`Storage::insert`自身がすでに採用している割り切り(第15章)を
 /// そのまま引き継いだもので、この章のスコープでは新たに解決しない。
+///
+/// # 第24章での変更: 一意性検査と索引の更新
+///
+/// `PRIMARY KEY`・`UNIQUE`列を持つテーブルは、第24章から`CREATE TABLE`が
+/// 必ず対応する`UNIQUE`索引を自動生成している(`Database::execute_create_table`)。
+/// 第20章の`constraints::check_uniqueness`(既存の全行を読んで`O(n)`で比較する)
+/// は、その「既存行との比較」の部分を`crate::index::check_uniqueness_with_index`
+/// (`UNIQUE`索引への`lookup`、`O(log n)`)へ置き換えた。同じ`INSERT`文の中の
+/// 行同士の重複(`candidates`同士)は索引に無いキーの衝突なので
+/// `check_uniqueness_with_index`では検出できず、引き続き
+/// `constraints::check_uniqueness`(`others`を空にした呼び出し)へ残す。
+///
+/// 検証をすべて通過したら、`storage.insert`で行を書き込んだ直後に
+/// `storage.index_insert_row`で**その行が対象になる全索引**(`UNIQUE`・
+/// 非`UNIQUE`の両方)を更新する(Index Maintenance)。
 pub fn storage_insert(
     storage: &mut Storage,
     table_id: TableId,
@@ -130,21 +145,15 @@ pub fn storage_insert(
     rows: &[Vec<Expr>],
 ) -> DbResult<usize> {
     let planned = plan_insert_rows(schema, functions, columns, rows)?;
-    // `PRIMARY KEY`・`UNIQUE`を持たないテーブルでは、既存の全行をわざわざ
-    // 読んで`decode_tuple`し直すコストが無駄になる。`unique_constrained_columns`
-    // が空ならこの走査そのものを丸ごと省く。
     if schema.unique_constrained_columns().next().is_some() {
-        let mut existing = Vec::with_capacity(planned.len());
-        for entry in storage.scan(table_id)? {
-            let (_, bytes) = entry?;
-            existing.push(decode_tuple(schema, &bytes)?);
-        }
-        constraints::check_uniqueness(schema, existing.iter(), &planned)?;
+        crate::index::check_uniqueness_with_index(storage, table_id, schema, &planned, &HashSet::new())?;
+        constraints::check_uniqueness(schema, std::iter::empty(), &planned)?;
     }
     let count = planned.len();
     for tuple in planned {
         let bytes = encode_tuple(schema, &tuple);
-        storage.insert(table_id, &bytes)?;
+        let rid = storage.insert(table_id, &bytes)?;
+        storage.index_insert_row(table_id, &tuple, rid)?;
     }
     Ok(count)
 }
@@ -278,6 +287,25 @@ pub fn update(
 /// 更新前の値(`decode_tuple`で復元した`tuple`)を使って評価するため、複数の
 /// 列を書き換える`UPDATE`でも後続の代入が直前の代入結果を見ることはない
 /// (`update`と同じ規則)。
+///
+/// # 第24章での変更: 一意性検査と索引の更新
+///
+/// `storage_insert`と同じ理由で、既存行との一意性検査は
+/// `crate::index::check_uniqueness_with_index`(索引への`lookup`)へ置き換えた。
+/// `UPDATE`は`INSERT`と違い「更新される行自身の更新前の値」を比較対象から
+/// 除く必要がある(`UPDATE users SET id = id`のような値を変えない更新や、
+/// 同じ文の中で2行が値を交換する更新を、自分自身との衝突として誤検出
+/// しないため)。この除外を、`others`(更新されない行だけを集めた`Vec`)を
+/// 作る代わりに、`planned`(更新される全行)の**更新前**の`RecordId`の
+/// 集合(`exclude`)として`check_uniqueness_with_index`へ渡す形で行う。
+///
+/// Index Maintenanceは、`storage.update`が返す新しい`RecordId`(ページ内に
+/// 収まれば元と同じ、収まらずページをまたいで移動すれば別の値になる、
+/// `Storage::update`のドキュメントを参照)をそのまま使い、更新前の値を
+/// `storage.index_delete_row`で取り除いてから、更新後の値を
+/// `storage.index_insert_row`で挿入し直す。値が変わらない列でも、行が
+/// 別のページへ移動していれば`RecordId`は変わるため、この削除→挿入を
+/// 省略すると索引が古い`RecordId`を指したまま残ってしまう。
 pub fn storage_update(
     storage: &mut Storage,
     table_id: TableId,
@@ -286,8 +314,7 @@ pub fn storage_update(
     assignments: &[BoundAssignment],
     predicate: Option<&BoundExpr>,
 ) -> DbResult<usize> {
-    let mut planned: Vec<(RecordId, Tuple)> = Vec::new();
-    let mut others: Vec<Tuple> = Vec::new();
+    let mut planned: Vec<(RecordId, Tuple, Tuple)> = Vec::new();
     for entry in storage.scan(table_id)? {
         let (rid, bytes) = entry?;
         let tuple = decode_tuple(schema, &bytes)?;
@@ -297,7 +324,6 @@ pub fn storage_update(
             Some(pred) => predicate_matches(eval_bound_expr(pred, functions, Some(&row))?)?,
         };
         if !matched {
-            others.push(tuple);
             continue;
         }
 
@@ -305,19 +331,23 @@ pub fn storage_update(
         for assignment in assignments {
             new_values[assignment.column_index] = eval_bound_expr(&assignment.value, functions, Some(&row))?;
         }
-        planned.push((rid, Tuple::new(schema, new_values)?));
+        let new_tuple = Tuple::new(schema, new_values)?;
+        planned.push((rid, tuple, new_tuple));
     }
 
-    // `update`(MemTable版)と同じ理由で、更新されない行(`others`)だけを
-    // 比較相手にする。`others`はすでに上のループで、更新される行を除いて
-    // 集め終えている。
-    let candidates: Vec<Tuple> = planned.iter().map(|(_, tuple)| tuple.clone()).collect();
-    constraints::check_uniqueness(schema, others.iter(), &candidates)?;
+    if schema.unique_constrained_columns().next().is_some() {
+        let exclude: HashSet<RecordId> = planned.iter().map(|(rid, _, _)| *rid).collect();
+        let candidates: Vec<Tuple> = planned.iter().map(|(_, _, new_tuple)| new_tuple.clone()).collect();
+        crate::index::check_uniqueness_with_index(storage, table_id, schema, &candidates, &exclude)?;
+        constraints::check_uniqueness(schema, std::iter::empty(), &candidates)?;
+    }
 
     let count = planned.len();
-    for (rid, new_tuple) in planned {
+    for (old_rid, old_tuple, new_tuple) in planned {
         let bytes = encode_tuple(schema, &new_tuple);
-        storage.update(table_id, rid, &bytes)?;
+        let new_rid = storage.update(table_id, old_rid, &bytes)?.unwrap_or(old_rid);
+        storage.index_delete_row(table_id, &old_tuple, old_rid)?;
+        storage.index_insert_row(table_id, &new_tuple, new_rid)?;
     }
     Ok(count)
 }
@@ -361,6 +391,8 @@ pub fn delete(
 /// 新しい`Vec`へ集めるのとは集め方が逆(こちらは消す側を集める)だが、
 /// どちらも「対象を確定させてから初めて書き換える」という順序は同じであり、
 /// 集め終える前に評価が失敗すれば`storage`はまだ何も変更されていない。
+/// 第24章から、削除する行ごとに`storage.index_delete_row`を呼び、
+/// `table_id`の全索引からその行のエントリを取り除く(Index Maintenance)。
 pub fn storage_delete(
     storage: &mut Storage,
     table_id: TableId,
@@ -368,7 +400,7 @@ pub fn storage_delete(
     functions: &FunctionRegistry,
     predicate: Option<&BoundExpr>,
 ) -> DbResult<usize> {
-    let mut to_delete: Vec<RecordId> = Vec::new();
+    let mut to_delete: Vec<(RecordId, Tuple)> = Vec::new();
     for entry in storage.scan(table_id)? {
         let (rid, bytes) = entry?;
         let tuple = decode_tuple(schema, &bytes)?;
@@ -378,13 +410,14 @@ pub fn storage_delete(
             Some(pred) => predicate_matches(eval_bound_expr(pred, functions, Some(&row))?)?,
         };
         if matched {
-            to_delete.push(rid);
+            to_delete.push((rid, tuple));
         }
     }
 
     let count = to_delete.len();
-    for rid in to_delete {
+    for (rid, tuple) in to_delete {
         storage.delete(table_id, rid)?;
+        storage.index_delete_row(table_id, &tuple, rid)?;
     }
     Ok(count)
 }
