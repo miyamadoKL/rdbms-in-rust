@@ -61,7 +61,11 @@ fn predicate_matches(value: Value) -> DbResult<bool> {
 /// `infer_type`が`None`(型が定まらない)を返すが、これは`NULL`という有効な
 /// `UNKNOWN`述語(0行にマッチする)であって型エラーではないため、`Some(Boolean)`
 /// と同じく許可する。
-fn check_predicate_type(
+///
+/// `pub(crate)`なのは、`FROM`を伴わない`SELECT`(`database`モジュールの
+/// `execute_select_without_from`)も、意味を持たないまま構文としてだけ受理する
+/// `WHERE`句の型を同じ規則で検査するため。
+pub(crate) fn check_predicate_type(
     predicate: &Expr,
     schema: &Schema,
     functions: &FunctionRegistry,
@@ -217,7 +221,15 @@ fn describe_type(data_type: Option<DataType>) -> String {
 ///   登録された戻り値の型(`Some`)を返す。各引数は、宣言された型または
 ///   `None`でなければエラー。
 /// - 括弧`(expr)`は中身の式の型・検査をそのまま引き継ぐ。
-fn infer_type(
+///
+/// `pub(crate)`なのは、`FROM`を伴わない`SELECT`(`database`モジュールの
+/// `execute_select_without_from`)も、`FROM`を伴う`SELECT`と同じ型検査を
+/// 各射影式に適用するため。`eval_arith`のような実行時の評価関数は`NULL`を
+/// 型検査より先に伝播させる(`checked_add`等に辿り着く前に`is_null`で
+/// 早期リターンする)ため、`infer_type`による静的検査を経由しない経路では
+/// `NULL + 'x'`のような型不正の式でも`NULL`として黙って成功してしまう。
+/// `FROM`の有無で成否が変わらないよう、両方の経路で同じ静的検査を先に通す。
+pub(crate) fn infer_type(
     expr: &Expr,
     schema: &Schema,
     functions: &FunctionRegistry,

@@ -113,11 +113,29 @@ impl Database {
 
     /// `FROM`を伴わない`SELECT`。式リストをその場で評価するだけで、行は常に
     /// ちょうど1件返る。
+    ///
+    /// `FROM`が無いので列参照できる列は無く、`executor::infer_type`に渡す
+    /// `Schema`は空(`Schema::new(Vec::new())`)になる。`FROM`を伴う`SELECT`
+    /// (`execute_select_with_from`、`executor::project`が担う)と同じく、
+    /// 各射影式を`eval_expr`で実際に評価する前に`executor::infer_type`で
+    /// 静的に型検査する。`eval_arith`のような実行時の評価関数は、両辺の型を
+    /// 検査するより先に`NULL`を伝播させて早期リターンするため、この静的検査を
+    /// 経由しない経路のままだと`SELECT NULL + 'x'`のような型不正の式が
+    /// `NULL`として黙って成功してしまう(`FROM`を伴う`SELECT NULL + 'x' FROM t`は
+    /// `executor::project`がすでに`infer_type`で拒否する)。`FROM`の有無で
+    /// 成否が変わらないよう、こちらの経路にも同じ静的検査を先に通す。
+    /// 構文としてだけ受理する(`from`が無いと意味を持たない)`WHERE`句も、
+    /// 同じ理由で`executor::check_predicate_type`にかけておく。
     fn execute_select_without_from(
         &self,
         sql: &str,
         select: &SelectStatement,
     ) -> DbResult<QueryResult> {
+        let empty_schema = Schema::new(Vec::new());
+        if let Some(predicate) = &select.where_clause {
+            executor::check_predicate_type(predicate, &empty_schema, &self.functions)?;
+        }
+
         let mut columns = Vec::with_capacity(select.items.len());
         let mut values = Vec::with_capacity(select.items.len());
         for item in &select.items {
@@ -129,6 +147,7 @@ impl Database {
                     ));
                 }
             };
+            executor::infer_type(expr, &empty_schema, &self.functions)?;
             let value = eval::eval_expr(expr, &self.functions, None)?;
             // `Value::Null`はどの`DataType`にも属さないため、結果列の表示用の型を
             // 決められない。この章ではPostgreSQLの`unknown`型のような専用の型を
@@ -446,6 +465,71 @@ mod tests {
         let mut db = Database::memory();
         let result = db.execute("SELECT id;");
         assert!(matches!(result, Err(DbError::Eval(_))));
+    }
+
+    #[test]
+    fn null_plus_text_is_rejected_the_same_way_with_and_without_from() {
+        // `eval_arith`は両辺の型を検査するより先に`NULL`を伝播させて早期リターン
+        // するため、`infer_type`による静的検査を経由しない経路のままだと
+        // `SELECT NULL + 'x'`(FROMなし)は`NULL`として黙って成功してしまい、
+        // `SELECT NULL + 'x' FROM t`(`executor::project`がすでに`infer_type`で
+        // 検査する)は拒否される、というFROMの有無による非対称が生じる。
+        // `execute_select_without_from`にも同じ静的検査を通すことで、両方の経路が
+        // 同じ文言の`エラー`になることを確認する。
+        let without_from_message =
+            expect_eval_error_message(&mut Database::memory(), "SELECT NULL + 'x'");
+
+        let mut empty_db = users_db();
+        let empty_from_message =
+            expect_eval_error_message(&mut empty_db, "SELECT NULL + 'x' FROM users");
+
+        let mut populated_db = users_db();
+        populated_db
+            .execute("INSERT INTO users VALUES (1, 'Alice')")
+            .unwrap();
+        let populated_from_message =
+            expect_eval_error_message(&mut populated_db, "SELECT NULL + 'x' FROM users");
+
+        assert_eq!(without_from_message, "算術演算はBIGINT同士にのみ使えます: NULLとTEXT");
+        assert_eq!(without_from_message, empty_from_message);
+        assert_eq!(without_from_message, populated_from_message);
+    }
+
+    #[test]
+    fn null_plus_text_is_null_is_rejected_the_same_way_with_and_without_from() {
+        // `IS NULL`は被演算子の型を問わないが、被演算子自身(`NULL + 'x'`)は
+        // 再帰的に検査されるため、この式全体もFROMの有無に関係なく同じ
+        // エラーになる。
+        let without_from_message =
+            expect_eval_error_message(&mut Database::memory(), "SELECT (NULL + 'x') IS NULL");
+
+        let mut empty_db = users_db();
+        let empty_from_message = expect_eval_error_message(
+            &mut empty_db,
+            "SELECT (NULL + 'x') IS NULL FROM users",
+        );
+
+        let mut populated_db = users_db();
+        populated_db
+            .execute("INSERT INTO users VALUES (1, 'Alice')")
+            .unwrap();
+        let populated_from_message = expect_eval_error_message(
+            &mut populated_db,
+            "SELECT (NULL + 'x') IS NULL FROM users",
+        );
+
+        assert_eq!(without_from_message, empty_from_message);
+        assert_eq!(without_from_message, populated_from_message);
+    }
+
+    #[test]
+    fn null_plus_bigint_still_propagates_null_without_from() {
+        // `NULL + 1`はどちらも`BigInt`か`None`(型未定の`NULL`)であり、
+        // `infer_type`の検査を正しく通過する。型として正しい式に対する実行時の
+        // `NULL`伝播(`eval_arith`)は、この静的検査の変更後もそのまま働く。
+        let mut db = Database::memory();
+        let result = db.execute("SELECT NULL + 1;").unwrap();
+        assert_eq!(result.rows()[0].values(), &[Value::Null]);
     }
 
     #[test]

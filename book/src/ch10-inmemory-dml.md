@@ -404,6 +404,62 @@ minidb> SELECT id FROM users WHERE 1;
 `infer_type`が`AND`の両辺の型まで検査することで、`WHERE 1 AND 2`は空でも非空でもどちらのテーブルに対しても同じ`エラー`になります。
 `WHERE NOT 1`(単項`NOT`の被演算子の型)や`WHERE abs('x') = 1`(関数`abs`の引数の型)も同じ理由で式木全体の検査が必要で、`infer_type`の再帰呼び出しがこれらすべてをまとめて検査します。
 
+`infer_type`による静的検査は、`FROM`を伴う`SELECT`(`executor::project`)と`WHERE`(`check_predicate_type`)にはすでに通っていますが、`FROM`を伴わない`SELECT`(第7章で導入した`execute_select_without_from`)には元は通っていませんでした。
+`execute_select_without_from`は各射影式を`eval::eval_expr`でその場で評価するだけだったため、`SELECT NULL + 'x'`のような型として誤った式が、`eval_arith`のNULL伝播(前章までで見たとおり、`if l.is_null() || r.is_null()`という早期リターンが型の検査より先に働く)にすり抜けられ、`NULL`として黙って成功してしまいます。
+一方、同じ式に`FROM`を付けた`SELECT NULL + 'x' FROM users`は、`executor::project`がすでに`infer_type`で拒否します。
+`FROM`の有無だけで成否が変わってしまうこの非対称を無くすため、`execute_select_without_from`にも`executor::infer_type`と`executor::check_predicate_type`を追加しました(`infer_type`と`check_predicate_type`はこの章のために`pub(crate)`にしています)。
+
+```rust
+fn execute_select_without_from(
+    &self,
+    sql: &str,
+    select: &SelectStatement,
+) -> DbResult<QueryResult> {
+    let empty_schema = Schema::new(Vec::new());
+    if let Some(predicate) = &select.where_clause {
+        executor::check_predicate_type(predicate, &empty_schema, &self.functions)?;
+    }
+
+    let mut columns = Vec::with_capacity(select.items.len());
+    let mut values = Vec::with_capacity(select.items.len());
+    for item in &select.items {
+        let expr = match item {
+            SelectItem::Expr { expr, .. } => expr,
+            SelectItem::Wildcard { .. } => {
+                return Err(DbError::Eval(
+                    "*はFROMを伴うSELECTでのみ使えます".to_string(),
+                ));
+            }
+        };
+        executor::infer_type(expr, &empty_schema, &self.functions)?;
+        let value = eval::eval_expr(expr, &self.functions, None)?;
+        // `Value::Null`はどの`DataType`にも属さないため、結果列の表示用の型を
+        // 決められない。この章ではPostgreSQLの`unknown`型のような専用の型を
+        // 別途設けず、`TEXT`をプレースホルダーとして使う(値そのものは
+        // `Value::Null`のままなので、表示や後続の計算がこの選択に影響されることはない)。
+        let data_type = value.data_type().unwrap_or(DataType::Text);
+        let nullable = value.is_null();
+        let name = sql[item.span().start..item.span().end].to_string();
+        columns.push(Column::new(name, data_type, nullable));
+        values.push(value);
+    }
+
+    let schema = Schema::new(columns);
+    let tuple = Tuple::new(&schema, values)?;
+
+    Ok(QueryResult {
+        schema,
+        rows: vec![tuple],
+        command_tag: None,
+    })
+}
+```
+
+`FROM`が無いので列参照できる列は無く、`infer_type`と`check_predicate_type`に渡す`Schema`は空(`Schema::new(Vec::new())`)です。
+`WHERE`句は`from`が無いと構文としてだけ受理され意味を持たない(このクレートでは実際にフィルタしない)ままですが、型だけは同じ規則で検査しておきます。
+`SELECT NULL + 'x'`と`SELECT NULL + 'x' FROM users`は、テーブルが空でも行を持っていても、これで同じ`エラー`(`算術演算はBIGINT同士にのみ使えます: NULLとTEXT`)になります。
+逆に`SELECT NULL + 1`のように両辺が`BigInt`か`None`(型未定の`NULL`)であれば`infer_type`の検査を正しく通過するので、型として正しい式に対する`eval_arith`の`NULL`伝播(前章で述べたとおり)はそのまま働き、結果は`NULL`のまま成功します。
+
 Filter演算子は、`守るべき不変条件`の1番目を、`check_predicate_type`と`predicate_matches`の2段構えでコードにしています。
 
 ```rust
