@@ -226,15 +226,12 @@ fn tri_or(l: Tri, r: Tri) -> Tri {
 
 /// `CAST`の型名(テキスト)を`DataType`へ解決する。
 ///
-/// カタログはまだ存在しない(第9章で作る)ため、この章では`BIGINT` / `TEXT` /
-/// `BOOLEAN`という3つの名前を直接文字列比較で解決する簡易実装に留める。
+/// 実際の解決は`DataType::from_sql_name`に委ねる。第9章の`CREATE TABLE`も
+/// 同じ関数で列の型名を解決しており、「型名の一覧」がこのクレートに2箇所
+/// 存在する事態を避けている。
 fn resolve_data_type(type_name: &str) -> DbResult<DataType> {
-    match type_name.to_ascii_uppercase().as_str() {
-        "BIGINT" => Ok(DataType::BigInt),
-        "TEXT" => Ok(DataType::Text),
-        "BOOLEAN" => Ok(DataType::Boolean),
-        other => Err(DbError::Eval(format!("未知の型名です: {other}"))),
-    }
+    DataType::from_sql_name(type_name)
+        .ok_or_else(|| DbError::Eval(format!("未知の型名です: {type_name}")))
 }
 
 /// `CAST(value AS target)`を評価する。

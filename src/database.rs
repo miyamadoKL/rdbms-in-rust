@@ -1,57 +1,88 @@
 //! SQL文字列を受け取り、結果を返す実行の入口。
 //!
 //! `Database::execute`は、まずSQL文字列を`parser::parse_statement`でASTへ変換する。
-//! 実際に実行できるのは、`FROM`を伴わない`SELECT`の式リストである。式の評価は
-//! `eval`モジュールに委ね、算術・比較・三値論理・`IS NULL`・`CAST`・Scalar Function
-//! 呼び出しがすべて動く。`CREATE TABLE`・`INSERT`・`FROM`/`WHERE`付きの`SELECT`は
-//! 構文解析までは通るが、実行するとカタログとインメモリ表が揃う章(第9〜10章)を
-//! 指し示す`DbError::NotImplemented`を返す。
+//! 実行できるのは、`FROM`を伴わない`SELECT`の式リストと、`CREATE TABLE`・
+//! `DROP TABLE`である。`SELECT`の式評価は`eval`モジュールに委ね、算術・比較・
+//! 三値論理・`IS NULL`・`CAST`・Scalar Function呼び出しがすべて動く。`CREATE TABLE`・
+//! `DROP TABLE`は`catalog`モジュールの`Catalog`にテーブル定義を登録・削除する。
+//! `INSERT`・`FROM`/`WHERE`付きの`SELECT`は構文解析までは通るが、実行すると
+//! インメモリ表が揃う第10章を指し示す`DbError::NotImplemented`を返す。
 
-use crate::ast::{SelectStatement, Statement};
+use crate::ast::{CreateTableStatement, DropTableStatement, SelectStatement, Statement};
+use crate::catalog::Catalog;
 use crate::error::{DbError, DbResult};
 use crate::eval::{self, FunctionRegistry};
 use crate::types::{Column, DataType, Schema, Tuple, Value};
 
 /// minidbのデータベース1つを表す。
 ///
-/// 現時点ではScalar Functionのレジストリしか状態を持たない。ディスクへの永続化は
-/// 第2部で`Database::open`のような別のコンストラクタとして追加する。
+/// Scalar Functionのレジストリと、テーブル定義を保持する`Catalog`を持つ。
+/// ディスクへの永続化は第2部で`Database::open`のような別のコンストラクタとして
+/// 追加する。
 pub struct Database {
     functions: FunctionRegistry,
+    catalog: Catalog,
 }
 
 impl Database {
     /// インメモリのDatabaseを作る。組み込みのScalar Function(`abs`、`length`)は
-    /// 最初から登録済みの状態で始まる。
+    /// 最初から登録済みの状態で始まり、カタログは空の状態で始まる。
     pub fn memory() -> Self {
         Database {
             functions: FunctionRegistry::with_builtins(),
+            catalog: Catalog::new(),
         }
+    }
+
+    /// 現在のカタログへの参照。第10章のDML実行は、この参照でテーブル定義を引く。
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
     }
 
     /// SQL文字列を1本実行し、結果を返す。
     ///
     /// 構文解析(`parser::parse_statement`)がまず走り、`DbError::Lex`または
     /// `DbError::Parse`はそのまま呼び出し元に伝わる。構文解析に成功しても、
-    /// この章の時点で実行できない構文(`FROM`/`WHERE`付き`SELECT`、
-    /// `CREATE TABLE`、`INSERT`)は`DbError::NotImplemented`を返す。
+    /// この章の時点で実行できない構文(`FROM`/`WHERE`付き`SELECT`、`INSERT`)は
+    /// `DbError::NotImplemented`を返す。
     pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
         let statement = crate::parser::parse_statement(sql)?;
         match statement {
             Statement::Select(select) => self.execute_select(sql, &select),
-            Statement::CreateTable(_) => Err(DbError::NotImplemented(
-                "CREATE TABLEの実行(カタログへの登録)は第9章で対応します".to_string(),
-            )),
+            Statement::CreateTable(create) => self.execute_create_table(&create),
+            Statement::DropTable(drop) => self.execute_drop_table(&drop),
             Statement::Insert(_) => Err(DbError::NotImplemented(
                 "INSERTの実行(表への追加)は第10章で対応します".to_string(),
             )),
         }
     }
 
+    /// `CREATE TABLE`を実行し、列定義を`Schema`へ変換したうえで`Catalog`に登録する。
+    fn execute_create_table(&mut self, create: &CreateTableStatement) -> DbResult<QueryResult> {
+        let mut columns = Vec::with_capacity(create.columns.len());
+        for column_def in &create.columns {
+            let data_type = DataType::from_sql_name(&column_def.type_name.name).ok_or_else(
+                || DbError::Eval(format!("未知の型名です: {}", column_def.type_name.name)),
+            )?;
+            let nullable = !column_def.not_null;
+            columns.push(Column::new(column_def.name.name.clone(), data_type, nullable));
+        }
+
+        let schema = Schema::new(columns);
+        self.catalog.create_table(&create.table.name, schema)?;
+        Ok(QueryResult::command("CREATE TABLE"))
+    }
+
+    /// `DROP TABLE`を実行し、`Catalog`からテーブル定義を削除する。
+    fn execute_drop_table(&mut self, drop: &DropTableStatement) -> DbResult<QueryResult> {
+        self.catalog.drop_table(&drop.table.name)?;
+        Ok(QueryResult::command("DROP TABLE"))
+    }
+
     fn execute_select(&self, sql: &str, select: &SelectStatement) -> DbResult<QueryResult> {
         if select.from.is_some() || select.where_clause.is_some() {
             return Err(DbError::NotImplemented(
-                "FROM・WHEREを伴うSELECTの実行(カタログと表の参照)は第9〜10章で対応します"
+                "FROM・WHEREを伴うSELECTの実行(表の中身を読む手段)は第10章で対応します"
                     .to_string(),
             ));
         }
@@ -77,23 +108,39 @@ impl Database {
         Ok(QueryResult {
             schema,
             rows: vec![tuple],
+            command_tag: None,
         })
     }
 }
 
-/// `Database::execute`の結果。列構成(`Schema`)と、それに従う行の並びを持つ。
+/// `Database::execute`の結果。
+///
+/// `SELECT`は列構成(`Schema`)と、それに従う行の並びを持つ。`CREATE TABLE`・
+/// `DROP TABLE`のようなDDL文は返す行を持たないため、`schema`は空、`rows`も
+/// 空のベクタになり、代わりに`command_tag`が完了した文の種類(`"CREATE TABLE"`など)
+/// を持つ。行を1件も返さない`SELECT`と区別するためにフィールドを分けている。
 pub struct QueryResult {
     schema: Schema,
     rows: Vec<Tuple>,
+    command_tag: Option<&'static str>,
 }
 
 impl QueryResult {
-    /// 結果の列構成を返す。
+    /// DDL文が完了したことを表す`QueryResult`を作る。
+    fn command(tag: &'static str) -> Self {
+        QueryResult {
+            schema: Schema::new(Vec::new()),
+            rows: Vec::new(),
+            command_tag: Some(tag),
+        }
+    }
+
+    /// 結果の列構成を返す。DDL文の完了では列を持たない空の`Schema`を返す。
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
 
-    /// 結果の行を返す。
+    /// 結果の行を返す。DDL文の完了では常に空のスライスを返す。
     pub fn rows(&self) -> &[Tuple] {
         &self.rows
     }
@@ -101,6 +148,10 @@ impl QueryResult {
 
 impl std::fmt::Display for QueryResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(tag) = self.command_tag {
+            return write!(f, "{tag}");
+        }
+
         let header = self
             .schema
             .columns()
@@ -293,16 +344,88 @@ mod tests {
     }
 
     #[test]
-    fn create_table_is_not_implemented_yet() {
-        let mut db = Database::memory();
-        let result = db.execute("CREATE TABLE users (id BIGINT NOT NULL)");
-        assert!(matches!(result, Err(DbError::NotImplemented(_))));
-    }
-
-    #[test]
     fn insert_is_not_implemented_yet() {
         let mut db = Database::memory();
         let result = db.execute("INSERT INTO users VALUES (1)");
         assert!(matches!(result, Err(DbError::NotImplemented(_))));
+    }
+
+    // ---- CREATE TABLE ----
+
+    #[test]
+    fn create_table_registers_the_table_in_the_catalog() {
+        let mut db = Database::memory();
+        let result = db
+            .execute("CREATE TABLE users (id BIGINT NOT NULL, name TEXT)")
+            .unwrap();
+        assert_eq!(result.to_string(), "CREATE TABLE");
+
+        let info = db.catalog().table("users").unwrap();
+        assert_eq!(info.schema.columns().len(), 2);
+        assert_eq!(info.schema.columns()[0].name, "id");
+        assert_eq!(info.schema.columns()[0].data_type, DataType::BigInt);
+        assert!(!info.schema.columns()[0].nullable);
+        assert_eq!(info.schema.columns()[1].name, "name");
+        assert_eq!(info.schema.columns()[1].data_type, DataType::Text);
+        assert!(info.schema.columns()[1].nullable);
+    }
+
+    #[test]
+    fn create_table_result_has_no_rows() {
+        let mut db = Database::memory();
+        let result = db
+            .execute("CREATE TABLE users (id BIGINT NOT NULL)")
+            .unwrap();
+        assert!(result.rows().is_empty());
+        assert!(result.schema().is_empty());
+    }
+
+    #[test]
+    fn create_table_rejects_duplicate_name() {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE users (id BIGINT NOT NULL)")
+            .unwrap();
+        let result = db.execute("CREATE TABLE users (id BIGINT NOT NULL)");
+        assert!(matches!(result, Err(DbError::DuplicateTable(name)) if name == "users"));
+    }
+
+    #[test]
+    fn create_table_rejects_unknown_type_name() {
+        let mut db = Database::memory();
+        let result = db.execute("CREATE TABLE users (id FLOAT)");
+        assert!(matches!(result, Err(DbError::Eval(_))));
+        // 型名の解決に失敗した時点でカタログには何も登録されない。
+        assert!(db.catalog().table("users").is_none());
+    }
+
+    // ---- DROP TABLE ----
+
+    #[test]
+    fn drop_table_removes_a_registered_table() {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE users (id BIGINT NOT NULL)")
+            .unwrap();
+        let result = db.execute("DROP TABLE users").unwrap();
+        assert_eq!(result.to_string(), "DROP TABLE");
+        assert!(db.catalog().table("users").is_none());
+    }
+
+    #[test]
+    fn drop_table_rejects_unknown_table() {
+        let mut db = Database::memory();
+        let result = db.execute("DROP TABLE users");
+        assert!(matches!(result, Err(DbError::TableNotFound(name)) if name == "users"));
+    }
+
+    #[test]
+    fn create_drop_create_cycle_succeeds() {
+        // 削除したテーブル名は再利用できる: 削除→同名で再作成が通ることを確認する。
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE users (id BIGINT NOT NULL)")
+            .unwrap();
+        db.execute("DROP TABLE users").unwrap();
+        let result = db.execute("CREATE TABLE users (id BIGINT NOT NULL, name TEXT)");
+        assert!(result.is_ok());
+        assert_eq!(db.catalog().table("users").unwrap().schema.columns().len(), 2);
     }
 }

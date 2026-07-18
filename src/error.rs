@@ -19,6 +19,14 @@ pub enum DbError {
     #[error("スキーマ不一致: {0}")]
     SchemaMismatch(String),
 
+    /// `CREATE TABLE`が、すでにカタログへ登録済みのテーブル名を指定したエラー。
+    #[error("テーブルはすでに存在します: {0}")]
+    DuplicateTable(String),
+
+    /// `DROP TABLE`が、カタログに登録されていないテーブル名を指定したエラー。
+    #[error("テーブルが存在しません: {0}")]
+    TableNotFound(String),
+
     /// 式の評価に失敗したエラー(型不一致、ゼロ除算、整数オーバーフロー、
     /// `CAST`の失敗、未知の関数・型名など)。
     #[error("評価エラー: {0}")]

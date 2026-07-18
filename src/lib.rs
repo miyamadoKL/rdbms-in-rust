@@ -3,10 +3,13 @@
 //! 教材の各章はこのクレートを段階的に育てていく。現時点では
 //! エラー型、識別子のNewtype、簡易ログマクロ、関係モデルの型、
 //! SQL文字列をToken列へ変換する字句解析器(`lexer`)、Token列をASTへ変換する
-//! 構文解析器(`parser`、`ast`)、`Expr`を`Value`へ変換する式評価器(`eval`)に加えて、
-//! `SELECT`の式リストを実行できる最初の縦切り(`Database`)を提供する。
+//! 構文解析器(`parser`、`ast`)、`Expr`を`Value`へ変換する式評価器(`eval`)、
+//! テーブル定義の唯一の情報源であるインメモリカタログ(`catalog`)に加えて、
+//! `SELECT`の式リストと`CREATE TABLE`・`DROP TABLE`を実行できる縦切り
+//! (`Database`)を提供する。
 
 pub mod ast;
+pub mod catalog;
 pub mod database;
 pub mod error;
 pub mod eval;
@@ -16,6 +19,7 @@ pub mod parser;
 pub mod types;
 
 pub use ast::{Expr, Statement};
+pub use catalog::{Catalog, TableInfo};
 pub use database::{Database, QueryResult};
 pub use error::{DbError, DbResult};
 pub use eval::{FunctionRegistry, eval_expr};

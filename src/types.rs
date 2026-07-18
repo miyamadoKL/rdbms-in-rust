@@ -33,6 +33,22 @@ pub enum Value {
     Text(String),
 }
 
+impl DataType {
+    /// SQLの型名(大文字小文字を無視)から`DataType`を解決する。
+    ///
+    /// 対応する型が無ければ`None`を返す。`CAST`の型名解決(第8章の`eval`モジュール)と
+    /// `CREATE TABLE`の列定義の型名解決(第9章の`Database::execute`)が、この関数を
+    /// 共通の実装として使う。
+    pub fn from_sql_name(name: &str) -> Option<DataType> {
+        match name.to_ascii_uppercase().as_str() {
+            "BIGINT" => Some(DataType::BigInt),
+            "TEXT" => Some(DataType::Text),
+            "BOOLEAN" => Some(DataType::Boolean),
+            _ => None,
+        }
+    }
+}
+
 impl Value {
     /// この値の`DataType`を返す。
     ///
@@ -192,6 +208,19 @@ mod tests {
             Column::new("name", DataType::Text, false),
             Column::new("nickname", DataType::Text, true),
         ])
+    }
+
+    #[test]
+    fn from_sql_name_resolves_known_types_case_insensitively() {
+        assert_eq!(DataType::from_sql_name("BIGINT"), Some(DataType::BigInt));
+        assert_eq!(DataType::from_sql_name("bigint"), Some(DataType::BigInt));
+        assert_eq!(DataType::from_sql_name("Text"), Some(DataType::Text));
+        assert_eq!(DataType::from_sql_name("boolean"), Some(DataType::Boolean));
+    }
+
+    #[test]
+    fn from_sql_name_rejects_unknown_type() {
+        assert_eq!(DataType::from_sql_name("FLOAT"), None);
     }
 
     #[test]

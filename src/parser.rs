@@ -7,6 +7,7 @@
 //! 対応する構文は次のとおり。
 //! - `SELECT <式> [, <式> ...] [FROM <table>] [WHERE <式>]`
 //! - `CREATE TABLE <table> (<col> <type> [NOT NULL], ...)`
+//! - `DROP TABLE <table>`
 //! - `INSERT INTO <table> VALUES (<式>, ...)`
 //! - 式: リテラル(整数・文字列・真偽値・`NULL`)、列参照、二項演算(`+ - * /`、
 //!   比較、`AND` `OR`)、単項演算(`-` `NOT`)、`IS [NOT] NULL`、関数呼び出し、
@@ -15,8 +16,8 @@
 //! 優先順位は低い順に`OR` < `AND` < `NOT` < 比較 < `+` `-` < `*` `/` < 単項`-`。
 
 use crate::ast::{
-    BinaryOperator, ColumnDef, CreateTableStatement, Expr, Ident, InsertStatement, SelectItem,
-    SelectStatement, Statement, UnaryOperator,
+    BinaryOperator, ColumnDef, CreateTableStatement, DropTableStatement, Expr, Ident,
+    InsertStatement, SelectItem, SelectStatement, Statement, UnaryOperator,
 };
 use crate::error::{DbError, DbResult};
 use crate::lexer::{self, Keyword, Span, Token, TokenKind};
@@ -131,10 +132,13 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Create) => self
                 .parse_create_table_statement()
                 .map(Statement::CreateTable),
+            TokenKind::Keyword(Keyword::Drop) => {
+                self.parse_drop_table_statement().map(Statement::DropTable)
+            }
             TokenKind::Keyword(Keyword::Insert) => {
                 self.parse_insert_statement().map(Statement::Insert)
             }
-            _ => Err(self.unexpected("SELECT・CREATE TABLE・INSERT INTOのいずれか")),
+            _ => Err(self.unexpected("SELECT・CREATE TABLE・DROP TABLE・INSERT INTOのいずれか")),
         }
     }
 
@@ -223,6 +227,20 @@ impl<'a> Parser<'a> {
             name,
             type_name,
             not_null,
+        })
+    }
+
+    // ---- DROP TABLE ----
+
+    fn parse_drop_table_statement(&mut self) -> DbResult<DropTableStatement> {
+        let start = self.expect_keyword(Keyword::Drop, "DROP")?.start;
+        self.expect_keyword(Keyword::Table, "TABLE")?;
+        let table = self.expect_ident()?;
+        let end = table.span.end;
+
+        Ok(DropTableStatement {
+            table,
+            span: Span::new(start, end),
         })
     }
 
@@ -773,6 +791,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_drop_table() {
+        let statement = parse_statement("DROP TABLE users").unwrap();
+        match statement {
+            Statement::DropTable(drop) => assert_eq!(drop.table.name, "users"),
+            other => panic!("DROP TABLE文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
     fn parses_insert() {
         let statement = parse_statement("INSERT INTO users VALUES (1, 'Alice')").unwrap();
         match statement {
@@ -815,7 +842,9 @@ mod tests {
 
     #[test]
     fn syntax_error_on_unknown_statement_start() {
-        let err = parse_statement("DROP TABLE users").unwrap_err();
+        // `UPDATE`はLexerの予約語だが、この章のParserはまだ文の先頭として
+        // 受理しない(対応するのは第10章)。
+        let err = parse_statement("UPDATE users SET id = 1").unwrap_err();
         assert!(matches!(err, DbError::Parse { .. }));
     }
 

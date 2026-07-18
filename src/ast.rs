@@ -20,6 +20,8 @@ pub enum Statement {
     Select(SelectStatement),
     /// `CREATE TABLE`文。
     CreateTable(CreateTableStatement),
+    /// `DROP TABLE`文。
+    DropTable(DropTableStatement),
     /// `INSERT INTO`文。
     Insert(InsertStatement),
 }
@@ -30,6 +32,7 @@ impl Statement {
         match self {
             Statement::Select(s) => s.span,
             Statement::CreateTable(s) => s.span,
+            Statement::DropTable(s) => s.span,
             Statement::Insert(s) => s.span,
         }
     }
@@ -86,6 +89,13 @@ pub struct ColumnDef {
     pub type_name: Ident,
     /// `NOT NULL`が指定されていたかどうか。
     pub not_null: bool,
+    pub span: Span,
+}
+
+/// `DROP TABLE`文。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTableStatement {
+    pub table: Ident,
     pub span: Span,
 }
 
