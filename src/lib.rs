@@ -10,7 +10,9 @@
 //! Deleteの各演算子(`executor`)に加えて、`SELECT`・`INSERT`・`UPDATE`・
 //! `DELETE`・`CREATE TABLE`・`DROP TABLE`を実行できる縦切り(`Database`)を
 //! 提供する。第2部からは、データベースファイルのオンディスク形式(File Header、
-//! Page、Checksum)を扱う`page`が加わる。
+//! Page、Checksum)を扱う`page`、Pageの`payload`内に可変長レコードを詰める
+//! Slotted Page(`slotted_page`)と、`Tuple`をそのバイト列との間でencode/decode
+//! する`tuple_codec`が加わる。
 
 pub mod ast;
 pub mod catalog;
@@ -22,7 +24,9 @@ pub mod ids;
 pub mod lexer;
 pub mod page;
 pub mod parser;
+pub mod slotted_page;
 pub mod storage_mem;
+pub mod tuple_codec;
 pub mod types;
 
 pub use ast::{Expr, Statement};
@@ -30,14 +34,16 @@ pub use catalog::{Catalog, TableInfo};
 pub use database::{Database, QueryResult};
 pub use error::{DbError, DbResult};
 pub use eval::{FunctionRegistry, eval_expr};
-pub use ids::{PageId, TableId, TransactionId};
+pub use ids::{PageId, RecordId, SlotId, TableId, TransactionId};
 pub use lexer::{Keyword, Span, Token, TokenKind, tokenize};
 pub use page::{
     FILE_HEADER_SIZE, FORMAT_VERSION, MAGIC, PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, PAGE_SIZE,
     FileHeader, Page, PageType,
 };
 pub use parser::parse_statement;
+pub use slotted_page::{SLOT_ENTRY_SIZE, SLOTTED_HEADER_SIZE, SlotStatus, SlottedPage};
 pub use storage_mem::{MemStorage, MemTable};
+pub use tuple_codec::{decode_tuple, encode_tuple};
 pub use types::{Column, DataType, Row, Schema, Tuple, Value};
 
 /// 簡易ログ出力マクロ(依存追加を避けるため `eprintln!` を薄くラップするだけ)。

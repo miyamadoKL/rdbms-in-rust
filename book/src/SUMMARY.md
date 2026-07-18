@@ -19,7 +19,7 @@
 # 第2部 Storage: ディスクにデータを保存する
 
 - [第11章 データベースファイルとページ](ch11-database-file.md)
-- [第12章 Slotted Page、Tuple、RID]()
+- [第12章 Slotted Page、Tuple、RID](ch12-slotted-page.md)
 - [第13章 Disk ManagerとHeap File]()
 - [第14章 Buffer Pool]()
 - [第15章 永続カタログと空き領域管理]()

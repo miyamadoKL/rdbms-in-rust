@@ -65,6 +65,12 @@ pub enum DbError {
     /// Format Version不一致、checksum不一致、バイト数不一致、未知のPage Typeなど)。
     #[error("破損したページです: {0}")]
     CorruptPage(String),
+
+    /// Tupleのバイト列が、渡された`Schema`のもとで復元できないエラー
+    /// (バイト列がNULLビットマップや値の途中で尽きている、`TEXT`の長さプレフィックス
+    /// が実際の残りバイト数を超えているなど)。
+    #[error("破損したタプルです: {0}")]
+    CorruptTuple(String),
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。
