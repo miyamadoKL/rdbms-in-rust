@@ -235,6 +235,16 @@ impl<'a> Row<'a> {
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.tuple.get_by_name(self.schema, name)
     }
+
+    /// 列インデックスから値を引く。
+    ///
+    /// `Binder`(第17章)が解決した`BoundExpr::ColumnRef`は列名ではなく索引を
+    /// 持つため、実行時の評価(`eval::eval_bound_expr`)はこちらを使う。索引は
+    /// 束縛の時点で`Schema`と突き合わせ済みなので、名前を毎回文字列比較で
+    /// 探し直す`get`より安く、かつ列名の変化(将来のリネーム等)に影響されない。
+    pub fn get_index(&self, index: usize) -> Option<&Value> {
+        self.tuple.get(index)
+    }
 }
 
 #[cfg(test)]

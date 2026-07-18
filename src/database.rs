@@ -1,11 +1,18 @@
 //! SQL文字列を受け取り、結果を返す実行の入口。
 //!
-//! `Database::execute`は、まずSQL文字列を`parser::parse_statement`でASTへ変換する。
-//! `CREATE TABLE`・`DROP TABLE`はテーブル定義を登録・削除し、`SELECT`・
-//! `INSERT`・`UPDATE`・`DELETE`は、テーブル定義を引いたうえで`executor`
-//! モジュールのSequential Scan・Filter・Projection・Insert・Update・Delete
-//! 演算子を正しい順序で呼び出す。テーブル定義と行を実際にどこへ持つかは
-//! [`Backend`]が決める。
+//! 第17章から、`Database::execute`は3段階のパイプラインになった。
+//!
+//! 1. **構文解析**(`parser::parse_statement`): SQL文字列を`Statement`(AST)へ変換する。
+//! 2. **名前解決**(`binder::Binder::bind`): `Statement`をカタログと突き合わせ、
+//!    テーブル名・列名を解決し、式の型を検査した`BoundStatement`(Bound AST)へ
+//!    変換する。未知のテーブル・列、曖昧な列参照、型不一致は、この段階で
+//!    位置情報付きの`DbError::Bind`として検出される。
+//! 3. **実行**: `CREATE TABLE`・`DROP TABLE`はテーブル定義を登録・削除し、
+//!    `SELECT`・`INSERT`・`UPDATE`・`DELETE`は`executor`モジュールの
+//!    Sequential Scan・Filter・Projection・Insert・Update・Delete演算子を
+//!    正しい順序で呼び出す。
+//!
+//! テーブル定義と行を実際にどこへ持つかは[`Backend`]が決める。
 //!
 //! # `Backend`: メモリとディスクの切り替え
 //!
@@ -26,11 +33,9 @@
 
 use std::path::Path;
 
-use crate::ast::{
-    CreateTableStatement, DeleteStatement, DropTableStatement, InsertStatement, SelectItem,
-    SelectStatement, Statement, UpdateStatement,
-};
-use crate::catalog::{Catalog, TableInfo};
+use crate::ast::{CreateTableStatement, DropTableStatement, Statement};
+use crate::binder::{Binder, BoundDelete, BoundInsert, BoundSelect, BoundStatement, BoundUpdate};
+use crate::catalog::Catalog;
 use crate::error::{DbError, DbResult};
 use crate::eval::{self, FunctionRegistry};
 use crate::executor;
@@ -141,33 +146,45 @@ impl Database {
         }
     }
 
-    /// テーブル名から`TableInfo`を引く。バックエンドの違いを吸収する、
-    /// 各`execute_*`が共通して使う入口。
-    fn table_info(&self, name: &str) -> Option<&TableInfo> {
+    /// AST(`Statement`)を`Binder`へ渡し、`BoundStatement`へ変換する。
+    ///
+    /// `Backend`のどちらであっても、`binder::CatalogLookup`を実装した
+    /// `Catalog`または`Storage`をそのまま`Binder`へ渡せる(モジュール冒頭の
+    /// 説明のとおり、`Binder`はどちらのバックエンドかを意識しない)。
+    fn bind(&self, statement: Statement, sql: &str) -> DbResult<BoundStatement> {
         match &self.backend {
-            Backend::Memory { catalog, .. } => catalog.table(name),
-            Backend::Disk { storage } => storage.table(name),
+            Backend::Memory { catalog, .. } => Binder::new(catalog, &self.functions, sql).bind(statement),
+            Backend::Disk { storage } => Binder::new(storage, &self.functions, sql).bind(statement),
         }
     }
 
     /// SQL文字列を1本実行し、結果を返す。
     ///
-    /// 構文解析(`parser::parse_statement`)がまず走り、`DbError::Lex`または
-    /// `DbError::Parse`はそのまま呼び出し元に伝わる。
+    /// 構文解析(`parser::parse_statement`)→名前解決(`Binder::bind`)→実行という
+    /// 3段階を順に通す。構文解析の失敗(`DbError::Lex`・`DbError::Parse`)、
+    /// 名前解決の失敗(`DbError::Bind`)は、どちらもそのまま呼び出し元に伝わる。
     pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
         let statement = crate::parser::parse_statement(sql)?;
-        match statement {
-            Statement::Select(select) => self.execute_select(sql, &select),
-            Statement::CreateTable(create) => self.execute_create_table(&create),
-            Statement::DropTable(drop) => self.execute_drop_table(&drop),
-            Statement::Insert(insert) => self.execute_insert(&insert),
-            Statement::Update(update) => self.execute_update(&update),
-            Statement::Delete(delete) => self.execute_delete(&delete),
+        let bound = self.bind(statement, sql)?;
+        match bound {
+            BoundStatement::Select(select) => self.execute_select(&select),
+            BoundStatement::CreateTable(create) => self.execute_create_table(&create),
+            BoundStatement::DropTable(drop) => self.execute_drop_table(&drop),
+            BoundStatement::Insert(insert) => self.execute_insert(insert),
+            BoundStatement::Update(update) => self.execute_update(update),
+            BoundStatement::Delete(delete) => self.execute_delete(delete),
         }
     }
 
     /// `CREATE TABLE`を実行し、列定義を`Schema`へ変換したうえで`Catalog`に登録し、
     /// `MemStorage`に空のテーブルを作る。
+    ///
+    /// `CREATE TABLE`は`Binder`による名前解決を経ない(`BoundStatement::CreateTable`
+    /// はASTをそのまま持ち回す)。`Binder`が解決するのは既存のカタログエントリを
+    /// 指す名前であり、`CREATE TABLE`が持つ名前(テーブル名・列名)はこれから
+    /// 新しく作る名前だからである。列の型名(`BIGINT`等)をここで解決するのも
+    /// 同じ理由で、`schema.column(name)`のような既存の列への参照ではなく、
+    /// 新しい`Schema`を組み立てる作業の一部にすぎない。
     ///
     /// 列名の重複検査(`DbError::DuplicateColumn`)は`Schema::new`自体ではなく、
     /// ここ(`CREATE TABLE`の実行経路)で行う。`Schema`は`SELECT`の出力列を
@@ -206,6 +223,14 @@ impl Database {
     }
 
     /// `DROP TABLE`を実行し、テーブル定義とその行をまとめて削除する。
+    ///
+    /// テーブルが存在することは`Binder`(`bind_drop_table`)がすでに位置情報付きの
+    /// `DbError::Bind`として検査済みである。ここで呼ぶ`Catalog::drop_table`・
+    /// `Storage::drop_table`自身も未知のテーブル名を`DbError::TableNotFound`
+    /// として検出するが、これは二重検査というより、`Catalog`・`Storage`という
+    /// データ構造自身が持つべき不変条件(登録されていない名前は削除できない)を
+    /// 手放さずに残しているだけである。`Binder`とbindしてから実行するまでの間に
+    /// 状態が変わる余地はこの章には無いため、実際には後者が発火することはない。
     fn execute_drop_table(&mut self, drop: &DropTableStatement) -> DbResult<QueryResult> {
         match &mut self.backend {
             Backend::Memory { catalog, storage } => {
@@ -219,10 +244,13 @@ impl Database {
         Ok(QueryResult::command("DROP TABLE"))
     }
 
-    fn execute_select(&self, sql: &str, select: &SelectStatement) -> DbResult<QueryResult> {
-        match &select.from {
-            None => self.execute_select_without_from(sql, select),
-            Some(table) => self.execute_select_with_from(sql, select, &table.name),
+    /// 束縛済みの`SELECT`を実行する。`tables`が空なら`FROM`が無い`SELECT`、
+    /// 1つあれば`FROM`を伴う`SELECT`として分岐する。
+    fn execute_select(&self, select: &BoundSelect) -> DbResult<QueryResult> {
+        if select.tables.is_empty() {
+            self.execute_select_without_from(select)
+        } else {
+            self.execute_select_with_from(select)
         }
     }
 
@@ -231,37 +259,34 @@ impl Database {
     ///
     /// `WHERE`があれば、この1件のタプルに対して`executor::filter`をそのまま
     /// かける。`filter`は`FROM`を伴う`SELECT`(`execute_select_with_from`)でも
-    /// 使っている演算子で、内部で`executor::check_predicate_type`による静的な
-    /// 型検査と、`executor::predicate_matches`による三値論理の絞り込みの両方を
-    /// 行う。この1件を再利用することで、`WHERE`句の意味論(`TRUE`なら1行、
-    /// `FALSE`または`NULL`なら0行)を`FROM`を伴う`SELECT`と同じコードで揃える。
-    /// `WHERE`が無ければ、常に1件がそのまま残ったものとして扱う。
+    /// 使っている演算子で、`predicate_matches`による三値論理の絞り込みを行う。
+    /// `predicate`が`BOOLEAN`(または型未定の`NULL`)を返す式であることは
+    /// `Binder`がすでに検査済みなので、この1件を再利用することで、`WHERE`句の
+    /// 意味論(`TRUE`なら1行、`FALSE`または`NULL`なら0行)を`FROM`を伴う
+    /// `SELECT`と同じコードで揃える。`WHERE`が無ければ、常に1件がそのまま
+    /// 残ったものとして扱う。
     ///
     /// 出力列の型は、`FROM`を伴う`SELECT`(`executor::project`)と同じく
-    /// `executor::infer_type`が静的に決める。`eval_arith`のような実行時の
-    /// 評価関数は、両辺の型を検査するより先に`NULL`を伝播させて早期リターン
-    /// するため、この静的検査を経由しない経路のままだと`SELECT NULL + 'x'`の
-    /// ような型不正の式が`NULL`として黙って成功したり、`SELECT NULL + 1`の
-    /// ような型として正しい式でも、実際に評価した`Value`の型(`NULL`は
-    /// `data_type()`が`None`)から列の型を決めてしまい、`FROM`を伴う場合と
-    /// 異なる型(`TEXT`)になってしまったりする。`infer_type`が返す`Some(T)`を
-    /// そのまま列の型として使い、`None`(`NULL`単体などで型が定まらない場合)
-    /// だけを`TEXT`のプレースホルダーで代用することで、`FROM`の有無に関係なく
-    /// 同じ列の型になる。
+    /// `item.expr.data_type()`(`Binder`が静的に決めた型)をそのまま使う。
+    /// `eval_arith`のような実行時の評価関数は、両辺の型を検査するより先に
+    /// `NULL`を伝播させて早期リターンするため、`Binder`の静的検査を経由しない
+    /// 経路のままだと`SELECT NULL + 'x'`のような型不正の式が`NULL`として
+    /// 黙って成功したり、`SELECT NULL + 1`のような型として正しい式でも、
+    /// 実際に評価した`Value`の型(`NULL`は`data_type()`が`None`)から列の型を
+    /// 決めてしまい、`FROM`を伴う場合と異なる型(`TEXT`)になってしまったり
+    /// する。`Binder`が返す`Some(T)`をそのまま列の型として使い、`None`
+    /// (`NULL`単体などで型が定まらない場合)だけを`TEXT`のプレースホルダーで
+    /// 代用することで、`FROM`の有無に関係なく同じ列の型になる。
     ///
     /// `WHERE`が`TRUE`にならなかった場合、この1件は結果に含まれないため、
     /// 射影式は`executor::project`が0件の行を評価しないのと同じ理由で評価しない
     /// (値に依存するエラーがもし起きても、そもそも結果に含まれない行なので
     /// 表面化させない)。
-    fn execute_select_without_from(
-        &self,
-        sql: &str,
-        select: &SelectStatement,
-    ) -> DbResult<QueryResult> {
+    fn execute_select_without_from(&self, select: &BoundSelect) -> DbResult<QueryResult> {
         let empty_schema = Schema::new(Vec::new());
         let implicit_row = Tuple::new(&empty_schema, Vec::new())
             .expect("空のSchemaに対する空の値の並びは常にスキーマ検査を通る");
-        let matched = match &select.where_clause {
+        let matched = match &select.predicate {
             Some(predicate) => {
                 !executor::filter(&empty_schema, &self.functions, vec![implicit_row], predicate)?
                     .is_empty()
@@ -269,33 +294,20 @@ impl Database {
             None => true,
         };
 
-        let mut columns = Vec::with_capacity(select.items.len());
-        let mut values = Vec::with_capacity(select.items.len());
-        for item in &select.items {
-            let expr = match item {
-                SelectItem::Expr { expr, .. } => expr,
-                SelectItem::Wildcard { .. } => {
-                    return Err(DbError::Eval(
-                        "*はFROMを伴うSELECTでのみ使えます".to_string(),
-                    ));
-                }
-            };
-            // `infer_type`が型を決められない(`None`を返す)式は`TEXT`で代用する。
-            // このプレースホルダーの理由は`executor::infer_type`のドキュメント
-            // コメント参照。
-            let data_type =
-                executor::infer_type(expr, &empty_schema, &self.functions)?.unwrap_or(DataType::Text);
-            let name = sql[item.span().start..item.span().end].to_string();
+        let mut columns = Vec::with_capacity(select.projection.len());
+        let mut values = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            let data_type = item.expr.data_type().unwrap_or(DataType::Text);
 
             if matched {
-                let value = eval::eval_expr(expr, &self.functions, None)?;
-                columns.push(Column::new(name, data_type, value.is_null()));
+                let value = eval::eval_bound_expr(&item.expr, &self.functions, None)?;
+                columns.push(Column::new(item.output_name.clone(), data_type, value.is_null()));
                 values.push(value);
             } else {
                 // この1件は`WHERE`で除外されたので評価しない。`nullable`は
                 // `executor::project`の計算列と同じく常に`true`にする(行ごとに
                 // `NULL`になったりならなかったりしうるため)。
-                columns.push(Column::new(name, data_type, true));
+                columns.push(Column::new(item.output_name.clone(), data_type, true));
             }
         }
 
@@ -318,42 +330,30 @@ impl Database {
     ///
     /// Sequential Scanだけがバックエンドで実装が分かれる(`executor::seq_scan`
     /// と`executor::storage_seq_scan`)。どちらも復元済みの`Vec<Tuple>`を返す
-    /// ため、その先のFilter・Projectionはバックエンドを意識しない。
-    fn execute_select_with_from(
-        &self,
-        sql: &str,
-        select: &SelectStatement,
-        table_name: &str,
-    ) -> DbResult<QueryResult> {
-        let table_info = self
-            .table_info(table_name)
-            .ok_or_else(|| DbError::TableNotFound(table_name.to_string()))?;
+    /// ため、その先のFilter・Projectionはバックエンドを意識しない。テーブル名の
+    /// 解決(`TableId`の取得)はすでに`Binder`が済ませているため、この関数は
+    /// `select.tables[0]`が指す`TableId`と`Schema`をそのまま使うだけでよい。
+    fn execute_select_with_from(&self, select: &BoundSelect) -> DbResult<QueryResult> {
+        let table = &select.tables[0];
 
         let scanned = match &self.backend {
             Backend::Memory { storage, .. } => {
                 let mem_table = storage
-                    .table(table_info.id)
+                    .table(table.table_id)
                     .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
                 executor::seq_scan(mem_table)
             }
             Backend::Disk { storage } => {
-                executor::storage_seq_scan(storage, table_info.id, &table_info.schema)?
+                executor::storage_seq_scan(storage, table.table_id, &table.schema)?
             }
         };
 
-        let filtered = match &select.where_clause {
-            Some(predicate) => {
-                executor::filter(&table_info.schema, &self.functions, scanned, predicate)?
-            }
+        let filtered = match &select.predicate {
+            Some(predicate) => executor::filter(&table.schema, &self.functions, scanned, predicate)?,
             None => scanned,
         };
-        let (schema, rows) = executor::project(
-            &table_info.schema,
-            &self.functions,
-            &filtered,
-            &select.items,
-            sql,
-        )?;
+        let (schema, rows) =
+            executor::project(&table.schema, &self.functions, &filtered, &select.projection)?;
 
         Ok(QueryResult {
             schema,
@@ -365,25 +365,20 @@ impl Database {
     /// `INSERT INTO`を実行する。`executor::insert`(または`executor::storage_insert`)
     /// が、`VALUES`の評価から書き込みまでを行う。
     ///
-    /// `table_info`をここで複製(`clone`)しているのは、この後`&mut self.backend`
-    /// を借用するためである。`self.table_info(...)`が返す`&TableInfo`は
-    /// `self`(の`backend`フィールド)を不変借用したままなので、複製せずに
-    /// 保持し続けると、直後の可変借用と両立しない。
-    fn execute_insert(&mut self, insert: &InsertStatement) -> DbResult<QueryResult> {
-        let table_info = self
-            .table_info(&insert.table.name)
-            .ok_or_else(|| DbError::TableNotFound(insert.table.name.clone()))?
-            .clone();
-        let schema = &table_info.schema;
-
+    /// テーブル名・明示された列名の解決は`Binder`の`bind_insert`が済ませて
+    /// いるため、`BoundInsert`は`table_id`と`schema`を独立に(カタログからの
+    /// 借用ではなく複製として)持っている。第16章まではこの複製を`execute_insert`
+    /// 自身が`table_info.clone()`という形で行っていたが、`Binder`が返す時点で
+    /// 複製済みになったことで、その回避策はここでは要らなくなった。
+    fn execute_insert(&mut self, insert: BoundInsert) -> DbResult<QueryResult> {
         let count = match &mut self.backend {
             Backend::Memory { storage, .. } => {
                 let mem_table = storage
-                    .table_mut(table_info.id)
+                    .table_mut(insert.table_id)
                     .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
                 executor::insert(
                     mem_table,
-                    schema,
+                    &insert.schema,
                     &self.functions,
                     insert.columns.as_deref(),
                     &insert.rows,
@@ -391,8 +386,8 @@ impl Database {
             }
             Backend::Disk { storage } => executor::storage_insert(
                 storage,
-                table_info.id,
-                schema,
+                insert.table_id,
+                &insert.schema,
                 &self.functions,
                 insert.columns.as_deref(),
                 &insert.rows,
@@ -402,68 +397,57 @@ impl Database {
     }
 
     /// `UPDATE`を実行する。`executor::update`(または`executor::storage_update`)
-    /// が、`WHERE`に一致した行への`SET`の適用までを行う。`table_info`を複製する
-    /// 理由は`execute_insert`のコメントを参照。
-    fn execute_update(&mut self, update: &UpdateStatement) -> DbResult<QueryResult> {
-        let table_info = self
-            .table_info(&update.table.name)
-            .ok_or_else(|| DbError::TableNotFound(update.table.name.clone()))?
-            .clone();
-        let schema = &table_info.schema;
-
+    /// が、`WHERE`に一致した行への`SET`の適用までを行う。テーブル名・`SET`の
+    /// 対象列・`WHERE`の名前解決と型検査は、いずれも`Binder`の`bind_update`が
+    /// 済ませている。
+    fn execute_update(&mut self, update: BoundUpdate) -> DbResult<QueryResult> {
         let count = match &mut self.backend {
             Backend::Memory { storage, .. } => {
                 let mem_table = storage
-                    .table_mut(table_info.id)
+                    .table_mut(update.table_id)
                     .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
                 executor::update(
                     mem_table,
-                    schema,
+                    &update.schema,
                     &self.functions,
                     &update.assignments,
-                    update.where_clause.as_ref(),
+                    update.predicate.as_ref(),
                 )?
             }
             Backend::Disk { storage } => executor::storage_update(
                 storage,
-                table_info.id,
-                schema,
+                update.table_id,
+                &update.schema,
                 &self.functions,
                 &update.assignments,
-                update.where_clause.as_ref(),
+                update.predicate.as_ref(),
             )?,
         };
         Ok(QueryResult::command_with_count("UPDATE", count))
     }
 
     /// `DELETE FROM`を実行する。`executor::delete`(または`executor::storage_delete`)
-    /// が、`WHERE`に一致した行の削除までを行う。`table_info`を複製する理由は
-    /// `execute_insert`のコメントを参照。
-    fn execute_delete(&mut self, delete: &DeleteStatement) -> DbResult<QueryResult> {
-        let table_info = self
-            .table_info(&delete.table.name)
-            .ok_or_else(|| DbError::TableNotFound(delete.table.name.clone()))?
-            .clone();
-        let schema = &table_info.schema;
-
+    /// が、`WHERE`に一致した行の削除までを行う。テーブル名・`WHERE`の名前解決と
+    /// 型検査は`Binder`の`bind_delete`が済ませている。
+    fn execute_delete(&mut self, delete: BoundDelete) -> DbResult<QueryResult> {
         let count = match &mut self.backend {
             Backend::Memory { storage, .. } => {
                 let mem_table = storage
-                    .table_mut(table_info.id)
+                    .table_mut(delete.table_id)
                     .expect("catalogに登録されたテーブルはstorageにも必ず存在する");
                 executor::delete(
                     mem_table,
-                    schema,
+                    &delete.schema,
                     &self.functions,
-                    delete.where_clause.as_ref(),
+                    delete.predicate.as_ref(),
                 )?
             }
             Backend::Disk { storage } => executor::storage_delete(
                 storage,
-                table_info.id,
-                schema,
+                delete.table_id,
+                &delete.schema,
                 &self.functions,
-                delete.where_clause.as_ref(),
+                delete.predicate.as_ref(),
             )?,
         };
         Ok(QueryResult::command_with_count("DELETE", count))
@@ -653,10 +637,12 @@ mod tests {
     }
 
     #[test]
-    fn column_ref_without_from_is_an_eval_error() {
+    fn column_ref_without_from_is_a_bind_error() {
+        // `FROM`が無いので`id`を解決できるテーブルが1つも無い。`Binder`が
+        // 未知の列参照として位置情報付きで拒否する。
         let mut db = Database::memory();
         let result = db.execute("SELECT id;");
-        assert!(matches!(result, Err(DbError::Eval(_))));
+        assert!(matches!(result, Err(DbError::Bind { .. })));
     }
 
     #[test]
@@ -742,12 +728,13 @@ mod tests {
     }
 
     #[test]
-    fn select_without_from_where_non_boolean_is_an_eval_error() {
+    fn select_without_from_where_non_boolean_is_a_bind_error() {
         // `WHERE 1`のような`BOOLEAN`でも`NULL`でもない述語は、`FROM`を伴う
-        // `SELECT`と同じく`DbError::Eval`になる(黙って0行や1行にはしない)。
+        // `SELECT`と同じく`Binder`が`DbError::Bind`で拒否する(黙って0行や
+        // 1行にはしない)。
         let mut db = Database::memory();
         let result = db.execute("SELECT 1 WHERE 1;");
-        assert!(matches!(result, Err(DbError::Eval(_))));
+        assert!(matches!(result, Err(DbError::Bind { .. })));
     }
 
     #[test]
@@ -898,16 +885,18 @@ mod tests {
 
     #[test]
     fn select_with_from_rejects_unknown_table() {
+        // テーブル名の解決は`Binder`が行うため、未知のテーブル名は
+        // 位置情報付きの`DbError::Bind`になる。
         let mut db = Database::memory();
         let result = db.execute("SELECT id FROM users");
-        assert!(matches!(result, Err(DbError::TableNotFound(name)) if name == "users"));
+        assert!(matches!(result, Err(DbError::Bind { .. })));
     }
 
     #[test]
     fn insert_rejects_unknown_table() {
         let mut db = Database::memory();
         let result = db.execute("INSERT INTO users VALUES (1)");
-        assert!(matches!(result, Err(DbError::TableNotFound(name)) if name == "users"));
+        assert!(matches!(result, Err(DbError::Bind { .. })));
     }
 
     // ---- CREATE TABLE ----
@@ -990,9 +979,11 @@ mod tests {
 
     #[test]
     fn drop_table_rejects_unknown_table() {
+        // `Binder`の`bind_drop_table`が、実行(`Catalog::drop_table`)より先に
+        // 位置情報付きで存在を確認する。
         let mut db = Database::memory();
         let result = db.execute("DROP TABLE users");
-        assert!(matches!(result, Err(DbError::TableNotFound(name)) if name == "users"));
+        assert!(matches!(result, Err(DbError::Bind { .. })));
     }
 
     #[test]
@@ -1016,16 +1007,18 @@ mod tests {
         db
     }
 
-    /// `sql`を実行し、`DbError::Eval`のメッセージ文字列を取り出す。それ以外の
-    /// 結果(成功、または`Eval`以外のエラー)ならテストを失敗させる。
-    /// 空テーブルと非空テーブルでの同じ型エラーの文言を比較するテスト
+    /// `sql`を実行し、`DbError::Eval`または`DbError::Bind`のメッセージ文字列を
+    /// 取り出す。値に依存する検査(ゼロ除算など)は実行時に`DbError::Eval`のまま
+    /// だが、式の型検査は第17章から`Binder`が`DbError::Bind`として検出する。
+    /// どちらの経路でも文言そのものは変わらないことを確認したいテスト
     /// (`..._is_rejected_with_the_same_error_on_empty_and_non_empty_tables`)が
-    /// 共通して使う。
+    /// 共通して使うため、この関数はどちらのバリアントからもメッセージだけを
+    /// 取り出す。
     fn expect_eval_error_message(db: &mut Database, sql: &str) -> String {
         match db.execute(sql) {
-            Err(DbError::Eval(message)) => message,
+            Err(DbError::Eval(message)) | Err(DbError::Bind { message, .. }) => message,
             Ok(_) => panic!("{sql:?}は失敗するはずだったが成功した"),
-            Err(other) => panic!("DbError::Evalを期待したが{other}が返った"),
+            Err(other) => panic!("DbError::EvalまたはDbError::Bindを期待したが{other}が返った"),
         }
     }
 
@@ -1168,10 +1161,10 @@ mod tests {
     fn select_where_1_is_rejected_even_on_an_empty_table() {
         // `users`が空だと`filter`の行ループが1度も回らないため、行を評価して
         // 初めて気づく検査だけでは`WHERE 1`のような書き誤りを見逃してしまう。
-        // `check_predicate_type`による事前の静的検査がその穴を塞ぐ。
+        // `Binder`の`bind_predicate`による束縛時の静的検査がその穴を塞ぐ。
         let mut db = users_db();
         let result = db.execute("SELECT id FROM users WHERE 1");
-        assert!(matches!(result, Err(DbError::Eval(_))));
+        assert!(matches!(result, Err(DbError::Bind { .. })));
     }
 
     #[test]
@@ -1305,10 +1298,10 @@ mod tests {
     #[test]
     fn update_where_1_is_rejected_even_on_an_empty_table() {
         // `select_where_1_is_rejected_even_on_an_empty_table`と同じ理由で、
-        // `users`が空でも`UPDATE ... WHERE 1`は静的検査で拒否される。
+        // `users`が空でも`UPDATE ... WHERE 1`は束縛時の静的検査で拒否される。
         let mut db = users_db();
         let result = db.execute("UPDATE users SET name = 'x' WHERE 1");
-        assert!(matches!(result, Err(DbError::Eval(_))));
+        assert!(matches!(result, Err(DbError::Bind { .. })));
     }
 
     #[test]
@@ -1347,10 +1340,10 @@ mod tests {
     #[test]
     fn delete_where_1_is_rejected_even_on_an_empty_table() {
         // `select_where_1_is_rejected_even_on_an_empty_table`と同じ理由で、
-        // `users`が空でも`DELETE ... WHERE 1`は静的検査で拒否される。
+        // `users`が空でも`DELETE ... WHERE 1`は束縛時の静的検査で拒否される。
         let mut db = users_db();
         let result = db.execute("DELETE FROM users WHERE 1");
-        assert!(matches!(result, Err(DbError::Eval(_))));
+        assert!(matches!(result, Err(DbError::Bind { .. })));
     }
 
     #[test]

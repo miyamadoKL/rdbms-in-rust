@@ -6,6 +6,18 @@
 //! 返す素朴な関数にとどめる。`Database::execute`は、これらの関数を文の種類
 //! ごとに正しい順序で呼び出す配線役に徹する。
 //!
+//! # 第17章から: 名前解決・型検査は`binder`モジュールへ移した
+//!
+//! 第10章では、`WHERE`句や`SELECT`の対象式の型検査(`infer_type`・
+//! `check_predicate_type`)、`*`の展開(`resolve_items`)はこのモジュールが
+//! 担っていた。第17章で`Binder`(`crate::binder`)を導入し、これらをすべて
+//! `Database::execute`のBind段階へ移した。`filter`・`project`・`update`・
+//! `delete`が受け取る`predicate`・`projection`・`assignments`は、すでに
+//! `Binder`が名前解決・型検査を終えた`BoundExpr`(または、それを含む型)であり、
+//! このモジュールは`Expr`という生のASTには一切触れない。`INSERT`の`VALUES`
+//! だけは例外で、列参照を持たない式(既存の行を参照する構文が無い)なので、
+//! 引き続き生の`Expr`のまま`eval::eval_expr`で評価する。
+//!
 //! # 行の供給源が2つある
 //!
 //! 第16章から、行の供給源は`MemTable`(第10章、プロセスのメモリ上)と
@@ -25,9 +37,10 @@
 //! ときには、この共通化はそちらの設計に沿った形で自然に生まれる。先取りして
 //! 今traitを導入する理由はない。
 
-use crate::ast::{Assignment, BinaryOperator, Expr, Ident, SelectItem, UnaryOperator};
+use crate::ast::Expr;
+use crate::binder::{BoundAssignment, BoundExpr, BoundSelectItem};
 use crate::error::{DbError, DbResult};
-use crate::eval::{FunctionRegistry, eval_expr};
+use crate::eval::{FunctionRegistry, eval_bound_expr, eval_expr};
 use crate::ids::{RecordId, TableId};
 use crate::storage::Storage;
 use crate::storage_mem::MemTable;
@@ -42,21 +55,21 @@ use crate::types::{Column, DataType, Row, Schema, Tuple, Value};
 /// ような`BOOLEAN`ではない値が渡された場合は、それを黙って「マッチしない」
 /// 側に丸めてしまうと`WHERE 1`のような書き誤りを見逃すことになるため、
 /// `DbError::Eval`にする。
+///
+/// この最後の分岐(`BOOLEAN`・`NULL`以外)は、通常は届かない。`predicate`は
+/// `Binder`(第17章)の`bind_predicate`がすでに`BOOLEAN`または型未定の`NULL`
+/// であることを検査済みの`BoundExpr`だからである。それでもこの分岐を残して
+/// あるのは、`Binder`を経由しない呼び出し経路を想定した保険ではなく、
+/// 「`BoundExpr::data_type()`が`Some(Boolean)`または`None`である」という
+/// 事実をRustの型システムはコンパイル時に保証しないためである。仮に
+/// `Binder`側にバグがあって型検査をすり抜けた場合でも、`executor`が
+/// `BOOLEAN`でない値を暗黙に「マッチしない」側へ丸めてしまう(=誤りを
+/// 隠してしまう)ことだけは避けたい、という最終防衛線として残している。
 fn predicate_matches(value: Value) -> DbResult<bool> {
     match value {
         Value::Boolean(true) => Ok(true),
         Value::Boolean(false) | Value::Null => Ok(false),
         other => {
-            // `Value::Boolean`と`Value::Null`は直前の分岐で処理済みなので、ここに
-            // 来る`other`は必ず`data_type()`が`Some`を返す値(`BigInt`/`Text`)である。
-            // `Option`を`{:?}`でそのまま表示すると`Some(BigInt)`のようにRustの内部
-            // 表現が利用者に漏れてしまうため、`unwrap`してSQLの型名だけを見せる。
-            //
-            // なお、この分岐へ実際に到達するのは`check_predicate_type`による事前の
-            // 静的検査をすり抜けたときだけである(通常は起こらない。`infer_type`の
-            // 判定ミスなどに備えた保険)。行の有無に関わらず`WHERE 1`のような式を
-            // 拒否する主経路は`check_predicate_type`であり、こちらは行を実際に評価
-            // した後の最終防衛線に過ぎない。
             let data_type = other
                 .data_type()
                 .expect("BooleanとNullは既に処理済みなのでdata_type()は必ずSomeを返す");
@@ -64,39 +77,6 @@ fn predicate_matches(value: Value) -> DbResult<bool> {
                 "WHERE句はBOOLEANまたはNULLを返す式である必要があります: {data_type}が渡されました"
             )))
         }
-    }
-}
-
-/// `predicate`が`BOOLEAN`を返す式(または型が定まらない`NULL`)であることを、
-/// 行を1件も評価せずに`infer_type`で静的に検査する。
-///
-/// `predicate_matches`は行ごとに評価した`Value`を見て初めて型の誤りに気づくため、
-/// テーブルが空で行ループが1度も回らない場合(`SELECT/UPDATE/DELETE ... WHERE 1`を
-/// 空テーブルに対して実行するなど)は`predicate_matches`が一度も呼ばれず、
-/// `WHERE 1`のような書き誤りを見逃してしまう。`filter`・`update`・`delete`は、
-/// 行ループに入る前にこの関数を呼ぶことで、行の有無に関わらず同じ不変条件
-/// (「`WHERE`句は`BOOLEAN`か`NULL`を返す式でなければならない」)を保証する。
-///
-/// `infer_type`は`predicate`の式木全体を再帰的に検査するため、`WHERE 1 AND 2`や
-/// `WHERE NOT 1`、`WHERE abs('x') = 1`のように、トップレベルの演算子だけを見ても
-/// 気づけない被演算子の型違反も、ここで一度に検出できる。`WHERE NULL`は
-/// `infer_type`が`None`(型が定まらない)を返すが、これは`NULL`という有効な
-/// `UNKNOWN`述語(0行にマッチする)であって型エラーではないため、`Some(Boolean)`
-/// と同じく許可する。
-///
-/// `pub(crate)`なのは、`FROM`を伴わない`SELECT`(`database`モジュールの
-/// `execute_select_without_from`)も、意味を持たないまま構文としてだけ受理する
-/// `WHERE`句の型を同じ規則で検査するため。
-pub(crate) fn check_predicate_type(
-    predicate: &Expr,
-    schema: &Schema,
-    functions: &FunctionRegistry,
-) -> DbResult<()> {
-    match infer_type(predicate, schema, functions)? {
-        Some(DataType::Boolean) | None => Ok(()),
-        Some(other) => Err(DbError::Eval(format!(
-            "WHERE句はBOOLEANを返す式である必要があります: 式の型は{other}です"
-        ))),
     }
 }
 
@@ -129,19 +109,23 @@ pub fn storage_seq_scan(storage: &Storage, table_id: TableId, schema: &Schema) -
 /// なった行も、`TRUE`ではないので落ちる。`NULL`の行を「一致しなかった」側に
 /// 含めるこの規則、および`BOOLEAN`でも`NULL`でもない値(`WHERE 1`など)を
 /// エラーにする規則は、`predicate_matches`が`update`・`delete`とも共通して
-/// 適用する。`rows`が空でも`WHERE 1`のような書き誤りを見逃さないよう、行
-/// ループへ入る前に`check_predicate_type`で`predicate`の型を静的に検査する。
+/// 適用する。
+///
+/// `predicate`が`BOOLEAN`(または型未定の`NULL`)を返す式であることは、
+/// `Binder`の`bind_predicate`がすでに検査済みである。第10章の`filter`が
+/// 行ループへ入る前に呼んでいた`check_predicate_type`は、この章では不要に
+/// なった(`rows`が空でも、Bind段階の検査がすでに`WHERE 1`のような書き誤りを
+/// 検出しているため)。
 pub fn filter(
     schema: &Schema,
     functions: &FunctionRegistry,
     rows: Vec<Tuple>,
-    predicate: &Expr,
+    predicate: &BoundExpr,
 ) -> DbResult<Vec<Tuple>> {
-    check_predicate_type(predicate, schema, functions)?;
     let mut kept = Vec::with_capacity(rows.len());
     for tuple in rows {
         let row = Row::new(schema, &tuple);
-        let value = eval_expr(predicate, functions, Some(&row))?;
+        let value = eval_bound_expr(predicate, functions, Some(&row))?;
         if predicate_matches(value)? {
             kept.push(tuple);
         }
@@ -149,284 +133,48 @@ pub fn filter(
     Ok(kept)
 }
 
-/// Projection演算子。`SELECT`の対象式リストを各行に適用し、出力用の
-/// `Schema`と行の並びを組み立てる。
+/// Projection演算子。束縛済みの射影対象リスト(`projection`)を各行に適用し、
+/// 出力用の`Schema`と行の並びを組み立てる。
 ///
-/// `*`(`SelectItem::Wildcard`)は`table_schema`の全列への列参照へ展開してから
-/// 扱うため、以降の処理は「列参照または式のリスト」という1種類の形だけを
-/// 見ればよい。
-///
-/// 出力列の型・nullableは、単純な列参照であれば`table_schema`の定義をそのまま
-/// 使うため常に正確である。計算結果(`id + 1`のような式)の型は、行を実際に
-/// 評価せず、式のASTと`table_schema`だけから`infer_type`が静的に決める
-/// (1行目がNULLだったり、テーブルが空だったりしても型がぶれない)。
-/// `infer_type`が型を決められない式(`NULL`単体など、`None`を返す式)は、
-/// `DataType::Text`をプレースホルダーとして使う。この場合の`nullable`は、
-/// 行ごとに`NULL`になったりならなかったりしうるため、常に`true`とする。
-/// 名前解決を伴う本格的な型検査は第17章のBinderで置き換える。
+/// `*`の展開は`Binder`(第17章)がすでに行っているため、この関数は「列参照または
+/// 式のリスト」という1種類の形だけを見ればよい。出力列の型・nullableは、
+/// 単純な列参照であれば`table_schema`の定義をそのまま使うため常に正確である。
+/// 計算結果(`id + 1`のような式)の型は、`item.expr.data_type()`(`Binder`が
+/// 構築時に決めた型)をそのまま使う。行を実際に評価しないこの型決定の理由は
+/// `binder::Binder::bind_expr`のドキュメントコメントを参照。
 pub fn project(
     table_schema: &Schema,
     functions: &FunctionRegistry,
     rows: &[Tuple],
-    items: &[SelectItem],
-    sql: &str,
+    projection: &[BoundSelectItem],
 ) -> DbResult<(Schema, Vec<Tuple>)> {
-    let resolved = resolve_items(table_schema, items, sql);
-
-    let mut out_columns = Vec::with_capacity(resolved.len());
-    for (expr, name) in &resolved {
-        if let Expr::ColumnRef { name: col_name, .. } = expr
-            && let Some(column) = table_schema.column(col_name)
-        {
-            let mut column = column.clone();
-            column.name = name.clone();
+    let mut out_columns = Vec::with_capacity(projection.len());
+    for item in projection {
+        if let BoundExpr::ColumnRef { column_index, .. } = &item.expr {
+            let mut column = table_schema.columns()[*column_index].clone();
+            column.name = item.output_name.clone();
             out_columns.push(column);
             continue;
         }
 
-        // `infer_type`が型を決められない(`None`を返す)式は`TEXT`で代用する。
-        // このプレースホルダーの理由は`infer_type`のドキュメントコメント参照。
-        let data_type = infer_type(expr, table_schema, functions)?.unwrap_or(DataType::Text);
-        out_columns.push(Column::new(name.clone(), data_type, true));
+        // `data_type()`が`None`(型が定まらない、`NULL`単体など)を返す式は
+        // `TEXT`で代用する。この場合の`nullable`は、行ごとに`NULL`になったり
+        // ならなかったりしうるため常に`true`にする。
+        let data_type = item.expr.data_type().unwrap_or(DataType::Text);
+        out_columns.push(Column::new(item.output_name.clone(), data_type, true));
     }
     let out_schema = Schema::new(out_columns);
 
     let mut out_rows = Vec::with_capacity(rows.len());
     for tuple in rows {
         let row = Row::new(table_schema, tuple);
-        let mut values = Vec::with_capacity(resolved.len());
-        for (expr, _) in &resolved {
-            values.push(eval_expr(expr, functions, Some(&row))?);
+        let mut values = Vec::with_capacity(projection.len());
+        for item in projection {
+            values.push(eval_bound_expr(&item.expr, functions, Some(&row))?);
         }
         out_rows.push(Tuple::new(&out_schema, values)?);
     }
     Ok((out_schema, out_rows))
-}
-
-/// エラーメッセージ用に`Option<DataType>`を表示する。`None`(型が定まらない、
-/// `NULL`リテラルなど)は`NULL`と表示する。
-fn describe_type(data_type: Option<DataType>) -> String {
-    match data_type {
-        Some(t) => t.to_string(),
-        None => "NULL".to_string(),
-    }
-}
-
-/// 式の出力型を、行を実際に評価せず、式のASTと`schema`だけから静的に決める。
-///
-/// 戻り値は`Option<DataType>`で、`None`は「型が定まらない」ことを表す。
-/// `NULL`リテラル単体だけがこれに当たる(`Value::Null`がどの`DataType`にも
-/// 属さない、つまり`Value::data_type`が`None`を返すのと同じ考え方)。
-/// それ以外の式は必ず`Some`を返す。`NULL`が被演算子として現れても、演算子
-/// 自身の出力の「型」は`NULL`かどうかに関係なく決まる(例えば`1 + NULL`は
-/// 実行結果こそ常に`NULL`だが、これを`SELECT`すれば`BIGINT`型の列になり、
-/// `Value::Null`は`nullable`な列であればどんな`DataType`にも適合するため
-/// 問題は起きない)。`None`まで遡って伝播するのは、`NULL`リテラル自身と、
-/// それを素通りさせるだけの`(...)`(括弧)だけである。
-///
-/// `project`が`SELECT`の出力列の型を決めるのに使うだけでなく、`check_predicate_type`
-/// が`WHERE`句の型を検査するのにも使う。単に出力型を決めるだけでなく、各演算子・
-/// 関数がその被演算子に課す型制約を式木全体にわたって再帰的に検査し、違反があれば
-/// `eval_expr`が実際にその式を評価したときに返すのと同じ文言の`DbError::Eval`を
-/// 返す。この検査は行を1件も評価せずに式のASTと`schema`だけから完結するため、
-/// テーブルが空でも、行を持っていても、同じ結果になる。
-///
-/// - 整数・文字列・真偽値リテラルは、そのリテラルが表す型(`Some`)。
-/// - `NULL`リテラル単体は型が定まらない(`None`)。
-/// - 列参照は、`schema`に定義された、その列の型(`Some`)。列は必ず宣言された
-///   型を持つため、`nullable`かどうかに関係なく`Some`になる。
-/// - 単項`-`は、被演算子が`BigInt`または`None`でなければエラー。出力は
-///   常に`Some(BigInt)`。
-/// - 単項`NOT`は、被演算子が`Boolean`または`None`でなければエラー。出力は
-///   常に`Some(Boolean)`。
-/// - 算術演算(`+ - * /`)は、両辺が`BigInt`または`None`でなければエラー。
-///   出力は常に`Some(BigInt)`。
-/// - 比較演算(`= <> < <= > >=`)は、両辺が同じ型か、どちらかが`None`でなければ
-///   エラー。出力は常に`Some(Boolean)`。
-/// - 論理演算(`AND` `OR`)は、両辺が`Boolean`または`None`でなければエラー。
-///   出力は常に`Some(Boolean)`。
-/// - `IS [NOT] NULL`は、被演算子の型を問わない(ただし被演算子自身の式は
-///   再帰的に検査する)。出力は常に`Some(Boolean)`。
-/// - `CAST(expr AS type)`は、`expr`自身を再帰的に検査するだけで、`expr`と
-///   `type`の組み合わせが`eval_cast`の対応表に載っているかどうかまでは
-///   検査しない(この組み合わせの妥当性は値に依存しないため原理的には静的に
-///   検査できるが、この章のスコープには含めない)。出力は常に`type`が指す
-///   型(`Some`)。`CAST(NULL AS type)`も`type`を返す(`eval_cast`が`NULL`を
-///   そのまま`NULL`として通すのと同じ理由で、`CAST`の宣言上の型は入力の
-///   `NULL`らしさに影響されない)。
-/// - 関数呼び出しは、`functions`に登録された引数の個数・型を検査してから、
-///   登録された戻り値の型(`Some`)を返す。各引数は、宣言された型または
-///   `None`でなければエラー。
-/// - 括弧`(expr)`は中身の式の型・検査をそのまま引き継ぐ。
-///
-/// `pub(crate)`なのは、`FROM`を伴わない`SELECT`(`database`モジュールの
-/// `execute_select_without_from`)も、`FROM`を伴う`SELECT`と同じ型検査を
-/// 各射影式に適用するため。`eval_arith`のような実行時の評価関数は`NULL`を
-/// 型検査より先に伝播させる(`checked_add`等に辿り着く前に`is_null`で
-/// 早期リターンする)ため、`infer_type`による静的検査を経由しない経路では
-/// `NULL + 'x'`のような型不正の式でも`NULL`として黙って成功してしまう。
-/// `FROM`の有無で成否が変わらないよう、両方の経路で同じ静的検査を先に通す。
-pub(crate) fn infer_type(
-    expr: &Expr,
-    schema: &Schema,
-    functions: &FunctionRegistry,
-) -> DbResult<Option<DataType>> {
-    match expr {
-        Expr::IntLiteral { .. } => Ok(Some(DataType::BigInt)),
-        Expr::StringLiteral { .. } => Ok(Some(DataType::Text)),
-        Expr::BoolLiteral { .. } => Ok(Some(DataType::Boolean)),
-        Expr::NullLiteral { .. } => Ok(None),
-        Expr::ColumnRef { name, .. } => schema
-            .column(name)
-            .map(|column| Some(column.data_type))
-            .ok_or_else(|| DbError::Eval(format!("列'{name}'が見つかりません"))),
-        Expr::UnaryOp { op, expr, .. } => {
-            let operand = infer_type(expr, schema, functions)?;
-            match op {
-                UnaryOperator::Negate => {
-                    if let Some(data_type) = operand
-                        && data_type != DataType::BigInt
-                    {
-                        return Err(DbError::Eval(format!(
-                            "単項-はBIGINTに対してのみ使えます: {data_type}が渡されました"
-                        )));
-                    }
-                    Ok(Some(DataType::BigInt))
-                }
-                UnaryOperator::Not => {
-                    if let Some(data_type) = operand
-                        && data_type != DataType::Boolean
-                    {
-                        return Err(DbError::Eval(format!(
-                            "論理演算はBOOLEANまたはNULLに対してのみ使えます: {data_type}が渡されました"
-                        )));
-                    }
-                    Ok(Some(DataType::Boolean))
-                }
-            }
-        }
-        Expr::BinaryOp { op, lhs, rhs, .. } => match op {
-            BinaryOperator::Add
-            | BinaryOperator::Subtract
-            | BinaryOperator::Multiply
-            | BinaryOperator::Divide => {
-                let l = infer_type(lhs, schema, functions)?;
-                let r = infer_type(rhs, schema, functions)?;
-                let l_ok = l.is_none() || l == Some(DataType::BigInt);
-                let r_ok = r.is_none() || r == Some(DataType::BigInt);
-                if !l_ok || !r_ok {
-                    return Err(DbError::Eval(format!(
-                        "算術演算はBIGINT同士にのみ使えます: {}と{}",
-                        describe_type(l),
-                        describe_type(r)
-                    )));
-                }
-                Ok(Some(DataType::BigInt))
-            }
-            BinaryOperator::Eq
-            | BinaryOperator::NotEq
-            | BinaryOperator::Lt
-            | BinaryOperator::LtEq
-            | BinaryOperator::Gt
-            | BinaryOperator::GtEq => {
-                let l = infer_type(lhs, schema, functions)?;
-                let r = infer_type(rhs, schema, functions)?;
-                let ok = match (l, r) {
-                    (None, _) | (_, None) => true,
-                    (Some(a), Some(b)) => a == b,
-                };
-                if !ok {
-                    return Err(DbError::Eval(format!(
-                        "比較演算は同じ型同士にのみ使えます: {}と{}",
-                        describe_type(l),
-                        describe_type(r)
-                    )));
-                }
-                Ok(Some(DataType::Boolean))
-            }
-            BinaryOperator::And | BinaryOperator::Or => {
-                // 実際の`eval_binary`(`eval`モジュール)がlhsを先に評価してから
-                // rhsを評価するのに合わせ、こちらもlhsを先に検査する。
-                let l = infer_type(lhs, schema, functions)?;
-                if let Some(data_type) = l
-                    && data_type != DataType::Boolean
-                {
-                    return Err(DbError::Eval(format!(
-                        "論理演算はBOOLEANまたはNULLに対してのみ使えます: {data_type}が渡されました"
-                    )));
-                }
-                let r = infer_type(rhs, schema, functions)?;
-                if let Some(data_type) = r
-                    && data_type != DataType::Boolean
-                {
-                    return Err(DbError::Eval(format!(
-                        "論理演算はBOOLEANまたはNULLに対してのみ使えます: {data_type}が渡されました"
-                    )));
-                }
-                Ok(Some(DataType::Boolean))
-            }
-        },
-        Expr::IsNull { expr, .. } => {
-            // 被演算子の型は問わないが、被演算子自身が無効な式(未知の関数呼び出し
-            // など)でないことは検査する。`eval_expr`もIS NULLを評価する前に
-            // 被演算子を評価してエラーを伝播させるのと同じ順序。
-            infer_type(expr, schema, functions)?;
-            Ok(Some(DataType::Boolean))
-        }
-        Expr::Cast { expr, type_name, .. } => {
-            infer_type(expr, schema, functions)?;
-            DataType::from_sql_name(&type_name.name)
-                .map(Some)
-                .ok_or_else(|| DbError::Eval(format!("未知の型名です: {}", type_name.name)))
-        }
-        Expr::FunctionCall { name, args, .. } => {
-            let arg_types = functions.arg_types(name)?;
-            let canonical_name = name.to_ascii_lowercase();
-            if args.len() != arg_types.len() {
-                return Err(DbError::Eval(format!(
-                    "{canonical_name}は引数を{}個取ります(渡されたのは{}個です)",
-                    arg_types.len(),
-                    args.len()
-                )));
-            }
-            for (arg, expected) in args.iter().zip(arg_types) {
-                let actual = infer_type(arg, schema, functions)?;
-                if let Some(actual_type) = actual
-                    && actual_type != *expected
-                {
-                    return Err(DbError::Eval(format!(
-                        "{canonical_name}は{expected}を引数に取ります: {actual_type}が渡されました"
-                    )));
-                }
-            }
-            functions.return_type(name).map(Some)
-        }
-        Expr::Paren { expr, .. } => infer_type(expr, schema, functions),
-    }
-}
-
-/// `SelectItem`の並びを、`*`を展開したうえで`(評価する式, 出力列名)`の並びに変換する。
-fn resolve_items(table_schema: &Schema, items: &[SelectItem], sql: &str) -> Vec<(Expr, String)> {
-    let mut resolved = Vec::new();
-    for item in items {
-        match item {
-            SelectItem::Wildcard { span } => {
-                for column in table_schema.columns() {
-                    resolved.push((
-                        Expr::ColumnRef {
-                            name: column.name.clone(),
-                            span: *span,
-                        },
-                        column.name.clone(),
-                    ));
-                }
-            }
-            SelectItem::Expr { expr, span } => {
-                resolved.push((expr.clone(), sql[span.start..span.end].to_string()));
-            }
-        }
-    }
-    resolved
 }
 
 /// Values演算子とInsert演算子。`VALUES`の各行を評価し、`Tuple::new`による
@@ -438,11 +186,16 @@ fn resolve_items(table_schema: &Schema, items: &[SelectItem], sql: &str) -> Vec<
 /// 「一部だけ挿入された`INSERT`」という中途半端な状態を避けるこの順序は、
 /// `CREATE TABLE`が列定義を1つずつ検査してから最後に1回だけ登録する
 /// (第9章)のと同じ考え方である。
+///
+/// `columns`は、`Binder`(第17章)の`bind_insert`が列名を`schema`上の索引へ
+/// 解決した並びである(未知の列名・重複した列名はBind段階ですでに拒否されて
+/// いるため、ここでは`schema.len()`の範囲内で重複の無い添字だけが渡ってくる
+/// 前提で良い)。
 pub fn insert(
     table: &mut MemTable,
     schema: &Schema,
     functions: &FunctionRegistry,
-    columns: Option<&[Ident]>,
+    columns: Option<&[usize]>,
     rows: &[Vec<Expr>],
 ) -> DbResult<usize> {
     let planned = plan_insert_rows(schema, functions, columns, rows)?;
@@ -467,7 +220,7 @@ pub fn storage_insert(
     table_id: TableId,
     schema: &Schema,
     functions: &FunctionRegistry,
-    columns: Option<&[Ident]>,
+    columns: Option<&[usize]>,
     rows: &[Vec<Expr>],
 ) -> DbResult<usize> {
     let planned = plan_insert_rows(schema, functions, columns, rows)?;
@@ -492,14 +245,15 @@ pub fn storage_insert(
 fn plan_insert_rows(
     schema: &Schema,
     functions: &FunctionRegistry,
-    columns: Option<&[Ident]>,
+    columns: Option<&[usize]>,
     rows: &[Vec<Expr>],
 ) -> DbResult<Vec<Tuple>> {
     let mut planned = Vec::with_capacity(rows.len());
     for row_exprs in rows {
         // `VALUES`の各要素は、テーブルの行を伴わない文脈で評価する。
         // `INSERT INTO t VALUES (id + 1)`のように挿入する側の値が既存の行を
-        // 参照する構文は無いため、`row`は常に`None`でよい。
+        // 参照する構文は無いため、列参照が現れようが無く、`Binder`による
+        // 名前解決の対象にもならない。`row`は常に`None`でよい。
         let evaluated = row_exprs
             .iter()
             .map(|expr| eval_expr(expr, functions, None))
@@ -515,11 +269,9 @@ fn plan_insert_rows(
 /// (`NOT NULL`列であれば、後段の`Tuple::new`が検査して拒否する)。
 ///
 /// 列名指定が無い場合は、`VALUES`の並びをそのままスキーマの列順とみなす。
-fn expand_to_schema(
-    schema: &Schema,
-    columns: Option<&[Ident]>,
-    values: Vec<Value>,
-) -> DbResult<Vec<Value>> {
+/// `columns`(列インデックス)の妥当性・重複の無さは、これを組み立てた
+/// `Binder`の`bind_insert`がすでに保証しているため、ここでは検査しない。
+fn expand_to_schema(schema: &Schema, columns: Option<&[usize]>, values: Vec<Value>) -> DbResult<Vec<Value>> {
     let Some(columns) = columns else {
         return Ok(values);
     };
@@ -533,18 +285,7 @@ fn expand_to_schema(
     }
 
     let mut full = vec![Value::Null; schema.len()];
-    let mut assigned = vec![false; schema.len()];
-    for (column, value) in columns.iter().zip(values) {
-        let index = schema
-            .index_of(&column.name)
-            .ok_or_else(|| DbError::Eval(format!("列'{}'が見つかりません", column.name)))?;
-        if assigned[index] {
-            return Err(DbError::Eval(format!(
-                "列'{}'がINSERTの列リストに重複しています",
-                column.name
-            )));
-        }
-        assigned[index] = true;
+    for (&index, value) in columns.iter().zip(values) {
         full[index] = value;
     }
     Ok(full)
@@ -560,24 +301,21 @@ fn expand_to_schema(
 /// 一括で`table`へ反映する。行の途中で型検査に失敗した場合、それより前に
 /// 検査を通っていた行も含めて、`table`は一切変更されない。
 ///
-/// `table`が空でも`WHERE 1`のような書き誤りを見逃さないよう、行ループへ入る前に
-/// `check_predicate_type`で`predicate`の型を静的に検査する(`filter`と同じ理由)。
+/// `assignments`の代入先(`column_index`)、`predicate`の型は、いずれも
+/// `Binder`の`bind_update`がすでに検査済みである。
 pub fn update(
     table: &mut MemTable,
     schema: &Schema,
     functions: &FunctionRegistry,
-    assignments: &[Assignment],
-    predicate: Option<&Expr>,
+    assignments: &[BoundAssignment],
+    predicate: Option<&BoundExpr>,
 ) -> DbResult<usize> {
-    if let Some(pred) = predicate {
-        check_predicate_type(pred, schema, functions)?;
-    }
     let mut planned = Vec::new();
     for (index, tuple) in table.rows().iter().enumerate() {
         let row = Row::new(schema, tuple);
         let matched = match predicate {
             None => true,
-            Some(pred) => predicate_matches(eval_expr(pred, functions, Some(&row))?)?,
+            Some(pred) => predicate_matches(eval_bound_expr(pred, functions, Some(&row))?)?,
         };
         if !matched {
             continue;
@@ -585,10 +323,7 @@ pub fn update(
 
         let mut new_values = tuple.values().to_vec();
         for assignment in assignments {
-            let target = schema.index_of(&assignment.column.name).ok_or_else(|| {
-                DbError::Eval(format!("列'{}'が見つかりません", assignment.column.name))
-            })?;
-            new_values[target] = eval_expr(&assignment.value, functions, Some(&row))?;
+            new_values[assignment.column_index] = eval_bound_expr(&assignment.value, functions, Some(&row))?;
         }
         planned.push((index, Tuple::new(schema, new_values)?));
     }
@@ -611,22 +346,14 @@ pub fn update(
 /// 更新前の値(`decode_tuple`で復元した`tuple`)を使って評価するため、複数の
 /// 列を書き換える`UPDATE`でも後続の代入が直前の代入結果を見ることはない
 /// (`update`と同じ規則)。
-///
-/// `table`が空でも`WHERE 1`のような書き誤りを見逃さないよう、行ループへ
-/// 入る前に`check_predicate_type`で`predicate`の型を静的に検査する(`filter`・
-/// `update`と同じ理由)。
 pub fn storage_update(
     storage: &mut Storage,
     table_id: TableId,
     schema: &Schema,
     functions: &FunctionRegistry,
-    assignments: &[Assignment],
-    predicate: Option<&Expr>,
+    assignments: &[BoundAssignment],
+    predicate: Option<&BoundExpr>,
 ) -> DbResult<usize> {
-    if let Some(pred) = predicate {
-        check_predicate_type(pred, schema, functions)?;
-    }
-
     let mut planned: Vec<(RecordId, Tuple)> = Vec::new();
     for entry in storage.scan(table_id)? {
         let (rid, bytes) = entry?;
@@ -634,7 +361,7 @@ pub fn storage_update(
         let row = Row::new(schema, &tuple);
         let matched = match predicate {
             None => true,
-            Some(pred) => predicate_matches(eval_expr(pred, functions, Some(&row))?)?,
+            Some(pred) => predicate_matches(eval_bound_expr(pred, functions, Some(&row))?)?,
         };
         if !matched {
             continue;
@@ -642,10 +369,7 @@ pub fn storage_update(
 
         let mut new_values = tuple.values().to_vec();
         for assignment in assignments {
-            let target = schema.index_of(&assignment.column.name).ok_or_else(|| {
-                DbError::Eval(format!("列'{}'が見つかりません", assignment.column.name))
-            })?;
-            new_values[target] = eval_expr(&assignment.value, functions, Some(&row))?;
+            new_values[assignment.column_index] = eval_bound_expr(&assignment.value, functions, Some(&row))?;
         }
         planned.push((rid, Tuple::new(schema, new_values)?));
     }
@@ -664,25 +388,19 @@ pub fn storage_update(
 /// 行)を新しい`Vec`へ集め終えてから`table`へ書き戻す。集め終える前に評価が
 /// 失敗すれば、その時点で`table`はまだ元のままなので、失敗した`DELETE`が
 /// 一部の行だけ消してしまうことはない。
-///
-/// `table`が空でも`WHERE 1`のような書き誤りを見逃さないよう、行ループへ入る前に
-/// `check_predicate_type`で`predicate`の型を静的に検査する(`filter`と同じ理由)。
 pub fn delete(
     table: &mut MemTable,
     schema: &Schema,
     functions: &FunctionRegistry,
-    predicate: Option<&Expr>,
+    predicate: Option<&BoundExpr>,
 ) -> DbResult<usize> {
-    if let Some(pred) = predicate {
-        check_predicate_type(pred, schema, functions)?;
-    }
     let mut kept = Vec::with_capacity(table.rows().len());
     let mut deleted = 0usize;
     for tuple in table.rows() {
         let row = Row::new(schema, tuple);
         let matched = match predicate {
             None => true,
-            Some(pred) => predicate_matches(eval_expr(pred, functions, Some(&row))?)?,
+            Some(pred) => predicate_matches(eval_bound_expr(pred, functions, Some(&row))?)?,
         };
         if matched {
             deleted += 1;
@@ -703,21 +421,13 @@ pub fn delete(
 /// 新しい`Vec`へ集めるのとは集め方が逆(こちらは消す側を集める)だが、
 /// どちらも「対象を確定させてから初めて書き換える」という順序は同じであり、
 /// 集め終える前に評価が失敗すれば`storage`はまだ何も変更されていない。
-///
-/// `table`が空でも`WHERE 1`のような書き誤りを見逃さないよう、行ループへ
-/// 入る前に`check_predicate_type`で`predicate`の型を静的に検査する(`filter`・
-/// `delete`と同じ理由)。
 pub fn storage_delete(
     storage: &mut Storage,
     table_id: TableId,
     schema: &Schema,
     functions: &FunctionRegistry,
-    predicate: Option<&Expr>,
+    predicate: Option<&BoundExpr>,
 ) -> DbResult<usize> {
-    if let Some(pred) = predicate {
-        check_predicate_type(pred, schema, functions)?;
-    }
-
     let mut to_delete: Vec<RecordId> = Vec::new();
     for entry in storage.scan(table_id)? {
         let (rid, bytes) = entry?;
@@ -725,7 +435,7 @@ pub fn storage_delete(
         let row = Row::new(schema, &tuple);
         let matched = match predicate {
             None => true,
-            Some(pred) => predicate_matches(eval_expr(pred, functions, Some(&row))?)?,
+            Some(pred) => predicate_matches(eval_bound_expr(pred, functions, Some(&row))?)?,
         };
         if matched {
             to_delete.push(rid);
@@ -743,7 +453,8 @@ pub fn storage_delete(
 mod tests {
     use super::*;
     use crate::ast::Statement;
-    use crate::lexer::Span;
+    use crate::binder::{Binder, BoundStatement};
+    use crate::catalog::Catalog;
 
     fn users_schema() -> Schema {
         Schema::new(vec![
@@ -761,22 +472,57 @@ mod tests {
         Tuple::new(&schema, vec![Value::BigInt(id), name]).unwrap()
     }
 
-    /// テスト用に、SQLの式1個を`Expr`へ変換する。`SELECT`に埋め込んで
-    /// パースするのは、`eval`モジュールのテストと同じやり方。
-    fn expr(sql: &str) -> Expr {
-        match crate::parser::parse_statement(&format!("SELECT {sql}")).unwrap() {
-            Statement::Select(select) => match select.items.into_iter().next().unwrap() {
-                SelectItem::Expr { expr, .. } => expr,
-                SelectItem::Wildcard { .. } => panic!("式を期待したがWildcardが返った"),
-            },
-            other => panic!("SELECT文を期待したが{other:?}が返った"),
+    /// テスト用に、`users`(`users_schema()`)を1つ持つカタログを通して`sql`を
+    /// 束縛する。`filter`・`project`・`update`が受け取る`BoundExpr`・
+    /// `BoundSelectItem`・`BoundAssignment`は、この章からは`Binder`を経由
+    /// してしか作れないため、演算子のテストも実際に`Binder`を通す。
+    fn users_catalog() -> Catalog {
+        let mut catalog = Catalog::new();
+        catalog.create_table("users", users_schema()).unwrap();
+        catalog
+    }
+
+    fn bind_select(sql: &str) -> crate::binder::BoundSelect {
+        let catalog = users_catalog();
+        let functions = FunctionRegistry::with_builtins();
+        let statement = crate::parser::parse_statement(sql).unwrap();
+        match Binder::new(&catalog, &functions, sql).bind(statement).unwrap() {
+            BoundStatement::Select(select) => select,
+            other => panic!("Selectを期待したが{other:?}が返った"),
         }
     }
 
-    fn ident(name: &str) -> Ident {
-        Ident {
-            name: name.to_string(),
-            span: Span::new(0, 0),
+    /// `WHERE`の1式だけを束縛して取り出す。
+    fn bound_predicate(where_sql: &str) -> BoundExpr {
+        bind_select(&format!("SELECT id FROM users WHERE {where_sql}"))
+            .predicate
+            .expect("WHEREを指定したのでpredicateがあるはず")
+    }
+
+    fn bound_projection(select_sql: &str) -> Vec<BoundSelectItem> {
+        bind_select(&format!("SELECT {select_sql} FROM users")).projection
+    }
+
+    fn bound_assignments(update_sql: &str) -> Vec<BoundAssignment> {
+        let catalog = users_catalog();
+        let functions = FunctionRegistry::with_builtins();
+        let sql = format!("UPDATE users SET {update_sql}");
+        let statement = crate::parser::parse_statement(&sql).unwrap();
+        match Binder::new(&catalog, &functions, &sql).bind(statement).unwrap() {
+            BoundStatement::Update(update) => update.assignments,
+            other => panic!("Updateを期待したが{other:?}が返った"),
+        }
+    }
+
+    /// テスト用に、SQLの式1個を`Expr`へ変換する。`INSERT`の`VALUES`は
+    /// 束縛されない生の`Expr`のままなので、`insert`系のテストで使う。
+    fn expr(sql: &str) -> Expr {
+        match crate::parser::parse_statement(&format!("SELECT {sql}")).unwrap() {
+            Statement::Select(select) => match select.items.into_iter().next().unwrap() {
+                crate::ast::SelectItem::Expr { expr, .. } => expr,
+                crate::ast::SelectItem::Wildcard { .. } => panic!("式を期待したがWildcardが返った"),
+            },
+            other => panic!("SELECT文を期待したが{other:?}が返った"),
         }
     }
 
@@ -802,38 +548,14 @@ mod tests {
         let functions = FunctionRegistry::with_builtins();
         let rows = vec![
             tuple(1, Some("Alice")),
-            tuple(2, None),  // `name = 'Alice'`はUNKNOWN
+            tuple(2, None),        // `name = 'Alice'`はUNKNOWN
             tuple(3, Some("Bob")), // `name = 'Alice'`はFALSE
         ];
 
-        let kept = filter(&schema, &functions, rows, &expr("name = 'Alice'")).unwrap();
+        let predicate = bound_predicate("name = 'Alice'");
+        let kept = filter(&schema, &functions, rows, &predicate).unwrap();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].values()[0], Value::BigInt(1));
-    }
-
-    #[test]
-    fn filter_rejects_a_non_boolean_predicate_instead_of_silently_dropping_rows() {
-        // `WHERE 1`はBIGINTを返す式であり、暗黙にBOOLEANへ変換したり
-        // 「一致しなかった」側へ黙って丸めたりせず、エラーにする。
-        let schema = users_schema();
-        let functions = FunctionRegistry::with_builtins();
-        let rows = vec![tuple(1, Some("Alice"))];
-
-        let result = filter(&schema, &functions, rows, &expr("1"));
-        assert!(matches!(result, Err(DbError::Eval(_))));
-    }
-
-    #[test]
-    fn filter_rejects_a_non_boolean_predicate_even_on_an_empty_table() {
-        // 行が1件も無いと`predicate_matches`は一度も呼ばれないため、
-        // `check_predicate_type`による事前の静的検査が無いと`WHERE 1`のような
-        // 書き誤りが空テーブルに対しては素通りしてしまう。
-        let schema = users_schema();
-        let functions = FunctionRegistry::with_builtins();
-        let rows: Vec<Tuple> = Vec::new();
-
-        let result = filter(&schema, &functions, rows, &expr("1"));
-        assert!(matches!(result, Err(DbError::Eval(_))));
     }
 
     // ---- predicate_matches ----
@@ -847,10 +569,7 @@ mod tests {
 
     #[test]
     fn predicate_matches_rejects_non_boolean_values() {
-        assert!(matches!(
-            predicate_matches(Value::BigInt(1)),
-            Err(DbError::Eval(_))
-        ));
+        assert!(matches!(predicate_matches(Value::BigInt(1)), Err(DbError::Eval(_))));
         assert!(matches!(
             predicate_matches(Value::Text("x".to_string())),
             Err(DbError::Eval(_))
@@ -877,16 +596,11 @@ mod tests {
         let schema = users_schema();
         let functions = FunctionRegistry::with_builtins();
         let rows = vec![tuple(1, Some("Alice"))];
-        let items = vec![SelectItem::Wildcard { span: Span::new(0, 0) }];
+        let projection = bound_projection("*");
 
-        let (out_schema, out_rows) =
-            project(&schema, &functions, &rows, &items, "SELECT *").unwrap();
+        let (out_schema, out_rows) = project(&schema, &functions, &rows, &projection).unwrap();
         assert_eq!(
-            out_schema
-                .columns()
-                .iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>(),
+            out_schema.columns().iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
             vec!["id", "name"]
         );
         assert_eq!(out_rows[0].values(), tuple(1, Some("Alice")).values());
@@ -901,43 +615,40 @@ mod tests {
         let schema = users_schema();
         let functions = FunctionRegistry::with_builtins();
         let rows = vec![tuple(1, Some("Alice")), tuple(2, None)];
-        let sql = "SELECT id, name";
-        let items = match crate::parser::parse_statement(sql).unwrap() {
-            Statement::Select(select) => select.items,
-            other => panic!("SELECT文を期待したが{other:?}が返った"),
-        };
+        let projection = bound_projection("id, name");
 
-        let (out_schema, out_rows) = project(&schema, &functions, &rows, &items, sql).unwrap();
+        let (out_schema, out_rows) = project(&schema, &functions, &rows, &projection).unwrap();
         assert!(out_schema.columns()[1].nullable);
         assert_eq!(out_rows.len(), 2);
-    }
-
-    /// テスト用に、`SELECT`文のSQLから`items`(対象式リスト)だけを取り出す。
-    fn select_items(sql: &str) -> Vec<SelectItem> {
-        match crate::parser::parse_statement(sql).unwrap() {
-            Statement::Select(select) => select.items,
-            other => panic!("SELECT文を期待したが{other:?}が返った"),
-        }
     }
 
     #[test]
     fn project_infers_computed_column_type_statically_even_when_first_row_is_null() {
         // `x`はNULLを許すBIGINT列。1行目が`abs(x)`をNULLにする値でも、出力列の
-        // 型は実際に1行評価した結果ではなく、式のASTと入力`Schema`だけから
-        // 静的に決まるため`BigInt`のままになる。もし旧実装のように1行目を
-        // 評価して`data_type()`(NULLは`None`)から型を決めていたら、ここが
-        // `Text`にフォールバックし、2行目の非NULLなBIGINTを`Tuple::new`の
-        // スキーマ検査が`SchemaMismatch`として拒否していた。
-        let schema = Schema::new(vec![Column::new("x", DataType::BigInt, true)]);
+        // 型は実際に1行評価した結果ではなく、`Binder`が式のASTと入力`Schema`
+        // だけから静的に決めるため`BigInt`のままになる。もし1行目を評価して
+        // `data_type()`(NULLは`None`)から型を決めていたら、ここが`Text`に
+        // フォールバックし、2行目の非NULLなBIGINTを`Tuple::new`のスキーマ検査が
+        // `SchemaMismatch`として拒否していた。
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table("t", Schema::new(vec![Column::new("x", DataType::BigInt, true)]))
+            .unwrap();
         let functions = FunctionRegistry::with_builtins();
+        let sql = "SELECT abs(x) FROM t";
+        let statement = crate::parser::parse_statement(sql).unwrap();
+        let select = match Binder::new(&catalog, &functions, sql).bind(statement).unwrap() {
+            BoundStatement::Select(select) => select,
+            other => panic!("Selectを期待したが{other:?}が返った"),
+        };
+
+        let schema = Schema::new(vec![Column::new("x", DataType::BigInt, true)]);
         let rows = vec![
             Tuple::new(&schema, vec![Value::Null]).unwrap(),
             Tuple::new(&schema, vec![Value::BigInt(-5)]).unwrap(),
         ];
-        let items = select_items("SELECT abs(x)");
 
-        let (out_schema, out_rows) =
-            project(&schema, &functions, &rows, &items, "SELECT abs(x)").unwrap();
+        let (out_schema, out_rows) = project(&schema, &functions, &rows, &select.projection).unwrap();
         assert_eq!(out_schema.columns()[0].data_type, DataType::BigInt);
         assert_eq!(out_rows[0].values()[0], Value::Null);
         assert_eq!(out_rows[1].values()[0], Value::BigInt(5));
@@ -945,14 +656,13 @@ mod tests {
 
     #[test]
     fn project_infers_computed_column_type_on_an_empty_table() {
-        // 行が1件も無くても、`infer_type`は式のASTだけから型を決められる。
+        // 行が1件も無くても、`Binder`は式のASTだけから型を決められる。
         let schema = users_schema();
         let functions = FunctionRegistry::with_builtins();
         let rows: Vec<Tuple> = vec![];
-        let items = select_items("SELECT id + 1");
+        let projection = bound_projection("id + 1");
 
-        let (out_schema, out_rows) =
-            project(&schema, &functions, &rows, &items, "SELECT id + 1").unwrap();
+        let (out_schema, out_rows) = project(&schema, &functions, &rows, &projection).unwrap();
         assert_eq!(out_schema.columns()[0].data_type, DataType::BigInt);
         assert!(out_rows.is_empty());
     }
@@ -962,10 +672,9 @@ mod tests {
         let schema = users_schema();
         let functions = FunctionRegistry::with_builtins();
         let rows = vec![tuple(1, Some("Alice")), tuple(2, Some("Bob"))];
-        let items = select_items("SELECT length(name)");
+        let projection = bound_projection("length(name)");
 
-        let (out_schema, out_rows) =
-            project(&schema, &functions, &rows, &items, "SELECT length(name)").unwrap();
+        let (out_schema, out_rows) = project(&schema, &functions, &rows, &projection).unwrap();
         assert_eq!(out_schema.columns()[0].data_type, DataType::BigInt);
         assert_eq!(out_rows[0].values()[0], Value::BigInt(5));
         assert_eq!(out_rows[1].values()[0], Value::BigInt(3));
@@ -991,7 +700,9 @@ mod tests {
         let functions = FunctionRegistry::with_builtins();
         let mut table = MemTable::new();
 
-        let columns = vec![ident("id")];
+        // `id`だけを指定する列インデックス(0番)。実際の解決は`Binder`の
+        // `bind_insert`が行うが、この関数自体は解決済みの索引を受け取るだけ。
+        let columns = vec![0usize];
         let rows = vec![vec![expr("1")]];
         insert(&mut table, &schema, &functions, Some(&columns), &rows).unwrap();
         assert_eq!(table.rows()[0].values(), &[Value::BigInt(1), Value::Null]);
@@ -1004,10 +715,7 @@ mod tests {
         let mut table = MemTable::new();
 
         // 1行目は妥当だが、2行目は`id`(NOT NULL)にNULLを渡していて失敗する。
-        let rows = vec![
-            vec![expr("1"), expr("'Alice'")],
-            vec![expr("NULL"), expr("'Bob'")],
-        ];
+        let rows = vec![vec![expr("1"), expr("'Alice'")], vec![expr("NULL"), expr("'Bob'")]];
         let result = insert(&mut table, &schema, &functions, None, &rows);
         assert!(result.is_err());
         assert!(table.rows().is_empty());
@@ -1023,19 +731,9 @@ mod tests {
         table.rows_mut().push(tuple(1, Some("Alice")));
         table.rows_mut().push(tuple(2, Some("Bob")));
 
-        let assignments = vec![Assignment {
-            column: ident("name"),
-            value: expr("'Carol'"),
-            span: Span::new(0, 0),
-        }];
-        let count = update(
-            &mut table,
-            &schema,
-            &functions,
-            &assignments,
-            Some(&expr("id = 1")),
-        )
-        .unwrap();
+        let assignments = bound_assignments("name = 'Carol'");
+        let predicate = bound_predicate("id = 1");
+        let count = update(&mut table, &schema, &functions, &assignments, Some(&predicate)).unwrap();
 
         assert_eq!(count, 1);
         assert_eq!(table.rows()[0].values()[1], Value::Text("Carol".to_string()));
@@ -1050,40 +748,13 @@ mod tests {
         table.rows_mut().push(tuple(1, Some("Alice")));
         table.rows_mut().push(tuple(2, Some("Bob")));
 
-        let assignments = vec![Assignment {
-            column: ident("id"),
-            value: expr("NULL"),
-            span: Span::new(0, 0),
-        }];
+        let assignments = bound_assignments("id = NULL");
         let result = update(&mut table, &schema, &functions, &assignments, None);
         assert!(result.is_err());
         // 1行目の検査で失敗したので、2行目まで検査が進んでいても`table`は
         // 一切変更されていない。
         assert_eq!(table.rows()[0].values()[0], Value::BigInt(1));
         assert_eq!(table.rows()[1].values()[0], Value::BigInt(2));
-    }
-
-    #[test]
-    fn update_rejects_a_non_boolean_predicate_even_on_an_empty_table() {
-        // `filter`と同じ理由で、`table`が空だと行ループが1度も回らないため、
-        // `check_predicate_type`による事前検査が無いと`WHERE 1`が素通りする。
-        let schema = users_schema();
-        let functions = FunctionRegistry::with_builtins();
-        let mut table = MemTable::new();
-
-        let assignments = vec![Assignment {
-            column: ident("name"),
-            value: expr("'Carol'"),
-            span: Span::new(0, 0),
-        }];
-        let result = update(
-            &mut table,
-            &schema,
-            &functions,
-            &assignments,
-            Some(&expr("1")),
-        );
-        assert!(matches!(result, Err(DbError::Eval(_))));
     }
 
     // ---- Delete ----
@@ -1096,7 +767,8 @@ mod tests {
         table.rows_mut().push(tuple(1, Some("Alice")));
         table.rows_mut().push(tuple(2, Some("Bob")));
 
-        let count = delete(&mut table, &schema, &functions, Some(&expr("id = 1"))).unwrap();
+        let predicate = bound_predicate("id = 1");
+        let count = delete(&mut table, &schema, &functions, Some(&predicate)).unwrap();
         assert_eq!(count, 1);
         assert_eq!(table.rows().len(), 1);
         assert_eq!(table.rows()[0].values()[0], Value::BigInt(2));
@@ -1113,18 +785,6 @@ mod tests {
         let count = delete(&mut table, &schema, &functions, None).unwrap();
         assert_eq!(count, 2);
         assert!(table.rows().is_empty());
-    }
-
-    #[test]
-    fn delete_rejects_a_non_boolean_predicate_even_on_an_empty_table() {
-        // `filter`と同じ理由で、`table`が空だと行ループが1度も回らないため、
-        // `check_predicate_type`による事前検査が無いと`WHERE 1`が素通りする。
-        let schema = users_schema();
-        let functions = FunctionRegistry::with_builtins();
-        let mut table = MemTable::new();
-
-        let result = delete(&mut table, &schema, &functions, Some(&expr("1")));
-        assert!(matches!(result, Err(DbError::Eval(_))));
     }
 
     // ---- Storage版(seq_scan/insert/update/delete) ----
@@ -1178,10 +838,7 @@ mod tests {
         let functions = FunctionRegistry::with_builtins();
 
         // 1行目は妥当だが、2行目は`id`(NOT NULL)にNULLを渡していて失敗する。
-        let rows = vec![
-            vec![expr("1"), expr("'Alice'")],
-            vec![expr("NULL"), expr("'Bob'")],
-        ];
+        let rows = vec![vec![expr("1"), expr("'Alice'")], vec![expr("NULL"), expr("'Bob'")]];
         let result = storage_insert(&mut storage, table_id, &schema, &functions, None, &rows);
         assert!(result.is_err());
         assert!(storage_seq_scan(&storage, table_id, &schema).unwrap().is_empty());
@@ -1200,27 +857,14 @@ mod tests {
             &schema,
             &functions,
             None,
-            &[
-                vec![expr("1"), expr("'Alice'")],
-                vec![expr("2"), expr("'Bob'")],
-            ],
+            &[vec![expr("1"), expr("'Alice'")], vec![expr("2"), expr("'Bob'")]],
         )
         .unwrap();
 
-        let assignments = vec![Assignment {
-            column: ident("name"),
-            value: expr("'Carol'"),
-            span: Span::new(0, 0),
-        }];
-        let count = storage_update(
-            &mut storage,
-            table_id,
-            &schema,
-            &functions,
-            &assignments,
-            Some(&expr("id = 1")),
-        )
-        .unwrap();
+        let assignments = bound_assignments("name = 'Carol'");
+        let predicate = bound_predicate("id = 1");
+        let count =
+            storage_update(&mut storage, table_id, &schema, &functions, &assignments, Some(&predicate)).unwrap();
         assert_eq!(count, 1);
 
         let scanned = storage_seq_scan(&storage, table_id, &schema).unwrap();
@@ -1242,49 +886,17 @@ mod tests {
             &schema,
             &functions,
             None,
-            &[
-                vec![expr("1"), expr("'Alice'")],
-                vec![expr("2"), expr("'Bob'")],
-            ],
+            &[vec![expr("1"), expr("'Alice'")], vec![expr("2"), expr("'Bob'")]],
         )
         .unwrap();
 
-        let count = storage_delete(&mut storage, table_id, &schema, &functions, Some(&expr("id = 1"))).unwrap();
+        let predicate = bound_predicate("id = 1");
+        let count = storage_delete(&mut storage, table_id, &schema, &functions, Some(&predicate)).unwrap();
         assert_eq!(count, 1);
 
         let scanned = storage_seq_scan(&storage, table_id, &schema).unwrap();
         assert_eq!(scanned.len(), 1);
         assert_eq!(scanned[0].values()[0], Value::BigInt(2));
-
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn storage_update_and_storage_delete_reject_a_non_boolean_predicate_even_on_an_empty_table() {
-        // `update`・`delete`(MemTable版)と同じ理由で、行ループへ入る前の
-        // `check_predicate_type`が無いと、テーブルが空の間は`WHERE 1`のような
-        // 書き誤りを見逃してしまう。
-        let (path, mut storage, table_id) = users_storage("empty-predicate");
-        let schema = users_schema();
-        let functions = FunctionRegistry::with_builtins();
-
-        let assignments = vec![Assignment {
-            column: ident("name"),
-            value: expr("'Carol'"),
-            span: Span::new(0, 0),
-        }];
-        let update_result = storage_update(
-            &mut storage,
-            table_id,
-            &schema,
-            &functions,
-            &assignments,
-            Some(&expr("1")),
-        );
-        assert!(matches!(update_result, Err(DbError::Eval(_))));
-
-        let delete_result = storage_delete(&mut storage, table_id, &schema, &functions, Some(&expr("1")));
-        assert!(matches!(delete_result, Err(DbError::Eval(_))));
 
         std::fs::remove_file(&path).unwrap();
     }

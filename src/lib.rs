@@ -20,9 +20,13 @@
 //! ストレージエンジン`storage`が加わる。第16章では、`database`のSQL実行経路が
 //! `storage`(永続モード、`Database::open`)と`storage_mem`(インメモリモード、
 //! `Database::memory`)のどちらでも動くようになり、`CREATE TABLE`・`INSERT`・
-//! `SELECT`・`UPDATE`・`DELETE`が再起動をまたいで残る。
+//! `SELECT`・`UPDATE`・`DELETE`が再起動をまたいで残る。第17章では、ASTを
+//! カタログと突き合わせて名前解決・型検査を行う`Binder`が加わり、`database`の
+//! 実行経路は構文解析(`parser`)→名前解決(`binder`)→実行(`executor`)という
+//! 3段階になる。
 
 pub mod ast;
+pub mod binder;
 pub mod buffer_pool;
 pub mod catalog;
 pub mod database;
@@ -43,6 +47,7 @@ pub mod tuple_codec;
 pub mod types;
 
 pub use ast::{Expr, Statement};
+pub use binder::{Binder, BoundExpr, BoundStatement, CatalogLookup};
 pub use buffer_pool::{BufferPool, BufferPoolStats, PageReadGuard, PageWriteGuard};
 pub use catalog::{Catalog, TableInfo};
 pub use database::{Database, QueryResult};

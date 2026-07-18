@@ -136,6 +136,8 @@ pub enum TokenKind {
     Comma,
     /// `;`
     Semicolon,
+    /// `.`。`users.id`のような修飾列参照を書くための区切り(第17章)。
+    Dot,
     /// 入力の終端を表す番兵トークン。
     Eof,
 }
@@ -453,6 +455,7 @@ impl<'a> Lexer<'a> {
             ')' => TokenKind::RParen,
             ',' => TokenKind::Comma,
             ';' => TokenKind::Semicolon,
+            '.' => TokenKind::Dot,
             other => {
                 return Err(DbError::Lex {
                     message: format!("不明な文字です: {other:?}"),
@@ -595,6 +598,19 @@ mod tests {
                 TokenKind::IntLiteral(2),
                 TokenKind::RParen,
                 TokenKind::Semicolon,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_dot_for_qualified_column_refs() {
+        assert_eq!(
+            kinds("u.id"),
+            vec![
+                TokenKind::Ident("u".to_string()),
+                TokenKind::Dot,
+                TokenKind::Ident("id".to_string()),
                 TokenKind::Eof,
             ]
         );

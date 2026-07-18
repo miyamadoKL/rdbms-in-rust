@@ -19,8 +19,8 @@
 
 use crate::ast::{
     Assignment, BinaryOperator, ColumnDef, CreateTableStatement, DeleteStatement,
-    DropTableStatement, Expr, Ident, InsertStatement, SelectItem, SelectStatement, Statement,
-    UnaryOperator, UpdateStatement,
+    DropTableStatement, Expr, FromClause, Ident, InsertStatement, SelectItem, SelectStatement,
+    Statement, UnaryOperator, UpdateStatement,
 };
 use crate::error::{DbError, DbResult};
 use crate::lexer::{self, Keyword, Span, Token, TokenKind};
@@ -168,8 +168,21 @@ impl<'a> Parser<'a> {
         let from = if let TokenKind::Keyword(Keyword::From) = self.peek_kind() {
             self.advance();
             let table = self.expect_ident()?;
-            end = table.span.end;
-            Some(table)
+            let mut from_end = table.span.end;
+            let alias = if let TokenKind::Keyword(Keyword::As) = self.peek_kind() {
+                self.advance();
+                let alias = self.expect_ident()?;
+                from_end = alias.span.end;
+                Some(alias)
+            } else {
+                None
+            };
+            end = from_end;
+            Some(FromClause {
+                span: Span::new(table.span.start, from_end),
+                table,
+                alias,
+            })
         } else {
             None
         };
@@ -517,10 +530,26 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Ident(name) => {
                 let start_span = self.advance().span;
-                if *self.peek_kind() == TokenKind::LParen {
+                if *self.peek_kind() == TokenKind::Dot {
+                    // `u.id`。関数呼び出しは`schema.func()`のような修飾名を
+                    // このSQLサブセットでは扱わないため、`.`を見た時点で
+                    // 列参照だと確定できる。
+                    self.advance();
+                    let column = self.expect_ident()?;
+                    let span = Span::new(start_span.start, column.span.end);
+                    Ok(Expr::ColumnRef {
+                        qualifier: Some(Ident {
+                            name,
+                            span: start_span,
+                        }),
+                        name: column.name,
+                        span,
+                    })
+                } else if *self.peek_kind() == TokenKind::LParen {
                     self.parse_function_call(name, start_span)
                 } else {
                     Ok(Expr::ColumnRef {
+                        qualifier: None,
                         name,
                         span: start_span,
                     })
@@ -649,7 +678,11 @@ mod tests {
             Expr::StringLiteral { value, .. } => Expr::StringLiteral { value, span: dummy },
             Expr::BoolLiteral { value, .. } => Expr::BoolLiteral { value, span: dummy },
             Expr::NullLiteral { .. } => Expr::NullLiteral { span: dummy },
-            Expr::ColumnRef { name, .. } => Expr::ColumnRef { name, span: dummy },
+            Expr::ColumnRef { qualifier, name, .. } => Expr::ColumnRef {
+                qualifier: qualifier.map(|q| Ident { name: q.name, span: dummy }),
+                name,
+                span: dummy,
+            },
             Expr::UnaryOp { op, expr, .. } => Expr::UnaryOp {
                 op,
                 expr: Box::new(strip_spans(*expr)),
@@ -923,10 +956,39 @@ mod tests {
         assert_expr_eq(
             "id",
             Expr::ColumnRef {
+                qualifier: None,
                 name: "id".to_string(),
                 span: Span::new(0, 0),
             },
         );
+    }
+
+    #[test]
+    fn parses_qualified_column_ref() {
+        assert_expr_eq(
+            "u.id",
+            Expr::ColumnRef {
+                qualifier: Some(Ident {
+                    name: "u".to_string(),
+                    span: Span::new(0, 0),
+                }),
+                name: "id".to_string(),
+                span: Span::new(0, 0),
+            },
+        );
+    }
+
+    #[test]
+    fn parses_from_with_alias() {
+        let statement = parse_statement("SELECT u.id FROM users AS u").unwrap();
+        match statement {
+            Statement::Select(select) => {
+                let from = select.from.expect("FROMがあるはず");
+                assert_eq!(from.table.name, "users");
+                assert_eq!(from.alias.map(|a| a.name), Some("u".to_string()));
+            }
+            other => panic!("Statement::Selectを期待したが{other:?}が返った"),
+        }
     }
 
     #[test]
@@ -943,7 +1005,7 @@ mod tests {
         let statement = parse_statement("SELECT id FROM users WHERE id = 1").unwrap();
         match statement {
             Statement::Select(select) => {
-                assert_eq!(select.from.map(|t| t.name), Some("users".to_string()));
+                assert_eq!(select.from.map(|t| t.table.name), Some("users".to_string()));
                 assert!(select.where_clause.is_some());
             }
             other => panic!("SELECT文を期待したが{other:?}が返った"),

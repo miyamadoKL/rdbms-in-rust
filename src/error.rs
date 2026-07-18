@@ -61,6 +61,21 @@ pub enum DbError {
         column: usize,
     },
 
+    /// `Binder`(第17章)がASTをBound ASTへ変換できなかったエラー。発生位置の
+    /// 行・列を持つ。未知のテーブル・列参照、複数テーブルにまたがる曖昧な
+    /// 列参照、式の型検査の失敗がここに当たる。`Lex`・`Parse`と表示形式を
+    /// 揃えている(`行N列M: 種別: メッセージ`)ので、利用者はエラーがどの段階
+    /// (字句解析・構文解析・名前解決)で起きたかを見分けられる。
+    #[error("行{line}列{column}: 名前解決エラー: {message}")]
+    Bind {
+        /// エラーの内容。
+        message: String,
+        /// 発生位置の行番号(1始まり)。
+        line: usize,
+        /// 発生位置の列番号(1始まり)。
+        column: usize,
+    },
+
     /// File HeaderまたはPageのバイト列が壊れているエラー(Magic Number不一致、
     /// Format Version不一致、checksum不一致、バイト数不一致、未知のPage Typeなど)。
     #[error("破損したページです: {0}")]

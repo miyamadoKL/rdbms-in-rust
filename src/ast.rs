@@ -59,15 +59,27 @@ pub struct Ident {
 pub struct SelectStatement {
     /// `SELECT`の直後に並ぶ、カンマ区切りの式リスト。
     pub items: Vec<SelectItem>,
-    /// `FROM <table>`。省略した`SELECT`は、列を持たない空のSchemaに対する
-    /// 1件のタプルを暗黙の入力とみなして実行する(`where_clause`のドキュメント
+    /// `FROM <table> [AS <alias>]`。省略した`SELECT`は、列を持たない空のSchemaに
+    /// 対する1件のタプルを暗黙の入力とみなして実行する(`where_clause`のドキュメント
     /// コメント参照)。
-    pub from: Option<Ident>,
+    pub from: Option<FromClause>,
     /// `WHERE <expr>`。`from`を伴わない`SELECT`でも構文として受理するだけでなく、
     /// 意味も持つ。`from`が無い`SELECT`は、この1件の暗黙のタプルに対して
     /// `where_clause`を適用し、`TRUE`なら1行、`FALSE`または`NULL`(UNKNOWN)なら
     /// 0行を返す(`database`モジュールの`execute_select_without_from`参照)。
     pub where_clause: Option<Expr>,
+    pub span: Span,
+}
+
+/// `SELECT`の`FROM <table> [AS <alias>]`。
+///
+/// `alias`があれば、`table`自身の名前は`Binder`(第17章)による列参照の解決では
+/// 使えなくなる(`AS`はテーブルを新しい名前で覆い隠す、標準SQLの規則)。
+/// `alias`が無い場合は`table`の名前がそのまま修飾子として使える。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FromClause {
+    pub table: Ident,
+    pub alias: Option<Ident>,
     pub span: Span,
 }
 
@@ -210,8 +222,12 @@ pub enum Expr {
     NullLiteral {
         span: Span,
     },
-    /// 列参照。`users.id`のような修飾名は、Lexerが`.`を扱わないため対象外。
+    /// 列参照。`users.id`のような修飾名も、`qualifier`に`users`を持つことで
+    /// 表現できる(第17章で`Dot`トークンに対応した)。`qualifier`がテーブル名
+    /// そのものを指すかテーブルAliasを指すかはASTの時点では区別せず、
+    /// どちらの解決(`Binder`)も同じ`Ident`から行う。
     ColumnRef {
+        qualifier: Option<Ident>,
         name: String,
         span: Span,
     },

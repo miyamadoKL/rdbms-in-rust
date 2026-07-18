@@ -5,7 +5,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 
 ## 目次
 
-現在執筆済みなのは[はじめに](book/src/index.md)と第1〜16章のみで、第17章以降は準備中です。
+現在執筆済みなのは[はじめに](book/src/index.md)と第1〜17章のみで、第18章以降は準備中です。
 
 ### 第0部 設計と開発環境
 
@@ -34,7 +34,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 
 ### 第3部 Query Execution: SQLを実行計画へ変換する
 
-- 第17章 Binderと名前解決
+- [第17章 Binderと名前解決](book/src/ch17-binder.md)
 - 第18章 関係代数とLogical Plan
 - 第19章 Physical PlanとVolcano Executor
 - 第20章 制約
