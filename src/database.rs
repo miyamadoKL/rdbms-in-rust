@@ -53,8 +53,8 @@ use crate::eval::FunctionRegistry;
 use crate::executor;
 use crate::logical_plan::{self, DeleteNode, InsertNode, LogicalPlan, UpdateNode};
 use crate::physical_plan::{
-    self, DiskSeqScanExec, DistinctExec, Executor, FilterExec, HashAggregateExec, HashJoinExec, LimitExec,
-    MemSeqScanExec, NestedLoopJoinExec, PhysicalPlan, ProjectionExec, SortExec, ValuesExec,
+    self, DiskSeqScanExec, DistinctExec, Executor, FilterExec, HashAggregateExec, HashJoinExec, IndexNestedLoopJoinExec,
+    IndexScanExec, LimitExec, MemSeqScanExec, NestedLoopJoinExec, PhysicalPlan, ProjectionExec, SortExec, ValuesExec,
 };
 use crate::storage::Storage;
 use crate::storage_mem::MemStorage;
@@ -365,7 +365,7 @@ impl Database {
     /// 実行が効くのは、あくまで計画の中間段階(`Filter`を通過する前の
     /// 候補行、`WHERE`に一致しなかった行)がメモリに残らないという点である。
     fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {
-        let physical = physical_plan::optimize(plan);
+        let physical = physical_plan::optimize(plan, self.index_storage());
         let schema = physical.output_schema();
         let mut executor = self.build_query_executor(&physical)?;
 
@@ -405,6 +405,16 @@ impl Database {
                 };
                 Ok(exec)
             }
+            PhysicalPlan::IndexScan(scan) => {
+                // `optimize`が`IndexScan`を選ぶのは`self.index_storage()`が
+                // `Some`を返した(=`Backend::Disk`の)ときだけである
+                // (`physical_plan::optimize`のドキュメントを参照)。
+                let Backend::Disk { storage } = &self.backend else {
+                    unreachable!("IndexScanはBackend::Diskのときにしかoptimizeが選ばない")
+                };
+                let exec = IndexScanExec::new(storage, scan.table_id, &scan.schema, &scan.index_name, &scan.kind)?;
+                Ok(Box::new(exec))
+            }
             PhysicalPlan::Values(values) => {
                 let exec = ValuesExec::new(values.schema.clone(), &self.functions, &values.rows)?;
                 Ok(Box::new(exec))
@@ -423,6 +433,24 @@ impl Database {
                 let left = self.build_query_executor(&join.left)?;
                 let right = self.build_query_executor(&join.right)?;
                 let exec = HashJoinExec::new(left, right, &join.keys, &self.functions)?;
+                Ok(Box::new(exec))
+            }
+            PhysicalPlan::IndexNestedLoopJoin(join) => {
+                // `IndexScan`と同じ理由で、`optimize`がこのノードを選ぶのは
+                // 常に`Backend::Disk`のときだけである。
+                let Backend::Disk { storage } = &self.backend else {
+                    unreachable!("IndexNestedLoopJoinはBackend::Diskのときにしかoptimizeが選ばない")
+                };
+                let left = self.build_query_executor(&join.left)?;
+                let exec = IndexNestedLoopJoinExec::new(
+                    left,
+                    storage,
+                    join.table_id,
+                    join.schema.clone(),
+                    &join.index_name,
+                    &join.outer_key,
+                    &self.functions,
+                );
                 Ok(Box::new(exec))
             }
             PhysicalPlan::Aggregate(aggregate) => {
@@ -480,8 +508,21 @@ impl Database {
                 )
             }
         };
-        let physical = physical_plan::optimize(logical);
+        let physical = physical_plan::optimize(logical, self.index_storage());
         Ok(QueryResult::explain(physical.to_string()))
+    }
+
+    /// `physical_plan::optimize`にPoint/Range Index Scan・Index Nested Loop
+    /// Joinのアクセスパスを検討させてよい`Storage`を返す(第25章)。
+    ///
+    /// 索引は`Backend::Disk`だけが持てる(第24章、`Database::memory`は
+    /// `CREATE INDEX`自体を拒否する)ため、`Backend::Memory`では常に`None`を
+    /// 返し、`optimize`は`Scan`を`SeqScan`のまま(索引を検討せず)変換する。
+    fn index_storage(&self) -> Option<&Storage> {
+        match &self.backend {
+            Backend::Memory { .. } => None,
+            Backend::Disk { storage } => Some(storage.as_ref()),
+        }
     }
 
     /// `INSERT INTO`を実行する。`executor::insert`(または`executor::storage_insert`)
@@ -2484,6 +2525,426 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         for suffix in ["users_id_idx", "users_email_idx"] {
             let _ = std::fs::remove_file(format!("{}.idx.{suffix}", path.display()));
+        }
+    }
+
+    // ---- Index Scanとアクセスパス(第25章) ----
+
+    fn orders_disk_db(path: &std::path::Path) -> Database {
+        let mut db = Database::open(path).unwrap();
+        db.execute("CREATE TABLE orders (id BIGINT NOT NULL, amount BIGINT, name TEXT)").unwrap();
+        db
+    }
+
+    /// 本体ファイルと、`names`が指す索引ファイルをまとめて削除する。
+    fn remove_db_and_indexes(path: &std::path::Path, names: &[&str]) {
+        std::fs::remove_file(path).unwrap();
+        for name in names {
+            let _ = std::fs::remove_file(format!("{}.idx.{name}", path.display()));
+        }
+    }
+
+    #[test]
+    fn point_predicate_on_an_indexed_column_chooses_index_scan_and_absorbs_the_whole_filter() {
+        let path = temp_db_path("index-scan-point");
+        let mut db = orders_disk_db(&path);
+        db.execute("CREATE INDEX idx_id ON orders (id)").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 100, 'Alice'), (2, 200, 'Bob')").unwrap();
+
+        let plan = db.execute("EXPLAIN SELECT id, amount, name FROM orders WHERE id = 1").unwrap().to_string();
+        assert_eq!(
+            plan,
+            "QUERY PLAN\n----------\nProjection(id, amount, name)\n  └─ IndexScan(idx_id, id = 1)\n(2 rows)"
+        );
+
+        let result = db.execute("SELECT id, amount, name FROM orders WHERE id = 1").unwrap();
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::BigInt(1), Value::BigInt(100), Value::Text("Alice".to_string())]);
+
+        remove_db_and_indexes(&path, &["idx_id"]);
+    }
+
+    #[test]
+    fn point_predicate_leaves_the_rest_of_a_conjunction_in_a_residual_filter() {
+        // `id`だけに索引がある。`id = 1 AND name = 'Alice'`は、`id = 1`だけが
+        // IndexScanに吸収され、`name = 'Alice'`はFilterに残る。
+        let path = temp_db_path("index-scan-residual-filter");
+        let mut db = orders_disk_db(&path);
+        db.execute("CREATE INDEX idx_id ON orders (id)").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 100, 'Alice'), (1, 150, 'Zoe')").unwrap();
+
+        let plan = db
+            .execute("EXPLAIN SELECT id, amount, name FROM orders WHERE id = 1 AND name = 'Alice'")
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            plan,
+            "QUERY PLAN\n----------\nProjection(id, amount, name)\n  └─ Filter(name = 'Alice')\n    └─ IndexScan(idx_id, id = 1)\n(3 rows)"
+        );
+
+        let result = db.execute("SELECT id, amount, name FROM orders WHERE id = 1 AND name = 'Alice'").unwrap();
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values()[2], Value::Text("Alice".to_string()));
+
+        remove_db_and_indexes(&path, &["idx_id"]);
+    }
+
+    #[test]
+    fn range_predicate_on_both_bounds_becomes_a_single_range_index_scan() {
+        let path = temp_db_path("index-scan-range");
+        let mut db = orders_disk_db(&path);
+        db.execute("CREATE INDEX idx_amount ON orders (amount)").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 50, 'a'), (2, 100, 'b'), (3, 150, 'c'), (4, 200, 'd'), (5, 250, 'e')")
+            .unwrap();
+
+        let plan = db
+            .execute("EXPLAIN SELECT id FROM orders WHERE amount >= 100 AND amount <= 200")
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            plan,
+            "QUERY PLAN\n----------\nProjection(id)\n  └─ IndexScan(idx_amount, amount >= 100 AND amount <= 200)\n(2 rows)"
+        );
+
+        let result = db.execute("SELECT id FROM orders WHERE amount >= 100 AND amount <= 200 ORDER BY id").unwrap();
+        let ids: Vec<Value> = result.rows().iter().map(|row| row.values()[0].clone()).collect();
+        assert_eq!(ids, vec![Value::BigInt(2), Value::BigInt(3), Value::BigInt(4)]);
+
+        // 片側だけの境界(`>`のみ)でも同じくRange Index Scanになる。
+        let plan_lower_only = db.execute("EXPLAIN SELECT id FROM orders WHERE amount > 200").unwrap().to_string();
+        assert!(plan_lower_only.contains("IndexScan(idx_amount, amount > 200)"));
+
+        remove_db_and_indexes(&path, &["idx_amount"]);
+    }
+
+    #[test]
+    fn seq_scan_is_kept_when_the_predicate_column_has_no_index() {
+        let path = temp_db_path("index-scan-no-index");
+        let mut db = orders_disk_db(&path);
+        db.execute("INSERT INTO orders VALUES (1, 100, 'Alice')").unwrap();
+
+        // 索引を1つも作らなければ、第24章までと同じくSeqScan+Filterのまま
+        // (`Database::memory`と同じテキストになる)。
+        let plan = db.execute("EXPLAIN SELECT id FROM orders WHERE amount = 100").unwrap().to_string();
+        assert_eq!(
+            plan,
+            "QUERY PLAN\n----------\nProjection(id)\n  └─ Filter(amount = 100)\n    └─ SeqScan(orders)\n(3 rows)"
+        );
+
+        remove_db_and_indexes(&path, &[]);
+    }
+
+    #[test]
+    fn null_equality_predicate_never_uses_the_index() {
+        // `col = NULL`は三値論理でUNKNOWNになり常に0行だが(第8章)、
+        // その判定はFilterに任せる。`crate::btree::BTree`は`NULL`をキーに
+        // 持てない(第23章)ため、`choose_access_path`はこの述語を索引の対象から
+        // 外し、索引はそもそも引かない。
+        let path = temp_db_path("index-scan-null-equality");
+        let mut db = orders_disk_db(&path);
+        db.execute("CREATE INDEX idx_id ON orders (id)").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 100, 'Alice')").unwrap();
+
+        let plan = db.execute("EXPLAIN SELECT id FROM orders WHERE id = NULL").unwrap().to_string();
+        assert!(!plan.contains("IndexScan"), "col = NULLは索引を引いてはならない: {plan}");
+        assert!(plan.contains("SeqScan"));
+
+        let result = db.execute("SELECT id FROM orders WHERE id = NULL").unwrap();
+        assert!(result.rows().is_empty());
+
+        remove_db_and_indexes(&path, &["idx_id"]);
+    }
+
+    #[test]
+    fn index_scan_and_seq_scan_agree_on_the_same_query_results() {
+        // 同一のデータを持つ2つのDB(索引あり/無し)に同じクエリを実行し、
+        // 行集合が一致することを確認する。索引を検討するのは
+        // `physical_plan::optimize`だけであり、`IndexScanExec`が返す行の
+        // 中身(タプルのデコード)は`DiskSeqScanExec`と変わらないはずである。
+        let with_index_path = temp_db_path("index-vs-seq-with-index");
+        let without_index_path = temp_db_path("index-vs-seq-without-index");
+
+        let rows: Vec<String> = (0..200).map(|i| format!("({i}, {}, 'name{i}')", i * 3)).collect();
+        let insert_sql = format!("INSERT INTO orders VALUES {}", rows.join(", "));
+
+        let mut with_index = orders_disk_db(&with_index_path);
+        with_index.execute("CREATE INDEX idx_id ON orders (id)").unwrap();
+        with_index.execute("CREATE INDEX idx_amount ON orders (amount)").unwrap();
+        with_index.execute(&insert_sql).unwrap();
+
+        let mut without_index = orders_disk_db(&without_index_path);
+        without_index.execute(&insert_sql).unwrap();
+
+        for query in [
+            "SELECT id, amount, name FROM orders WHERE id = 42",
+            "SELECT id, amount, name FROM orders WHERE amount >= 100 AND amount <= 200",
+            "SELECT id, amount, name FROM orders WHERE amount > 590",
+            "SELECT id, amount, name FROM orders WHERE id = 999", // 一致なし
+        ] {
+            let with_index_plan = with_index.execute(&format!("EXPLAIN {query}")).unwrap().to_string();
+            assert!(with_index_plan.contains("IndexScan"), "索引ありDBはIndexScanを選ぶはず: {with_index_plan}");
+            let without_index_plan = without_index.execute(&format!("EXPLAIN {query}")).unwrap().to_string();
+            assert!(without_index_plan.contains("SeqScan"), "索引無しDBはSeqScanのまま: {without_index_plan}");
+
+            let mut with_index_rows: Vec<Vec<Value>> =
+                with_index.execute(query).unwrap().rows().iter().map(|row| row.values().to_vec()).collect();
+            let mut without_index_rows: Vec<Vec<Value>> =
+                without_index.execute(query).unwrap().rows().iter().map(|row| row.values().to_vec()).collect();
+            with_index_rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            without_index_rows.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            assert_eq!(with_index_rows, without_index_rows, "クエリ`{query}`の結果が索引の有無で食い違った");
+        }
+
+        remove_db_and_indexes(&with_index_path, &["idx_id", "idx_amount"]);
+        remove_db_and_indexes(&without_index_path, &[]);
+    }
+
+    #[test]
+    fn index_scan_excludes_a_row_removed_by_delete() {
+        let path = temp_db_path("index-scan-after-delete");
+        let mut db = orders_disk_db(&path);
+        db.execute("CREATE INDEX idx_id ON orders (id)").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 100, 'Alice'), (2, 200, 'Bob'), (3, 300, 'Carol')").unwrap();
+
+        assert_eq!(db.execute("DELETE FROM orders WHERE id = 2").unwrap().to_string(), "DELETE 1");
+
+        // 削除された`id = 2`はIndexScanでも0行(索引エントリ自体が
+        // Index Maintenanceで取り除かれている、第24章)。
+        let plan = db.execute("EXPLAIN SELECT id FROM orders WHERE id = 2").unwrap().to_string();
+        assert!(plan.contains("IndexScan(idx_id, id = 2)"));
+        assert!(db.execute("SELECT id FROM orders WHERE id = 2").unwrap().rows().is_empty());
+
+        // 削除していない行は引き続きIndexScanで見つかる。
+        let remaining = db.execute("SELECT id FROM orders WHERE id = 1").unwrap();
+        assert_eq!(remaining.rows().len(), 1);
+
+        remove_db_and_indexes(&path, &["idx_id"]);
+    }
+
+    #[test]
+    fn index_scan_reflects_an_update_to_the_indexed_column() {
+        let path = temp_db_path("index-scan-after-update");
+        let mut db = orders_disk_db(&path);
+        db.execute("CREATE INDEX idx_id ON orders (id)").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 100, 'Alice')").unwrap();
+
+        assert_eq!(db.execute("UPDATE orders SET id = 42 WHERE id = 1").unwrap().to_string(), "UPDATE 1");
+
+        // 更新前の値はもう見つからず、更新後の値でIndexScanが引ける
+        // (Index Maintenanceが古いエントリを削除し、新しいエントリを
+        // 挿入している、第24章)。
+        assert!(db.execute("SELECT name FROM orders WHERE id = 1").unwrap().rows().is_empty());
+        let updated = db.execute("SELECT name FROM orders WHERE id = 42").unwrap();
+        assert_eq!(updated.rows().len(), 1);
+        assert_eq!(updated.rows()[0].values(), &[Value::Text("Alice".to_string())]);
+
+        remove_db_and_indexes(&path, &["idx_id"]);
+    }
+
+    #[test]
+    fn index_nested_loop_join_is_chosen_when_the_inner_join_column_has_an_index() {
+        let path = temp_db_path("index-nlj-chosen");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE customers (id BIGINT NOT NULL, name TEXT)").unwrap();
+        db.execute("CREATE TABLE orders (id BIGINT, customer_id BIGINT, item TEXT)").unwrap();
+        db.execute("CREATE INDEX idx_customer_id ON orders (customer_id)").unwrap();
+        db.execute("INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')").unwrap();
+        db.execute(
+            "INSERT INTO orders VALUES (10, 1, 'apple'), (11, 1, 'banana'), (12, 2, 'cherry'), (13, NULL, 'orphan'), (14, 99, 'nomatch')",
+        )
+        .unwrap();
+
+        let plan = db
+            .execute("EXPLAIN SELECT customers.name, orders.item FROM customers JOIN orders ON customers.id = orders.customer_id")
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            plan,
+            "QUERY PLAN\n----------\nProjection(customers.name, orders.item)\n  └─ IndexNestedLoopJoin(INNER JOIN, id = customer_id)\n    └─ SeqScan(customers)\n    └─ IndexScan(idx_customer_id, customer_id = id)\n(4 rows)"
+        );
+
+        let result = db
+            .execute(
+                "SELECT customers.name, orders.item FROM customers JOIN orders ON customers.id = orders.customer_id ORDER BY customers.name, orders.item",
+            )
+            .unwrap();
+        let rows: Vec<(String, String)> = result
+            .rows()
+            .iter()
+            .map(|row| match row.values() {
+                [Value::Text(name), Value::Text(item)] => (name.clone(), item.clone()),
+                other => panic!("予期しない行: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("Alice".to_string(), "apple".to_string()),
+                ("Alice".to_string(), "banana".to_string()),
+                ("Bob".to_string(), "cherry".to_string()),
+            ]
+        );
+
+        remove_db_and_indexes(&path, &["idx_customer_id"]);
+    }
+
+    #[test]
+    fn index_nested_loop_join_and_hash_join_produce_identical_results() {
+        // Index Nested Loop Join(索引あり)とHash Join(索引無し)は、同じ
+        // データ・同じ等値条件に対して同じ行集合を返すはずである。
+        let with_index_path = temp_db_path("index-nlj-vs-hash-with-index");
+        let without_index_path = temp_db_path("index-nlj-vs-hash-without-index");
+        let sql = [
+            "CREATE TABLE customers (id BIGINT NOT NULL, name TEXT)",
+            "CREATE TABLE orders (id BIGINT, customer_id BIGINT, item TEXT)",
+            "INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')",
+            "INSERT INTO orders VALUES (10, 1, 'apple'), (11, 1, 'banana'), (12, 2, 'cherry'), (13, NULL, 'orphan'), (14, 99, 'nomatch')",
+        ];
+
+        let mut with_index = Database::open(&with_index_path).unwrap();
+        for statement in sql {
+            with_index.execute(statement).unwrap();
+        }
+        with_index.execute("CREATE INDEX idx_customer_id ON orders (customer_id)").unwrap();
+
+        let mut without_index = Database::open(&without_index_path).unwrap();
+        for statement in sql {
+            without_index.execute(statement).unwrap();
+        }
+
+        let query =
+            "SELECT customers.name, orders.item FROM customers JOIN orders ON customers.id = orders.customer_id ORDER BY customers.name, orders.item";
+        assert!(with_index.execute(&format!("EXPLAIN {query}")).unwrap().to_string().contains("IndexNestedLoopJoin"));
+        assert!(without_index.execute(&format!("EXPLAIN {query}")).unwrap().to_string().contains("HashJoin"));
+
+        let with_index_rows: Vec<Vec<Value>> =
+            with_index.execute(query).unwrap().rows().iter().map(|row| row.values().to_vec()).collect();
+        let without_index_rows: Vec<Vec<Value>> =
+            without_index.execute(query).unwrap().rows().iter().map(|row| row.values().to_vec()).collect();
+        assert_eq!(with_index_rows, without_index_rows);
+
+        remove_db_and_indexes(&with_index_path, &["idx_customer_id"]);
+        remove_db_and_indexes(&without_index_path, &[]);
+    }
+
+    #[test]
+    #[ignore = "実行時間の計測用。cargo test -- --ignored --nocapture で実行する"]
+    fn point_index_scan_grows_logarithmically_while_seq_scan_filter_grows_linearly() {
+        // 第24章はINSERT(索引経由の一意性検査)がO(log n)へ変わったことを
+        // 測った。この章ではSELECTの側、`WHERE id = 定数`という点検索が
+        // IndexScanでO(log n)になり、索引の無いSeqScan+FilterのO(n)から
+        // 実際に離れていくことを測る。
+        for n in [1_000usize, 2_000, 4_000, 8_000, 16_000] {
+            let path = temp_db_path(&format!("index-scan-scaling-{n}"));
+            let mut db = orders_disk_db(&path);
+            db.execute("CREATE INDEX idx_id ON orders (id)").unwrap();
+            let rows: Vec<String> = (0..n).map(|i| format!("({i}, {i}, 'name{i}')", i = i as i64)).collect();
+            db.execute(&format!("INSERT INTO orders VALUES {}", rows.join(", "))).unwrap();
+
+            let index_query = format!("SELECT id FROM orders WHERE id = {}", n / 2);
+            let seq_query = format!("SELECT id FROM orders WHERE amount = {}", n / 2);
+            assert!(db.execute(&format!("EXPLAIN {index_query}")).unwrap().to_string().contains("IndexScan"));
+            assert!(db.execute(&format!("EXPLAIN {seq_query}")).unwrap().to_string().contains("SeqScan"));
+
+            let start = std::time::Instant::now();
+            db.execute(&index_query).unwrap();
+            let index_elapsed = start.elapsed();
+
+            let start = std::time::Instant::now();
+            db.execute(&seq_query).unwrap();
+            let seq_elapsed = start.elapsed();
+
+            eprintln!("n={n:>6}  IndexScan={index_elapsed:>10?}  SeqScan+Filter={seq_elapsed:>10?}");
+
+            remove_db_and_indexes(&path, &["idx_id"]);
+        }
+    }
+
+    /// `n`人の`customers`と、そのうち`customer_id`が一致する行の割合を
+    /// `selective`で調節した`m`件の`orders`を作り、`customers JOIN orders`を
+    /// 索引あり(Index Nested Loop Join)・索引無し(Hash Join)の両方の
+    /// `Database`で実行して実行時間を計測する。`selective`が`true`なら
+    /// `customer_id`を`customers`の総数よりずっと広い範囲に散らし、一致する
+    /// 行はごく一部にとどめる。
+    fn measure_join_once(m: usize, selective: bool, label: &str) {
+        let n = 50usize;
+        let with_index_path = temp_db_path(&format!("index-nlj-scaling-with-{label}-{m}"));
+        let without_index_path = temp_db_path(&format!("index-nlj-scaling-without-{label}-{m}"));
+
+        let customers: Vec<String> = (0..n).map(|i| format!("({i}, 'c{i}')")).collect();
+        let modulus = if selective { n * 1000 } else { n };
+        let orders: Vec<String> = (0..m).map(|i| format!("({i}, {}, 'item{i}')", (i * 97) % modulus)).collect();
+        let setup = [
+            "CREATE TABLE customers (id BIGINT NOT NULL, name TEXT)".to_string(),
+            "CREATE TABLE orders (id BIGINT, customer_id BIGINT, item TEXT)".to_string(),
+            format!("INSERT INTO customers VALUES {}", customers.join(", ")),
+            format!("INSERT INTO orders VALUES {}", orders.join(", ")),
+        ];
+
+        let mut with_index = Database::open(&with_index_path).unwrap();
+        for statement in &setup {
+            with_index.execute(statement).unwrap();
+        }
+        with_index.execute("CREATE INDEX idx_customer_id ON orders (customer_id)").unwrap();
+
+        let mut without_index = Database::open(&without_index_path).unwrap();
+        for statement in &setup {
+            without_index.execute(statement).unwrap();
+        }
+
+        let query = "SELECT customers.name, orders.item FROM customers JOIN orders ON customers.id = orders.customer_id";
+        assert!(with_index.execute(&format!("EXPLAIN {query}")).unwrap().to_string().contains("IndexNestedLoopJoin"));
+        assert!(without_index.execute(&format!("EXPLAIN {query}")).unwrap().to_string().contains("HashJoin"));
+
+        let start = std::time::Instant::now();
+        let inlj_result = with_index.execute(query).unwrap();
+        let inlj_elapsed = start.elapsed();
+
+        let start = std::time::Instant::now();
+        let hash_result = without_index.execute(query).unwrap();
+        let hash_elapsed = start.elapsed();
+
+        assert_eq!(inlj_result.rows().len(), hash_result.rows().len());
+        eprintln!(
+            "{label:<9} m={m:>6}  matches={:>6}  IndexNestedLoopJoin={inlj_elapsed:>10?}  HashJoin={hash_elapsed:>10?}",
+            inlj_result.rows().len()
+        );
+
+        remove_db_and_indexes(&with_index_path, &["idx_customer_id"]);
+        remove_db_and_indexes(&without_index_path, &[]);
+    }
+
+    #[test]
+    #[ignore = "実行時間の計測用。cargo test -- --ignored --nocapture で実行する"]
+    fn index_nested_loop_join_is_not_always_faster_than_hash_join() {
+        // 単純なルール(索引があればIndex Nested Loop Joinを最優先する、この章の
+        // `physical_plan::optimize`)が、常に正しい選択とは限らないことを
+        // 実測で確認する。
+        //
+        // **選択的な結合(selective)**: `customer_id`を`customers`の総数より
+        // ずっと広い範囲に散らし、一致する行がごく一部にとどまるようにする。
+        // Hash Joinは一致するかどうかによらず`orders`の全`m`行をBuildする一方、
+        // Index Nested Loop Joinは`customers`の`n`行ぶんの`lookup`しか行わない。
+        // ここではIndex Nested Loop Joinが優位に立つ。
+        //
+        // **密な結合(dense)**: `customer_id`を`customers`の総数`n`だけに
+        // 絞り、`orders`のほぼ全行がどれかの`customer`と一致するようにする。
+        // Index Nested Loop Joinは一致した行1件ごとに`Storage::get`で
+        // Heapページを個別に読みに行く(`crate::buffer_pool::BufferPool`の
+        // 固定容量、第14章)のに対し、Hash JoinのBuildは`Storage::scan`で
+        // `orders`を先頭から順に1回だけ読む。一致件数が多いこの場合は、
+        // ランダムアクセスの積み重ねがBufferPoolの置き換えを増やし、
+        // Index Nested Loop Joinのほうが遅くなる。
+        //
+        // 「索引があるかどうか」という構文的な性質だけでは、この2つを
+        // 区別できない。実際にどちらが速いかはデータの分布(選択性)に
+        // 依存しており、それを知るには統計情報とコストモデルが要る
+        // (第28章)。
+        for m in [2_000usize, 8_000, 32_000] {
+            measure_join_once(m, true, "selective");
+        }
+        for m in [2_000usize, 8_000, 32_000] {
+            measure_join_once(m, false, "dense");
         }
     }
 }

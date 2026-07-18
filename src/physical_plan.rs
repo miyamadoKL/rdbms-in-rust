@@ -71,19 +71,21 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
+use std::ops::Bound;
 
 use crate::ast::{AggregateFunc, BinaryOperator, Expr, JoinKind};
 use crate::binder::{AggregateCall, BoundAssignment, BoundExpr, BoundSelectItem};
+use crate::btree::RangeScan;
 use crate::error::{DbError, DbResult};
 use crate::eval::{FunctionRegistry, eval_bound_expr, eval_expr};
 use crate::executor::predicate_matches;
 use crate::heap_file::Scan as HeapScan;
-use crate::ids::TableId;
+use crate::ids::{RecordId, TableId};
 use crate::logical_plan::{self, LogicalPlan, SortKey};
 use crate::storage::Storage;
 use crate::storage_mem::MemTable;
 use crate::tuple_codec::decode_tuple;
-use crate::types::{Row, Schema, Tuple, Value, compare_values};
+use crate::types::{DataType, Row, Schema, Tuple, Value, compare_values};
 
 // ==================================================================
 // PhysicalPlan: EXPLAINが表示する、実行アルゴリズムを確定した木
@@ -98,11 +100,17 @@ use crate::types::{Row, Schema, Tuple, Value, compare_values};
 #[derive(Debug, Clone, PartialEq)]
 pub enum PhysicalPlan {
     SeqScan(SeqScanNode),
+    /// `WHERE`の連言から索引の効く述語(Point・Range)を抽出できたときに
+    /// `SeqScan`の代わりに選ばれる(第25章、`choose_access_path`)。
+    IndexScan(IndexScanNode),
     Values(ValuesNode),
     Filter(FilterNode),
     /// `ON`が等値条件の連言(AND)へ分解できるときに選ばれる(第22章、
     /// `split_equi_join_keys`)。
     HashJoin(HashJoinNode),
+    /// `ON`が単一の等値条件で、内側テーブルの結合列に索引があるときに
+    /// `HashJoin`より優先して選ばれる(第25章)。
+    IndexNestedLoopJoin(IndexNestedLoopJoinNode),
     /// `ON`が任意の条件のときに選ばれる、Joinの基準実装(第22章)。
     NestedLoopJoin(NestedLoopJoinNode),
     Aggregate(AggregateNode),
@@ -123,6 +131,35 @@ pub struct SeqScanNode {
     pub table_id: TableId,
     pub table_name: String,
     pub schema: Schema,
+}
+
+/// [`PhysicalPlan::IndexScan`]が選んだアクセスパスの種類(第25章)。
+///
+/// `Point`は`col = 定数`から作る。`Range`は`col > / >= / < / <=`から作った
+/// `Bound<Value>`の対で、`std::ops::Bound`の意味は[`crate::btree::BTree::range`]
+/// (第24章)と同じ(`Bound::Unbounded`はその側に制限が無いことを表す)。
+/// `col = NULL`のような、`NULL`を値として持つ述語はどちらにも現れない
+/// (`crate::btree::BTree`が`NULL`をキーに持てないため、`choose_access_path`が
+/// 抽出の対象から外し、`Filter`に残す。本文の解説を参照)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexScanKind {
+    Point(Value),
+    Range { lower: Bound<Value>, upper: Bound<Value> },
+}
+
+/// [`PhysicalPlan::IndexScan`]が持つ情報(第25章)。`table_id`・`table_name`・
+/// `schema`は[`SeqScanNode`]と同じ形(このノードが置き換える対象がまさに
+/// `SeqScan`であることを表す)。`index_name`は`crate::storage::Storage`が
+/// 保持する索引名で、`IndexScanExec`がこの名前で`Storage::index_btree`を
+/// 引く。
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexScanNode {
+    pub table_id: TableId,
+    pub table_name: String,
+    pub schema: Schema,
+    pub index_name: String,
+    pub column_name: String,
+    pub kind: IndexScanKind,
 }
 
 /// [`PhysicalPlan::Values`]が持つ情報。`LogicalPlan::Values`と同じ形。
@@ -168,6 +205,32 @@ pub struct HashJoinNode {
     pub kind: JoinKind,
     pub keys: Vec<(BoundExpr, BoundExpr)>,
     pub condition: BoundExpr,
+}
+
+/// [`PhysicalPlan::IndexNestedLoopJoin`]が持つ情報(第25章)。
+///
+/// `HashJoin`と違い、内側テーブル(`right`)を独立した`PhysicalPlan`のまま
+/// 保持しない。内側の行は、`left`の行1件ごとに`outer_key`を評価し、その値で
+/// `index_name`が指す索引を`lookup`することで初めて決まる(HashJoinの
+/// Build段階のように内側の全行を先に読み切ることはしない)。`table_id`・
+/// `table_name`・`schema`は内側テーブルの情報で、索引から得た`RecordId`を
+/// Heapから`fetch`するために使う。
+///
+/// `outer_key`は`left`の出力(結合後スキーマの左半分)に対する式で、
+/// `HashJoinNode::keys`の`left_key`と同じくシフト不要である(理由は
+/// `HashJoinNode`のドキュメントを参照)。`condition`は`EXPLAIN`表示専用で、
+/// 実行(`IndexNestedLoopJoinExec`)は`outer_key`と`index_name`だけを見る。
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexNestedLoopJoinNode {
+    pub left: Box<PhysicalPlan>,
+    pub kind: JoinKind,
+    pub condition: BoundExpr,
+    pub outer_key: BoundExpr,
+    pub table_id: TableId,
+    pub table_name: String,
+    pub schema: Schema,
+    pub index_name: String,
+    pub column_name: String,
 }
 
 /// [`PhysicalPlan::Aggregate`]が持つ情報(第21章)。`LogicalPlan::Aggregate`と
@@ -241,12 +304,25 @@ pub struct DeleteNode {
 
 /// `LogicalPlan`を`PhysicalPlan`へ変換する。
 ///
-/// 索引が無いこの章では`Scan`は必ず`SeqScan`になり、他のノードも形を
-/// そのまま引き継ぐだけである。それでも変換の名前を`optimize`にしたのは、
-/// 第25章でIndex Scanが加わった後もこの関数が「実行アルゴリズムを選ぶ」
-/// 責務の置き場所であり続けるからである(この章の実装はその選択がまだ
-/// 1択しかない特殊ケースにすぎない)。
-pub fn optimize(plan: LogicalPlan) -> PhysicalPlan {
+/// `storage`は`Backend::Disk`のときだけ`Some`を渡す(`Database::execute_select`・
+/// `execute_explain`を参照)。索引は`crate::storage::Storage`(ディスク
+/// バックエンド)だけが持てる(第24章)ため、`storage`が`None`(メモリ
+/// バックエンド、または索引を使わない再帰呼び出し)のときは`Scan`が常に
+/// `SeqScan`になる。この判断は`Database::memory`が`CREATE INDEX`自体を
+/// `DbError::NotImplemented`で拒否している(第24章)こととも整合している。
+/// `storage`が`Some`でも、`WHERE`・`ON`に索引の効く述語が無ければやはり
+/// `SeqScan`・`HashJoin`・`NestedLoopJoin`が選ばれる。
+///
+/// アクセスパスの選択は、この章では単純なルールにとどめる。`Scan`の直上に
+/// `Filter`がある場合だけ`choose_access_path`(後述)で索引を試し、Point
+/// (`col = 定数`)・Range(`col > / >= / < / <=`)の優先順で選ぶ。`JOIN`を挟む
+/// クエリの`WHERE`は、この章ではまだ個々のテーブルへ押し下げない
+/// (Predicate Pushdownは第26章)。`Join`の側も、等値条件がちょうど1本で
+/// 内側テーブルの結合列に索引があるときだけIndex Nested Loop Joinを選び、
+/// それ以外は第22章のルール(等値ならHash Join、それ以外はNested Loop Join)
+/// のままである。どちらも統計情報やコストではなく構文的な性質だけで決める
+/// (コストベースの選択は第28章)。
+pub fn optimize(plan: LogicalPlan, storage: Option<&Storage>) -> PhysicalPlan {
     match plan {
         LogicalPlan::Scan(scan) => PhysicalPlan::SeqScan(SeqScanNode {
             table_id: scan.table_id,
@@ -254,26 +330,55 @@ pub fn optimize(plan: LogicalPlan) -> PhysicalPlan {
             schema: scan.schema,
         }),
         LogicalPlan::Values(values) => PhysicalPlan::Values(ValuesNode { schema: values.schema, rows: values.rows }),
-        LogicalPlan::Filter(filter) => {
-            PhysicalPlan::Filter(FilterNode { input: Box::new(optimize(*filter.input)), predicate: filter.predicate })
-        }
+        LogicalPlan::Filter(filter) => match (storage, *filter.input) {
+            (Some(storage), LogicalPlan::Scan(scan)) => match choose_access_path(storage, &scan, filter.predicate) {
+                AccessPath::Index { node, remaining: Some(predicate) } => {
+                    PhysicalPlan::Filter(FilterNode { input: Box::new(PhysicalPlan::IndexScan(node)), predicate })
+                }
+                AccessPath::Index { node, remaining: None } => PhysicalPlan::IndexScan(node),
+                AccessPath::SeqScan { predicate } => PhysicalPlan::Filter(FilterNode {
+                    input: Box::new(PhysicalPlan::SeqScan(SeqScanNode {
+                        table_id: scan.table_id,
+                        table_name: scan.table_name,
+                        schema: scan.schema,
+                    })),
+                    predicate,
+                }),
+            },
+            (_, input) => {
+                PhysicalPlan::Filter(FilterNode { input: Box::new(optimize(input, storage)), predicate: filter.predicate })
+            }
+        },
         LogicalPlan::Join(join) => {
-            let left = optimize(*join.left);
-            let right = optimize(*join.right);
+            let left = optimize(*join.left, storage);
+            let right = optimize(*join.right, storage);
             let left_len = left.output_schema().len();
             match split_equi_join_keys(&join.condition, left_len) {
                 Some(keys) => {
-                    let keys = keys
+                    let keys: Vec<(BoundExpr, BoundExpr)> = keys
                         .into_iter()
                         .map(|(left_key, right_key)| (left_key, shift_column_index(&right_key, left_len)))
                         .collect();
-                    PhysicalPlan::HashJoin(HashJoinNode {
-                        left: Box::new(left),
-                        right: Box::new(right),
-                        kind: join.kind,
-                        keys,
-                        condition: join.condition,
-                    })
+                    match index_scan_target(storage, &right, &keys) {
+                        Some(target) => PhysicalPlan::IndexNestedLoopJoin(IndexNestedLoopJoinNode {
+                            left: Box::new(left),
+                            kind: join.kind,
+                            condition: join.condition,
+                            outer_key: target.outer_key,
+                            table_id: target.table_id,
+                            table_name: target.table_name,
+                            schema: target.schema,
+                            index_name: target.index_name,
+                            column_name: target.column_name,
+                        }),
+                        None => PhysicalPlan::HashJoin(HashJoinNode {
+                            left: Box::new(left),
+                            right: Box::new(right),
+                            kind: join.kind,
+                            keys,
+                            condition: join.condition,
+                        }),
+                    }
                 }
                 None => PhysicalPlan::NestedLoopJoin(NestedLoopJoinNode {
                     left: Box::new(left),
@@ -284,23 +389,23 @@ pub fn optimize(plan: LogicalPlan) -> PhysicalPlan {
             }
         }
         LogicalPlan::Aggregate(aggregate) => PhysicalPlan::Aggregate(AggregateNode {
-            input: Box::new(optimize(*aggregate.input)),
+            input: Box::new(optimize(*aggregate.input, storage)),
             group_by: aggregate.group_by,
             calls: aggregate.calls,
             schema: aggregate.schema,
         }),
         LogicalPlan::Projection(projection) => PhysicalPlan::Projection(ProjectionNode {
-            input: Box::new(optimize(*projection.input)),
+            input: Box::new(optimize(*projection.input, storage)),
             projection: projection.projection,
         }),
         LogicalPlan::Distinct(distinct) => {
-            PhysicalPlan::Distinct(DistinctNode { input: Box::new(optimize(*distinct.input)) })
+            PhysicalPlan::Distinct(DistinctNode { input: Box::new(optimize(*distinct.input, storage)) })
         }
         LogicalPlan::Sort(sort) => {
-            PhysicalPlan::Sort(SortNode { input: Box::new(optimize(*sort.input)), keys: sort.keys })
+            PhysicalPlan::Sort(SortNode { input: Box::new(optimize(*sort.input, storage)), keys: sort.keys })
         }
         LogicalPlan::Limit(limit) => PhysicalPlan::Limit(LimitNode {
-            input: Box::new(optimize(*limit.input)),
+            input: Box::new(optimize(*limit.input, storage)),
             limit: limit.limit,
             offset: limit.offset,
         }),
@@ -309,7 +414,7 @@ pub fn optimize(plan: LogicalPlan) -> PhysicalPlan {
             table_name: insert.table_name,
             schema: insert.schema,
             columns: insert.columns,
-            input: Box::new(optimize(*insert.input)),
+            input: Box::new(optimize(*insert.input, storage)),
         }),
         LogicalPlan::Update(update) => PhysicalPlan::Update(UpdateNode {
             table_id: update.table_id,
@@ -317,16 +422,270 @@ pub fn optimize(plan: LogicalPlan) -> PhysicalPlan {
             schema: update.schema,
             assignments: update.assignments,
             predicate: update.predicate,
-            input: Box::new(optimize(*update.input)),
+            input: Box::new(optimize(*update.input, storage)),
         }),
         LogicalPlan::Delete(delete) => PhysicalPlan::Delete(DeleteNode {
             table_id: delete.table_id,
             table_name: delete.table_name,
             schema: delete.schema,
             predicate: delete.predicate,
-            input: Box::new(optimize(*delete.input)),
+            input: Box::new(optimize(*delete.input, storage)),
         }),
     }
+}
+
+// ------------------------------------------------------------------
+// Scan演算子の物理選択: WHEREの連言から索引の効く述語を抽出する(第25章)
+// ------------------------------------------------------------------
+
+/// `choose_access_path`が返す選択結果。
+enum AccessPath {
+    /// Point・Rangeいずれかの索引述語が見つかった。`remaining`は、抽出した
+    /// 述語を取り除いた残りの連言(すべて索引に吸収された場合は`None`)。
+    Index { node: IndexScanNode, remaining: Option<BoundExpr> },
+    /// 索引の効く述語が無かった。`predicate`は元の`predicate`をそのまま返す
+    /// (`flatten_conjuncts`は参照だけを取り出すため、何も見つからなかった
+    /// 場合はここで初めて所有権を返す。フラット化してから再構築すると
+    /// 元と等価だが同一ではないASTになり、`EXPLAIN`の表示がわずかに変わる
+    /// 余地があるため、それを避けるために所有権をそのまま持ち回す)。
+    SeqScan { predicate: BoundExpr },
+}
+
+/// `scan`(索引を検討する対象のテーブル)に対する`predicate`(`WHERE`の全体)
+/// から、`storage`が持つ索引で引ける述語を探す。
+///
+/// 優先順位はPoint(`col = 定数`)、Range(`col > / >= / < / <=`)、
+/// どちらも無ければ`SeqScan`である。同じ優先順位の中では、`predicate`を
+/// ANDで分解した連言(conjunct)の出現順で最初に見つかった、かつ対応する列に
+/// 索引があるものを選ぶ。`col = NULL`のような`NULL`値を持つ述語は対象外
+/// (`crate::btree::BTree`が`NULL`をキーに持てないため)で、常に残りの`Filter`
+/// 側に残る。
+fn choose_access_path(storage: &Storage, scan: &logical_plan::ScanNode, predicate: BoundExpr) -> AccessPath {
+    let mut conjuncts: Vec<&BoundExpr> = Vec::new();
+    collect_conjuncts(&predicate, &mut conjuncts);
+
+    // Point: 出現順で最初に見つかった、索引付き列への等値比較。
+    let point = conjuncts.iter().enumerate().find_map(|(i, conjunct)| {
+        let (column_index, op, value) = as_column_literal_comparison(conjunct)?;
+        if op != BinaryOperator::Eq || value.is_null() {
+            return None;
+        }
+        let info = storage.index_for_column(scan.table_id, column_index)?;
+        Some((i, info.name.clone(), info.column_name.clone(), value))
+    });
+
+    if let Some((i, index_name, column_name, value)) = point {
+        let remaining = rebuild_conjunction(exclude(&conjuncts, &[i]));
+        let node = IndexScanNode {
+            table_id: scan.table_id,
+            table_name: scan.table_name.clone(),
+            schema: scan.schema.clone(),
+            index_name,
+            column_name,
+            kind: IndexScanKind::Point(value),
+        };
+        return AccessPath::Index { node, remaining };
+    }
+
+    // Range: 列ごとに下限・上限の候補を集め、出現順で最初に列挙された
+    // (かつ索引がある)列を選ぶ。同じ列に複数の下限(または上限)があっても
+    // 最初の1本だけを使う(残りは`Filter`に残る残差条件として働くので、
+    // 正しさには影響しない。本文の解説を参照)。
+    let mut range_order: Vec<usize> = Vec::new();
+    let mut ranges: HashMap<usize, RangeAccum> = HashMap::new();
+    for (i, conjunct) in conjuncts.iter().enumerate() {
+        let Some((column_index, op, value)) = as_column_literal_comparison(conjunct) else { continue };
+        if op == BinaryOperator::Eq || value.is_null() {
+            continue;
+        }
+        let is_lower = matches!(op, BinaryOperator::Gt | BinaryOperator::GtEq);
+        let bound = match op {
+            BinaryOperator::Gt => Bound::Excluded(value),
+            BinaryOperator::GtEq => Bound::Included(value),
+            BinaryOperator::Lt => Bound::Excluded(value),
+            BinaryOperator::LtEq => Bound::Included(value),
+            _ => continue,
+        };
+        let accum = ranges.entry(column_index).or_insert_with(|| {
+            range_order.push(column_index);
+            RangeAccum::default()
+        });
+        if is_lower {
+            accum.lower.get_or_insert((i, bound));
+        } else {
+            accum.upper.get_or_insert((i, bound));
+        }
+    }
+
+    for column_index in range_order {
+        let Some(info) = storage.index_for_column(scan.table_id, column_index) else { continue };
+        let accum = ranges.remove(&column_index).expect("range_orderに積んだ列は必ずrangesに存在する");
+        let mut used = Vec::new();
+        let lower = match accum.lower {
+            Some((i, bound)) => {
+                used.push(i);
+                bound
+            }
+            None => Bound::Unbounded,
+        };
+        let upper = match accum.upper {
+            Some((i, bound)) => {
+                used.push(i);
+                bound
+            }
+            None => Bound::Unbounded,
+        };
+        let remaining = rebuild_conjunction(exclude(&conjuncts, &used));
+        let node = IndexScanNode {
+            table_id: scan.table_id,
+            table_name: scan.table_name.clone(),
+            schema: scan.schema.clone(),
+            index_name: info.name.clone(),
+            column_name: info.column_name.clone(),
+            kind: IndexScanKind::Range { lower, upper },
+        };
+        return AccessPath::Index { node, remaining };
+    }
+
+    AccessPath::SeqScan { predicate }
+}
+
+/// [`choose_access_path`]がRange述語を列ごとに集めるための一時的な状態。
+/// `lower`・`upper`は「連言の中の何番目か・その境界」の対で、`None`は
+/// まだその側の候補が見つかっていないことを表す。
+#[derive(Default)]
+struct RangeAccum {
+    lower: Option<(usize, Bound<Value>)>,
+    upper: Option<(usize, Bound<Value>)>,
+}
+
+/// `conjuncts`から`skip`に含まれる添字の要素を除いた残りを、`BoundExpr`の
+/// 所有権を持つ`Vec`として複製する。
+fn exclude(conjuncts: &[&BoundExpr], skip: &[usize]) -> Vec<BoundExpr> {
+    conjuncts.iter().enumerate().filter(|(i, _)| !skip.contains(i)).map(|(_, expr)| (*expr).clone()).collect()
+}
+
+/// `conjuncts`(すでにANDで分解済み、これ以上分解できない項の並び)を、
+/// 左結合の`AND`の木へ組み立て直す。0個なら`None`(残差条件が無い)、1個
+/// なら`Filter`を挟まずそのまま使えるようその1個だけを返す。
+fn rebuild_conjunction(conjuncts: Vec<BoundExpr>) -> Option<BoundExpr> {
+    let mut iter = conjuncts.into_iter();
+    let first = iter.next()?;
+    Some(iter.fold(first, |acc, next| {
+        let span = acc.span();
+        BoundExpr::BinaryOp {
+            op: BinaryOperator::And,
+            lhs: Box::new(acc),
+            rhs: Box::new(next),
+            data_type: DataType::Boolean,
+            span,
+        }
+    }))
+}
+
+/// 式が`column OP literal`または`literal OP column`という形なら、
+/// `(column_index, 演算子(常にcolumnを左辺と見た向き), literal値)`を返す。
+/// `OP`は`=`・`<`・`<=`・`>`・`>=`のいずれかに限る(`<>`・`AND`・`OR`等は
+/// `None`)。`column`は単一テーブルのScan直上のFilterが対象なので、
+/// `BoundExpr::ColumnRef::column_index`はそのままそのテーブルの`Schema`上の
+/// 添字である(結合後スキーマのオフセットは関係しない、`choose_access_path`の
+/// ドキュメントを参照)。
+fn as_column_literal_comparison(expr: &BoundExpr) -> Option<(usize, BinaryOperator, Value)> {
+    let BoundExpr::BinaryOp { op, lhs, rhs, .. } = strip_paren(expr) else { return None };
+    let op = *op;
+    if !matches!(
+        op,
+        BinaryOperator::Eq | BinaryOperator::Lt | BinaryOperator::LtEq | BinaryOperator::Gt | BinaryOperator::GtEq
+    ) {
+        return None;
+    }
+    match (column_index_of(lhs), column_index_of(rhs)) {
+        (Some(column_index), None) => literal_value(rhs).map(|value| (column_index, op, value)),
+        (None, Some(column_index)) => literal_value(lhs).map(|value| (column_index, flip_comparison(op), value)),
+        _ => None,
+    }
+}
+
+fn column_index_of(expr: &BoundExpr) -> Option<usize> {
+    match strip_paren(expr) {
+        BoundExpr::ColumnRef { column_index, .. } => Some(*column_index),
+        _ => None,
+    }
+}
+
+/// リテラルの`BoundExpr`を`Value`へ変換する。列参照や関数呼び出しなど、
+/// 実行時にしか値が定まらない式は`None`(索引述語として使えない)。
+fn literal_value(expr: &BoundExpr) -> Option<Value> {
+    match strip_paren(expr) {
+        BoundExpr::IntLiteral { value, .. } => Some(Value::BigInt(*value)),
+        BoundExpr::StringLiteral { value, .. } => Some(Value::Text(value.clone())),
+        BoundExpr::BoolLiteral { value, .. } => Some(Value::Boolean(*value)),
+        BoundExpr::NullLiteral { .. } => Some(Value::Null),
+        _ => None,
+    }
+}
+
+/// `column OP literal`と`literal OP column`とで、`column`を左辺として
+/// 見たときの向きへ演算子を裏返す(`100 <= col`は`col >= 100`)。`=`は
+/// 裏返しても`=`のままなので変わらない。
+fn flip_comparison(op: BinaryOperator) -> BinaryOperator {
+    match op {
+        BinaryOperator::Lt => BinaryOperator::Gt,
+        BinaryOperator::LtEq => BinaryOperator::GtEq,
+        BinaryOperator::Gt => BinaryOperator::Lt,
+        BinaryOperator::GtEq => BinaryOperator::LtEq,
+        other => other,
+    }
+}
+
+// ------------------------------------------------------------------
+// Join演算子の物理選択: Index Nested Loop Join(第25章)
+// ------------------------------------------------------------------
+
+/// `index_scan_target`が見つけた、Index Nested Loop Joinの内側テーブルの
+/// 情報。[`IndexNestedLoopJoinNode`]のうち`left`・`kind`・`condition`(呼び
+/// 出し側がすでに持っている)以外のフィールドをまとめただけの値である。
+struct IndexJoinTarget {
+    outer_key: BoundExpr,
+    table_id: TableId,
+    table_name: String,
+    schema: Schema,
+    index_name: String,
+    column_name: String,
+}
+
+/// `keys`(すでにHash Joinの鍵として取り出し済みの等値条件)が、Index
+/// Nested Loop Joinとしても実行できるなら、その内側テーブルの情報を返す。
+///
+/// 条件は3つとも満たす必要がある。
+///
+/// 1. 等値条件がちょうど1本(`keys.len() == 1`)であること。複数の等値条件
+///    (`a.x = b.x AND a.y = b.y`)を1本のB+Tree索引だけで引く手段はこの章には
+///    無い(索引キーは単一列に限る、第24章)。
+/// 2. `right_key`が(`Paren`で包まれていてもよい)単純な列参照であること。
+///    `b.x + 1 = a.y`のような式は索引の値として直接引けない。
+/// 3. `right`が`PhysicalPlan::SeqScan`のままであること(`right`側に`Filter`が
+///    無い)。`FROM`直下の`JOIN`の右辺には`WHERE`が押し下げられない
+///    (`choose_access_path`と同じ理由、Predicate Pushdownは第26章)ため、
+///    `right`が`Filter`を伴うことはこの章では無い。
+fn index_scan_target(
+    storage: Option<&Storage>,
+    right: &PhysicalPlan,
+    keys: &[(BoundExpr, BoundExpr)],
+) -> Option<IndexJoinTarget> {
+    let storage = storage?;
+    let [(left_key, right_key)] = keys else { return None };
+    let right_column_index = column_index_of(right_key)?;
+    let PhysicalPlan::SeqScan(scan) = right else { return None };
+    let info = storage.index_for_column(scan.table_id, right_column_index)?;
+    Some(IndexJoinTarget {
+        outer_key: left_key.clone(),
+        table_id: scan.table_id,
+        table_name: scan.table_name.clone(),
+        schema: scan.schema.clone(),
+        index_name: info.name.clone(),
+        column_name: info.column_name.clone(),
+    })
 }
 
 // ------------------------------------------------------------------
@@ -492,6 +851,7 @@ impl PhysicalPlan {
     pub fn output_schema(&self) -> Schema {
         match self {
             PhysicalPlan::SeqScan(scan) => scan.schema.clone(),
+            PhysicalPlan::IndexScan(scan) => scan.schema.clone(),
             PhysicalPlan::Values(values) => values.schema.clone(),
             PhysicalPlan::Filter(filter) => filter.input.output_schema(),
             PhysicalPlan::NestedLoopJoin(join) => {
@@ -499,6 +859,9 @@ impl PhysicalPlan {
             }
             PhysicalPlan::HashJoin(join) => {
                 logical_plan::join_schema(&join.left.output_schema(), &join.right.output_schema())
+            }
+            PhysicalPlan::IndexNestedLoopJoin(join) => {
+                logical_plan::join_schema(&join.left.output_schema(), &join.schema)
             }
             PhysicalPlan::Aggregate(aggregate) => aggregate.schema.clone(),
             PhysicalPlan::Projection(projection) => {
@@ -513,10 +876,14 @@ impl PhysicalPlan {
 
     fn children(&self) -> Vec<&PhysicalPlan> {
         match self {
-            PhysicalPlan::SeqScan(_) | PhysicalPlan::Values(_) => Vec::new(),
+            PhysicalPlan::SeqScan(_) | PhysicalPlan::IndexScan(_) | PhysicalPlan::Values(_) => Vec::new(),
             PhysicalPlan::Filter(filter) => vec![&filter.input],
             PhysicalPlan::NestedLoopJoin(join) => vec![&join.left, &join.right],
             PhysicalPlan::HashJoin(join) => vec![&join.left, &join.right],
+            // `right`側は独立した`PhysicalPlan`を持たない(`IndexNestedLoopJoinNode`の
+            // ドキュメントを参照)。木としての子は`left`だけで、内側テーブルへの
+            // 索引アクセスは`write_tree`が合成した1行として表示する(下記)。
+            PhysicalPlan::IndexNestedLoopJoin(join) => vec![&join.left],
             PhysicalPlan::Aggregate(aggregate) => vec![&aggregate.input],
             PhysicalPlan::Projection(projection) => vec![&projection.input],
             PhysicalPlan::Distinct(distinct) => vec![&distinct.input],
@@ -531,6 +898,9 @@ impl PhysicalPlan {
     fn label(&self) -> String {
         match self {
             PhysicalPlan::SeqScan(scan) => format!("SeqScan({})", scan.table_name),
+            PhysicalPlan::IndexScan(scan) => {
+                format!("IndexScan({}, {})", scan.index_name, fmt_index_scan_kind(&scan.column_name, &scan.kind))
+            }
             PhysicalPlan::Values(values) => {
                 let row_word = if values.rows.len() == 1 { "row" } else { "rows" };
                 format!("Values({} {row_word})", values.rows.len())
@@ -546,6 +916,9 @@ impl PhysicalPlan {
                     .map(|(l, r)| format!("{} = {}", logical_plan::fmt_bound_expr(l), logical_plan::fmt_bound_expr(r)))
                     .collect();
                 format!("HashJoin({}, {})", join.kind.name(), keys.join(" AND "))
+            }
+            PhysicalPlan::IndexNestedLoopJoin(join) => {
+                format!("IndexNestedLoopJoin({}, {})", join.kind.name(), logical_plan::fmt_bound_expr(&join.condition))
             }
             PhysicalPlan::Aggregate(aggregate) => {
                 let group_by: Vec<String> = aggregate.group_by.iter().map(logical_plan::fmt_bound_expr).collect();
@@ -597,7 +970,58 @@ impl PhysicalPlan {
         for child in self.children() {
             child.write_tree(f, depth + 1)?;
         }
+        // `IndexNestedLoopJoin`の内側テーブルは独立した`PhysicalPlan`(木の子)
+        // としては存在しない(`IndexNestedLoopJoinNode`のドキュメント、
+        // `children`を参照)。木としての深さはここで手動に1段掘り、`left`と
+        // 並ぶ形の1行として「どの索引をどの外側キーで引くか」を表示する。
+        if let PhysicalPlan::IndexNestedLoopJoin(join) = self {
+            let indent = "  ".repeat(depth + 1);
+            writeln!(
+                f,
+                "{indent}└─ IndexScan({}, {} = {})",
+                join.index_name,
+                join.column_name,
+                logical_plan::fmt_bound_expr(&join.outer_key)
+            )?;
+        }
         Ok(())
+    }
+}
+
+/// [`Value`]を`EXPLAIN`表示用に整形する。`TEXT`だけ引用符を付け、それ以外は
+/// `Value`の`Display`実装(`database`モジュールの表形式出力と同じ)をそのまま
+/// 使う。`logical_plan::fmt_bound_expr`が`StringLiteral`をこの形で表示するのと
+/// 揃えてある。
+fn fmt_index_value(value: &Value) -> String {
+    match value {
+        Value::Text(s) => format!("'{s}'"),
+        other => other.to_string(),
+    }
+}
+
+/// [`IndexScanNode::kind`]を`EXPLAIN`表示用に整形する。
+///
+/// ```text
+/// id = 42                    (Point)
+/// amount >= 100 AND amount <= 200   (Range、両端)
+/// amount > 100                      (Range、下限だけ)
+/// ```
+fn fmt_index_scan_kind(column_name: &str, kind: &IndexScanKind) -> String {
+    match kind {
+        IndexScanKind::Point(value) => format!("{column_name} = {}", fmt_index_value(value)),
+        IndexScanKind::Range { lower, upper } => {
+            let lower = match lower {
+                Bound::Included(v) => Some(format!("{column_name} >= {}", fmt_index_value(v))),
+                Bound::Excluded(v) => Some(format!("{column_name} > {}", fmt_index_value(v))),
+                Bound::Unbounded => None,
+            };
+            let upper = match upper {
+                Bound::Included(v) => Some(format!("{column_name} <= {}", fmt_index_value(v))),
+                Bound::Excluded(v) => Some(format!("{column_name} < {}", fmt_index_value(v))),
+                Bound::Unbounded => None,
+            };
+            [lower, upper].into_iter().flatten().collect::<Vec<_>>().join(" AND ")
+        }
     }
 }
 
@@ -737,6 +1161,83 @@ impl<'a> Executor for DiskSeqScanExec<'a> {
                 let (_, bytes) = entry?;
                 decode_tuple(self.schema, &bytes).map(Some)
             }
+        }
+    }
+}
+
+/// [`IndexScanExec`]が読み進める順序。Pointは`BTree::lookup`が返した
+/// `RecordId`の一覧を先頭から順に、Rangeは[`RangeScan`](第24章)を
+/// `next_leaf`のリンクに沿って順にたどる。
+enum IndexScanSource<'a> {
+    Point(std::vec::IntoIter<RecordId>),
+    Range(RangeScan<'a>),
+}
+
+/// Point・Range Index Scan演算子(第25章)。`crate::physical_plan::optimize`が
+/// `WHERE`から抽出した索引述語(`IndexScanKind`)にもとづき、`crate::btree::BTree`
+/// (第23・24章)から`RecordId`を引き、`Storage::get`でHeapから実データを
+/// `fetch`する。
+///
+/// `DiskSeqScanExec`と違い、`Storage::scan`(ページを先頭から順に読む)は
+/// 経由しない。索引が返す`RecordId`の並びだけを頼りに、対応するHeapページを
+/// 直接読みに行く。索引はディスクバックエンドにしか存在しない(第24章)ため、
+/// `MemSeqScanExec`に対応する索引版はこのクレートには無い(モジュール冒頭の
+/// `optimize`のドキュメントを参照)。
+///
+/// **Lazy Delete済みエントリの扱い**: `crate::btree::BTree::delete`と
+/// `Storage::index_delete_row`(第24章)により、行を削除すれば索引エントリも
+/// 同時に取り除かれるため、通常の運用では索引が指す`RecordId`のHeap行が
+/// 存在しないという状況は起こらない。それでも`next()`は`Storage::get`が
+/// `None`(該当スロットが空)を返した`RecordId`を無条件にエラーにはせず、
+/// 読み飛ばして次の`RecordId`へ進む。索引とHeapの整合性は`Storage`が保つ
+/// べき不変条件であり、`IndexScanExec`はそれを信じたうえで、万一の食い違いを
+/// panicではなく黙って読み飛ばす形で吸収する(`crate::btree::BTree`の
+/// Lazy Deleteという名前が示す「取りこぼしより多少の無駄読みを許す」設計と
+/// 対称的な選択である)。
+pub struct IndexScanExec<'a> {
+    storage: &'a Storage,
+    table_id: TableId,
+    schema: &'a Schema,
+    source: IndexScanSource<'a>,
+}
+
+impl<'a> IndexScanExec<'a> {
+    pub fn new(storage: &'a Storage, table_id: TableId, schema: &'a Schema, index_name: &str, kind: &IndexScanKind) -> DbResult<Self> {
+        let btree = storage
+            .index_btree(index_name)
+            .unwrap_or_else(|| unreachable!("optimizeが選んだ索引'{index_name}'はStorageに必ず存在する"));
+        let source = match kind {
+            IndexScanKind::Point(value) => IndexScanSource::Point(btree.lookup(value)?.into_iter()),
+            IndexScanKind::Range { lower, upper } => IndexScanSource::Range(btree.range(lower.as_ref(), upper.as_ref())?),
+        };
+        Ok(IndexScanExec { storage, table_id, schema, source })
+    }
+}
+
+impl<'a> Executor for IndexScanExec<'a> {
+    fn output_schema(&self) -> &Schema {
+        self.schema
+    }
+
+    fn next(&mut self) -> DbResult<Option<Tuple>> {
+        loop {
+            let rid = match &mut self.source {
+                IndexScanSource::Point(iter) => match iter.next() {
+                    Some(rid) => rid,
+                    None => return Ok(None),
+                },
+                IndexScanSource::Range(iter) => match iter.next() {
+                    Some(Ok((_, rid))) => rid,
+                    Some(Err(err)) => return Err(err),
+                    None => return Ok(None),
+                },
+            };
+            if let Some(bytes) = self.storage.get(self.table_id, rid)? {
+                return decode_tuple(self.schema, &bytes).map(Some);
+            }
+            // Lazy Delete済み(索引にエントリが残っているのにHeapから
+            // すでに消えている)場合はここに来る。モジュールドキュメントの
+            // とおり読み飛ばして次の`RecordId`へ進む。
         }
     }
 }
@@ -1008,6 +1509,99 @@ impl<'a> Executor for HashJoinExec<'a> {
                     self.current_left = None;
                 }
             }
+        }
+    }
+}
+
+/// Index Nested Loop Join演算子(第25章)。`left`の行1件ごとに`outer_key`を
+/// 評価し、その値で`index_name`が指す索引を`lookup`して内側テーブルの
+/// `RecordId`を求め、Heapから`fetch`して連結する。
+///
+/// `NestedLoopJoinExec`・`HashJoinExec`と違い、内側テーブルの全行を
+/// コンストラクタで読み切ることも、`Vec`やハッシュテーブルへ溜めることも
+/// しない。内側の行は、外側の1行が来るたびに索引への`lookup`(`O(log n)`)で
+/// その都度求める。外側の行数を`n`、一致1件あたりの索引探索を`O(log m)`
+/// (`m`は内側テーブルの行数)とすると、総コストは`O(n log m)`になり、
+/// `NestedLoopJoinExec`の`O(n × m)`より内側テーブルが大きいほど有利になる
+/// (本文の実測を参照)。
+///
+/// `outer_key`が`NULL`を評価した場合は、索引を引かずに一致0件として扱う
+/// (`HashJoinExec`のNULLキー除外と同じ、SQLの三値論理にもとづく規則)。
+pub struct IndexNestedLoopJoinExec<'a> {
+    left: Box<dyn Executor + 'a>,
+    storage: &'a Storage,
+    table_id: TableId,
+    index_name: &'a str,
+    outer_key: &'a BoundExpr,
+    functions: &'a FunctionRegistry,
+    left_schema: Schema,
+    right_schema: Schema,
+    schema: Schema,
+    current_left: Option<Tuple>,
+    matches: std::vec::IntoIter<RecordId>,
+}
+
+impl<'a> IndexNestedLoopJoinExec<'a> {
+    pub fn new(
+        left: Box<dyn Executor + 'a>,
+        storage: &'a Storage,
+        table_id: TableId,
+        right_schema: Schema,
+        index_name: &'a str,
+        outer_key: &'a BoundExpr,
+        functions: &'a FunctionRegistry,
+    ) -> Self {
+        let left_schema = left.output_schema().clone();
+        let schema = logical_plan::join_schema(&left_schema, &right_schema);
+        IndexNestedLoopJoinExec {
+            left,
+            storage,
+            table_id,
+            index_name,
+            outer_key,
+            functions,
+            left_schema,
+            right_schema,
+            schema,
+            current_left: None,
+            matches: Vec::new().into_iter(),
+        }
+    }
+}
+
+impl<'a> Executor for IndexNestedLoopJoinExec<'a> {
+    fn output_schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn next(&mut self) -> DbResult<Option<Tuple>> {
+        loop {
+            if let Some(rid) = self.matches.next() {
+                let left_tuple = self.current_left.as_ref().expect("直前にSomeを設定済み");
+                if let Some(bytes) = self.storage.get(self.table_id, rid)? {
+                    let right_tuple = decode_tuple(&self.right_schema, &bytes)?;
+                    return concat_tuple(&self.schema, left_tuple, &right_tuple).map(Some);
+                }
+                // Lazy Delete済み(IndexScanExecのドキュメントを参照)。
+                // この`rid`は読み飛ばし、`matches`の続きへ進む。
+                continue;
+            }
+
+            let Some(tuple) = self.left.next()? else {
+                return Ok(None);
+            };
+            let row = Row::new(&self.left_schema, &tuple);
+            let key = eval_bound_expr(self.outer_key, self.functions, Some(&row))?;
+            self.current_left = Some(tuple);
+            self.matches = if key.is_null() {
+                Vec::new().into_iter() // NULLキーは結合しない
+            } else {
+                let btree = self
+                    .storage
+                    .index_btree(self.index_name)
+                    .unwrap_or_else(|| unreachable!("optimizeが選んだ索引'{}'はStorageに必ず存在する", self.index_name));
+                btree.lookup(&key)?.into_iter()
+            };
         }
     }
 }
@@ -1374,14 +1968,14 @@ mod tests {
     #[test]
     fn optimize_turns_scan_into_seq_scan() {
         let select = bind_select("SELECT name FROM users WHERE id = 42");
-        let physical = optimize(build_select(select));
+        let physical = optimize(build_select(select), None);
         assert_eq!(physical.to_string(), "Projection(name)\n  └─ Filter(id = 42)\n    └─ SeqScan(users)\n");
     }
 
     #[test]
     fn optimize_preserves_output_schema() {
         let select = bind_select("SELECT id, name FROM users");
-        let physical = optimize(build_select(select));
+        let physical = optimize(build_select(select), None);
         let schema = physical.output_schema();
         let names: Vec<&str> = schema.columns().iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["id", "name"]);
@@ -1745,7 +2339,7 @@ mod tests {
     fn sort_orders_ascending_with_nulls_first() {
         let select = bind_select_orders("SELECT amount FROM orders ORDER BY amount");
         let logical = crate::logical_plan::build_select(select);
-        let physical = optimize(logical);
+        let physical = optimize(logical, None);
         let PhysicalPlan::Sort(sort) = physical else { panic!("Sortを期待した") };
         let functions = FunctionRegistry::with_builtins();
         let rows = vec![amount_only_row(Some(3)), amount_only_row(None), amount_only_row(Some(1))];
@@ -1759,7 +2353,7 @@ mod tests {
     fn sort_desc_puts_nulls_last() {
         let select = bind_select_orders("SELECT amount FROM orders ORDER BY amount DESC");
         let logical = crate::logical_plan::build_select(select);
-        let physical = optimize(logical);
+        let physical = optimize(logical, None);
         let PhysicalPlan::Sort(sort) = physical else { panic!("Sortを期待した") };
         let functions = FunctionRegistry::with_builtins();
         let rows = vec![amount_only_row(Some(3)), amount_only_row(None), amount_only_row(Some(1))];
@@ -1774,7 +2368,7 @@ mod tests {
         // `dept`が同じ行同士は、入力に現れた順序のまま残る(安定ソート)。
         let select = bind_select_orders("SELECT dept, amount FROM orders ORDER BY dept");
         let logical = crate::logical_plan::build_select(select);
-        let physical = optimize(logical);
+        let physical = optimize(logical, None);
         let PhysicalPlan::Sort(sort) = physical else { panic!("Sortを期待した") };
         let functions = FunctionRegistry::with_builtins();
         let rows = vec![
@@ -1903,14 +2497,14 @@ mod tests {
     #[test]
     fn optimize_chooses_hash_join_for_an_equality_condition() {
         let select = bind_select_ab("SELECT a.id FROM a JOIN b ON a.id = b.id");
-        let physical = optimize(build_select(select));
+        let physical = optimize(build_select(select), None);
         assert!(physical.to_string().contains("HashJoin"));
     }
 
     #[test]
     fn optimize_chooses_nested_loop_join_for_a_non_equality_condition() {
         let select = bind_select_ab("SELECT a.id FROM a JOIN b ON a.id > b.id");
-        let physical = optimize(build_select(select));
+        let physical = optimize(build_select(select), None);
         assert!(physical.to_string().contains("NestedLoopJoin"));
     }
 
@@ -2044,7 +2638,7 @@ mod tests {
             BoundStatement::Select(select) => *select,
             other => panic!("Selectを期待したが{other:?}が返った"),
         };
-        let physical = optimize(build_select(select));
+        let physical = optimize(build_select(select), None);
         // 左深い木: 一番外側(根に近い)のJoinの子にもう1つJoinが現れる。
         let text = physical.to_string();
         assert_eq!(text.matches("Join").count(), 2);

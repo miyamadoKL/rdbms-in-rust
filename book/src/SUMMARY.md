@@ -35,7 +35,7 @@
 - [第22章 Joinアルゴリズム](ch22-join.md)
 - [第23章 B+Tree I: 検索、挿入、分割](ch23-btree-1.md)
 - [第24章 B+Tree II: 範囲検索、削除、CREATE INDEX](ch24-btree-2.md)
-- [第25章 Index Scanとアクセスパス]()
+- [第25章 Index Scanとアクセスパス](ch25-index-scan.md)
 
 # 第4部 Query Optimizer: よりよい実行計画を選ぶ
 

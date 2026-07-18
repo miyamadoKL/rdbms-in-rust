@@ -498,6 +498,36 @@ impl Storage {
         self.indexes.values().filter(move |e| e.info.table_id == table_id).map(|e| &e.info)
     }
 
+    /// `table_id`のテーブルの`column_index`番目の列に対応する索引の
+    /// [`IndexInfo`]を引く(第25章)。`UNIQUE`かどうかを問わない点が
+    /// [`Self::unique_index_for_column`]との違いで、`crate::physical_plan::optimize`が
+    /// `WHERE`や`ON`の等値・範囲述語をPoint/Range Index Scan、Index Nested Loop
+    /// Joinのアクセスパスとして使えるかどうかを判定するために使う。
+    ///
+    /// 同じ列に複数の索引(`CREATE INDEX`で作った索引と、`PRIMARY KEY`/`UNIQUE`
+    /// 制約から自動生成された索引が両方存在する場合など)があれば、索引名の
+    /// 辞書順で最小のものを返す。`self.indexes`は`HashMap`であり走査順は
+    /// 非決定的なため、複数候補がある場合に毎回同じ索引を選ぶにはこの
+    /// タイブレークが要る。
+    pub fn index_for_column(&self, table_id: TableId, column_index: usize) -> Option<&IndexInfo> {
+        self.indexes
+            .values()
+            .filter(|e| e.info.table_id == table_id && e.info.column_index == column_index)
+            .map(|e| &e.info)
+            .min_by(|a, b| a.name.cmp(&b.name))
+    }
+
+    /// 索引名から、その索引の実データを持つ`BTree`を引く(第25章)。
+    /// `crate::physical_plan::IndexScanExec`・`IndexNestedLoopJoinExec`が、
+    /// `optimize`(または自身の`next()`)が選んだ索引へ`lookup`・`range`する
+    /// ために使う。索引名は`optimize`が`Storage::index_for_column`で
+    /// 見つけたものをそのまま`PhysicalPlan`に積んでいるため、`None`が返るのは
+    /// この関数を`optimize`が選んだのではない索引名で呼んだ場合に限る
+    /// (呼び出し側のバグ)。
+    pub(crate) fn index_btree(&self, index_name: &str) -> Option<&BTree> {
+        self.indexes.get(index_name).map(|e| &e.btree)
+    }
+
     /// `table_id`のテーブルの`column_index`番目の列に対応する`UNIQUE`索引の
     /// `BTree`を引く(第24章)。`crate::index::check_uniqueness_with_index`が、
     /// 第20章の走査ベース一意性検査の代わりにこの索引へ`lookup`するために使う。
