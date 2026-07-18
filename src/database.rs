@@ -53,8 +53,8 @@ use crate::eval::FunctionRegistry;
 use crate::executor;
 use crate::logical_plan::{self, DeleteNode, InsertNode, LogicalPlan, UpdateNode};
 use crate::physical_plan::{
-    self, DiskSeqScanExec, DistinctExec, Executor, FilterExec, HashAggregateExec, LimitExec, MemSeqScanExec,
-    PhysicalPlan, ProjectionExec, SortExec, ValuesExec,
+    self, DiskSeqScanExec, DistinctExec, Executor, FilterExec, HashAggregateExec, HashJoinExec, LimitExec,
+    MemSeqScanExec, NestedLoopJoinExec, PhysicalPlan, ProjectionExec, SortExec, ValuesExec,
 };
 use crate::storage::Storage;
 use crate::storage_mem::MemStorage;
@@ -187,7 +187,7 @@ impl Database {
         let statement = crate::parser::parse_statement(sql)?;
         let bound = self.bind(statement, sql)?;
         match bound {
-            BoundStatement::Select(select) => self.execute_select(logical_plan::build_select(select)),
+            BoundStatement::Select(select) => self.execute_select(logical_plan::build_select(*select)),
             BoundStatement::CreateTable(create) => self.execute_create_table(&create),
             BoundStatement::DropTable(drop) => self.execute_drop_table(&drop),
             BoundStatement::Insert(insert) => self.execute_insert(logical_plan::build_insert(insert)),
@@ -349,6 +349,18 @@ impl Database {
                 let input = self.build_query_executor(&filter.input)?;
                 Ok(Box::new(FilterExec::new(input, &filter.predicate, &self.functions)))
             }
+            PhysicalPlan::NestedLoopJoin(join) => {
+                let left = self.build_query_executor(&join.left)?;
+                let right = self.build_query_executor(&join.right)?;
+                let exec = NestedLoopJoinExec::new(left, right, &join.condition, &self.functions)?;
+                Ok(Box::new(exec))
+            }
+            PhysicalPlan::HashJoin(join) => {
+                let left = self.build_query_executor(&join.left)?;
+                let right = self.build_query_executor(&join.right)?;
+                let exec = HashJoinExec::new(left, right, &join.keys, &self.functions)?;
+                Ok(Box::new(exec))
+            }
             PhysicalPlan::Aggregate(aggregate) => {
                 let input = self.build_query_executor(&aggregate.input)?;
                 let exec = HashAggregateExec::new(
@@ -390,7 +402,7 @@ impl Database {
     /// 入れ子の`Explain`はここに渡ってこない。
     fn execute_explain(&self, inner: BoundStatement) -> DbResult<QueryResult> {
         let logical = match inner {
-            BoundStatement::Select(select) => logical_plan::build_select(select),
+            BoundStatement::Select(select) => logical_plan::build_select(*select),
             BoundStatement::Insert(insert) => logical_plan::build_insert(insert),
             BoundStatement::Update(update) => logical_plan::build_update(update),
             BoundStatement::Delete(delete) => logical_plan::build_delete(delete),
@@ -1981,5 +1993,156 @@ mod tests {
              └─ SeqScan(t)\n\
              (4 rows)"
         );
+    }
+
+    // ---- JOIN(第22章) ----
+
+    fn join_db() -> Database {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE customers (id BIGINT NOT NULL, name TEXT)").unwrap();
+        db.execute("CREATE TABLE orders (customer_id BIGINT, item TEXT)").unwrap();
+        db.execute("INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')").unwrap();
+        db.execute(
+            "INSERT INTO orders VALUES (1, 'apple'), (1, 'banana'), (2, 'cherry'), (NULL, 'orphan'), (99, 'nomatch')",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn inner_join_returns_only_matching_rows() {
+        let mut db = join_db();
+        let result = db
+            .execute("SELECT customers.name, orders.item FROM customers JOIN orders ON customers.id = orders.customer_id")
+            .unwrap();
+        // Alice(2件) + Bob(1件) = 3行。Carolに一致する注文は無く、
+        // customer_idがNULL・99の注文はどの顧客とも一致しない。
+        assert_eq!(result.rows().len(), 3);
+    }
+
+    #[test]
+    fn join_without_on_matching_predicate_uses_nested_loop_join() {
+        let mut db = join_db();
+        let explain = db
+            .execute("EXPLAIN SELECT customers.name FROM customers JOIN orders ON customers.id <> orders.customer_id")
+            .unwrap();
+        assert!(explain.to_string().contains("NestedLoopJoin"));
+    }
+
+    #[test]
+    fn equi_join_uses_hash_join() {
+        let mut db = join_db();
+        let explain = db
+            .execute("EXPLAIN SELECT customers.name FROM customers JOIN orders ON customers.id = orders.customer_id")
+            .unwrap();
+        assert!(explain.to_string().contains("HashJoin"));
+    }
+
+    #[test]
+    fn ambiguous_unqualified_column_after_join_is_rejected() {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE a (id BIGINT NOT NULL)").unwrap();
+        db.execute("CREATE TABLE b (id BIGINT NOT NULL)").unwrap();
+        let result = db.execute("SELECT id FROM a JOIN b ON a.id = b.id");
+        assert!(matches!(result, Err(DbError::Bind { .. })));
+    }
+
+    #[test]
+    fn three_way_join_chains_left_to_right() {
+        let mut db = join_db();
+        db.execute("CREATE TABLE shippers (item TEXT, carrier TEXT)").unwrap();
+        db.execute("INSERT INTO shippers VALUES ('apple', 'FastCo'), ('banana', 'SlowCo')").unwrap();
+        let result = db
+            .execute(
+                "SELECT customers.name, shippers.carrier FROM customers \
+                 JOIN orders ON customers.id = orders.customer_id \
+                 JOIN shippers ON orders.item = shippers.item \
+                 ORDER BY customers.name, shippers.carrier",
+            )
+            .unwrap();
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(result.rows()[0].values()[0], Value::Text("Alice".to_string()));
+    }
+
+    #[test]
+    fn join_can_be_combined_with_where_group_by_and_order_by() {
+        let mut db = join_db();
+        let result = db
+            .execute(
+                "SELECT customers.name, COUNT(*) FROM customers JOIN orders ON customers.id = orders.customer_id \
+                 WHERE orders.item <> 'banana' GROUP BY customers.name ORDER BY customers.name",
+            )
+            .unwrap();
+        assert_eq!(result.rows().len(), 2);
+    }
+
+    #[test]
+    fn empty_table_join_returns_no_rows() {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE a (id BIGINT NOT NULL)").unwrap();
+        db.execute("CREATE TABLE b (id BIGINT NOT NULL)").unwrap();
+        let result = db.execute("SELECT a.id FROM a JOIN b ON a.id = b.id").unwrap();
+        assert!(result.rows().is_empty());
+    }
+
+    #[test]
+    fn nested_loop_and_hash_join_agree_end_to_end() {
+        // 同じデータに対し、等値条件(Hash Join)と、`a.id = b.id`と同値になる
+        // 非等値の連言(`>=`かつ`<=`、NestedLoopJoinが選ばれる)から、
+        // 実質的に同じ行が取り出せることを確認する。
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE a (id BIGINT NOT NULL)").unwrap();
+        db.execute("CREATE TABLE b (id BIGINT NOT NULL)").unwrap();
+        db.execute("INSERT INTO a VALUES (1), (2), (3)").unwrap();
+        db.execute("INSERT INTO b VALUES (2), (3), (4)").unwrap();
+
+        let via_hash = db.execute("SELECT a.id FROM a JOIN b ON a.id = b.id ORDER BY a.id").unwrap();
+        let via_nlj = db.execute("SELECT a.id FROM a JOIN b ON a.id >= b.id AND a.id <= b.id ORDER BY a.id").unwrap();
+
+        assert_eq!(via_hash.rows(), via_nlj.rows());
+        assert!(db.execute("EXPLAIN SELECT a.id FROM a JOIN b ON a.id = b.id").unwrap().to_string().contains("HashJoin"));
+        assert!(
+            db.execute("EXPLAIN SELECT a.id FROM a JOIN b ON a.id >= b.id AND a.id <= b.id")
+                .unwrap()
+                .to_string()
+                .contains("NestedLoopJoin")
+        );
+    }
+
+    #[test]
+    #[ignore = "実行時間の計測用。cargo test -- --ignored --nocapture で実行する"]
+    fn nested_loop_join_is_quadratic_while_hash_join_is_linear() {
+        // NestedLoopJoinはO(n×m)、Hash JoinはO(n+m)という、この章が主張する
+        // 計算量の違いを、実際に実行時間を測って確認する。同じデータ・同じ
+        // 意味論(`a.id = b.id`)を持つ2つの条件を使い分け、片方だけを
+        // NestedLoopJoinへ強制する(`a.id >= b.id AND a.id <= b.id`は`=`と
+        // 同値だが、この章の`split_equi_join_keys`は`>=`・`<=`を等値条件として
+        // 認識しないため、必ずNestedLoopJoinが選ばれる)。
+        for n in [500usize, 1000, 2000] {
+            let mut db = Database::memory();
+            db.execute("CREATE TABLE a (id BIGINT NOT NULL)").unwrap();
+            db.execute("CREATE TABLE b (id BIGINT NOT NULL)").unwrap();
+            let a_values: Vec<String> = (0..n).map(|i| format!("({i})")).collect();
+            let b_values: Vec<String> = (0..n).map(|i| format!("({i})")).collect();
+            db.execute(&format!("INSERT INTO a VALUES {}", a_values.join(", "))).unwrap();
+            db.execute(&format!("INSERT INTO b VALUES {}", b_values.join(", "))).unwrap();
+
+            let hash_sql = "SELECT a.id FROM a JOIN b ON a.id = b.id";
+            let nlj_sql = "SELECT a.id FROM a JOIN b ON a.id >= b.id AND a.id <= b.id";
+            assert!(db.execute(&format!("EXPLAIN {hash_sql}")).unwrap().to_string().contains("HashJoin"));
+            assert!(db.execute(&format!("EXPLAIN {nlj_sql}")).unwrap().to_string().contains("NestedLoopJoin"));
+
+            let start = std::time::Instant::now();
+            let hash_result = db.execute(hash_sql).unwrap();
+            let hash_elapsed = start.elapsed();
+
+            let start = std::time::Instant::now();
+            let nlj_result = db.execute(nlj_sql).unwrap();
+            let nlj_elapsed = start.elapsed();
+
+            assert_eq!(hash_result.rows().len(), n);
+            assert_eq!(nlj_result.rows().len(), n);
+            eprintln!("n={n:>5}  HashJoin={hash_elapsed:>10?}  NestedLoopJoin={nlj_elapsed:>10?}");
+        }
     }
 }

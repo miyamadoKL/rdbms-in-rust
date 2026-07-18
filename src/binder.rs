@@ -52,8 +52,8 @@ use std::collections::HashSet;
 
 use crate::ast::{
     AggregateFunc, Assignment, BinaryOperator, CreateTableStatement, DeleteStatement,
-    DropTableStatement, Expr, FromClause, Ident, InsertStatement, SelectItem, SelectStatement,
-    Statement, UnaryOperator, UpdateStatement,
+    DropTableStatement, Expr, FromClause, Ident, InsertStatement, JoinKind, SelectItem,
+    SelectStatement, Statement, UnaryOperator, UpdateStatement,
 };
 use crate::catalog::{Catalog, TableInfo};
 use crate::error::{DbError, DbResult};
@@ -98,7 +98,10 @@ impl CatalogLookup for Storage {
 /// 削除)は名前ベースのままでよいため、ASTのバリアントをそのまま返す。
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundStatement {
-    Select(BoundSelect),
+    /// `JOIN`(第22章)で`joins`フィールドが加わり`BoundSelect`が大きくなった
+    /// ため、他の(小さい)variantとのサイズ差を抑えるために`Box`で間接化する
+    /// (`ast::Statement::Select`が`Box<SelectStatement>`にしているのと同じ理由)。
+    Select(Box<BoundSelect>),
     CreateTable(CreateTableStatement),
     DropTable(DropTableStatement),
     Insert(BoundInsert),
@@ -132,13 +135,33 @@ impl BoundTableRef {
     }
 }
 
+/// `FROM`が持つ1個の`JOIN`(第22章)。`tables[i + 1]`を`tables[0..=i]`(それまでに
+/// 登場した全テーブル)へ結合する条件を表す。`tables`の要素数は
+/// `joins.len() + 1`(`FROM`が空でない限り)になる。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundJoinStep {
+    pub kind: JoinKind,
+    /// `ON`に続く結合条件。`WHERE`と同じ`bind_predicate`で束縛するため、
+    /// 必ずBOOLEAN(または型未定のNULL)を返す式になっている。
+    pub condition: BoundExpr,
+}
+
 /// 束縛済みの`SELECT`。
 ///
-/// `tables`は`FROM`が無ければ0個、あれば1個の`Vec`になる。要素数を`1`に固定
-/// した型(`Option<BoundTableRef>`)ではなく`Vec`にしているのは、第22章の
-/// `JOIN`で複数テーブルの`FROM`が導入されたときに、この型をそのまま使い
-/// 回せるようにするためである。[`Binder::resolve_column`]の曖昧列検出も、
-/// この`Vec`の要素数に関係なく動く形で書いてある。
+/// `tables`は`FROM`が無ければ0個、`JOIN`が無ければ1個、`JOIN`が`n`個連なれば
+/// `n + 1`個になる。要素数を固定した型ではなく`Vec`にしているのは、第17章の
+/// 時点でこの型を先取りしておいたためである。[`Binder::resolve_column`]の
+/// 曖昧列検出も、この`Vec`の要素数に関係なく動く形で書いてある。
+///
+/// `tables`に2個以上の要素があるとき、`BoundExpr::ColumnRef`の`column_index`は
+/// 個々のテーブルの`Schema`内のローカルな添字ではなく、`tables`を左から右へ
+/// 連結した**結合後スキーマ**上のフラットな添字になる(`table_ordinal`が`0`の
+/// テーブルの列は`0..tables[0].schema.len()`、`1`のテーブルの列はその続き、
+/// という並び)。これは`LogicalPlan::build_select`が`JOIN`を左深い木
+/// (left-deep tree)として組み立てたとき、各`Join`ノードが生成する行が
+/// 「左部分木の出力列」+「右側テーブルの列」という並びの結合行になり、
+/// この並びが`tables`のフラットな添字とちょうど一致するように選んだ規則である
+/// (詳細は`logical_plan`モジュール、`physical_plan`モジュールの解説を参照)。
 ///
 /// `aggregate`が`Some`の場合、`projection`と`having`は`FROM`の列を直接指す
 /// `ColumnRef`をもう含まない。集約が絡む`SELECT`では、`GROUP BY`の列と集約
@@ -151,6 +174,9 @@ impl BoundTableRef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundSelect {
     pub tables: Vec<BoundTableRef>,
+    /// `tables[i + 1]`を結合する`JOIN`の並び(第22章)。要素数は
+    /// `tables.len().saturating_sub(1)`。
+    pub joins: Vec<BoundJoinStep>,
     /// `SELECT DISTINCT`が指定されていたかどうか(第21章)。
     pub distinct: bool,
     /// `SELECT`が生成する行の列。末尾の`hidden_column_count`個は、`SELECT`が
@@ -245,8 +271,11 @@ pub enum BoundExpr {
     NullLiteral {
         span: Span,
     },
-    /// 列参照。`table_ordinal`は所属する[`BoundSelect::tables`]の添字、
-    /// `column_index`はそのテーブルの`Schema`上の列の添字。
+    /// 列参照。`table_ordinal`は所属する[`BoundSelect::tables`]の添字。
+    /// `column_index`は、テーブルが1個(`JOIN`が無い)の場合はそのテーブルの
+    /// `Schema`上の列の添字と一致するが、`JOIN`で複数テーブルになった場合は
+    /// **結合後スキーマ**(`tables`を左から右へ連結した列の並び)上のフラットな
+    /// 添字になる(`BoundSelect`のドキュメント、「結合後スキーマ」の説明を参照)。
     ColumnRef {
         table_ordinal: usize,
         column_index: usize,
@@ -406,7 +435,7 @@ impl<'a> Binder<'a> {
     /// AST(`Statement`)をBound AST(`BoundStatement`)へ変換する。
     pub fn bind(&self, statement: Statement) -> DbResult<BoundStatement> {
         match statement {
-            Statement::Select(select) => self.bind_select(*select).map(BoundStatement::Select),
+            Statement::Select(select) => self.bind_select(*select).map(|select| BoundStatement::Select(Box::new(select))),
             Statement::CreateTable(create) => Ok(BoundStatement::CreateTable(create)),
             Statement::DropTable(drop) => self.bind_drop_table(drop),
             Statement::Insert(insert) => self.bind_insert(insert).map(BoundStatement::Insert),
@@ -450,7 +479,7 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_select(&self, select: SelectStatement) -> DbResult<BoundSelect> {
-        let tables = self.bind_from(select.from.as_ref())?;
+        let (tables, joins) = self.bind_from(select.from.as_ref())?;
 
         let mut projection = Vec::with_capacity(select.items.len());
         for item in select.items {
@@ -460,16 +489,17 @@ impl<'a> Binder<'a> {
                         return Err(self.error_at(span, "*はFROMを伴うSELECTでのみ使えます"));
                     }
                     // 複数テーブルの`*`は、テーブルの登場順→各テーブル内は列の
-                    // 宣言順に展開する。この章の`Parser`はFROMに1テーブルしか
-                    // 持てないため`tables.len()`は常に`1`だが、この展開順序は
-                    // 第22章のJOINで複数テーブルになっても変わらない規則として
-                    // 先に決めておく。
+                    // 宣言順に展開する(`FROM a JOIN b ON ...`なら`a`の列、
+                    // 続けて`b`の列)。`column_index`は個々のテーブル内の
+                    // ローカルな添字ではなく、結合後スキーマ上のフラットな
+                    // 添字にする(`BoundSelect`のドキュメント参照)。
+                    let mut offset = 0;
                     for (table_ordinal, table) in tables.iter().enumerate() {
-                        for (column_index, column) in table.schema.columns().iter().enumerate() {
+                        for (local_index, column) in table.schema.columns().iter().enumerate() {
                             projection.push(BoundSelectItem {
                                 expr: BoundExpr::ColumnRef {
                                     table_ordinal,
-                                    column_index,
+                                    column_index: offset + local_index,
                                     name: column.name.clone(),
                                     data_type: column.data_type,
                                     span,
@@ -477,6 +507,7 @@ impl<'a> Binder<'a> {
                                 output_name: column.name.clone(),
                             });
                         }
+                        offset += table.schema.len();
                     }
                 }
                 SelectItem::Expr { expr, span } => {
@@ -489,7 +520,7 @@ impl<'a> Binder<'a> {
 
         let predicate = match &select.where_clause {
             Some(expr) => {
-                let bound = self.bind_predicate(expr, &tables)?;
+                let bound = self.bind_predicate(expr, &tables, "WHERE")?;
                 if bound_contains_aggregate(&bound) {
                     return Err(self.error_at(
                         bound.span(),
@@ -514,7 +545,7 @@ impl<'a> Binder<'a> {
             .collect::<DbResult<Vec<_>>>()?;
 
         let raw_having = match &select.having {
-            Some(expr) => Some(self.bind_predicate(expr, &tables)?),
+            Some(expr) => Some(self.bind_predicate(expr, &tables, "HAVING")?),
             None => None,
         };
 
@@ -593,6 +624,7 @@ impl<'a> Binder<'a> {
 
         Ok(BoundSelect {
             tables,
+            joins,
             distinct: select.distinct,
             projection,
             predicate,
@@ -793,11 +825,35 @@ impl<'a> Binder<'a> {
         }
     }
 
-    fn bind_from(&self, from: Option<&FromClause>) -> DbResult<Vec<BoundTableRef>> {
-        match from {
-            Some(from) => Ok(vec![self.resolve_table(&from.table, from.alias.as_ref())?]),
-            None => Ok(Vec::new()),
+    /// `FROM`(あれば)を、単一テーブルの参照または`JOIN`の連鎖として束縛する。
+    ///
+    /// 返り値の1つ目はテーブルを左から右へ並べた`Vec`、2つ目はそれぞれの
+    /// `JOIN`の`ON`条件を同じ順序で並べた`Vec`(要素数はテーブルの個数より
+    /// 1つ少ない)である。`i`番目の`JOIN`の`ON`条件は`tables[0..=i+1]`
+    /// (それまでに`FROM`へ登場した全テーブル)のスコープで束縛するため、
+    /// `FROM a JOIN b ON a.x = b.x JOIN c ON a.y = c.y`のように、3番目以降の
+    /// `JOIN`条件が直前のテーブルだけでなくそれより前のテーブルも参照できる
+    /// (標準SQLが認める規則であり、`Binder`もこれに従う)。
+    fn bind_from(&self, from: Option<&FromClause>) -> DbResult<(Vec<BoundTableRef>, Vec<BoundJoinStep>)> {
+        let Some(from) = from else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+
+        let mut tables = vec![self.resolve_table(&from.table, from.alias.as_ref())?];
+        let mut joins = Vec::with_capacity(from.joins.len());
+        for join in &from.joins {
+            let right = self.resolve_table(&join.table, join.alias.as_ref())?;
+            tables.push(right);
+            let condition = self.bind_predicate(&join.on, &tables, "ON")?;
+            if bound_contains_aggregate(&condition) {
+                return Err(self.error_at(
+                    condition.span(),
+                    "集約関数はON句では使えません(集約はJOINの後に計算されます)".to_string(),
+                ));
+            }
+            joins.push(BoundJoinStep { kind: join.kind, condition });
         }
+        Ok((tables, joins))
     }
 
     fn bind_insert(&self, insert: InsertStatement) -> DbResult<BoundInsert> {
@@ -844,7 +900,7 @@ impl<'a> Binder<'a> {
         }
 
         let predicate = match &update.where_clause {
-            Some(expr) => Some(self.bind_predicate(expr, tables)?),
+            Some(expr) => Some(self.bind_predicate(expr, tables, "WHERE")?),
             None => None,
         };
 
@@ -874,7 +930,7 @@ impl<'a> Binder<'a> {
         let tables = std::slice::from_ref(&table);
 
         let predicate = match &delete.where_clause {
-            Some(expr) => Some(self.bind_predicate(expr, tables)?),
+            Some(expr) => Some(self.bind_predicate(expr, tables, "WHERE")?),
             None => None,
         };
 
@@ -890,13 +946,18 @@ impl<'a> Binder<'a> {
     /// `WHERE`句を束縛したうえで、`BOOLEAN`(または型未定の`NULL`)を返す式に
     /// なっていることを検査する。`executor::check_predicate_type`(第10章)が
     /// 行っていた検査と同じ規則を、束縛の時点でまとめて行う。
-    fn bind_predicate(&self, expr: &Expr, tables: &[BoundTableRef]) -> DbResult<BoundExpr> {
+    /// `clause`(`"WHERE"`・`"HAVING"`・`"ON"`)は、型不一致のエラーメッセージに
+    /// 使う句の名前。`WHERE`・`HAVING`・`JOIN`の`ON`は、どれも「行を絞り込む
+    /// (または結合する)条件がBOOLEANを返す式でなければならない」という同じ
+    /// 検査を共有しているが、エラーメッセージにはどの句が違反したのかを
+    /// 正確に示す。
+    fn bind_predicate(&self, expr: &Expr, tables: &[BoundTableRef], clause: &str) -> DbResult<BoundExpr> {
         let bound = self.bind_expr(expr, tables)?;
         match bound.data_type() {
             Some(DataType::Boolean) | None => Ok(bound),
             Some(other) => Err(self.error_at(
                 bound.span(),
-                format!("WHERE句はBOOLEANを返す式である必要があります: 式の型は{other}です"),
+                format!("{clause}句はBOOLEANを返す式である必要があります: 式の型は{other}です"),
             )),
         }
     }
@@ -1171,11 +1232,12 @@ impl<'a> Binder<'a> {
                 .ok_or_else(|| {
                     self.error_at(qualifier.span, format!("テーブルまたはAlias'{}'が見つかりません", qualifier.name))
                 })?;
-            let column_index = table
+            let local_index = table
                 .schema
                 .index_of(name)
                 .ok_or_else(|| self.error_at(span, format!("列'{name}'は'{}'に存在しません", qualifier.name)))?;
-            let data_type = table.schema.columns()[column_index].data_type;
+            let data_type = table.schema.columns()[local_index].data_type;
+            let column_index = table_offset(tables, table_ordinal) + local_index;
             return Ok(BoundExpr::ColumnRef {
                 table_ordinal,
                 column_index,
@@ -1189,10 +1251,10 @@ impl<'a> Binder<'a> {
             .iter()
             .enumerate()
             .filter_map(|(table_ordinal, table)| {
-                table
-                    .schema
-                    .index_of(name)
-                    .map(|column_index| (table_ordinal, column_index, table.schema.columns()[column_index].data_type))
+                table.schema.index_of(name).map(|local_index| {
+                    let column_index = table_offset(tables, table_ordinal) + local_index;
+                    (table_ordinal, column_index, table.schema.columns()[local_index].data_type)
+                })
             })
             .collect();
 
@@ -1218,6 +1280,16 @@ impl<'a> Binder<'a> {
             }
         }
     }
+}
+
+/// `tables[..table_ordinal]`の列数の合計。結合後スキーマ上での、
+/// `table_ordinal`番目のテーブルの先頭列が占める添字を返す
+/// (`BoundSelect`のドキュメント、「結合後スキーマ」の説明を参照)。
+/// `table_ordinal`が`0`のときは常に`0`を返すため、`JOIN`を持たない
+/// (`tables`の要素数が1個の)`SELECT`では、このオフセットは常に`0`のままで
+/// `column_index`はこれまでどおりテーブル内のローカルな添字と一致する。
+fn table_offset(tables: &[BoundTableRef], table_ordinal: usize) -> usize {
+    tables[..table_ordinal].iter().map(|table| table.schema.len()).sum()
 }
 
 /// エラーメッセージ用に`Option<DataType>`を表示する。`None`(型が定まらない、
@@ -1291,6 +1363,19 @@ mod tests {
                     Column::new("name", DataType::Text, true),
                 ]),
             )
+            .unwrap();
+        catalog
+    }
+
+    /// `JOIN`のテスト用に、`a(id, x)`・`b(id, y)`という、あえて同名の`id`列を
+    /// 両方に持つ2テーブルのカタログ。
+    fn ab_catalog() -> Catalog {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table("a", Schema::new(vec![Column::new("id", DataType::BigInt, false), Column::new("x", DataType::Text, true)]))
+            .unwrap();
+        catalog
+            .create_table("b", Schema::new(vec![Column::new("id", DataType::BigInt, false), Column::new("y", DataType::Text, true)]))
             .unwrap();
         catalog
     }
@@ -1384,9 +1469,10 @@ mod tests {
 
     #[test]
     fn ambiguous_column_is_rejected_across_multiple_tables() {
-        // 現在のParserはFROMに1テーブルしか持てないため、この曖昧さはSQL文
-        // からは作れない。第22章のJOINを見据えて`resolve_column`を直接呼び、
-        // 複数テーブルへの一般化が実際に効くことを確認する。
+        // `resolve_column`を直接呼ぶ形の単体テスト。`tables`の要素数に
+        // 関係なく曖昧列検出が働くことを確認する(下の`ambiguous_column_
+        // via_join_is_rejected`が、実際のJOIN構文から同じ分岐に到達することを
+        // 確認する)。
         let functions = FunctionRegistry::with_builtins();
         let sql = "id";
         let binder = Binder::new(&EmptyCatalog, &functions, sql);
@@ -1404,6 +1490,94 @@ mod tests {
         fn table(&self, _name: &str) -> Option<&TableInfo> {
             None
         }
+    }
+
+    // ---- JOIN(第22章) ----
+
+    #[test]
+    fn ambiguous_column_via_join_is_rejected() {
+        // `a`・`b`はどちらも`id`という列を持つ。`JOIN`で`tables`が2要素になった
+        // ことで、`ambiguous_column_is_rejected_across_multiple_tables`が
+        // 単体テストとしてのみ確認していた分岐に、実際のSQL文から到達できる。
+        let catalog = ab_catalog();
+        let err = bind("SELECT id FROM a JOIN b ON a.id = b.id", &catalog).unwrap_err();
+        match err {
+            DbError::Bind { message, .. } => assert!(message.contains("曖昧です")),
+            other => panic!("DbError::Bindを期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn qualified_column_ref_resolves_across_joined_tables() {
+        let catalog = ab_catalog();
+        let bound = bind("SELECT a.id, b.y FROM a JOIN b ON a.id = b.id", &catalog).unwrap();
+        let BoundStatement::Select(select) = bound else {
+            panic!("Selectを期待した");
+        };
+        assert_eq!(select.tables.len(), 2);
+        // `a`は2列(id, x)なので、`b`の列の結合後スキーマ上の添字は2から始まる。
+        // `b.y`は`b`の中ではローカル添字1(0番目がid)なので、結合後は2+1=3。
+        match &select.projection[1].expr {
+            BoundExpr::ColumnRef { table_ordinal, column_index, .. } => {
+                assert_eq!(*table_ordinal, 1);
+                assert_eq!(*column_index, 3);
+            }
+            other => panic!("ColumnRefを期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn select_star_after_join_expands_left_table_then_right_table() {
+        let catalog = ab_catalog();
+        let bound = bind("SELECT * FROM a JOIN b ON a.id = b.id", &catalog).unwrap();
+        let BoundStatement::Select(select) = bound else {
+            panic!("Selectを期待した");
+        };
+        let names: Vec<&str> = select.projection.iter().map(|item| item.output_name.as_str()).collect();
+        assert_eq!(names, vec!["id", "x", "id", "y"]);
+    }
+
+    #[test]
+    fn chained_join_condition_can_reference_an_earlier_table() {
+        // `c`の結合条件が、直前の`b`だけでなく最初の`a`も参照できることを確認する。
+        let mut catalog = ab_catalog();
+        catalog
+            .create_table("c", Schema::new(vec![Column::new("id", DataType::BigInt, false), Column::new("z", DataType::Text, true)]))
+            .unwrap();
+        let bound =
+            bind("SELECT a.id FROM a JOIN b ON a.id = b.id JOIN c ON a.id = c.id", &catalog).unwrap();
+        let BoundStatement::Select(select) = bound else {
+            panic!("Selectを期待した");
+        };
+        assert_eq!(select.tables.len(), 3);
+        assert_eq!(select.joins.len(), 2);
+    }
+
+    #[test]
+    fn on_clause_must_be_boolean() {
+        let catalog = ab_catalog();
+        let err = bind("SELECT a.id FROM a JOIN b ON a.id", &catalog).unwrap_err();
+        match err {
+            DbError::Bind { message, .. } => assert!(message.contains("BOOLEAN")),
+            other => panic!("DbError::Bindを期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn aggregate_in_on_clause_is_rejected() {
+        let catalog = ab_catalog();
+        let err = bind("SELECT a.id FROM a JOIN b ON a.id = COUNT(*)", &catalog).unwrap_err();
+        match err {
+            DbError::Bind { message, .. } => assert!(message.contains("ON句")),
+            other => panic!("DbError::Bindを期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn unknown_table_in_join_is_rejected() {
+        let catalog = ab_catalog();
+        let err = bind("SELECT a.id FROM a JOIN does_not_exist ON a.id = 1", &catalog).unwrap_err();
+        assert!(matches!(err, DbError::Bind { .. }));
     }
 
     #[test]
@@ -1484,7 +1658,7 @@ mod tests {
     fn bind_select_orders(sql: &str) -> BoundSelect {
         let catalog = orders_catalog();
         match bind(sql, &catalog).unwrap() {
-            BoundStatement::Select(select) => select,
+            BoundStatement::Select(select) => *select,
             other => panic!("Selectを期待したが{other:?}が返った"),
         }
     }

@@ -428,7 +428,7 @@ mod tests {
         let functions = FunctionRegistry::with_builtins();
         let statement = crate::parser::parse_statement(sql).unwrap();
         match Binder::new(&catalog, &functions, sql).bind(statement).unwrap() {
-            BoundStatement::Select(select) => select,
+            BoundStatement::Select(select) => *select,
             other => panic!("Selectを期待したが{other:?}が返った"),
         }
     }

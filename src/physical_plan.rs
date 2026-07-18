@@ -72,7 +72,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 
-use crate::ast::{AggregateFunc, Expr};
+use crate::ast::{AggregateFunc, BinaryOperator, Expr, JoinKind};
 use crate::binder::{AggregateCall, BoundAssignment, BoundExpr, BoundSelectItem};
 use crate::error::{DbError, DbResult};
 use crate::eval::{FunctionRegistry, eval_bound_expr, eval_expr};
@@ -100,6 +100,11 @@ pub enum PhysicalPlan {
     SeqScan(SeqScanNode),
     Values(ValuesNode),
     Filter(FilterNode),
+    /// `ON`が等値条件の連言(AND)へ分解できるときに選ばれる(第22章、
+    /// `split_equi_join_keys`)。
+    HashJoin(HashJoinNode),
+    /// `ON`が任意の条件のときに選ばれる、Joinの基準実装(第22章)。
+    NestedLoopJoin(NestedLoopJoinNode),
     Aggregate(AggregateNode),
     Projection(ProjectionNode),
     Distinct(DistinctNode),
@@ -132,6 +137,37 @@ pub struct ValuesNode {
 pub struct FilterNode {
     pub input: Box<PhysicalPlan>,
     pub predicate: BoundExpr,
+}
+
+/// [`PhysicalPlan::NestedLoopJoin`]が持つ情報(第22章)。`condition`は
+/// `LogicalPlan::Join::condition`をそのまま引き継ぐ(左右を連結した
+/// 結合後スキーマ上のフラットな`column_index`を持つ)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NestedLoopJoinNode {
+    pub left: Box<PhysicalPlan>,
+    pub right: Box<PhysicalPlan>,
+    pub kind: JoinKind,
+    pub condition: BoundExpr,
+}
+
+/// [`PhysicalPlan::HashJoin`]が持つ情報(第22章)。
+///
+/// `keys`は`condition`(等値条件の連言)から取り出した`(left_key, right_key)`の
+/// 対の並びで、結合キーが複数列でも(`a.x = b.x AND a.y = b.y`)全て保持する。
+/// `left_key`は`left`の出力(結合後スキーマの左半分)に対する添字のまま、
+/// `right_key`は`right`単体の出力に対する添字へシフト済み(`optimize`の
+/// `shift_column_index`)である。これは、Build段階(`right`をそのまま
+/// 1件ずつ読んで鍵を計算する)が`right`自身の`Executor`が返す行(左側を
+/// まだ連結していない、`right`単体のスキーマを持つ行)に対して鍵を評価する
+/// 必要があるためである。`condition`は`EXPLAIN`での表示にだけ使い、
+/// 実行(`HashJoinExec`)は`keys`だけを見る。
+#[derive(Debug, Clone, PartialEq)]
+pub struct HashJoinNode {
+    pub left: Box<PhysicalPlan>,
+    pub right: Box<PhysicalPlan>,
+    pub kind: JoinKind,
+    pub keys: Vec<(BoundExpr, BoundExpr)>,
+    pub condition: BoundExpr,
 }
 
 /// [`PhysicalPlan::Aggregate`]が持つ情報(第21章)。`LogicalPlan::Aggregate`と
@@ -221,6 +257,32 @@ pub fn optimize(plan: LogicalPlan) -> PhysicalPlan {
         LogicalPlan::Filter(filter) => {
             PhysicalPlan::Filter(FilterNode { input: Box::new(optimize(*filter.input)), predicate: filter.predicate })
         }
+        LogicalPlan::Join(join) => {
+            let left = optimize(*join.left);
+            let right = optimize(*join.right);
+            let left_len = left.output_schema().len();
+            match split_equi_join_keys(&join.condition, left_len) {
+                Some(keys) => {
+                    let keys = keys
+                        .into_iter()
+                        .map(|(left_key, right_key)| (left_key, shift_column_index(&right_key, left_len)))
+                        .collect();
+                    PhysicalPlan::HashJoin(HashJoinNode {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        kind: join.kind,
+                        keys,
+                        condition: join.condition,
+                    })
+                }
+                None => PhysicalPlan::NestedLoopJoin(NestedLoopJoinNode {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    kind: join.kind,
+                    condition: join.condition,
+                }),
+            }
+        }
         LogicalPlan::Aggregate(aggregate) => PhysicalPlan::Aggregate(AggregateNode {
             input: Box::new(optimize(*aggregate.input)),
             group_by: aggregate.group_by,
@@ -267,6 +329,162 @@ pub fn optimize(plan: LogicalPlan) -> PhysicalPlan {
     }
 }
 
+// ------------------------------------------------------------------
+// Join演算子の物理選択: 等値条件ならHash Join、それ以外はNested Loop Join
+// ------------------------------------------------------------------
+
+/// `condition`が、左右をちょうど1個ずつ参照する等値比較の連言(AND)へ
+/// 分解できるなら、その`(left_key, right_key)`の対の並びを返す。分解できない
+/// (`OR`を含む、比較演算子が`=`以外の項がある、左右どちらか一方だけを
+/// 参照しない項がある、など)場合は`None`を返し、呼び出し元(`optimize`)は
+/// `NestedLoopJoin`を選ぶ。
+///
+/// この章の物理選択はこの1点だけを見る単純なルールである。統計情報や
+/// コストを比較して選ぶわけではない(第28章)。等値条件が1つも取り出せない
+/// `ON true`のような結合(実質的な直積)も、この関数が`None`を返すことで
+/// 自然に`NestedLoopJoin`へ倒れる。
+fn split_equi_join_keys(condition: &BoundExpr, left_len: usize) -> Option<Vec<(BoundExpr, BoundExpr)>> {
+    let mut conjuncts = Vec::new();
+    collect_conjuncts(condition, &mut conjuncts);
+
+    let mut keys = Vec::with_capacity(conjuncts.len());
+    for conjunct in conjuncts {
+        let BoundExpr::BinaryOp { op: BinaryOperator::Eq, lhs, rhs, .. } = strip_paren(conjunct) else {
+            return None;
+        };
+        let (left_key, right_key) = match (columns_side(lhs, left_len), columns_side(rhs, left_len)) {
+            (Some(Side::Left), Some(Side::Right)) => (lhs.as_ref().clone(), rhs.as_ref().clone()),
+            (Some(Side::Right), Some(Side::Left)) => (rhs.as_ref().clone(), lhs.as_ref().clone()),
+            _ => return None,
+        };
+        keys.push((left_key, right_key));
+    }
+    if keys.is_empty() { None } else { Some(keys) }
+}
+
+/// `AND`で結ばれた式木を、これ以上`AND`で分解できない項(conjunct)の並びへ
+/// 展開する。`Paren`は素通しする(`(a = b) AND (c = d)`のような書き方でも
+/// 分解できるようにするため)。
+fn collect_conjuncts<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
+    match strip_paren(expr) {
+        BoundExpr::BinaryOp { op: BinaryOperator::And, lhs, rhs, .. } => {
+            collect_conjuncts(lhs, out);
+            collect_conjuncts(rhs, out);
+        }
+        other => out.push(other),
+    }
+}
+
+fn strip_paren(expr: &BoundExpr) -> &BoundExpr {
+    match expr {
+        BoundExpr::Paren { expr, .. } => strip_paren(expr),
+        other => other,
+    }
+}
+
+/// 式が参照する列(`ColumnRef`)の`column_index`が、すべて左側
+/// (`< left_len`)か、すべて右側(`>= left_len`)かを判定する。列参照を
+/// 1つも含まない式(定数式)や、左右が混在する式は`None`を返す。
+///
+/// `None`を返す式をHash Joinの鍵にできないのは当然として、列参照を持たない
+/// 定数式(`a.x = 1`のような、実質的にJOIN条件ではなくFilter条件)も
+/// この章では等値鍵として扱わない。等値鍵は必ず左右それぞれの行から
+/// 1つの値を取り出して比較する式であるべきで、定数だけの項を残差条件として
+/// 切り出す最適化(Hash Joinの鍵とFilterの併用)はこの章の範囲外である
+/// (章末の演習課題)。
+fn columns_side(expr: &BoundExpr, left_len: usize) -> Option<Side> {
+    let mut side = None;
+    if !collect_column_side(expr, left_len, &mut side) {
+        return None;
+    }
+    side
+}
+
+/// `expr`の中の列参照を再帰的に辿り、`side`が`None`なら最初に見つかった側を
+/// 記録し、以後見つかる列参照がすべて同じ側であれば`true`を返す。異なる側の
+/// 列参照が混在した時点で`false`を返す(呼び出し元はこれを「判定不能」として
+/// `None`を返す合図に使う)。
+fn collect_column_side(expr: &BoundExpr, left_len: usize, side: &mut Option<Side>) -> bool {
+    match expr {
+        BoundExpr::ColumnRef { column_index, .. } => {
+            let this_side = if *column_index < left_len { Side::Left } else { Side::Right };
+            match side {
+                None => {
+                    *side = Some(this_side);
+                    true
+                }
+                Some(existing) => *existing == this_side,
+            }
+        }
+        BoundExpr::IntLiteral { .. } | BoundExpr::StringLiteral { .. } | BoundExpr::BoolLiteral { .. } | BoundExpr::NullLiteral { .. } => {
+            true
+        }
+        BoundExpr::UnaryOp { expr, .. } | BoundExpr::Paren { expr, .. } | BoundExpr::Cast { expr, .. } => {
+            collect_column_side(expr, left_len, side)
+        }
+        BoundExpr::BinaryOp { lhs, rhs, .. } => {
+            collect_column_side(lhs, left_len, side) && collect_column_side(rhs, left_len, side)
+        }
+        BoundExpr::IsNull { expr, .. } => collect_column_side(expr, left_len, side),
+        BoundExpr::FunctionCall { args, .. } => args.iter().all(|arg| collect_column_side(arg, left_len, side)),
+        BoundExpr::Aggregate { .. } => false, // ON句に集約は現れない(Binderが拒否済み)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Left,
+    Right,
+}
+
+/// `expr`の中の`ColumnRef::column_index`から`delta`を引いた式を組み立てる。
+///
+/// `HashJoinNode::keys`の`right_key`は、結合後スキーマ(左を含む)上の
+/// フラットな添字のまま`optimize`に渡ってくるが、Build段階は`right`単体の
+/// `Executor`が返す行(左側を連結する前の、`right`自身のスキーマを持つ行)に
+/// 対してこの鍵を評価する必要がある。この関数は、結合後スキーマ上の添字
+/// (`>= left_len`のはず)を`right`単体のスキーマ上のローカルな添字へ
+/// 変換するために、木を再帰的に組み立て直す。
+fn shift_column_index(expr: &BoundExpr, delta: usize) -> BoundExpr {
+    match expr {
+        BoundExpr::ColumnRef { table_ordinal, column_index, name, data_type, span } => BoundExpr::ColumnRef {
+            table_ordinal: *table_ordinal,
+            column_index: column_index - delta,
+            name: name.clone(),
+            data_type: *data_type,
+            span: *span,
+        },
+        BoundExpr::IntLiteral { .. }
+        | BoundExpr::StringLiteral { .. }
+        | BoundExpr::BoolLiteral { .. }
+        | BoundExpr::NullLiteral { .. } => expr.clone(),
+        BoundExpr::UnaryOp { op, expr, data_type, span } => {
+            BoundExpr::UnaryOp { op: *op, expr: Box::new(shift_column_index(expr, delta)), data_type: *data_type, span: *span }
+        }
+        BoundExpr::BinaryOp { op, lhs, rhs, data_type, span } => BoundExpr::BinaryOp {
+            op: *op,
+            lhs: Box::new(shift_column_index(lhs, delta)),
+            rhs: Box::new(shift_column_index(rhs, delta)),
+            data_type: *data_type,
+            span: *span,
+        },
+        BoundExpr::IsNull { expr, negated, span } => {
+            BoundExpr::IsNull { expr: Box::new(shift_column_index(expr, delta)), negated: *negated, span: *span }
+        }
+        BoundExpr::FunctionCall { name, args, data_type, span } => BoundExpr::FunctionCall {
+            name: name.clone(),
+            args: args.iter().map(|arg| shift_column_index(arg, delta)).collect(),
+            data_type: *data_type,
+            span: *span,
+        },
+        BoundExpr::Paren { expr, span } => BoundExpr::Paren { expr: Box::new(shift_column_index(expr, delta)), span: *span },
+        BoundExpr::Cast { expr, data_type, span } => {
+            BoundExpr::Cast { expr: Box::new(shift_column_index(expr, delta)), data_type: *data_type, span: *span }
+        }
+        BoundExpr::Aggregate { .. } => expr.clone(), // ON句に現れないので到達しない
+    }
+}
+
 impl PhysicalPlan {
     /// この演算子が返す行の列構成。ルールは`LogicalPlan::output_schema`と
     /// 同じで、`Projection`の列構成は同じ[`logical_plan::projection_schema`]
@@ -276,6 +494,12 @@ impl PhysicalPlan {
             PhysicalPlan::SeqScan(scan) => scan.schema.clone(),
             PhysicalPlan::Values(values) => values.schema.clone(),
             PhysicalPlan::Filter(filter) => filter.input.output_schema(),
+            PhysicalPlan::NestedLoopJoin(join) => {
+                logical_plan::join_schema(&join.left.output_schema(), &join.right.output_schema())
+            }
+            PhysicalPlan::HashJoin(join) => {
+                logical_plan::join_schema(&join.left.output_schema(), &join.right.output_schema())
+            }
             PhysicalPlan::Aggregate(aggregate) => aggregate.schema.clone(),
             PhysicalPlan::Projection(projection) => {
                 logical_plan::projection_schema(&projection.input.output_schema(), &projection.projection)
@@ -291,6 +515,8 @@ impl PhysicalPlan {
         match self {
             PhysicalPlan::SeqScan(_) | PhysicalPlan::Values(_) => Vec::new(),
             PhysicalPlan::Filter(filter) => vec![&filter.input],
+            PhysicalPlan::NestedLoopJoin(join) => vec![&join.left, &join.right],
+            PhysicalPlan::HashJoin(join) => vec![&join.left, &join.right],
             PhysicalPlan::Aggregate(aggregate) => vec![&aggregate.input],
             PhysicalPlan::Projection(projection) => vec![&projection.input],
             PhysicalPlan::Distinct(distinct) => vec![&distinct.input],
@@ -310,6 +536,17 @@ impl PhysicalPlan {
                 format!("Values({} {row_word})", values.rows.len())
             }
             PhysicalPlan::Filter(filter) => format!("Filter({})", logical_plan::fmt_bound_expr(&filter.predicate)),
+            PhysicalPlan::NestedLoopJoin(join) => {
+                format!("NestedLoopJoin({}, {})", join.kind.name(), logical_plan::fmt_bound_expr(&join.condition))
+            }
+            PhysicalPlan::HashJoin(join) => {
+                let keys: Vec<String> = join
+                    .keys
+                    .iter()
+                    .map(|(l, r)| format!("{} = {}", logical_plan::fmt_bound_expr(l), logical_plan::fmt_bound_expr(r)))
+                    .collect();
+                format!("HashJoin({}, {})", join.kind.name(), keys.join(" AND "))
+            }
             PhysicalPlan::Aggregate(aggregate) => {
                 let group_by: Vec<String> = aggregate.group_by.iter().map(logical_plan::fmt_bound_expr).collect();
                 let calls: Vec<String> = aggregate
@@ -579,6 +816,199 @@ impl<'a> Executor for ProjectionExec<'a> {
             values.push(eval_bound_expr(&item.expr, self.functions, Some(&row))?);
         }
         Tuple::new(&self.out_schema, values).map(Some)
+    }
+}
+
+/// `left`と`right`の1行ずつを連結し、`schema`(`logical_plan::join_schema`と
+/// 同じ規則)に対する`Tuple`にする(第22章)。`NestedLoopJoinExec`・
+/// `HashJoinExec`の両方が同じ形の連結を必要とするため、共通の関数として
+/// 切り出してある。
+fn concat_tuple(schema: &Schema, left: &Tuple, right: &Tuple) -> DbResult<Tuple> {
+    let mut values = Vec::with_capacity(left.values().len() + right.values().len());
+    values.extend(left.values().iter().cloned());
+    values.extend(right.values().iter().cloned());
+    Tuple::new(schema, values)
+}
+
+/// Nested Loop Join演算子(第22章)。`ON`が任意の条件でも動く基準実装で、
+/// `left`の行1件ごとに`right`の全行を突き合わせる。
+///
+/// 教科書的なNested Loop Joinは`left`の行1件ごとに`right`の子計画を
+/// もう一度実行し直す(rescan)が、この章の`Executor`は`Box<dyn Executor>`と
+/// いうTrait Objectであり、状態を持つイテレータを「巻き戻す」手段を
+/// 持たない(第19章)。この実装は`right`をコンストラクタで一度だけ`Vec<Tuple>`
+/// へ読み切り(build段階、`right`だけをblockingに読む)、以後は`left`から
+/// 1行受け取るたびにその`Vec`を先頭から順に見比べる。比較の回数は
+/// `left`の行数×`right`の行数のままなので、計算量(O(n×m))は教科書的な
+/// 実装と変わらない。
+pub struct NestedLoopJoinExec<'a> {
+    left: Box<dyn Executor + 'a>,
+    right_rows: Vec<Tuple>,
+    condition: &'a BoundExpr,
+    functions: &'a FunctionRegistry,
+    schema: Schema,
+    current_left: Option<Tuple>,
+    right_index: usize,
+}
+
+impl<'a> NestedLoopJoinExec<'a> {
+    pub fn new(
+        left: Box<dyn Executor + 'a>,
+        mut right: Box<dyn Executor + 'a>,
+        condition: &'a BoundExpr,
+        functions: &'a FunctionRegistry,
+    ) -> DbResult<Self> {
+        let left_schema = left.output_schema().clone();
+        let right_schema = right.output_schema().clone();
+        let mut right_rows = Vec::new();
+        while let Some(tuple) = right.next()? {
+            right_rows.push(tuple);
+        }
+        let schema = logical_plan::join_schema(&left_schema, &right_schema);
+        Ok(NestedLoopJoinExec { left, right_rows, condition, functions, schema, current_left: None, right_index: 0 })
+    }
+}
+
+impl<'a> Executor for NestedLoopJoinExec<'a> {
+    fn output_schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn next(&mut self) -> DbResult<Option<Tuple>> {
+        loop {
+            if self.current_left.is_none() {
+                let Some(tuple) = self.left.next()? else {
+                    return Ok(None);
+                };
+                self.current_left = Some(tuple);
+                self.right_index = 0;
+            }
+            let left_tuple = self.current_left.as_ref().expect("直前にSomeを設定済み");
+
+            while self.right_index < self.right_rows.len() {
+                let right_tuple = &self.right_rows[self.right_index];
+                self.right_index += 1;
+                let combined = concat_tuple(&self.schema, left_tuple, right_tuple)?;
+                let row = Row::new(&self.schema, &combined);
+                let value = eval_bound_expr(self.condition, self.functions, Some(&row))?;
+                if predicate_matches(value)? {
+                    return Ok(Some(combined));
+                }
+            }
+            // `right_rows`を使い切った。この`left`の行についてはこれ以上
+            // 一致しないので、次の`left`の行へ進む。
+            self.current_left = None;
+        }
+    }
+}
+
+/// Hash Join演算子(第22章)。`ON`が等値条件の連言(AND)であるときに選ばれる
+/// (`physical_plan::optimize`の`split_equi_join_keys`)。
+///
+/// **Build側**(`right`)を先にコンストラクタで全件読み切り、`right_keys`を
+/// 評価した結果をハッシュテーブルの鍵にして`Vec<Tuple>`(同じ鍵を持つ行の
+/// 多重集合)を溜める。**Probe側**(`left`)は`next()`が呼ばれるたびに1行ずつ
+/// 引き、`left_keys`を評価した鍵でハッシュテーブルを引いて一致する`right`の
+/// 行と連結する。Build段階だけがblockingで、Probe段階は`FilterExec`と同じ
+/// 「一致するまで子を引く」streamingの形になる。
+///
+/// **NULLキーは結合しない**(SQLの等価比較は`NULL = NULL`をUNKNOWNとみなす、
+/// 第8章の三値論理)。Build側は鍵にNULLを含む行をハッシュテーブルへ挿入
+/// しない(挿入しなければ、その行はどのProbe行とも一致しようがなく、結果的に
+/// 結合結果から自然に除外される)。Probe側も鍵にNULLを含む行はハッシュ
+/// テーブルを引かずに次の行へ進む。`Vec<Value>`をそのままキーにした場合、
+/// 導出された`Hash`/`Eq`は`NULL`同士を構造的に等しいとみなしてしまう
+/// (第21章の`GROUP BY`はこれを利用してNULL同士を同じグループにまとめていた)
+/// ため、この章のJOINではその判定に頼らず、鍵を計算した時点で明示的に
+/// NULLを検査する。
+pub struct HashJoinExec<'a> {
+    left: Box<dyn Executor + 'a>,
+    left_schema: Schema,
+    build: HashMap<Vec<Value>, Vec<Tuple>>,
+    /// `(left_key, right_key)`の対の並び。Build段階で使い終えた`right_key`も
+    /// そのまま保持しているのは、`keys`という1つの借用を丸ごと持ち回すほうが、
+    /// `left_key`だけを複製して別のフィールドに分ける(所有権とライフタイム
+    /// が余分に絡む)よりも単純だからである。
+    keys: &'a [(BoundExpr, BoundExpr)],
+    functions: &'a FunctionRegistry,
+    schema: Schema,
+    current_left: Option<Tuple>,
+    current_key: Option<Vec<Value>>,
+    match_index: usize,
+}
+
+impl<'a> HashJoinExec<'a> {
+    /// `keys`は`(left_key, right_key)`の対の並びで、`right_key`はすでに
+    /// `right`単体のスキーマ上のローカルな添字へシフト済みでなければならない
+    /// (`HashJoinNode::keys`のドキュメント参照)。
+    pub fn new(
+        left: Box<dyn Executor + 'a>,
+        mut right: Box<dyn Executor + 'a>,
+        keys: &'a [(BoundExpr, BoundExpr)],
+        functions: &'a FunctionRegistry,
+    ) -> DbResult<Self> {
+        let left_schema = left.output_schema().clone();
+        let right_schema = right.output_schema().clone();
+        let schema = logical_plan::join_schema(&left_schema, &right_schema);
+
+        let mut build: HashMap<Vec<Value>, Vec<Tuple>> = HashMap::new();
+        while let Some(tuple) = right.next()? {
+            let row = Row::new(&right_schema, &tuple);
+            let key: Vec<Value> =
+                keys.iter().map(|(_, right_key)| eval_bound_expr(right_key, functions, Some(&row))).collect::<DbResult<_>>()?;
+            if key.iter().any(Value::is_null) {
+                continue; // NULLキーは結合しない(モジュールのドキュメント参照)
+            }
+            build.entry(key).or_default().push(tuple);
+        }
+
+        Ok(HashJoinExec { left, left_schema, build, keys, functions, schema, current_left: None, current_key: None, match_index: 0 })
+    }
+}
+
+impl<'a> Executor for HashJoinExec<'a> {
+    fn output_schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn next(&mut self) -> DbResult<Option<Tuple>> {
+        loop {
+            if self.current_left.is_none() {
+                let Some(tuple) = self.left.next()? else {
+                    return Ok(None);
+                };
+                let row = Row::new(&self.left_schema, &tuple);
+                let key: Vec<Value> = self
+                    .keys
+                    .iter()
+                    .map(|(left_key, _)| eval_bound_expr(left_key, self.functions, Some(&row)))
+                    .collect::<DbResult<_>>()?;
+                self.current_left = Some(tuple);
+                if key.iter().any(Value::is_null) {
+                    self.current_key = None; // NULLキーは結合しない
+                } else {
+                    self.current_key = Some(key);
+                }
+                self.match_index = 0;
+            }
+
+            let Some(key) = &self.current_key else {
+                self.current_left = None;
+                continue;
+            };
+            let matches = self.build.get(key);
+            let found = matches.and_then(|rows| rows.get(self.match_index));
+            match found {
+                Some(right_tuple) => {
+                    self.match_index += 1;
+                    let left_tuple = self.current_left.as_ref().expect("直前にSomeを設定済み");
+                    return concat_tuple(&self.schema, left_tuple, right_tuple).map(Some);
+                }
+                None => {
+                    self.current_left = None;
+                }
+            }
+        }
     }
 }
 
@@ -934,7 +1364,7 @@ mod tests {
         let functions = FunctionRegistry::with_builtins();
         let statement = parse_statement(sql).unwrap();
         match Binder::new(&catalog, &functions, sql).bind(statement).unwrap() {
-            BoundStatement::Select(select) => select,
+            BoundStatement::Select(select) => *select,
             other => panic!("Selectを期待したが{other:?}が返った"),
         }
     }
@@ -1104,7 +1534,7 @@ mod tests {
         let functions = FunctionRegistry::with_builtins();
         let statement = parse_statement(sql).unwrap();
         match Binder::new(&catalog, &functions, sql).bind(statement).unwrap() {
-            BoundStatement::Select(select) => select,
+            BoundStatement::Select(select) => *select,
             other => panic!("Selectを期待したが{other:?}が返った"),
         }
     }
@@ -1410,5 +1840,213 @@ mod tests {
         let rows: Vec<Tuple> = (0..5).map(|i| order_row(Some("eng"), Some(i))).collect();
         let mut exec = LimitExec::new(exec_over_rows(rows), Some(0), None);
         assert!(collect_all(&mut exec).is_empty());
+    }
+
+    // ---- Join(第22章) ----
+
+    /// `a(id, x)`・`b(id, y)`という2テーブルのカタログ。`b.id`はNULLキーの
+    /// テストのためnullableにしてある。
+    fn ab_catalog() -> Catalog {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table("a", Schema::new(vec![Column::new("id", DataType::BigInt, false), Column::new("x", DataType::Text, true)]))
+            .unwrap();
+        catalog
+            .create_table("b", Schema::new(vec![Column::new("id", DataType::BigInt, true), Column::new("y", DataType::Text, true)]))
+            .unwrap();
+        catalog
+    }
+
+    fn bind_select_ab(sql: &str) -> crate::binder::BoundSelect {
+        let catalog = ab_catalog();
+        let functions = FunctionRegistry::with_builtins();
+        let statement = parse_statement(sql).unwrap();
+        match Binder::new(&catalog, &functions, sql).bind(statement).unwrap() {
+            BoundStatement::Select(select) => *select,
+            other => panic!("Selectを期待したが{other:?}が返った"),
+        }
+    }
+
+    fn a_schema() -> Schema {
+        Schema::new(vec![Column::new("id", DataType::BigInt, false), Column::new("x", DataType::Text, true)])
+    }
+
+    fn b_schema() -> Schema {
+        Schema::new(vec![Column::new("id", DataType::BigInt, true), Column::new("y", DataType::Text, true)])
+    }
+
+    fn a_row(id: i64, x: &str) -> Tuple {
+        Tuple::new(&a_schema(), vec![Value::BigInt(id), Value::Text(x.to_string())]).unwrap()
+    }
+
+    fn b_row(id: Option<i64>, y: &str) -> Tuple {
+        let id = id.map(Value::BigInt).unwrap_or(Value::Null);
+        Tuple::new(&b_schema(), vec![id, Value::Text(y.to_string())]).unwrap()
+    }
+
+    fn exec_over_a_rows(rows: Vec<Tuple>) -> Box<dyn Executor> {
+        Box::new(ValuesRowsExec { schema: a_schema(), rows: rows.into_iter() })
+    }
+
+    fn exec_over_b_rows(rows: Vec<Tuple>) -> Box<dyn Executor> {
+        Box::new(ValuesRowsExec { schema: b_schema(), rows: rows.into_iter() })
+    }
+
+    /// `condition`(結合後スキーマ上のフラットな添字を持つ)から、`optimize`が
+    /// 行うのと同じ手順でHash Joinの鍵を取り出す。取り出せなければ`None`。
+    fn equi_keys(condition: &BoundExpr) -> Option<Vec<(BoundExpr, BoundExpr)>> {
+        let left_len = a_schema().len();
+        split_equi_join_keys(condition, left_len)
+            .map(|keys| keys.into_iter().map(|(l, r)| (l, shift_column_index(&r, left_len))).collect())
+    }
+
+    #[test]
+    fn optimize_chooses_hash_join_for_an_equality_condition() {
+        let select = bind_select_ab("SELECT a.id FROM a JOIN b ON a.id = b.id");
+        let physical = optimize(build_select(select));
+        assert!(physical.to_string().contains("HashJoin"));
+    }
+
+    #[test]
+    fn optimize_chooses_nested_loop_join_for_a_non_equality_condition() {
+        let select = bind_select_ab("SELECT a.id FROM a JOIN b ON a.id > b.id");
+        let physical = optimize(build_select(select));
+        assert!(physical.to_string().contains("NestedLoopJoin"));
+    }
+
+    #[test]
+    fn nested_loop_and_hash_join_produce_identical_results_for_an_equi_join() {
+        // NLJとHash Joinは異なるアルゴリズムだが、同じ入力・同じ等値条件に
+        // 対しては同じ行集合を、同じ順序(`left`優先、`right`は元のスキャン順)
+        // で返すはずである。この一致を、同一クエリを両方の演算子で実行して
+        // 突き合わせることで確認する。
+        let select = bind_select_ab("SELECT a.id FROM a JOIN b ON a.id = b.id");
+        let condition = select.joins[0].condition.clone();
+        let keys = equi_keys(&condition).expect("等値条件のはず");
+
+        // `a.id = 2`が2行、`b.id = 2`が2行あるので、この組み合わせだけで
+        // 2×2 = 4行のマッチが生まれる(重複キーの多重集合としての結合)。
+        let a_rows = vec![a_row(1, "a1"), a_row(2, "a2"), a_row(2, "a2b"), a_row(3, "a3")];
+        let b_rows = vec![b_row(Some(2), "b2"), b_row(None, "bnull"), b_row(Some(2), "b2b"), b_row(Some(9), "bnomatch")];
+
+        let functions = FunctionRegistry::with_builtins();
+        let mut nlj =
+            NestedLoopJoinExec::new(exec_over_a_rows(a_rows.clone()), exec_over_b_rows(b_rows.clone()), &condition, &functions)
+                .unwrap();
+        let mut hash = HashJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(b_rows), &keys, &functions).unwrap();
+
+        let nlj_rows = collect_all(&mut nlj);
+        let hash_rows = collect_all(&mut hash);
+        assert_eq!(nlj_rows.len(), 4);
+        assert_eq!(nlj_rows, hash_rows);
+    }
+
+    #[test]
+    fn hash_join_excludes_null_keys_from_both_sides() {
+        let select = bind_select_ab("SELECT a.id FROM a JOIN b ON a.id = b.id");
+        let condition = select.joins[0].condition.clone();
+        let keys = equi_keys(&condition).expect("等値条件のはず");
+
+        let a_rows = vec![a_row(1, "a1")];
+        let b_rows = vec![b_row(Some(1), "b1"), b_row(None, "bnull")];
+
+        let functions = FunctionRegistry::with_builtins();
+        let mut hash = HashJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(b_rows), &keys, &functions).unwrap();
+        let rows = collect_all(&mut hash);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn nested_loop_join_excludes_null_keys_via_three_valued_logic() {
+        // NLJは専用のNULL処理を持たず、`WHERE`と同じ三値論理(`eval_bound_expr`・
+        // `predicate_matches`)を経由するだけでNULLキーの行が自然に除外される
+        // ことを確認する。
+        let select = bind_select_ab("SELECT a.id FROM a JOIN b ON a.id = b.id");
+        let condition = select.joins[0].condition.clone();
+
+        let a_rows = vec![a_row(1, "a1")];
+        let b_rows = vec![b_row(Some(1), "b1"), b_row(None, "bnull")];
+
+        let functions = FunctionRegistry::with_builtins();
+        let mut nlj = NestedLoopJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(b_rows), &condition, &functions).unwrap();
+        let rows = collect_all(&mut nlj);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn join_against_an_empty_right_table_returns_no_rows() {
+        let select = bind_select_ab("SELECT a.id FROM a JOIN b ON a.id = b.id");
+        let condition = select.joins[0].condition.clone();
+        let keys = equi_keys(&condition).expect("等値条件のはず");
+
+        let a_rows = vec![a_row(1, "a1"), a_row(2, "a2")];
+
+        let functions = FunctionRegistry::with_builtins();
+        let mut nlj =
+            NestedLoopJoinExec::new(exec_over_a_rows(a_rows.clone()), exec_over_b_rows(Vec::new()), &condition, &functions)
+                .unwrap();
+        let mut hash = HashJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(Vec::new()), &keys, &functions).unwrap();
+        assert!(collect_all(&mut nlj).is_empty());
+        assert!(collect_all(&mut hash).is_empty());
+    }
+
+    #[test]
+    fn join_against_an_empty_left_table_returns_no_rows() {
+        let select = bind_select_ab("SELECT a.id FROM a JOIN b ON a.id = b.id");
+        let condition = select.joins[0].condition.clone();
+        let keys = equi_keys(&condition).expect("等値条件のはず");
+
+        let b_rows = vec![b_row(Some(1), "b1")];
+
+        let functions = FunctionRegistry::with_builtins();
+        let mut nlj =
+            NestedLoopJoinExec::new(exec_over_a_rows(Vec::new()), exec_over_b_rows(b_rows.clone()), &condition, &functions)
+                .unwrap();
+        let mut hash = HashJoinExec::new(exec_over_a_rows(Vec::new()), exec_over_b_rows(b_rows), &keys, &functions).unwrap();
+        assert!(collect_all(&mut nlj).is_empty());
+        assert!(collect_all(&mut hash).is_empty());
+    }
+
+    #[test]
+    fn split_equi_join_keys_handles_a_conjunction_of_two_equalities() {
+        let select = bind_select_ab("SELECT a.id FROM a JOIN b ON a.id = b.id AND a.x = b.y");
+        let condition = select.joins[0].condition.clone();
+        let keys = split_equi_join_keys(&condition, a_schema().len()).expect("2つの等値条件のはず");
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn split_equi_join_keys_rejects_an_or_condition() {
+        let select = bind_select_ab("SELECT a.id FROM a JOIN b ON a.id = b.id OR a.x = b.y");
+        let condition = select.joins[0].condition.clone();
+        assert!(split_equi_join_keys(&condition, a_schema().len()).is_none());
+    }
+
+    #[test]
+    fn split_equi_join_keys_rejects_a_condition_mixing_both_sides_on_one_term() {
+        // `a.id + b.id = 3`は、左辺が左右両方のテーブルを参照しており、
+        // どちらか一方の側だけを参照する式という前提を満たさない。
+        let select = bind_select_ab("SELECT a.id FROM a JOIN b ON a.id + b.id = 3");
+        let condition = select.joins[0].condition.clone();
+        assert!(split_equi_join_keys(&condition, a_schema().len()).is_none());
+    }
+
+    #[test]
+    fn multi_way_join_chains_three_tables_left_deep() {
+        let mut catalog = ab_catalog();
+        catalog
+            .create_table("c", Schema::new(vec![Column::new("id", DataType::BigInt, false), Column::new("z", DataType::Text, true)]))
+            .unwrap();
+        let functions = FunctionRegistry::with_builtins();
+        let sql = "SELECT a.id, c.z FROM a JOIN b ON a.id = b.id JOIN c ON a.id = c.id";
+        let statement = parse_statement(sql).unwrap();
+        let select = match Binder::new(&catalog, &functions, sql).bind(statement).unwrap() {
+            BoundStatement::Select(select) => *select,
+            other => panic!("Selectを期待したが{other:?}が返った"),
+        };
+        let physical = optimize(build_select(select));
+        // 左深い木: 一番外側(根に近い)のJoinの子にもう1つJoinが現れる。
+        let text = physical.to_string();
+        assert_eq!(text.matches("Join").count(), 2);
     }
 }

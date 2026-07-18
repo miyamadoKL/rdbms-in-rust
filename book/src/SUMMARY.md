@@ -32,7 +32,7 @@
 - [第19章 Physical PlanとVolcano Executor](ch19-volcano-executor.md)
 - [第20章 制約](ch20-constraints.md)
 - [第21章 Sort、Limit、Distinct、Aggregate](ch21-sort-aggregate.md)
-- [第22章 Joinアルゴリズム]()
+- [第22章 Joinアルゴリズム](ch22-join.md)
 - [第23章 B+Tree I: 検索、挿入、分割]()
 - [第24章 B+Tree II: 範囲検索、削除、CREATE INDEX]()
 - [第25章 Index Scanとアクセスパス]()

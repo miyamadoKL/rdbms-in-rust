@@ -20,8 +20,8 @@
 
 use crate::ast::{
     AggregateFunc, Assignment, BinaryOperator, ColumnDef, CreateTableStatement, DeleteStatement,
-    DropTableStatement, ExplainStatement, Expr, FromClause, Ident, InsertStatement, OrderByItem,
-    SelectItem, SelectStatement, Statement, UnaryOperator, UpdateStatement,
+    DropTableStatement, ExplainStatement, Expr, FromClause, Ident, InsertStatement, JoinClause,
+    JoinKind, OrderByItem, SelectItem, SelectStatement, Statement, UnaryOperator, UpdateStatement,
 };
 use crate::error::{DbError, DbResult};
 use crate::lexer::{self, Keyword, Span, Token, TokenKind};
@@ -213,11 +213,19 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+
+            let mut joins = Vec::new();
+            while let Some(join) = self.parse_join_clause()? {
+                from_end = join.span.end;
+                joins.push(join);
+            }
+
             end = from_end;
             Some(FromClause {
                 span: Span::new(table.span.start, from_end),
                 table,
                 alias,
+                joins,
             })
         } else {
             None
@@ -318,6 +326,49 @@ impl<'a> Parser<'a> {
         };
         let span = Span::new(expr.span().start, end);
         Ok(OrderByItem { expr, desc, span })
+    }
+
+    /// `FROM`の直後、または直前の`JOIN`の直後に続く`[INNER] JOIN <table>
+    /// [AS <alias>] ON <expr>`を1個読む(第22章)。次のトークンが`JOIN`・
+    /// `INNER`のどちらでもなければ、`JOIN`の連鎖はここで終わりなので`None`を
+    /// 返す(呼び出し側の`while let`が抜ける)。
+    ///
+    /// `JOIN`単独は`INNER JOIN`の別名として受理する。標準SQLも`JOIN`だけを
+    /// 書いた場合は`INNER JOIN`とみなす規則なので、`Parser`の時点で
+    /// `JoinKind::Inner`へ統一してしまい、`Binder`以降はこの2つの書き方の
+    /// 違いを一切意識しない。
+    fn parse_join_clause(&mut self) -> DbResult<Option<JoinClause>> {
+        let start = match self.peek_kind() {
+            TokenKind::Keyword(Keyword::Join) => self.peek().span.start,
+            TokenKind::Keyword(Keyword::Inner) => self.peek().span.start,
+            _ => return Ok(None),
+        };
+
+        if let TokenKind::Keyword(Keyword::Inner) = self.peek_kind() {
+            self.advance();
+            self.expect_keyword(Keyword::Join, "JOIN")?;
+        } else {
+            self.advance();
+        }
+
+        let table = self.expect_ident()?;
+        let alias = if let TokenKind::Keyword(Keyword::As) = self.peek_kind() {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        self.expect_keyword(Keyword::On, "ON")?;
+        let on = self.parse_expr(0)?;
+        let end = on.span().end;
+
+        Ok(Some(JoinClause {
+            kind: JoinKind::Inner,
+            table,
+            alias,
+            on,
+            span: Span::new(start, end),
+        }))
     }
 
     /// `*`は`parse_expr`(乗算の`*`と同じToken)に渡すと式として解釈できないため、
@@ -1168,6 +1219,74 @@ mod tests {
             }
             other => panic!("Statement::Selectを期待したが{other:?}が返った"),
         }
+    }
+
+    // ---- JOIN(第22章) ----
+
+    #[test]
+    fn parses_inner_join_with_on_clause() {
+        let statement = parse_statement("SELECT a.x FROM a INNER JOIN b ON a.id = b.id").unwrap();
+        match statement {
+            Statement::Select(select) => {
+                let from = select.from.expect("FROMがあるはず");
+                assert_eq!(from.joins.len(), 1);
+                assert_eq!(from.joins[0].kind, JoinKind::Inner);
+                assert_eq!(from.joins[0].table.name, "b");
+            }
+            other => panic!("Statement::Selectを期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn join_alone_is_treated_as_inner_join() {
+        let statement = parse_statement("SELECT a.x FROM a JOIN b ON a.id = b.id").unwrap();
+        match statement {
+            Statement::Select(select) => {
+                assert_eq!(select.from.unwrap().joins[0].kind, JoinKind::Inner);
+            }
+            other => panic!("Statement::Selectを期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_join_with_alias() {
+        let statement = parse_statement("SELECT x.id FROM a AS x JOIN b AS y ON x.id = y.id").unwrap();
+        match statement {
+            Statement::Select(select) => {
+                let from = select.from.unwrap();
+                assert_eq!(from.alias.map(|a| a.name), Some("x".to_string()));
+                assert_eq!(from.joins[0].alias.as_ref().map(|a| a.name.as_str()), Some("y"));
+            }
+            other => panic!("Statement::Selectを期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_multiple_chained_joins() {
+        let statement =
+            parse_statement("SELECT a.x FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id").unwrap();
+        match statement {
+            Statement::Select(select) => {
+                let from = select.from.unwrap();
+                assert_eq!(from.joins.len(), 2);
+                assert_eq!(from.joins[0].table.name, "b");
+                assert_eq!(from.joins[1].table.name, "c");
+            }
+            other => panic!("Statement::Selectを期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn join_without_on_is_a_syntax_error() {
+        let err = parse_statement("SELECT a.x FROM a JOIN b").unwrap_err();
+        assert!(matches!(err, DbError::Parse { .. }));
+    }
+
+    #[test]
+    fn comma_separated_from_is_still_rejected() {
+        // カンマ結合(`FROM a, b`)はこの章では対応しない(本文の解説を参照)。
+        let err = parse_statement("SELECT a.x FROM a, b").unwrap_err();
+        assert!(matches!(err, DbError::Parse { .. }));
     }
 
     #[test]

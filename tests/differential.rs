@@ -544,3 +544,94 @@ fn order_by_an_aggregate_outside_the_select_list_matches_sqlite() {
         "SELECT dept FROM orders GROUP BY dept ORDER BY COUNT(*) DESC, dept",
     );
 }
+
+// ---- 第22章: JOIN(Nested Loop Join、Hash Join) ----
+
+#[test]
+fn inner_equi_join_matches_sqlite() {
+    assert_same_result(
+        &[
+            "CREATE TABLE customers (id BIGINT NOT NULL, name TEXT)",
+            "CREATE TABLE orders (customer_id BIGINT, item TEXT)",
+            "INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')",
+            "INSERT INTO orders VALUES (1, 'apple'), (1, 'banana'), (2, 'cherry')",
+        ],
+        "SELECT customers.name, orders.item FROM customers JOIN orders ON customers.id = orders.customer_id",
+    );
+}
+
+#[test]
+fn inner_join_drops_rows_with_a_null_join_key_just_like_sqlite() {
+    // `customer_id`がNULLの注文は、どの顧客の`id`とも一致しようがない
+    // (`NULL = NULL`はUNKNOWN)。minidbのHash Join・SQLiteのどちらも、
+    // この行を結合結果から自然に落とすはずである。
+    assert_same_result(
+        &[
+            "CREATE TABLE customers (id BIGINT NOT NULL, name TEXT)",
+            "CREATE TABLE orders (customer_id BIGINT, item TEXT)",
+            "INSERT INTO customers VALUES (1, 'Alice')",
+            "INSERT INTO orders VALUES (1, 'apple'), (NULL, 'orphan')",
+        ],
+        "SELECT customers.name, orders.item FROM customers JOIN orders ON customers.id = orders.customer_id",
+    );
+}
+
+#[test]
+fn inner_join_on_a_non_equality_condition_matches_sqlite() {
+    assert_same_result(
+        &[
+            "CREATE TABLE a (id BIGINT NOT NULL)",
+            "CREATE TABLE b (id BIGINT NOT NULL)",
+            "INSERT INTO a VALUES (1), (2), (3)",
+            "INSERT INTO b VALUES (1), (2)",
+        ],
+        "SELECT a.id, b.id FROM a JOIN b ON a.id > b.id",
+    );
+}
+
+#[test]
+fn three_way_join_matches_sqlite() {
+    assert_same_result(
+        &[
+            "CREATE TABLE customers (id BIGINT NOT NULL, name TEXT)",
+            "CREATE TABLE orders (customer_id BIGINT, item TEXT)",
+            "CREATE TABLE shippers (item TEXT, carrier TEXT)",
+            "INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob')",
+            "INSERT INTO orders VALUES (1, 'apple'), (2, 'banana')",
+            "INSERT INTO shippers VALUES ('apple', 'FastCo'), ('banana', 'SlowCo')",
+        ],
+        "SELECT customers.name, shippers.carrier FROM customers \
+         JOIN orders ON customers.id = orders.customer_id \
+         JOIN shippers ON orders.item = shippers.item",
+    );
+}
+
+#[test]
+fn join_with_where_and_group_by_matches_sqlite() {
+    assert_same_result(
+        &[
+            "CREATE TABLE customers (id BIGINT NOT NULL, name TEXT)",
+            "CREATE TABLE orders (customer_id BIGINT, item TEXT)",
+            "INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob')",
+            "INSERT INTO orders VALUES (1, 'apple'), (1, 'banana'), (2, 'cherry')",
+        ],
+        "SELECT customers.name, COUNT(*) FROM customers JOIN orders ON customers.id = orders.customer_id \
+         WHERE orders.item <> 'banana' GROUP BY customers.name",
+    );
+}
+
+#[test]
+fn duplicate_join_keys_produce_a_cross_product_of_matching_rows_like_sqlite() {
+    // 両側に同じ結合キーの行が複数あるとき、結果はその組み合わせの数だけ
+    // 増える(2件×2件=4件)。Hash Joinの`build`が鍵ごとに複数行を保持できて
+    // いることを、SQLiteとの突き合わせで確認する。
+    assert_same_result(
+        &[
+            "CREATE TABLE a (id BIGINT NOT NULL, label TEXT)",
+            "CREATE TABLE b (id BIGINT NOT NULL, note TEXT)",
+            "INSERT INTO a VALUES (1, 'a1'), (1, 'a2')",
+            "INSERT INTO b VALUES (1, 'b1'), (1, 'b2')",
+        ],
+        "SELECT a.label, b.note FROM a JOIN b ON a.id = b.id",
+    );
+}

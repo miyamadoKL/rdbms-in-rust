@@ -72,6 +72,9 @@ pub enum Keyword {
     Distinct,
     Group,
     Having,
+    Inner,
+    Join,
+    On,
 }
 
 impl Keyword {
@@ -112,6 +115,9 @@ impl Keyword {
             "DISTINCT" => Keyword::Distinct,
             "GROUP" => Keyword::Group,
             "HAVING" => Keyword::Having,
+            "INNER" => Keyword::Inner,
+            "JOIN" => Keyword::Join,
+            "ON" => Keyword::On,
             _ => return None,
         };
         Some(keyword)

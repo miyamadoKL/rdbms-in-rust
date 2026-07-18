@@ -74,21 +74,21 @@ pub fn eval_expr(expr: &Expr, functions: &FunctionRegistry, row: Option<&Row>) -
 /// `eval_expr`の`Expr::ColumnRef`とは異なり、この索引は束縛の時点で検査済み
 /// なので、ここでの`get_index`は`Schema`に対する再検証を行わない。
 ///
-/// `table_ordinal`は現在は常に`0`である(この章のSQLサブセットは`FROM`に
-/// 1テーブルしか持てないため)。第22章の`JOIN`で複数テーブルの行を同時に
-/// 扱うようになったとき、`row`は1個の`Row`ではなく`table_ordinal`で選ぶ
-/// 複数の`Row`の並びに置き換わる。
+/// `table_ordinal`は、複数のテーブルを結合した`JOIN`(第22章)であっても
+/// `eval_bound_expr`自身は参照しない。`Binder`が`column_index`をすでに
+/// **結合後スキーマ**(`tables`を左から右へ連結した列の並び)上のフラットな
+/// 添字へ変換済みだからである(`binder`モジュールの`BoundSelect`ドキュメント
+/// 参照)。`row`は、`Join`演算子が左右のタプルを連結して作った1個の`Tuple`を
+/// 指す`Row`であり、単一テーブルの`SELECT`と同じ`get_index`だけで列参照を
+/// 解決できる。`table_ordinal`は主にエラーメッセージや`EXPLAIN`表示のための
+/// 付随情報として残してある。
 pub fn eval_bound_expr(expr: &BoundExpr, functions: &FunctionRegistry, row: Option<&Row>) -> DbResult<Value> {
     match expr {
         BoundExpr::IntLiteral { value, .. } => Ok(Value::BigInt(*value)),
         BoundExpr::StringLiteral { value, .. } => Ok(Value::Text(value.clone())),
         BoundExpr::BoolLiteral { value, .. } => Ok(Value::Boolean(*value)),
         BoundExpr::NullLiteral { .. } => Ok(Value::Null),
-        BoundExpr::ColumnRef { table_ordinal, column_index, name, .. } => {
-            debug_assert_eq!(
-                *table_ordinal, 0,
-                "この章のFROMは1テーブルのみなのでtable_ordinalは常に0のはず(第22章のJOINで変わる)"
-            );
+        BoundExpr::ColumnRef { column_index, name, .. } => {
             match row {
                 Some(row) => row
                     .get_index(*column_index)

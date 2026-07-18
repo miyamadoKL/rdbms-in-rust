@@ -61,7 +61,7 @@
 
 use std::fmt;
 
-use crate::ast::{BinaryOperator, Expr, UnaryOperator};
+use crate::ast::{BinaryOperator, Expr, JoinKind, UnaryOperator};
 use crate::binder::{
     AggregateCall, BoundAssignment, BoundDelete, BoundExpr, BoundInsert, BoundSelect, BoundSelectItem, BoundUpdate,
 };
@@ -83,6 +83,11 @@ pub enum LogicalPlan {
     /// `predicate`が`TRUE`になった行だけを残す。`WHERE`と`HAVING`のどちらも
     /// このノードで表す(モジュール冒頭の説明を参照)。
     Filter(FilterNode),
+    /// `left`・`right`を`condition`に従って結合する(第22章)。`left`・`right`
+    /// の出力を1行ずつ連結した行(結合後スキーマ)を生成する。複数の`JOIN`は
+    /// 左深い木(left-deep tree)として表現し、`n`個の`JOIN`を持つ`FROM`は
+    /// `n`個の`Join`ノードが縦に連なる形になる(`build_select`参照)。
+    Join(JoinNode),
     /// `group_by`の値が等しい行をグループ化し、グループごとに`calls`を計算する
     /// (第21章)。
     Aggregate(AggregateNode),
@@ -131,6 +136,22 @@ pub struct ValuesNode {
 pub struct FilterNode {
     pub input: Box<LogicalPlan>,
     pub predicate: BoundExpr,
+}
+
+/// [`LogicalPlan::Join`]が持つ情報(第22章)。
+///
+/// `condition`の中の`BoundExpr::ColumnRef`が持つ`column_index`は、
+/// `left.output_schema()`と`right.output_schema()`を連結した結合後スキーマ
+/// 上のフラットな添字である(`binder`モジュールの`BoundSelect`ドキュメント
+/// 参照)。`left`が左深い木の途中(それ自体が別の`Join`)であっても、その
+/// 出力列の並びは元の`FROM`に登場したテーブルの列をそのまま連結したものに
+/// なるため、この規則は木の深さに関係なく成り立つ。
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinNode {
+    pub left: Box<LogicalPlan>,
+    pub right: Box<LogicalPlan>,
+    pub kind: JoinKind,
+    pub condition: BoundExpr,
 }
 
 /// [`LogicalPlan::Projection`]が持つ情報。
@@ -233,6 +254,7 @@ impl LogicalPlan {
             LogicalPlan::Scan(scan) => scan.schema.clone(),
             LogicalPlan::Values(values) => values.schema.clone(),
             LogicalPlan::Filter(filter) => filter.input.output_schema(),
+            LogicalPlan::Join(join) => join_schema(&join.left.output_schema(), &join.right.output_schema()),
             LogicalPlan::Aggregate(aggregate) => aggregate.schema.clone(),
             LogicalPlan::Projection(projection) => {
                 projection_schema(&projection.input.output_schema(), &projection.projection)
@@ -249,6 +271,7 @@ impl LogicalPlan {
         match self {
             LogicalPlan::Scan(_) | LogicalPlan::Values(_) => Vec::new(),
             LogicalPlan::Filter(filter) => vec![&filter.input],
+            LogicalPlan::Join(join) => vec![&join.left, &join.right],
             LogicalPlan::Aggregate(aggregate) => vec![&aggregate.input],
             LogicalPlan::Projection(projection) => vec![&projection.input],
             LogicalPlan::Distinct(distinct) => vec![&distinct.input],
@@ -269,6 +292,7 @@ impl LogicalPlan {
                 format!("Values({} {row_word})", values.rows.len())
             }
             LogicalPlan::Filter(filter) => format!("Filter({})", fmt_bound_expr(&filter.predicate)),
+            LogicalPlan::Join(join) => format!("Join({}, {})", join.kind.name(), fmt_bound_expr(&join.condition)),
             LogicalPlan::Aggregate(aggregate) => {
                 let group_by: Vec<String> = aggregate.group_by.iter().map(fmt_bound_expr).collect();
                 let calls: Vec<String> = aggregate.calls.iter().map(fmt_aggregate_call).collect();
@@ -362,11 +386,51 @@ pub fn projection_schema(input_schema: &Schema, projection: &[BoundSelectItem]) 
     Schema::new(out_columns)
 }
 
+/// `Join`が生成する行の`Schema`を、左右の`Schema`から組み立てる。
+/// 単純に列を連結するだけであり、同名の列が両側にあってもここでは
+/// 衝突を検査しない(重複した列名を許すのはSQLの中間結果として自然な
+/// ことであり、`Binder`は`column_index`を使うぶんこの重複を気にしない。
+/// 利用者が最終的に見る出力列名は、常にこの`Schema`を直接ではなく
+/// `SELECT`の`projection`(`Binder`が展開・解決済み)から決まる)。
+pub fn join_schema(left: &Schema, right: &Schema) -> Schema {
+    let mut columns = Vec::with_capacity(left.len() + right.len());
+    columns.extend(left.columns().iter().cloned());
+    columns.extend(right.columns().iter().cloned());
+    Schema::new(columns)
+}
+
+/// `BoundSelect::tables`・`joins`から`FROM`部分の木を組み立てる。
+///
+/// `tables`が空なら(`FROM`を伴わない`SELECT`)列を持たない`Values`を1件返す。
+/// そうでなければ、先頭のテーブルを`Scan`にし、以降のテーブルを`joins`の
+/// 対応する`ON`条件で1つずつ`Join`として重ねていく。`n`個の`JOIN`から
+/// できる木は、`((table0 JOIN table1) JOIN table2) JOIN ...`という左深い木
+/// (left-deep tree)になる。`tables[i]`と`joins[i - 1]`が対応する
+/// (`Binder::bind_from`のドキュメント参照)。
+fn build_from(tables: Vec<crate::binder::BoundTableRef>, joins: Vec<crate::binder::BoundJoinStep>) -> LogicalPlan {
+    let mut tables = tables.into_iter();
+    let Some(first) = tables.next() else {
+        return LogicalPlan::Values(ValuesNode { schema: Schema::new(Vec::new()), rows: vec![Vec::new()] });
+    };
+
+    let mut plan = LogicalPlan::Scan(ScanNode { table_id: first.table_id, table_name: first.table_name, schema: first.schema });
+    for (table, join) in tables.zip(joins) {
+        let right = LogicalPlan::Scan(ScanNode { table_id: table.table_id, table_name: table.table_name, schema: table.schema });
+        plan = LogicalPlan::Join(JoinNode {
+            left: Box::new(plan),
+            right: Box::new(right),
+            kind: join.kind,
+            condition: join.condition,
+        });
+    }
+    plan
+}
+
 /// `BoundStatement::Select`を`LogicalPlan`へ変換する。
 ///
-/// `FROM`があれば`Scan`を根にし、無ければ列を持たない行を1件生成する
-/// `Values`を根にする。どちらの場合も、`WHERE`があれば`Filter`を、最後に
-/// 必ず`Projection`を積む。
+/// `FROM`があれば`Scan`(`JOIN`があれば`Join`を重ねた左深い木)を根にし、
+/// 無ければ列を持たない行を1件生成する`Values`を根にする。どちらの場合も、
+/// `WHERE`があれば`Filter`を、最後に必ず`Projection`を積む。
 ///
 /// ```text
 /// SELECT name FROM users WHERE id = 42
@@ -389,17 +453,7 @@ pub fn projection_schema(input_schema: &Schema, projection: &[BoundSelectItem]) 
 /// 2段構成だったのに対し、この章では`select`が持つ情報の有無に応じて木の
 /// 深さそのものが変わる。
 pub fn build_select(select: BoundSelect) -> LogicalPlan {
-    let source = match select.tables.into_iter().next() {
-        Some(table) => LogicalPlan::Scan(ScanNode {
-            table_id: table.table_id,
-            table_name: table.table_name,
-            schema: table.schema,
-        }),
-        None => LogicalPlan::Values(ValuesNode {
-            schema: Schema::new(Vec::new()),
-            rows: vec![Vec::new()],
-        }),
-    };
+    let source = build_from(select.tables, select.joins);
 
     let filtered = match select.predicate {
         Some(predicate) => LogicalPlan::Filter(FilterNode { input: Box::new(source), predicate }),
@@ -630,7 +684,7 @@ mod tests {
         else {
             panic!("Selectを期待した");
         };
-        let plan = build_select(select);
+        let plan = build_select(*select);
         assert_eq!(
             plan.to_string(),
             "Projection(name)\n  └─ Filter(id = 42)\n    └─ Scan(users)\n"
@@ -643,7 +697,7 @@ mod tests {
         let crate::binder::BoundStatement::Select(select) = bind("SELECT 1 + 1", &catalog) else {
             panic!("Selectを期待した");
         };
-        let plan = build_select(select);
+        let plan = build_select(*select);
         assert_eq!(plan.to_string(), "Projection(1 + 1)\n  └─ Values(1 row)\n");
     }
 
@@ -653,7 +707,7 @@ mod tests {
         let crate::binder::BoundStatement::Select(select) = bind("SELECT id FROM users", &catalog) else {
             panic!("Selectを期待した");
         };
-        let plan = build_select(select);
+        let plan = build_select(*select);
         assert_eq!(plan.to_string(), "Projection(id)\n  └─ Scan(users)\n");
     }
 
@@ -663,7 +717,7 @@ mod tests {
         let crate::binder::BoundStatement::Select(select) = bind("SELECT id, name FROM users", &catalog) else {
             panic!("Selectを期待した");
         };
-        let plan = build_select(select);
+        let plan = build_select(*select);
         let schema = plan.output_schema();
         let names: Vec<&str> = schema.columns().iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["id", "name"]);

@@ -132,15 +132,50 @@ impl AggregateFunc {
     }
 }
 
-/// `SELECT`の`FROM <table> [AS <alias>]`。
+/// `SELECT`の`FROM <table> [AS <alias>] [<JOIN> ...]`。
 ///
 /// `alias`があれば、`table`自身の名前は`Binder`(第17章)による列参照の解決では
 /// 使えなくなる(`AS`はテーブルを新しい名前で覆い隠す、標準SQLの規則)。
 /// `alias`が無い場合は`table`の名前がそのまま修飾子として使える。
+///
+/// `joins`は、`table`の右側へ順に連結する`INNER JOIN`の並び(第22章)。
+/// 空なら単一テーブルの`FROM`であり、この場合は第17章までと同じ意味を持つ。
+/// カンマ区切りの複数テーブル(`FROM a, b`)はこの章では構文として受理しない
+/// (`parser`モジュールのドキュメント、および本文の解説を参照)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct FromClause {
     pub table: Ident,
     pub alias: Option<Ident>,
+    pub joins: Vec<JoinClause>,
+    pub span: Span,
+}
+
+/// `JOIN`の種類(第22章)。この章では`INNER`(`JOIN`単独も同義)のみを扱う。
+/// `LEFT OUTER JOIN`等は章末の演習課題で追加する対象として、あえて
+/// バリアントを1つだけに絞ってある。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+}
+
+impl JoinKind {
+    /// `EXPLAIN`・エラーメッセージでの表示名。
+    pub fn name(self) -> &'static str {
+        match self {
+            JoinKind::Inner => "INNER JOIN",
+        }
+    }
+}
+
+/// `FROM`に続く1個の`[INNER] JOIN <table> [AS <alias>] ON <expr>`(第22章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinClause {
+    pub kind: JoinKind,
+    pub table: Ident,
+    pub alias: Option<Ident>,
+    /// `ON`に続く結合条件。`WHERE`と同じくBOOLEANを返す式でなければならない
+    /// (`Binder::bind_from`が検査する)。
+    pub on: Expr,
     pub span: Span,
 }
 
