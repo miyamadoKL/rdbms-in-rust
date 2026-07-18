@@ -1,10 +1,13 @@
-//! SQL文字列を受け取り、結果を返す最初の縦切り。
+//! SQL文字列を受け取り、結果を返す実行の入口。
 //!
-//! `Database::execute`は、この章時点では`toy_sql`の仮パーサに解析を委ね、
-//! 得られた式を評価して1行だけの`QueryResult`を返す。
+//! `Database::execute`は、まずSQL文字列を`parser::parse_statement`でASTへ変換する。
+//! 実際に実行できるのは、`FROM`を伴わない`SELECT`の式リストのうち、リテラルと
+//! 整数の加算だけである。`CREATE TABLE`・`INSERT`・`FROM`/`WHERE`付きの`SELECT`は
+//! 構文解析までは通るが、実行するとカタログや式評価が揃う章(第8〜10章)を指し示す
+//! `DbError::NotImplemented`を返す。
 
-use crate::error::DbResult;
-use crate::toy_sql;
+use crate::ast::{BinaryOperator, Expr, SelectStatement, Statement};
+use crate::error::{DbError, DbResult};
 use crate::types::{Column, Schema, Tuple, Value};
 
 /// minidbのデータベース1つを表す。
@@ -21,22 +24,80 @@ impl Database {
 
     /// SQL文字列を1本実行し、結果を返す。
     ///
-    /// 現時点で受理できる構文は`SELECT <式>;`のみ。構文の解析は`toy_sql`の
-    /// 仮実装に委ねている。
+    /// 構文解析(`parser::parse_statement`)がまず走り、`DbError::Lex`または
+    /// `DbError::Parse`はそのまま呼び出し元に伝わる。構文解析に成功しても、
+    /// この章の時点で実行できない構文(`FROM`/`WHERE`付き`SELECT`、
+    /// `CREATE TABLE`、`INSERT`)は`DbError::NotImplemented`を返す。
     pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
-        let select = toy_sql::parse_select(sql)?;
-        let value = select.expr.eval();
-        let data_type = value
-            .data_type()
-            .expect("toy_sqlが生成する式はリテラルの評価結果しか返さず、NULLにはならない");
+        let statement = crate::parser::parse_statement(sql)?;
+        match statement {
+            Statement::Select(select) => self.execute_select(sql, &select),
+            Statement::CreateTable(_) => Err(DbError::NotImplemented(
+                "CREATE TABLEの実行(カタログへの登録)は第9章で対応します".to_string(),
+            )),
+            Statement::Insert(_) => Err(DbError::NotImplemented(
+                "INSERTの実行(表への追加)は第10章で対応します".to_string(),
+            )),
+        }
+    }
 
-        let schema = Schema::new(vec![Column::new(select.expr_text, data_type, false)]);
-        let tuple = Tuple::new(&schema, vec![value])?;
+    fn execute_select(&self, sql: &str, select: &SelectStatement) -> DbResult<QueryResult> {
+        if select.from.is_some() || select.where_clause.is_some() {
+            return Err(DbError::NotImplemented(
+                "FROM・WHEREを伴うSELECTの実行(カタログと表の参照)は第9〜10章で対応します"
+                    .to_string(),
+            ));
+        }
+
+        let mut columns = Vec::with_capacity(select.items.len());
+        let mut values = Vec::with_capacity(select.items.len());
+        for item in &select.items {
+            let value = eval_expr(&item.expr)?;
+            let data_type = value.data_type().expect(
+                "eval_exprがこの章で返すのはリテラルの評価結果だけであり、NULLにはならない",
+            );
+            let name = sql[item.span.start..item.span.end].to_string();
+            columns.push(Column::new(name, data_type, false));
+            values.push(value);
+        }
+
+        let schema = Schema::new(columns);
+        let tuple = Tuple::new(&schema, values)?;
 
         Ok(QueryResult {
             schema,
             rows: vec![tuple],
         })
+    }
+}
+
+/// 式を評価して`Value`を返す。
+///
+/// この章で評価できるのは、リテラルと整数どうしの加算(`+`)だけである。
+/// それ以外の構文(減算・乗除・比較・論理演算・`IS NULL`・列参照・関数呼び出し)は、
+/// 構文解析はこの章で完成しているが、評価の意味づけ(型変換、三値論理、NULL伝播)は
+/// 第8章の役目なので、ここでは`DbError::NotImplemented`を返す。
+fn eval_expr(expr: &Expr) -> DbResult<Value> {
+    match expr {
+        Expr::IntLiteral { value, .. } => Ok(Value::BigInt(*value)),
+        Expr::StringLiteral { value, .. } => Ok(Value::Text(value.clone())),
+        Expr::BoolLiteral { value, .. } => Ok(Value::Boolean(*value)),
+        Expr::NullLiteral { .. } => Ok(Value::Null),
+        Expr::Paren { expr, .. } => eval_expr(expr),
+        Expr::BinaryOp {
+            op: BinaryOperator::Add,
+            lhs,
+            rhs,
+            ..
+        } => match (eval_expr(lhs)?, eval_expr(rhs)?) {
+            (Value::BigInt(l), Value::BigInt(r)) => Ok(Value::BigInt(l + r)),
+            _ => Err(DbError::NotImplemented(
+                "整数以外の加算・型変換は第8章の式評価で対応します".to_string(),
+            )),
+        },
+        _ => Err(DbError::NotImplemented(
+            "この式の評価は第8章の式評価で対応します".to_string(),
+        )),
     }
 }
 
@@ -124,10 +185,39 @@ mod tests {
     }
 
     #[test]
+    fn executes_chained_addition_left_to_right() {
+        let mut db = Database::memory();
+        let result = db.execute("SELECT 1 + 2 + 3;").unwrap();
+        assert_eq!(result.rows()[0].values(), &[Value::BigInt(6)]);
+    }
+
+    #[test]
+    fn multiplication_parses_but_is_not_evaluated_yet() {
+        // `parser`は`1 + 2 * 3`を`1 + (2 * 3)`という正しい木に組み立てる
+        // (`parser`のテストで確認済み)。ただし乗算の評価自体は第8章の対象なので、
+        // `execute`はこの式を解析はできても評価できず`NotImplemented`を返す。
+        let mut db = Database::memory();
+        let result = db.execute("SELECT 1 + 2 * 3;");
+        assert!(matches!(result, Err(DbError::NotImplemented(_))));
+    }
+
+    #[test]
+    fn executes_multiple_select_items() {
+        let mut db = Database::memory();
+        let result = db.execute("SELECT 1, 2 + 3;").unwrap();
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::BigInt(1), Value::BigInt(5)]
+        );
+        assert_eq!(result.schema().columns()[0].name, "1");
+        assert_eq!(result.schema().columns()[1].name, "2 + 3");
+    }
+
+    #[test]
     fn propagates_parse_error() {
         let mut db = Database::memory();
         let result = db.execute("this is not sql");
-        assert!(matches!(result, Err(DbError::Parse(_))));
+        assert!(matches!(result, Err(DbError::Parse { .. })));
     }
 
     #[test]
@@ -155,5 +245,26 @@ mod tests {
         let mut db = Database::memory();
         let result = db.execute("SELECT 1;").unwrap();
         assert_eq!(result.to_string(), "1\n-\n1\n(1 row)");
+    }
+
+    #[test]
+    fn select_with_from_is_not_implemented_yet() {
+        let mut db = Database::memory();
+        let result = db.execute("SELECT id FROM users");
+        assert!(matches!(result, Err(DbError::NotImplemented(_))));
+    }
+
+    #[test]
+    fn create_table_is_not_implemented_yet() {
+        let mut db = Database::memory();
+        let result = db.execute("CREATE TABLE users (id BIGINT NOT NULL)");
+        assert!(matches!(result, Err(DbError::NotImplemented(_))));
+    }
+
+    #[test]
+    fn insert_is_not_implemented_yet() {
+        let mut db = Database::memory();
+        let result = db.execute("INSERT INTO users VALUES (1)");
+        assert!(matches!(result, Err(DbError::NotImplemented(_))));
     }
 }

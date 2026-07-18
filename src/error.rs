@@ -19,9 +19,19 @@ pub enum DbError {
     #[error("スキーマ不一致: {0}")]
     SchemaMismatch(String),
 
-    /// SQL文字列を構文解析できなかったエラー。
-    #[error("構文エラー: {0}")]
-    Parse(String),
+    /// SQL文字列を構文解析できなかったエラー。発生位置の行・列を持つ。
+    ///
+    /// `Lex`と表示形式を揃えている(`行N列M: 種別: メッセージ`)。字句解析までは
+    /// 成功したが、Token列がこのSQLサブセットの文法に適合しない場合に返す。
+    #[error("行{line}列{column}: 構文エラー: {message}")]
+    Parse {
+        /// エラーの内容。
+        message: String,
+        /// 発生位置の行番号(1始まり)。
+        line: usize,
+        /// 発生位置の列番号(1始まり)。
+        column: usize,
+    },
 
     /// SQL文字列をToken列へ変換できなかったエラー。発生位置の行・列を持つ。
     #[error("行{line}列{column}: 字句エラー: {message}")]

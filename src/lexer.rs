@@ -17,7 +17,9 @@ pub struct Span {
 }
 
 impl Span {
-    fn new(start: usize, end: usize) -> Self {
+    /// クレート内の他モジュール(構文解析器など)が、複数のTokenのSpanを
+    /// 結合してより大きな構文要素のSpanを作れるよう`pub(crate)`にしている。
+    pub(crate) fn new(start: usize, end: usize) -> Self {
         Span { start, end }
     }
 }
