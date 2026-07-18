@@ -413,7 +413,8 @@ pub fn create_table(&mut self, name: &str, schema: Schema) -> DbResult<TableId> 
 
 `self.next_table_id += 1`ではなく`checked_add(1)`を使っているのは、`next_table_id`が`u64::MAX`のときに素朴な加算だとオーバーフローするからです。
 debugビルドではpanicし、releaseビルドでは`0`へ巻き戻って`TableId`の一意性が壊れます。
-`Storage::open`が`next_table_id == u64::MAX`のカタログをすでに`DbError::CorruptCatalog`として拒む(次の節を参照)ため、通常この分岐に到達するのは`u64::MAX`回`create_table`を呼び続けた場合に限られますが、その防御をすり抜けてメモリ上だけで`next_table_id`が`u64::MAX`に達した場合の二重の備えとして`checked_add`を使っています。
+`next_table_id == u64::MAX`は「有効な`TableId`を払い出し尽くした」という正当な状態であり、`Storage::open`はこれを拒みません(次の節を参照)。
+制限を課すのは「そのファイルを開けるかどうか」ではなく「新しい`TableId`を実際に払い出そうとする瞬間」であるべきなので、`checked_add`によるこの検査は`create_table`だけが担います。
 
 `TableInfo`は第9章の`Catalog`がすでに持っていた型(`id`、`name`、`schema`)をそのまま再利用しています。
 `insert`、`get`、`update`、`delete`は`TableId`を受け取り、名前からの解決は呼び出し側(次章で`Database`が担う想定)に任せる作りにしてあります。
@@ -585,9 +586,16 @@ assert!(matches!(err, DbError::CorruptCatalog(_)));
 そうなったファイルは、以後`DiskManager::open`のMagic Number検証にすら通らなくなり、二度と開けません。
 
 `Storage::open`は、`decode_catalog`が返した状態を`fsm`へ組み立てる前に、この種の矛盾をまとめて検証します。
-確認するのは、`next_table_id`が`u64::MAX`ではないこと(`u64::MAX`のままだと、次の`create_table`が`self.next_table_id`への加算でオーバーフローします)、参照している`PageId`が実際のページ数の範囲内にあること、Meta(`PageId(0)`)とCatalog(`PageId(1)`)という予約ページを指していないこと、あるページが複数のテーブル(または`free_pages`)に同時に属していないこと、そのページが実際に`PageType::Data`であること、テーブル定義の側では`TableId`とテーブル名が重複しておらず`next_table_id`より小さいこと、の6点です。
+確認するのは、参照している`PageId`が実際のページ数の範囲内にあること、Meta(`PageId(0)`)とCatalog(`PageId(1)`)という予約ページを指していないこと、あるページが複数のテーブル(または`free_pages`)に同時に属していないこと、そのページが実際に`PageType::Data`であること、テーブル定義の側では`TableId`とテーブル名が重複しておらず`next_table_id`より小さいこと、の5点です。
 1つ目の実験がバイト列そのものの整合性(checksum)を、2つ目の実験がバイト列の**構造**の整合性(宣言された長さと実際の残りバイト数の対応)を、3つ目の実験がバイト列の**意味**の整合性(参照しているページとテーブル定義が矛盾なく成り立つこと)を、それぞれ別の層で検証しているとわかります。
 Catalogページというたった1枚のページの安全性は、この3段の検査が揃って初めて成り立っています。
+
+意図して検証しない項目が1つあります。
+`next_table_id == u64::MAX`です。
+これは「有効な`TableId`をすべて払い出し尽くした」という、それ自体は矛盾のない状態であり、そのカタログを持つファイルは何度でも`open`できなければなりません。
+もし`open`がこの値を`CorruptCatalog`として拒んでいたら、`next_table_id == u64::MAX - 1`のカタログから`create_table`をちょうど1回成功させて`next_table_id`が`u64::MAX`になった直後、そのファイルは二度と`open`できなくなってしまいます。
+成功しただけの操作が、後から見ると「壊れたファイルを作った」ことになるのは受け入れられません。
+制限を課すべきなのは「そのファイルを開けるかどうか」ではなく「新しい`TableId`を実際に払い出そうとする瞬間」であり、それは`create_table`の`checked_add`(前の節を参照)が担います。
 
 ## 演習問題
 

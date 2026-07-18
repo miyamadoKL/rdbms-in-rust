@@ -358,7 +358,9 @@ fn read_header(payload: &[u8]) -> (u16, u16) {
 /// スロットを`offset`でソートしてから隣接する範囲だけを比べる
 /// `O(slot_count log slot_count)`で行う。1ページに収まるスロット数は最大でも
 /// 500程度(`PAGE_PAYLOAD_SIZE / SLOT_ENTRY_SIZE`)なので、`open`のたびに
-/// 毎回この検査を行ってもコストは無視できる。
+/// 毎回この検査を行ってもコストは無視できる。長さ0のタプル(`start == end`)は
+/// どのバイトも占有せず、他のどの範囲とも交差しえないため、この検査に渡す前に
+/// 除外する(理由の詳細は下の実装のコメントを参照)。
 fn validate_header(payload: &[u8]) -> DbResult<()> {
     if payload.len() < SLOTTED_HEADER_SIZE {
         return Err(DbError::CorruptPage(format!(
@@ -400,7 +402,18 @@ fn validate_header(payload: &[u8]) -> DbResult<()> {
                         payload.len()
                     )));
                 }
-                occupied_ranges.push((start, end));
+                // 長さ0のタプル(`start == end`、空の`&[]`をinsertした場合に
+                // 実際に起こりうる)は、どのバイトも占有しないため他のどの
+                // 範囲とも重なりえない。これを重複検査の対象へそのまま
+                // 加えると、同じ`start`を持つ空区間と非空区間(たとえば
+                // `[4079, 4079)`と`[4079, 4080)`)が、`start`だけをキーにした
+                // ソートの並び順(どちらが先に来るかは不定)次第で誤って
+                // 「重なっている」と判定されることがある。空区間はそもそも
+                // 交差判定の対象になりえないので、ここで除外しておくのが
+                // もっとも単純で取りこぼしのない直し方である。
+                if start != end {
+                    occupied_ranges.push((start, end));
+                }
             }
             STATUS_TOMBSTONE => {}
             other => {
@@ -627,6 +640,42 @@ mod tests {
             SlottedPageRef::open(&payload),
             Err(DbError::CorruptPage(_))
         ));
+    }
+
+    #[test]
+    fn open_accepts_a_page_containing_zero_length_tuples_in_any_insertion_order() {
+        // 回帰テスト: 長さ0のタプル(空の`&[]`)を挿入すると、その範囲は
+        // start == endの空区間になる。以前の実装は、この空区間と別のスロットの
+        // 非空区間がたまたま同じstartを持つ場合(例: 非空区間[4079, 4080)の
+        // 直後に空タプルをinsertすると、その空区間は[4079, 4079)になる)、
+        // 「startだけをキーにしたソート」の並び順が不定なせいで、両者を
+        // 誤って「重なっている」と判定しopenをCorruptPageで失敗させることが
+        // あった。非空→空、空→非空、空→空という3つの挿入順のどれでも、
+        // insert直後・compact後のどちらでも再openできることを確認する。
+        let cases: [(&[u8], &[u8]); 3] = [(b"x", b""), (b"", b"x"), (b"", b"")];
+        for (first, second) in cases {
+            let mut payload = fresh_payload();
+            let (s1, s2) = {
+                let mut page = SlottedPage::init(&mut payload);
+                let s1 = page.insert(first).unwrap();
+                let s2 = page.insert(second).unwrap();
+                (s1, s2)
+            };
+
+            assert!(SlottedPageRef::open(&payload).is_ok());
+            {
+                let mut page = SlottedPage::open(&mut payload).unwrap();
+                assert_eq!(page.get(s1), Some(first));
+                assert_eq!(page.get(s2), Some(second));
+                page.compact();
+                assert_eq!(page.get(s1), Some(first));
+                assert_eq!(page.get(s2), Some(second));
+            }
+
+            // compactの後も、この`payload`をあらためて開き直せる。
+            assert!(SlottedPageRef::open(&payload).is_ok());
+            assert!(SlottedPage::open(&mut payload).is_ok());
+        }
     }
 
     #[test]

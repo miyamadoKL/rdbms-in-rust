@@ -279,12 +279,12 @@ impl Storage {
     /// `next_table_id`がすでに`u64::MAX`で次の`TableId`を安全に割り当てられない
     /// 場合は`DbError::TableIdSpaceExhausted`を返す(`u64`のオーバーフローに
     /// よってdebugビルドでpanicする、releaseビルドで0へ巻き戻って`TableId`の
-    /// 一意性が壊れる、のどちらも避けるため)。`Storage::open`の
-    /// `validate_table_metadata`がCatalogページの`next_table_id`が
-    /// `u64::MAX`であることをすでに`DbError::CorruptCatalog`として拒否している
-    /// ため、通常この分岐に到達するのは`u64::MAX`回`create_table`を呼び続けた
-    /// 場合に限られる。ここでの`checked_add`は、その防御をすり抜けて
-    /// メモリ上だけで`next_table_id`が`u64::MAX`に達した場合の二重の備えである。
+    /// 一意性が壊れる、のどちらも避けるため)。`Storage::open`は
+    /// `next_table_id == u64::MAX`のカタログを「有効な`TableId`を払い出し
+    /// 尽くした」という正当な状態として受理し、拒否しない(`validate_table_metadata`
+    /// のドキュメントを参照)。つまりこの分岐は`Storage::open`側の防御の
+    /// すり抜けを拾う二重の備えではなく、`next_table_id`の上限をここ
+    /// (`create_table`)だけで一元的に守るための唯一の関所である。
     /// カタログの永続化(`persist_catalog`)に失敗した場合(たとえば
     /// `DbError::CatalogTooLarge`)は、メモリ上の登録も取り消す。カタログに
     /// 書き出せていないテーブルをメモリ上にだけ存在させておくと、次の操作で
@@ -630,21 +630,25 @@ impl Storage {
 /// ある検査(範囲・予約ページ・共有・`PageType`)は`Storage::open`側の
 /// `claim_page`が担う。
 ///
-/// - `next_table_id`が`u64::MAX`ではないこと。`u64::MAX`のままだと、次の
-///   `create_table`が`TableId(self.next_table_id)`を払い出した直後の
-///   `self.next_table_id += 1`でオーバーフローする(debugビルドではpanic、
-///   releaseビルドでは0へ巻き戻って`TableId`の一意性が壊れる)。
 /// - 各テーブルの`TableId`が`next_table_id`未満であること(そうでなければ、
 ///   次に`create_table`したテーブルが同じ`TableId`を再利用してしまう)。
 /// - テーブル名が重複していないこと(`TableId`自体の重複は`decode_catalog`が
 ///   デコードの時点で検出済み)。
+///
+/// `next_table_id == u64::MAX`はここでは拒まない。
+/// これは「有効な`TableId`をすべて払い出し尽くした」という正当な状態であり
+/// (最後に払い出した`TableId`は`u64::MAX - 1`)、そのカタログを持つファイルは
+/// 何度でも`open`できてよい。制限を課すべきなのは「新しい`TableId`を実際に
+/// 払い出そうとする瞬間」であって、「そのファイルを開けるかどうか」ではない。
+/// もし`open`の時点で`next_table_id == u64::MAX`を`CorruptCatalog`として
+/// 拒んでいたら、`next_table_id == u64::MAX - 1`のカタログから
+/// `create_table`をちょうど1回成功させて`next_table_id`が`u64::MAX`になった
+/// 直後、そのファイルは二度と`open`できなくなってしまう(成功しただけの
+/// 操作が、後から見ると「壊れたファイルを作った」ことになる)。この矛盾を
+/// 避けるため、`next_table_id == u64::MAX`は`open`側では正当なsentinelとして
+/// 受理し、実際にそこから先へ進もうとする`create_table`側だけを
+/// `checked_add`(このモジュールの`Storage::create_table`を参照)で防ぐ。
 fn validate_table_metadata(decoded: &DecodedCatalog) -> DbResult<()> {
-    if decoded.next_table_id == u64::MAX {
-        return Err(DbError::CorruptCatalog(
-            "next_table_idがu64::MAXです(これ以上TableIdを割り当てられません)".to_string(),
-        ));
-    }
-
     let mut seen_names = std::collections::HashSet::new();
     for entry in decoded.tables.values() {
         if entry.info.id.0 >= decoded.next_table_id {
@@ -1182,12 +1186,12 @@ mod tests {
     }
 
     #[test]
-    fn open_rejects_a_catalog_whose_next_table_id_is_u64_max() {
+    fn open_accepts_a_catalog_whose_next_table_id_is_u64_max_as_a_valid_sentinel() {
         // next_table_id=u64::MAX、table_count=0という、checksum・構造ともに
-        // 正常なカタログ。これをそのまま受理すると、次のcreate_tableが
-        // TableId(u64::MAX)を払い出した直後にnext_table_idへの加算で
-        // オーバーフローする(debugビルドはpanic、releaseビルドは0へ巻き戻って
-        // TableIdの一意性が壊れる)。
+        // 正常なカタログ。これは「有効なTableIdを払い出し尽くした」という
+        // 正当な状態であり、openはこれを拒んではならない
+        // (validate_table_metadataのドキュメントを参照)。次にcreate_tableを
+        // 呼んだときだけ、checked_addがTableIdSpaceExhaustedとして拒む。
         let path = temp_path("next-table-id-u64-max");
         Storage::create(&path).unwrap();
 
@@ -1195,17 +1199,21 @@ mod tests {
         let bytes = encode_catalog(u64::MAX, &tables, &[]);
         write_catalog_payload(&path, &bytes);
 
-        let err = expect_err(Storage::open(&path));
-        assert!(matches!(err, DbError::CorruptCatalog(_)));
+        let mut storage = Storage::open(&path).unwrap();
+        assert_eq!(storage.next_table_id, u64::MAX);
+        let err = expect_err(storage.create_table("a", users_schema()));
+        assert!(matches!(err, DbError::TableIdSpaceExhausted));
 
         std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
     fn create_table_rejects_when_next_table_id_would_overflow() {
-        // Storage::openの検証をすり抜けてメモリ上だけでnext_table_idが
-        // u64::MAXに達した場合でも、create_table自身のchecked_addが
-        // オーバーフローをTableIdSpaceExhaustedとして検出する(二重の備え)。
+        // next_table_idがu64::MAXに達している状態は、Storage::openが正当な
+        // sentinelとして受理する(validate_table_metadataのドキュメントを
+        // 参照)。オーバーフローを防ぐ関所はcreate_table自身のchecked_add
+        // だけであり、ここではそれが実際にTableIdSpaceExhaustedを返すことを
+        // 確認する。
         let path = temp_path("create-table-overflow");
         let mut storage = Storage::create(&path).unwrap();
         storage.next_table_id = u64::MAX;
@@ -1215,6 +1223,33 @@ mod tests {
         // 失敗した場合、next_table_idもテーブル一覧も変化しない。
         assert_eq!(storage.next_table_id, u64::MAX);
         assert!(storage.tables.is_empty());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_table_created_right_before_the_table_id_space_is_exhausted_survives_a_reopen() {
+        // next_table_id=u64::MAX-1のカタログから、まさに最後の1つとなる
+        // create_tableを成功させる。永続化されたnext_table_idはu64::MAXに
+        // なるが、それでもreopenは成功しなければならない(u64::MAXは
+        // Storage::openが拒む対象ではなく正当なsentinelである)。reopen後、
+        // 次のcreate_tableだけがTableIdSpaceExhaustedで失敗する。
+        let path = temp_path("last-table-id-before-exhaustion");
+        {
+            let mut storage = Storage::create(&path).unwrap();
+            storage.next_table_id = u64::MAX - 1;
+            let id = storage.create_table("last", users_schema()).unwrap();
+            assert_eq!(id, TableId(u64::MAX - 1));
+            assert_eq!(storage.next_table_id, u64::MAX);
+            storage.flush().unwrap();
+        }
+
+        let mut storage = Storage::open(&path).unwrap();
+        assert_eq!(storage.next_table_id, u64::MAX);
+        assert_eq!(storage.table("last").unwrap().id, TableId(u64::MAX - 1));
+
+        let err = expect_err(storage.create_table("one_more", users_schema()));
+        assert!(matches!(err, DbError::TableIdSpaceExhausted));
 
         std::fs::remove_file(&path).unwrap();
     }
