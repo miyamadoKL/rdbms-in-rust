@@ -86,6 +86,17 @@ pub enum DbError {
     /// evictできる候補が1つもないエラー。
     #[error("バッファプールの全フレームがpin中です: {0}")]
     BufferPoolFull(String),
+
+    /// 永続カタログ(Catalogページ)のバイト列から`Storage`の状態を復元できない
+    /// エラー(宣言されたテーブル数・列数・ページ数が実際のバイト列と矛盾している、
+    /// 未知の`DataType`コードが書かれている、名前が妥当なUTF-8でないなど)。
+    #[error("破損したカタログです: {0}")]
+    CorruptCatalog(String),
+
+    /// `Storage`のカタログ(テーブル定義・Free Page List)をエンコードした結果が
+    /// Catalogページ1枚(`PAGE_PAYLOAD_SIZE`バイト)に収まらないエラー。
+    #[error("カタログがページに収まりません: {0}バイト(上限{1}バイト)")]
+    CatalogTooLarge(usize, usize),
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

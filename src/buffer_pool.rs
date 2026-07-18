@@ -376,6 +376,11 @@ impl PageReadGuard<'_> {
         self.page_id
     }
 
+    /// このGuardが指すページの種類。
+    pub fn page_type(&self) -> PageType {
+        self.page().page_type
+    }
+
     /// ページ本体(`payload`)への読み取り専用アクセス。
     pub fn data(&self) -> &[u8] {
         self.page().payload()
@@ -413,6 +418,11 @@ impl PageWriteGuard<'_> {
     /// このGuardが指すページのID。
     pub fn page_id(&self) -> PageId {
         self.page_id
+    }
+
+    /// このGuardが指すページの種類。
+    pub fn page_type(&self) -> PageType {
+        self.page().page_type
     }
 
     /// ページ本体(`payload`)への読み取り専用アクセス。

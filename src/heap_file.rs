@@ -170,11 +170,7 @@ impl HeapFile {
     /// 全ページを先頭から順に走査し、生きている(削除されていない)全タプルを
     /// `(RecordId, タプルのバイト列)`として返すイテレータ。
     pub fn scan(&self) -> Scan<'_> {
-        Scan {
-            pool: &self.pool,
-            page_ids: self.page_ids.iter(),
-            current: None,
-        }
+        Scan::new(&self.pool, &self.page_ids)
     }
 }
 
@@ -188,6 +184,24 @@ pub struct Scan<'a> {
     pool: &'a BufferPool,
     page_ids: std::slice::Iter<'a, PageId>,
     current: Option<(crate::buffer_pool::PageReadGuard<'a>, u16)>,
+}
+
+impl<'a> Scan<'a> {
+    /// `pool`と`page_ids`を指定して走査を組み立てる。
+    ///
+    /// `HeapFile::scan`が使う入口だが、`pool`は`&BufferPool`、`page_ids`は
+    /// `&[PageId]`という2つの独立した参照だけを要求するため、両方を1つの構造体に
+    /// まとめて所有している`HeapFile`以外からも呼べる。第15章の`Storage`は、
+    /// 複数のテーブルを1つの`BufferPool`の上で管理し、テーブルごとの`page_ids`を
+    /// 別の場所(カタログ)に持つため、`HeapFile`そのものは使わずこの構築子だけを
+    /// 再利用する。
+    pub(crate) fn new(pool: &'a BufferPool, page_ids: &'a [PageId]) -> Self {
+        Scan {
+            pool,
+            page_ids: page_ids.iter(),
+            current: None,
+        }
+    }
 }
 
 impl Iterator for Scan<'_> {

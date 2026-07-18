@@ -14,7 +14,10 @@
 //! Slotted Page(`slotted_page`)と、`Tuple`をそのバイト列との間でencode/decode
 //! する`tuple_codec`、`Page`を実ファイルへ読み書きする`disk_manager`、複数の
 //! ページをまとめて1つのテーブルとして扱う`heap_file`、`disk_manager`の上に
-//! 固定容量のページキャッシュを置く`buffer_pool`が加わる。
+//! 固定容量のページキャッシュを置く`buffer_pool`が加わる。第15章では、
+//! ページごとの空き容量の見積もりを保持する`free_space_map`と、テーブル定義
+//! そのものを1つのファイルへ永続化し、複数のテーブルを1つのファイルに同居させる
+//! ストレージエンジン`storage`が加わる。
 
 pub mod ast;
 pub mod buffer_pool;
@@ -24,12 +27,14 @@ pub mod disk_manager;
 pub mod error;
 pub mod eval;
 pub mod executor;
+pub mod free_space_map;
 pub mod heap_file;
 pub mod ids;
 pub mod lexer;
 pub mod page;
 pub mod parser;
 pub mod slotted_page;
+pub mod storage;
 pub mod storage_mem;
 pub mod tuple_codec;
 pub mod types;
@@ -41,6 +46,7 @@ pub use database::{Database, QueryResult};
 pub use disk_manager::DiskManager;
 pub use error::{DbError, DbResult};
 pub use eval::{FunctionRegistry, eval_expr};
+pub use free_space_map::FreeSpaceMap;
 pub use heap_file::{HeapFile, Scan};
 pub use ids::{PageId, RecordId, SlotId, TableId, TransactionId};
 pub use lexer::{Keyword, Span, Token, TokenKind, tokenize};
@@ -50,6 +56,7 @@ pub use page::{
 };
 pub use parser::parse_statement;
 pub use slotted_page::{SLOT_ENTRY_SIZE, SLOTTED_HEADER_SIZE, SlotStatus, SlottedPage, SlottedPageRef};
+pub use storage::Storage;
 pub use storage_mem::{MemStorage, MemTable};
 pub use tuple_codec::{decode_tuple, encode_tuple};
 pub use types::{Column, DataType, Row, Schema, Tuple, Value};

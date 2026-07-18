@@ -125,12 +125,16 @@ impl FileHeader {
 /// この章で登録するのは、File Header専用ページ(`Meta`)と、それ以外の一般データ
 /// ページ(`Data`)の2種類だけである。Slotted Pageとしての内部構造(第12章)や、
 /// B+Treeの内部・葉ページの区別(第23章)は、この列挙型にあとから足していく。
+/// 第15章では、テーブル定義とFree Page Listを持つCatalogページ(`Catalog`)を
+/// 追加する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageType {
     /// File Header専用ページ。
     Meta,
     /// 一般のデータページ。
     Data,
+    /// `Storage`(第15章)が使う、テーブル定義とFree Page Listを保持するページ。
+    Catalog,
 }
 
 impl PageType {
@@ -138,6 +142,7 @@ impl PageType {
         match self {
             PageType::Meta => 0,
             PageType::Data => 1,
+            PageType::Catalog => 2,
         }
     }
 
@@ -145,6 +150,7 @@ impl PageType {
         match byte {
             0 => Ok(PageType::Meta),
             1 => Ok(PageType::Data),
+            2 => Ok(PageType::Catalog),
             other => Err(DbError::CorruptPage(format!(
                 "未知のPage Typeです: {other}"
             ))),

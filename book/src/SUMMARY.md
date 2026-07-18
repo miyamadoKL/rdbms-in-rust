@@ -22,7 +22,7 @@
 - [第12章 Slotted Page、Tuple、RID](ch12-slotted-page.md)
 - [第13章 Disk ManagerとHeap File](ch13-disk-manager.md)
 - [第14章 Buffer Pool](ch14-buffer-pool.md)
-- [第15章 永続カタログと空き領域管理]()
+- [第15章 永続カタログと空き領域管理](ch15-persistent-catalog.md)
 - [第16章 SQL経路の永続化]()
 
 # 第3部 Query Execution: SQLを実行計画へ変換する
