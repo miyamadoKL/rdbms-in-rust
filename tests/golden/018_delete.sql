@@ -1,0 +1,4 @@
+CREATE TABLE users (id BIGINT NOT NULL, name TEXT);
+INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+DELETE FROM users WHERE id = 1;
+SELECT * FROM users;

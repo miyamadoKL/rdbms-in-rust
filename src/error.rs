@@ -14,6 +14,52 @@ pub enum DbError {
     /// まだ実装されていない機能を呼び出したときのエラー。
     #[error("未実装: {0}")]
     NotImplemented(String),
+
+    /// 値の並びがSchemaの列数・型・nullable制約に適合しないエラー。
+    #[error("スキーマ不一致: {0}")]
+    SchemaMismatch(String),
+
+    /// `CREATE TABLE`が、すでにカタログへ登録済みのテーブル名を指定したエラー。
+    #[error("テーブルはすでに存在します: {0}")]
+    DuplicateTable(String),
+
+    /// `CREATE TABLE`の列定義に、同じ列名が2回以上出てきたエラー。
+    #[error("列名が重複しています: {0}")]
+    DuplicateColumn(String),
+
+    /// `DROP TABLE`が、カタログに登録されていないテーブル名を指定したエラー。
+    #[error("テーブルが存在しません: {0}")]
+    TableNotFound(String),
+
+    /// 式の評価に失敗したエラー(型不一致、ゼロ除算、整数オーバーフロー、
+    /// `CAST`の失敗、未知の関数・型名など)。
+    #[error("評価エラー: {0}")]
+    Eval(String),
+
+    /// SQL文字列を構文解析できなかったエラー。発生位置の行・列を持つ。
+    ///
+    /// `Lex`と表示形式を揃えている(`行N列M: 種別: メッセージ`)。字句解析までは
+    /// 成功したが、Token列がこのSQLサブセットの文法に適合しない場合に返す。
+    #[error("行{line}列{column}: 構文エラー: {message}")]
+    Parse {
+        /// エラーの内容。
+        message: String,
+        /// 発生位置の行番号(1始まり)。
+        line: usize,
+        /// 発生位置の列番号(1始まり)。
+        column: usize,
+    },
+
+    /// SQL文字列をToken列へ変換できなかったエラー。発生位置の行・列を持つ。
+    #[error("行{line}列{column}: 字句エラー: {message}")]
+    Lex {
+        /// エラーの内容。
+        message: String,
+        /// 発生位置の行番号(1始まり)。
+        line: usize,
+        /// 発生位置の列番号(1始まり)。
+        column: usize,
+    },
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

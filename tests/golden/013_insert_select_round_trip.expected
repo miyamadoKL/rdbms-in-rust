@@ -1,0 +1,8 @@
+CREATE TABLE
+
+INSERT 1
+
+id | name
+---------
+1 | Alice
+(1 row)

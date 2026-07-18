@@ -1,0 +1,10 @@
+CREATE TABLE
+
+INSERT 2
+
+UPDATE 1
+
+id | name
+---------
+1 | Carol
+(1 row)

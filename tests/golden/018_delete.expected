@@ -1,0 +1,10 @@
+CREATE TABLE
+
+INSERT 2
+
+DELETE 1
+
+id | name
+---------
+2 | Bob
+(1 row)
