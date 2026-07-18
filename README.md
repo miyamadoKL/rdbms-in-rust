@@ -1,9 +1,7 @@
 # rdbms-in-rust
 
-Rustで一から関係データベース管理システム(RDBMS)を作りながら、データベース内部の設計と実装を学ぶ
-Step-by-stepの日本語教材です。[*Writing an OS in Rust*](https://os.phil-opp.com/) のRDBMS版を目指し、
-インメモリの最小実装から始め、ディスク永続化、クエリ最適化、トランザクション、
-クライアント/サーバー化まで、全40章・全7部にわたって一つのRustクレートを段階的に育てていきます。
+Rustで一から関係データベース管理システム(RDBMS)を作りながら、データベース内部の設計と実装を学ぶStep-by-stepの日本語教材です。
+[*Writing an OS in Rust*](https://os.phil-opp.com/) のRDBMS版を目指し、インメモリの最小実装から始め、ディスク永続化、クエリ最適化、トランザクション、クライアント/サーバー化まで、全40章(7部構成)にわたって一つのRustクレートを段階的に育てていきます。
 
 ## 目次
 
@@ -70,10 +68,10 @@ Step-by-stepの日本語教材です。[*Writing an OS in Rust*](https://os.phil
 - 第39章 System Catalogとメンテナンス
 - 第40章 テスト、Fuzzing、Benchmark、リリース
 
-## 読み方・ビルド方法
+## 読み方とビルド方法
 
-執筆済みの章は上の目次からGitHub上でそのまま読めます。より読みやすいmdBook形式で読みたい場合や、
-未執筆章も含めた完全な目次(`book/src/SUMMARY.md`)を確認したい場合は、ローカルで以下を実行してください。
+執筆済みの章は上の目次からGitHub上でそのまま読めます。
+より読みやすいmdBook形式で読みたい場合や、未執筆章も含めた完全な目次(`book/src/SUMMARY.md`)を確認したい場合は、ローカルで以下を実行してください。
 
 ```sh
 cargo install mdbook
@@ -91,7 +89,7 @@ cargo build
 cargo test
 ```
 
-Markdown(本文・本README)のlintと、本文中のMermaid図のレンダリング検証は以下で行います。
+Markdown(本文と本README)のlintと、本文中のMermaid図のレンダリング検証は以下で行います。
 
 ```sh
 npx --yes markdownlint-cli2@0.22.1

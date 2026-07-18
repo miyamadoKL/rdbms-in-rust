@@ -19,7 +19,9 @@ fn run_sql(sql: &str) -> String {
 fn collect_sql_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("golden test dir {:?} を開けません: {e}", dir))
-        .filter_map(|entry| entry.ok())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|e| panic!("golden test dir {:?} の列挙中にエラー: {e}", dir))
+        .into_iter()
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("sql"))
         .collect();

@@ -3,6 +3,17 @@
 //! 後続の章(ストレージ、トランザクション)で使われる識別子の骨格。
 
 /// ディスク上の1ページを指す識別子。
+///
+/// `TableId` とは型が異なるため、呼び出し側が引数を取り違えてもコンパイルエラーになる。
+///
+/// ```compile_fail
+/// use minidb::{PageId, TableId};
+///
+/// fn load_page(page_id: PageId) {}
+///
+/// let table_id = TableId(1);
+/// load_page(table_id); // 型が違うためコンパイルエラー
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageId(pub u64);
 
