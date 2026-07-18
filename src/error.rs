@@ -14,6 +14,10 @@ pub enum DbError {
     /// まだ実装されていない機能を呼び出したときのエラー。
     #[error("未実装: {0}")]
     NotImplemented(String),
+
+    /// 値の並びがSchemaの列数・型・nullable制約に適合しないエラー。
+    #[error("スキーマ不一致: {0}")]
+    SchemaMismatch(String),
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

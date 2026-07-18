@@ -1,13 +1,15 @@
 //! minidb: Rustで自作するRDBMSのコアクレート。
 //!
 //! 教材の各章はこのクレートを段階的に育てていく。現時点では
-//! エラー型、識別子のNewtype、簡易ログマクロを提供する骨格。
+//! エラー型、識別子のNewtype、簡易ログマクロ、関係モデルの型を提供する骨格。
 
 pub mod error;
 pub mod ids;
+pub mod types;
 
 pub use error::{DbError, DbResult};
 pub use ids::{PageId, TableId, TransactionId};
+pub use types::{Column, DataType, Schema, Tuple, Value};
 
 /// 簡易ログ出力マクロ(依存追加を避けるため `eprintln!` を薄くラップするだけ)。
 ///
