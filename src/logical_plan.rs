@@ -17,11 +17,10 @@
 //!     └─ Scan(users)
 //! ```
 //!
-//! 演算子は次の7種類にとどめる。`Scan`・`Values`・`Filter`・`Projection`は
-//! `SELECT`が、`Insert`・`Update`・`Delete`はそれぞれの文が使う。`Join`・
-//! `Aggregate`・`Sort`・`Limit`にあたる構文はまだこのクレートに無いため、
-//! この章では対応する演算子を作らない(第21・22章で`LogicalPlan`にバリアントを
-//! 追加する余地として残す)。
+//! 演算子は次の11種類にとどめる。`Scan`・`Values`・`Filter`・`Projection`・
+//! `Aggregate`・`Distinct`・`Sort`・`Limit`は`SELECT`が、`Insert`・`Update`・
+//! `Delete`はそれぞれの文が使う。`Join`にあたる構文はまだこのクレートに無い
+//! ため、この章では対応する演算子を作らない(第22章で追加する余地として残す)。
 //!
 //! `LogicalPlan`が確定させるのは「何を計算するか」という演算子の並びと
 //! 依存関係だけであり、「どう計算するか」(`Scan`が全件走査になるのか索引を
@@ -29,20 +28,51 @@
 //! 第23〜25章でB+TreeとIndex Scanが揃うまでは意味を持たないが、`Scan`という
 //! 名前は最初から「走査する対象」だけを表し、「どう走査するか」を含まない
 //! 名前として選んである。
+//!
+//! # `SELECT`の評価順序と演算子の合成(第21章)
+//!
+//! `GROUP BY`・`HAVING`・集約関数・`DISTINCT`・`ORDER BY`・`LIMIT`/`OFFSET`が
+//! 揃ったことで、[`build_select`]が組み立てる木の形は標準SQLが定める
+//! `SELECT`の論理的な評価順序をそのまま反映するようになった。
+//!
+//! ```text
+//! FROM → WHERE → GROUP BY → HAVING → SELECT(射影) → DISTINCT → ORDER BY → LIMIT/OFFSET
+//! ```
+//!
+//! `LogicalPlan`の木では、この順序が根から葉への深さとして現れる(根に近いほど
+//! 後段)。
+//!
+//! ```text
+//! Limit
+//!   └─ Sort
+//!     └─ Distinct
+//!       └─ Projection
+//!         └─ Filter(HAVING)
+//!           └─ Aggregate
+//!             └─ Filter(WHERE)
+//!               └─ Scan
+//! ```
+//!
+//! `HAVING`を独立した演算子にせず`Filter`を再利用しているのは、`HAVING`が
+//! 「行を絞り込む」という点で`WHERE`と全く同じ演算だからである。違うのは
+//! 述語が評価する行の由来(`WHERE`は`Scan`が返す生の行、`HAVING`は`Aggregate`が
+//! 返すグループごとの集約結果)だけであり、これは`FilterNode::input`が指す
+//! 子が変わることで表現できる。
 
 use std::fmt;
 
 use crate::ast::{BinaryOperator, Expr, UnaryOperator};
 use crate::binder::{
-    BoundAssignment, BoundDelete, BoundExpr, BoundInsert, BoundSelect, BoundSelectItem, BoundUpdate,
+    AggregateCall, BoundAssignment, BoundDelete, BoundExpr, BoundInsert, BoundSelect, BoundSelectItem, BoundUpdate,
 };
 use crate::ids::TableId;
 use crate::types::{Column, DataType, Schema};
 
 /// 関係代数の演算子1個。
 ///
-/// `Filter`・`Projection`・`Insert`・`Update`・`Delete`は、それぞれ1個の
-/// 子(`input`)を持つ。`Scan`・`Values`は子を持たない葉である。
+/// `Filter`・`Projection`・`Aggregate`・`Distinct`・`Sort`・`Limit`・
+/// `Insert`・`Update`・`Delete`は、それぞれ1個の子(`input`)を持つ。`Scan`・
+/// `Values`は子を持たない葉である。
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
     /// テーブル全体を走査する。
@@ -50,10 +80,20 @@ pub enum LogicalPlan {
     /// `VALUES`が並べる、リテラル式の行の並び。`FROM`を伴わない`SELECT`は、
     /// 列を1つも持たない行を1件だけ持つ`Values`を入力とみなす。
     Values(ValuesNode),
-    /// `predicate`が`TRUE`になった行だけを残す。
+    /// `predicate`が`TRUE`になった行だけを残す。`WHERE`と`HAVING`のどちらも
+    /// このノードで表す(モジュール冒頭の説明を参照)。
     Filter(FilterNode),
+    /// `group_by`の値が等しい行をグループ化し、グループごとに`calls`を計算する
+    /// (第21章)。
+    Aggregate(AggregateNode),
     /// 各行から`projection`が指す列・式だけを取り出す。
     Projection(ProjectionNode),
+    /// 完全に一致する行を1つにまとめる(第21章)。
+    Distinct(DistinctNode),
+    /// `keys`に従って行を並べ替える(第21章)。
+    Sort(SortNode),
+    /// `offset`件飛ばしたうえで、先頭`limit`件だけを残す(第21章)。
+    Limit(LimitNode),
     /// `input`(`Values`)の各行を`table_id`のテーブルへ書き込む。
     Insert(InsertNode),
     /// `input`が指すテーブルのうち、`predicate`に一致した行へ`assignments`を適用する。
@@ -98,6 +138,50 @@ pub struct FilterNode {
 pub struct ProjectionNode {
     pub input: Box<LogicalPlan>,
     pub projection: Vec<BoundSelectItem>,
+}
+
+/// [`LogicalPlan::Aggregate`]が持つ情報(第21章)。
+///
+/// `group_by`は`input`の各行に対して評価するグループ化キーの式、`calls`は
+/// グループごとに計算する集約関数呼び出しである。`schema`は`group_by`の列
+/// (先頭)に`calls`の列(残り)を続けた出力列構成で、[`crate::binder::BoundAggregate::schema`]
+/// と同じもの。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregateNode {
+    pub input: Box<LogicalPlan>,
+    pub group_by: Vec<BoundExpr>,
+    pub calls: Vec<AggregateCall>,
+    pub schema: Schema,
+}
+
+/// [`LogicalPlan::Distinct`]が持つ情報(第21章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistinctNode {
+    pub input: Box<LogicalPlan>,
+}
+
+/// `ORDER BY`のキー1個(第21章)。`expr`は`input`が生成する行(`Sort`は
+/// `Projection`の直後に置かれるため、常に射影後の出力行)に対して評価する。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortKey {
+    pub expr: BoundExpr,
+    pub desc: bool,
+}
+
+/// [`LogicalPlan::Sort`]が持つ情報(第21章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortNode {
+    pub input: Box<LogicalPlan>,
+    pub keys: Vec<SortKey>,
+}
+
+/// [`LogicalPlan::Limit`]が持つ情報(第21章)。`limit`・`offset`は
+/// `Binder::eval_row_count_expr`が束縛の時点で評価し切った定数である。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LimitNode {
+    pub input: Box<LogicalPlan>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 /// [`LogicalPlan::Insert`]が持つ情報。
@@ -149,9 +233,13 @@ impl LogicalPlan {
             LogicalPlan::Scan(scan) => scan.schema.clone(),
             LogicalPlan::Values(values) => values.schema.clone(),
             LogicalPlan::Filter(filter) => filter.input.output_schema(),
+            LogicalPlan::Aggregate(aggregate) => aggregate.schema.clone(),
             LogicalPlan::Projection(projection) => {
                 projection_schema(&projection.input.output_schema(), &projection.projection)
             }
+            LogicalPlan::Distinct(distinct) => distinct.input.output_schema(),
+            LogicalPlan::Sort(sort) => sort.input.output_schema(),
+            LogicalPlan::Limit(limit) => limit.input.output_schema(),
             LogicalPlan::Insert(_) | LogicalPlan::Update(_) | LogicalPlan::Delete(_) => Schema::new(Vec::new()),
         }
     }
@@ -161,7 +249,11 @@ impl LogicalPlan {
         match self {
             LogicalPlan::Scan(_) | LogicalPlan::Values(_) => Vec::new(),
             LogicalPlan::Filter(filter) => vec![&filter.input],
+            LogicalPlan::Aggregate(aggregate) => vec![&aggregate.input],
             LogicalPlan::Projection(projection) => vec![&projection.input],
+            LogicalPlan::Distinct(distinct) => vec![&distinct.input],
+            LogicalPlan::Sort(sort) => vec![&sort.input],
+            LogicalPlan::Limit(limit) => vec![&limit.input],
             LogicalPlan::Insert(insert) => vec![&insert.input],
             LogicalPlan::Update(update) => vec![&update.input],
             LogicalPlan::Delete(delete) => vec![&delete.input],
@@ -177,10 +269,33 @@ impl LogicalPlan {
                 format!("Values({} {row_word})", values.rows.len())
             }
             LogicalPlan::Filter(filter) => format!("Filter({})", fmt_bound_expr(&filter.predicate)),
+            LogicalPlan::Aggregate(aggregate) => {
+                let group_by: Vec<String> = aggregate.group_by.iter().map(fmt_bound_expr).collect();
+                let calls: Vec<String> = aggregate.calls.iter().map(fmt_aggregate_call).collect();
+                format!("Aggregate(group_by=[{}], calls=[{}])", group_by.join(", "), calls.join(", "))
+            }
             LogicalPlan::Projection(projection) => {
                 let items: Vec<&str> = projection.projection.iter().map(|item| item.output_name.as_str()).collect();
                 format!("Projection({})", items.join(", "))
             }
+            LogicalPlan::Distinct(_) => "Distinct".to_string(),
+            LogicalPlan::Sort(sort) => {
+                let keys: Vec<String> = sort
+                    .keys
+                    .iter()
+                    .map(|key| {
+                        let dir = if key.desc { "DESC" } else { "ASC" };
+                        format!("{} {dir}", fmt_bound_expr(&key.expr))
+                    })
+                    .collect();
+                format!("Sort({})", keys.join(", "))
+            }
+            LogicalPlan::Limit(limit) => match (limit.limit, limit.offset) {
+                (Some(n), Some(o)) => format!("Limit(limit={n}, offset={o})"),
+                (Some(n), None) => format!("Limit(limit={n})"),
+                (None, Some(o)) => format!("Limit(offset={o})"),
+                (None, None) => "Limit".to_string(),
+            },
             LogicalPlan::Insert(insert) => format!("Insert({})", insert.table_name),
             LogicalPlan::Update(update) => format!("Update({})", update.table_name),
             LogicalPlan::Delete(delete) => format!("Delete({})", delete.table_name),
@@ -263,6 +378,16 @@ pub fn projection_schema(input_schema: &Schema, projection: &[BoundSelectItem]) 
 ///   Projection(1 + 1)
 ///     └─ Values(1 row)
 /// ```
+/// `BoundStatement::Select`を`LogicalPlan`へ変換する。
+///
+/// 演算子は`Filter(WHERE) → Aggregate → Filter(HAVING) → Projection → Distinct
+/// → Sort → Limit`という、標準SQLの評価順序(モジュール冒頭の説明を参照)と
+/// 同じ並びで積む。`GROUP BY`も集約関数も無い`SELECT`(`select.aggregate`が
+/// `None`)では`Aggregate`と`HAVING`のFilterを飛ばし、`DISTINCT`・`ORDER BY`・
+/// `LIMIT`/`OFFSET`を伴わない`SELECT`では対応するノードをそもそも積まない。
+/// 第18章までの実装が「`Filter`の後に必ず`Projection`が続く」という固定の
+/// 2段構成だったのに対し、この章では`select`が持つ情報の有無に応じて木の
+/// 深さそのものが変わる。
 pub fn build_select(select: BoundSelect) -> LogicalPlan {
     let source = match select.tables.into_iter().next() {
         Some(table) => LogicalPlan::Scan(ScanNode {
@@ -281,7 +406,72 @@ pub fn build_select(select: BoundSelect) -> LogicalPlan {
         None => source,
     };
 
-    LogicalPlan::Projection(ProjectionNode { input: Box::new(filtered), projection: select.projection })
+    let after_having = match select.aggregate {
+        Some(aggregate) => {
+            let aggregated = LogicalPlan::Aggregate(AggregateNode {
+                input: Box::new(filtered),
+                group_by: aggregate.group_by,
+                calls: aggregate.calls,
+                schema: aggregate.schema,
+            });
+            match select.having {
+                Some(having) => LogicalPlan::Filter(FilterNode { input: Box::new(aggregated), predicate: having }),
+                None => aggregated,
+            }
+        }
+        None => filtered,
+    };
+
+    let visible_len = select.projection.len() - select.hidden_column_count;
+    let projected =
+        LogicalPlan::Projection(ProjectionNode { input: Box::new(after_having), projection: select.projection });
+
+    let distinct = if select.distinct { LogicalPlan::Distinct(DistinctNode { input: Box::new(projected) }) } else { projected };
+
+    let sorted = if select.order_by.is_empty() {
+        distinct
+    } else {
+        let keys = select.order_by.into_iter().map(|item| SortKey { expr: item.expr, desc: item.desc }).collect();
+        LogicalPlan::Sort(SortNode { input: Box::new(distinct), keys })
+    };
+
+    let limited = if select.limit.is_none() && select.offset.is_none() {
+        sorted
+    } else {
+        LogicalPlan::Limit(LimitNode { input: Box::new(sorted), limit: select.limit, offset: select.offset })
+    };
+
+    // `ORDER BY`が`SELECT`の対象式に無い式を参照した場合(`Binder::bind_select`の
+    // 「`ORDER BY`はどの範囲を束縛するか」を参照)、その式は`projected`の末尾に
+    // **隠し列**として積まれている。`Sort`まではこの隠し列が必要だが、最終的に
+    // 利用者へ返す行には含めない。ここで先頭`visible_len`列だけを残す
+    // トリム用の`Projection`をもう1段積むことで、隠し列を取り除く。
+    // `Distinct`より後にトリムしているのは、`hidden_column_count > 0`のとき
+    // `Binder`が`DISTINCT`と隠し列の組み合わせをすでに拒否しているため
+    // (この経路には到達しない)ではなく、単に「`Sort`・`Limit`が終わってから
+    // 落とす」という順序が最も無駄が無いからである(`Limit`が件数を絞った後の
+    // 行だけをトリムすればよい)。
+    if select.hidden_column_count == 0 {
+        limited
+    } else {
+        let extended_schema = limited.output_schema();
+        let trim_projection = (0..visible_len)
+            .map(|index| {
+                let column = &extended_schema.columns()[index];
+                BoundSelectItem {
+                    expr: BoundExpr::ColumnRef {
+                        table_ordinal: 0,
+                        column_index: index,
+                        name: column.name.clone(),
+                        data_type: column.data_type,
+                        span: select.span,
+                    },
+                    output_name: column.name.clone(),
+                }
+            })
+            .collect();
+        LogicalPlan::Projection(ProjectionNode { input: Box::new(limited), projection: trim_projection })
+    }
 }
 
 /// `BoundStatement::Insert`を`LogicalPlan`へ変換する。
@@ -369,9 +559,22 @@ pub(crate) fn fmt_bound_expr(expr: &BoundExpr) -> String {
             let args: Vec<String> = args.iter().map(fmt_bound_expr).collect();
             format!("{name}({})", args.join(", "))
         }
+        BoundExpr::Aggregate { func, arg, .. } => {
+            let arg = arg.as_deref().map(fmt_bound_expr).unwrap_or_else(|| "*".to_string());
+            format!("{}({arg})", func.name())
+        }
         BoundExpr::Paren { expr, .. } => format!("({})", fmt_bound_expr(expr)),
         BoundExpr::Cast { expr, data_type, .. } => format!("CAST({} AS {data_type})", fmt_bound_expr(expr)),
     }
+}
+
+/// [`AggregateCall`]を`COUNT(*)`、`SUM(price)`のような文字列にする。
+/// `LogicalPlan`の`Display`実装(`EXPLAIN`の`Aggregate`ノード)に加えて、
+/// `Binder::rewrite_for_aggregate`(第21章)が同じ呼び出しかどうかを判定する
+/// ためにも使う(`pub(crate)`にしている理由)。
+pub(crate) fn fmt_aggregate_call(call: &AggregateCall) -> String {
+    let arg = call.arg.as_deref().map(fmt_bound_expr).unwrap_or_else(|| "*".to_string());
+    format!("{}({arg})", call.func.name())
 }
 
 fn fmt_binary_operator(op: BinaryOperator) -> &'static str {

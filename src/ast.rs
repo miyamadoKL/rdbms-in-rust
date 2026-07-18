@@ -16,8 +16,10 @@ use crate::lexer::Span;
 /// SQL文1本を表す。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    /// `SELECT`文。
-    Select(SelectStatement),
+    /// `SELECT`文。第21章で`ORDER BY`・`GROUP BY`・`HAVING`・`LIMIT`・`OFFSET`が
+    /// 加わり`SelectStatement`自体が大きくなったため、他の(小さい)variantとの
+    /// サイズ差を抑えるために`Box`で間接化する。
+    Select(Box<SelectStatement>),
     /// `CREATE TABLE`文。
     CreateTable(CreateTableStatement),
     /// `DROP TABLE`文。
@@ -63,6 +65,8 @@ pub struct Ident {
 /// `SELECT`文。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStatement {
+    /// `DISTINCT`が指定されていたかどうか(第21章)。
+    pub distinct: bool,
     /// `SELECT`の直後に並ぶ、カンマ区切りの式リスト。
     pub items: Vec<SelectItem>,
     /// `FROM <table> [AS <alias>]`。省略した`SELECT`は、列を持たない空のSchemaに
@@ -74,7 +78,58 @@ pub struct SelectStatement {
     /// `where_clause`を適用し、`TRUE`なら1行、`FALSE`または`NULL`(UNKNOWN)なら
     /// 0行を返す(`database`モジュールの`execute_select_without_from`参照)。
     pub where_clause: Option<Expr>,
+    /// `GROUP BY <式, ...>`(第21章)。空なら`GROUP BY`を持たない。
+    pub group_by: Vec<Expr>,
+    /// `HAVING <expr>`(第21章)。
+    pub having: Option<Expr>,
+    /// `ORDER BY <式> [ASC|DESC], ...`(第21章)。
+    pub order_by: Vec<OrderByItem>,
+    /// `LIMIT <expr>`(第21章)。
+    pub limit: Option<Expr>,
+    /// `OFFSET <expr>`(第21章)。`LIMIT`を伴わない`OFFSET`単体も構文としては許す。
+    pub offset: Option<Expr>,
     pub span: Span,
+}
+
+/// `ORDER BY`に並ぶ要素1個(第21章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderByItem {
+    pub expr: Expr,
+    /// `DESC`が指定されていたかどうか。`ASC`または未指定なら`false`。
+    pub desc: bool,
+    pub span: Span,
+}
+
+/// 集約関数の種類(第21章)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunc {
+    Count,
+    Sum,
+    Min,
+    Max,
+}
+
+impl AggregateFunc {
+    /// 識別子(大文字小文字を無視)を集約関数として解決する。集約関数でなければ`None`。
+    pub fn from_name(name: &str) -> Option<AggregateFunc> {
+        match name.to_ascii_uppercase().as_str() {
+            "COUNT" => Some(AggregateFunc::Count),
+            "SUM" => Some(AggregateFunc::Sum),
+            "MIN" => Some(AggregateFunc::Min),
+            "MAX" => Some(AggregateFunc::Max),
+            _ => None,
+        }
+    }
+
+    /// SQLの関数名としての表示(常に大文字)。
+    pub fn name(self) -> &'static str {
+        match self {
+            AggregateFunc::Count => "COUNT",
+            AggregateFunc::Sum => "SUM",
+            AggregateFunc::Min => "MIN",
+            AggregateFunc::Max => "MAX",
+        }
+    }
 }
 
 /// `SELECT`の`FROM <table> [AS <alias>]`。
@@ -274,6 +329,16 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
+    /// 集約関数呼び出し(第21章)。`COUNT`・`SUM`・`MIN`・`MAX`は、Scalar
+    /// Functionとは異なり複数行にまたがる状態(集計中の合計・件数など)を
+    /// 持つため、`FunctionCall`とは別のノードとして表す。`arg`が`None`なのは
+    /// `COUNT(*)`だけであり、他の3関数は構文の時点で必ず引数を1個持つ
+    /// (`Parser::parse_aggregate_call`が検査する)。
+    Aggregate {
+        func: AggregateFunc,
+        arg: Option<Box<Expr>>,
+        span: Span,
+    },
     /// `(expr)`。優先順位を明示するための括弧そのものをASTに残す。
     Paren {
         expr: Box<Expr>,
@@ -302,6 +367,7 @@ impl Expr {
             | Expr::BinaryOp { span, .. }
             | Expr::IsNull { span, .. }
             | Expr::FunctionCall { span, .. }
+            | Expr::Aggregate { span, .. }
             | Expr::Paren { span, .. }
             | Expr::Cast { span, .. } => *span,
         }

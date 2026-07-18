@@ -1,0 +1,20 @@
+CREATE TABLE
+
+QUERY PLAN
+----------
+Limit(limit=5)
+  └─ Sort(dept ASC)
+    └─ Projection(dept, COUNT(*))
+      └─ Filter(COUNT(*) > 1)
+        └─ Aggregate(group_by=[dept], calls=[COUNT(*)])
+          └─ Filter(amount IS NOT NULL)
+            └─ SeqScan(orders)
+(7 rows)
+
+QUERY PLAN
+----------
+Sort(dept ASC)
+  └─ Distinct
+    └─ Projection(dept)
+      └─ SeqScan(orders)
+(4 rows)

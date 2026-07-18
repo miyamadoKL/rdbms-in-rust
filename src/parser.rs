@@ -19,9 +19,9 @@
 //! 優先順位は低い順に`OR` < `AND` < `NOT` < 比較 < `+` `-` < `*` `/` < 単項`-`。
 
 use crate::ast::{
-    Assignment, BinaryOperator, ColumnDef, CreateTableStatement, DeleteStatement,
-    DropTableStatement, ExplainStatement, Expr, FromClause, Ident, InsertStatement, SelectItem,
-    SelectStatement, Statement, UnaryOperator, UpdateStatement,
+    AggregateFunc, Assignment, BinaryOperator, ColumnDef, CreateTableStatement, DeleteStatement,
+    DropTableStatement, ExplainStatement, Expr, FromClause, Ident, InsertStatement, OrderByItem,
+    SelectItem, SelectStatement, Statement, UnaryOperator, UpdateStatement,
 };
 use crate::error::{DbError, DbResult};
 use crate::lexer::{self, Keyword, Span, Token, TokenKind};
@@ -131,7 +131,7 @@ impl<'a> Parser<'a> {
     fn parse_statement(&mut self) -> DbResult<Statement> {
         match self.peek_kind() {
             TokenKind::Keyword(Keyword::Select) => {
-                self.parse_select_statement().map(Statement::Select)
+                self.parse_select_statement().map(|s| Statement::Select(Box::new(s)))
             }
             TokenKind::Keyword(Keyword::Create) => self
                 .parse_create_table_statement()
@@ -171,7 +171,7 @@ impl<'a> Parser<'a> {
         let start = self.expect_keyword(Keyword::Explain, "EXPLAIN")?.start;
 
         let statement = match self.peek_kind() {
-            TokenKind::Keyword(Keyword::Select) => self.parse_select_statement().map(Statement::Select)?,
+            TokenKind::Keyword(Keyword::Select) => self.parse_select_statement().map(|s| Statement::Select(Box::new(s)))?,
             TokenKind::Keyword(Keyword::Insert) => self.parse_insert_statement().map(Statement::Insert)?,
             TokenKind::Keyword(Keyword::Update) => self.parse_update_statement().map(Statement::Update)?,
             TokenKind::Keyword(Keyword::Delete) => self.parse_delete_statement().map(Statement::Delete)?,
@@ -186,6 +186,13 @@ impl<'a> Parser<'a> {
 
     fn parse_select_statement(&mut self) -> DbResult<SelectStatement> {
         let start = self.expect_keyword(Keyword::Select, "SELECT")?.start;
+
+        let distinct = if let TokenKind::Keyword(Keyword::Distinct) = self.peek_kind() {
+            self.advance();
+            true
+        } else {
+            false
+        };
 
         let mut items = vec![self.parse_select_item()?];
         while *self.peek_kind() == TokenKind::Comma {
@@ -225,12 +232,92 @@ impl<'a> Parser<'a> {
             None
         };
 
+        let group_by = if let TokenKind::Keyword(Keyword::Group) = self.peek_kind() {
+            self.advance();
+            self.expect_keyword(Keyword::By, "BY")?;
+            let mut exprs = vec![self.parse_expr(0)?];
+            while *self.peek_kind() == TokenKind::Comma {
+                self.advance();
+                exprs.push(self.parse_expr(0)?);
+            }
+            end = exprs.last().expect("直前にpushしたばかり").span().end;
+            exprs
+        } else {
+            Vec::new()
+        };
+
+        let having = if let TokenKind::Keyword(Keyword::Having) = self.peek_kind() {
+            self.advance();
+            let expr = self.parse_expr(0)?;
+            end = expr.span().end;
+            Some(expr)
+        } else {
+            None
+        };
+
+        let order_by = if let TokenKind::Keyword(Keyword::Order) = self.peek_kind() {
+            self.advance();
+            self.expect_keyword(Keyword::By, "BY")?;
+            let mut items = vec![self.parse_order_by_item()?];
+            while *self.peek_kind() == TokenKind::Comma {
+                self.advance();
+                items.push(self.parse_order_by_item()?);
+            }
+            end = items.last().expect("直前にpushしたばかり").span.end;
+            items
+        } else {
+            Vec::new()
+        };
+
+        let limit = if let TokenKind::Keyword(Keyword::Limit) = self.peek_kind() {
+            self.advance();
+            let expr = self.parse_expr(0)?;
+            end = expr.span().end;
+            Some(expr)
+        } else {
+            None
+        };
+
+        let offset = if let TokenKind::Keyword(Keyword::Offset) = self.peek_kind() {
+            self.advance();
+            let expr = self.parse_expr(0)?;
+            end = expr.span().end;
+            Some(expr)
+        } else {
+            None
+        };
+
         Ok(SelectStatement {
+            distinct,
             items,
             from,
             where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
             span: Span::new(start, end),
         })
+    }
+
+    /// `ORDER BY`の要素1個(`<式> [ASC|DESC]`)を読む。
+    fn parse_order_by_item(&mut self) -> DbResult<OrderByItem> {
+        let expr = self.parse_expr(0)?;
+        let mut end = expr.span().end;
+        let desc = match self.peek_kind() {
+            TokenKind::Keyword(Keyword::Asc) => {
+                end = self.advance().span.end;
+                false
+            }
+            TokenKind::Keyword(Keyword::Desc) => {
+                end = self.advance().span.end;
+                true
+            }
+            _ => false,
+        };
+        let span = Span::new(expr.span().start, end);
+        Ok(OrderByItem { expr, desc, span })
     }
 
     /// `*`は`parse_expr`(乗算の`*`と同じToken)に渡すと式として解釈できないため、
@@ -636,7 +723,20 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `name(...)`を読む。`name`が集約関数(`COUNT`・`SUM`・`MIN`・`MAX`、
+    /// 大文字小文字を無視)の名前と一致する場合は[`parse_aggregate_call`]に
+    /// 委ね、それ以外はScalar Functionの呼び出しとして読む。
+    ///
+    /// 集約関数を予約語にせず識別子のまま特別扱いしているのは、`abs`・
+    /// `length`(第8章)と同じくScalar Functionの名前が予約語ではない設計を
+    /// 崩さないためである。`count`という名前を列名やテーブル名として使いたい
+    /// 場合は、この関数を経由しない(`(`が続かない)限り、これまでどおり
+    /// 識別子として解決される。
     fn parse_function_call(&mut self, name: String, name_span: Span) -> DbResult<Expr> {
+        if let Some(func) = AggregateFunc::from_name(&name) {
+            return self.parse_aggregate_call(func, name_span);
+        }
+
         self.expect_punct(TokenKind::LParen, "(")?;
 
         let mut args = Vec::new();
@@ -652,6 +752,29 @@ impl<'a> Parser<'a> {
         Ok(Expr::FunctionCall {
             name,
             args,
+            span: Span::new(name_span.start, end),
+        })
+    }
+
+    /// 集約関数呼び出し`COUNT(*)` / `COUNT(<式>)` / `SUM(<式>)` / `MIN(<式>)` /
+    /// `MAX(<式>)`を読む。`*`が引数として書けるのは`COUNT`だけである
+    /// (`SUM(*)`のような構文はここで拒否する)。
+    fn parse_aggregate_call(&mut self, func: AggregateFunc, name_span: Span) -> DbResult<Expr> {
+        self.expect_punct(TokenKind::LParen, "(")?;
+
+        let arg = if func == AggregateFunc::Count && *self.peek_kind() == TokenKind::Star {
+            self.advance();
+            None
+        } else if *self.peek_kind() == TokenKind::Star {
+            return Err(self.unexpected(&format!("{}の引数には式が必要です(*は使えません)", func.name())));
+        } else {
+            Some(Box::new(self.parse_expr(0)?))
+        };
+
+        let end = self.expect_punct(TokenKind::RParen, ")")?.end;
+        Ok(Expr::Aggregate {
+            func,
+            arg,
             span: Span::new(name_span.start, end),
         })
     }
@@ -753,6 +876,11 @@ mod tests {
             Expr::FunctionCall { name, args, .. } => Expr::FunctionCall {
                 name,
                 args: args.into_iter().map(strip_spans).collect(),
+                span: dummy,
+            },
+            Expr::Aggregate { func, arg, .. } => Expr::Aggregate {
+                func,
+                arg: arg.map(|expr| Box::new(strip_spans(*expr))),
                 span: dummy,
             },
             Expr::Paren { expr, .. } => Expr::Paren {

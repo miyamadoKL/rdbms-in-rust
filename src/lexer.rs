@@ -63,6 +63,15 @@ pub enum Keyword {
     Primary,
     Key,
     Unique,
+    Order,
+    By,
+    Asc,
+    Desc,
+    Limit,
+    Offset,
+    Distinct,
+    Group,
+    Having,
 }
 
 impl Keyword {
@@ -94,6 +103,15 @@ impl Keyword {
             "PRIMARY" => Keyword::Primary,
             "KEY" => Keyword::Key,
             "UNIQUE" => Keyword::Unique,
+            "ORDER" => Keyword::Order,
+            "BY" => Keyword::By,
+            "ASC" => Keyword::Asc,
+            "DESC" => Keyword::Desc,
+            "LIMIT" => Keyword::Limit,
+            "OFFSET" => Keyword::Offset,
+            "DISTINCT" => Keyword::Distinct,
+            "GROUP" => Keyword::Group,
+            "HAVING" => Keyword::Having,
             _ => return None,
         };
         Some(keyword)

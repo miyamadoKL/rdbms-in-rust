@@ -19,16 +19,27 @@
 //! スキーマ情報を使って「`DataType::Boolean`と分かっている列でだけ、SQLiteの
 //! 整数`0`/`1`を`false`/`true`として読み替える」という列型ベースの変換を行う。
 //!
-//! 結果の比較は行の順序を無視した多重集合(bag)比較にしている。`ORDER BY`は
-//! まだ構文解析器が受理しないため(第21章で追加する)、この章で比較する
-//! `SELECT`はどれも`ORDER BY`を持たない。SQLの意味論上、`ORDER BY`の無い
-//! `SELECT`の行順序は未規定であり、Sequential Scanが挿入順を保つminidbと、
-//! SQLiteの実装詳細(たいてい挿入順やrowid順)がたまたま一致する保証は無い。
-//! 単純な`Vec`の順序比較のままだと、両エンジンが正しく同じ行集合を返して
-//! いても順序差でテストが偽の失敗をすることがあるため、両側をソートしてから
-//! 比較する。ソートしても重複行の個数は保たれるため、`(1,'a'),(1,'a'),(2,'b')`
-//! が`(1,'a'),(2,'b'),(1,'a')`とは一致しても`(1,'a'),(2,'b')`とは一致しない、
+//! 結果の比較は、`query`が`ORDER BY`を持つかどうかで2種類を使い分ける
+//! (第21章で`ORDER BY`が構文解析器に加わるまでは、常に順序を無視した比較
+//! しかできなかった)。
+//!
+//! `ORDER BY`が無い`SELECT`は、SQLの意味論上、行の順序が未規定である。
+//! Sequential Scanが挿入順を保つminidbと、SQLiteの実装詳細(たいてい挿入順や
+//! rowid順)がたまたま一致する保証は無いため、単純な`Vec`の順序比較のままだと
+//! 両エンジンが正しく同じ行集合を返していても順序差でテストが偽の失敗を
+//! することがある。この場合は両側をソートしてから比較する([`assert_same_result`])。
+//! ソートしても重複行の個数は保たれるため、`(1,'a'),(1,'a'),(2,'b')`が
+//! `(1,'a'),(2,'b'),(1,'a')`とは一致しても`(1,'a'),(2,'b')`とは一致しない、
 //! という多重集合としての等価性は失われない。
+//!
+//! `ORDER BY`がある`SELECT`は、逆に行の順序そのものがSQLの意味論の一部であり、
+//! 両エンジンの実装詳細ではなく`ORDER BY`の並べ替えが正しく行の順序を決定
+//! していることを確かめたい。この場合はソートせず、順序を保ったまま比較する
+//! ([`assert_same_result_ordered`])。`query`文字列に`ORDER BY`という部分文字列
+//! (大文字小文字を無視)が含まれるかどうかで、どちらの比較を使うべきかを
+//! 呼び出し側に判定させる仕組みは持たず、テストごとに明示的にどちらの関数を
+//! 呼ぶかを選ぶ(暗黙の文字列判定は、`'a ORDER BY b'`のような値の中身に
+//! たまたま含まれる文字列と、実際の`ORDER BY`句を取り違える余地があるため)。
 
 use minidb::{DataType, Database, Value};
 use rusqlite::Connection;
@@ -64,6 +75,18 @@ fn assert_same_result(setup: &[&str], query: &str) {
     assert_eq!(
         minidb_rows, sqlite_rows,
         "minidbとSQLiteの結果が一致しません: setup={setup:?}, query={query:?}"
+    );
+}
+
+/// [`assert_same_result`]の順序を保つ版(第21章)。`query`が`ORDER BY`を持ち、
+/// 行の順序そのものが検証対象であるテストに使う。
+fn assert_same_result_ordered(setup: &[&str], query: &str) {
+    let (minidb_rows, column_types) = run_minidb(setup, query);
+    let sqlite_rows = run_sqlite(setup, query, &column_types);
+
+    assert_eq!(
+        minidb_rows, sqlite_rows,
+        "minidbとSQLiteの結果(順序込み)が一致しません: setup={setup:?}, query={query:?}"
     );
 }
 
@@ -400,5 +423,124 @@ fn update_into_a_duplicate_primary_key_is_rejected_by_both_engines() {
             "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')",
         ],
         "UPDATE users SET id = 1 WHERE id = 2",
+    );
+}
+
+// ---- 第21章: ORDER BY / LIMIT / OFFSET / DISTINCT / GROUP BY / HAVING / 集約 ----
+
+#[test]
+fn order_by_ascending_matches_sqlites_default_null_first_order() {
+    // SQLiteの既定の並び順は、`NULL`をどの値よりも小さい値として扱う。
+    // `compare_values`(第21章)が採用した全順序は、この既定の挙動に
+    // 一致させてある。
+    assert_same_result_ordered(
+        &["CREATE TABLE t (x BIGINT)", "INSERT INTO t VALUES (3), (1), (NULL), (2)"],
+        "SELECT x FROM t ORDER BY x",
+    );
+}
+
+#[test]
+fn order_by_descending_matches_sqlites_null_last_order() {
+    assert_same_result_ordered(
+        &["CREATE TABLE t (x BIGINT)", "INSERT INTO t VALUES (3), (1), (NULL), (2)"],
+        "SELECT x FROM t ORDER BY x DESC",
+    );
+}
+
+#[test]
+fn order_by_multiple_keys_matches_sqlite() {
+    assert_same_result_ordered(
+        &[
+            "CREATE TABLE orders (dept TEXT, amount BIGINT)",
+            "INSERT INTO orders VALUES ('eng', 200), ('eng', 100), ('sales', 50)",
+        ],
+        "SELECT dept, amount FROM orders ORDER BY dept, amount",
+    );
+}
+
+#[test]
+fn order_by_text_uses_byte_order_like_sqlite() {
+    assert_same_result_ordered(
+        &["CREATE TABLE t (x TEXT)", "INSERT INTO t VALUES ('banana'), ('apple'), ('cherry')"],
+        "SELECT x FROM t ORDER BY x",
+    );
+}
+
+#[test]
+fn limit_and_offset_match_sqlite() {
+    assert_same_result_ordered(
+        &["CREATE TABLE t (x BIGINT)", "INSERT INTO t VALUES (1), (2), (3), (4), (5)"],
+        "SELECT x FROM t ORDER BY x LIMIT 2 OFFSET 1",
+    );
+}
+
+#[test]
+fn distinct_matches_sqlite_including_null_deduplication() {
+    assert_same_result(
+        &["CREATE TABLE t (x BIGINT)", "INSERT INTO t VALUES (1), (1), (NULL), (NULL), (2)"],
+        "SELECT DISTINCT x FROM t",
+    );
+}
+
+#[test]
+fn group_by_count_sum_min_max_match_sqlite() {
+    assert_same_result(
+        &[
+            "CREATE TABLE orders (dept TEXT, amount BIGINT)",
+            "INSERT INTO orders VALUES ('eng', 100), ('eng', 200), ('sales', 50), ('sales', NULL), ('hr', NULL)",
+        ],
+        "SELECT dept, COUNT(*), SUM(amount), MIN(amount), MAX(amount) FROM orders GROUP BY dept",
+    );
+}
+
+#[test]
+fn count_star_on_empty_table_matches_sqlite() {
+    assert_same_result(&["CREATE TABLE t (x BIGINT)"], "SELECT COUNT(*) FROM t");
+}
+
+#[test]
+fn having_filters_groups_and_matches_sqlite() {
+    assert_same_result(
+        &[
+            "CREATE TABLE orders (dept TEXT, amount BIGINT)",
+            "INSERT INTO orders VALUES ('eng', 100), ('eng', 200), ('sales', 50)",
+        ],
+        "SELECT dept, COUNT(*) FROM orders GROUP BY dept HAVING COUNT(*) > 1",
+    );
+}
+
+#[test]
+fn group_by_having_order_by_limit_match_sqlite_together() {
+    assert_same_result_ordered(
+        &[
+            "CREATE TABLE orders (dept TEXT, amount BIGINT)",
+            "INSERT INTO orders VALUES ('eng', 100), ('eng', 200), ('sales', 50), ('sales', 30), ('hr', 10)",
+        ],
+        "SELECT dept, SUM(amount) FROM orders GROUP BY dept HAVING COUNT(*) > 1 ORDER BY dept LIMIT 1",
+    );
+}
+
+#[test]
+fn order_by_a_column_outside_the_select_list_matches_sqlite() {
+    // `SELECT name FROM t ORDER BY id`という、SELECTの対象式に無い列を
+    // ORDER BYで参照する最頻出パターン。PostgreSQL・SQLiteのどちらでも
+    // 対応している挙動であり、隠し列(第21章)を経由してminidbでも同じ結果になる。
+    assert_same_result_ordered(
+        &[
+            "CREATE TABLE t (name TEXT, id BIGINT)",
+            "INSERT INTO t VALUES ('b', 2), ('a', 1), ('c', 3)",
+        ],
+        "SELECT name FROM t ORDER BY id",
+    );
+}
+
+#[test]
+fn order_by_an_aggregate_outside_the_select_list_matches_sqlite() {
+    assert_same_result_ordered(
+        &[
+            "CREATE TABLE orders (dept TEXT, amount BIGINT)",
+            "INSERT INTO orders VALUES ('eng', 100), ('eng', 200), ('sales', 50)",
+        ],
+        "SELECT dept FROM orders GROUP BY dept ORDER BY COUNT(*) DESC, dept",
     );
 }

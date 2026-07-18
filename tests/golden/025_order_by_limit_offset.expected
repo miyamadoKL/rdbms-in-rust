@@ -1,0 +1,36 @@
+CREATE TABLE
+
+INSERT 4
+
+x
+-
+NULL
+1
+2
+3
+(4 rows)
+
+x
+-
+3
+2
+1
+NULL
+(4 rows)
+
+x
+-
+NULL
+1
+(2 rows)
+
+x
+-
+1
+2
+(2 rows)
+
+x
+-
+3
+(1 row)

@@ -52,7 +52,10 @@ use crate::error::{DbError, DbResult};
 use crate::eval::FunctionRegistry;
 use crate::executor;
 use crate::logical_plan::{self, DeleteNode, InsertNode, LogicalPlan, UpdateNode};
-use crate::physical_plan::{self, DiskSeqScanExec, Executor, FilterExec, MemSeqScanExec, PhysicalPlan, ProjectionExec, ValuesExec};
+use crate::physical_plan::{
+    self, DiskSeqScanExec, DistinctExec, Executor, FilterExec, HashAggregateExec, LimitExec, MemSeqScanExec,
+    PhysicalPlan, ProjectionExec, SortExec, ValuesExec,
+};
 use crate::storage::Storage;
 use crate::storage_mem::MemStorage;
 use crate::types::{Column, DataType, Schema, Tuple, Value};
@@ -346,9 +349,32 @@ impl Database {
                 let input = self.build_query_executor(&filter.input)?;
                 Ok(Box::new(FilterExec::new(input, &filter.predicate, &self.functions)))
             }
+            PhysicalPlan::Aggregate(aggregate) => {
+                let input = self.build_query_executor(&aggregate.input)?;
+                let exec = HashAggregateExec::new(
+                    input,
+                    &aggregate.group_by,
+                    &aggregate.calls,
+                    aggregate.schema.clone(),
+                    &self.functions,
+                )?;
+                Ok(Box::new(exec))
+            }
             PhysicalPlan::Projection(projection) => {
                 let input = self.build_query_executor(&projection.input)?;
                 Ok(Box::new(ProjectionExec::new(input, &projection.projection, &self.functions)))
+            }
+            PhysicalPlan::Distinct(distinct) => {
+                let input = self.build_query_executor(&distinct.input)?;
+                Ok(Box::new(DistinctExec::new(input)))
+            }
+            PhysicalPlan::Sort(sort) => {
+                let input = self.build_query_executor(&sort.input)?;
+                Ok(Box::new(SortExec::new(input, &sort.keys, &self.functions)?))
+            }
+            PhysicalPlan::Limit(limit) => {
+                let input = self.build_query_executor(&limit.input)?;
+                Ok(Box::new(LimitExec::new(input, limit.limit, limit.offset)))
             }
             PhysicalPlan::Insert(_) | PhysicalPlan::Update(_) | PhysicalPlan::Delete(_) => {
                 unreachable!("Insert/Update/DeleteはSELECTの計画に現れない(logical_plan::build_selectは作らない)")
@@ -1717,5 +1743,243 @@ mod tests {
         let _ = db.catalog();
         // panicするのでここには到達しないが、後始末のため一応残しておく。
         std::fs::remove_file(&path).unwrap();
+    }
+
+    // ---- 第21章: ORDER BY / LIMIT / OFFSET / DISTINCT / GROUP BY / HAVING / 集約 ----
+
+    fn orders_db() -> Database {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE orders (dept TEXT, amount BIGINT)").unwrap();
+        db.execute(
+            "INSERT INTO orders VALUES \
+             ('eng', 100), ('eng', 200), ('sales', 50), ('sales', NULL), ('hr', NULL)",
+        )
+        .unwrap();
+        db
+    }
+
+    fn rows_as_strings(result: &QueryResult) -> Vec<String> {
+        result
+            .rows()
+            .iter()
+            .map(|tuple| tuple.values().iter().map(Value::to_string).collect::<Vec<_>>().join(","))
+            .collect()
+    }
+
+    #[test]
+    fn order_by_sorts_ascending_by_default_with_nulls_first() {
+        let mut db = orders_db();
+        let result = db.execute("SELECT amount FROM orders ORDER BY amount").unwrap();
+        assert_eq!(rows_as_strings(&result), vec!["NULL", "NULL", "50", "100", "200"]);
+    }
+
+    #[test]
+    fn order_by_desc_puts_nulls_last() {
+        let mut db = orders_db();
+        let result = db.execute("SELECT amount FROM orders ORDER BY amount DESC").unwrap();
+        assert_eq!(rows_as_strings(&result), vec!["200", "100", "50", "NULL", "NULL"]);
+    }
+
+    #[test]
+    fn order_by_multiple_keys_breaks_ties_with_the_second_key() {
+        let mut db = orders_db();
+        let result = db.execute("SELECT dept, amount FROM orders ORDER BY dept, amount DESC").unwrap();
+        assert_eq!(
+            rows_as_strings(&result),
+            vec!["eng,200", "eng,100", "hr,NULL", "sales,50", "sales,NULL"]
+        );
+    }
+
+    #[test]
+    fn limit_returns_only_the_first_n_rows_after_ordering() {
+        let mut db = orders_db();
+        let result = db.execute("SELECT amount FROM orders ORDER BY amount LIMIT 2").unwrap();
+        assert_eq!(rows_as_strings(&result), vec!["NULL", "NULL"]);
+    }
+
+    #[test]
+    fn limit_with_offset_skips_the_first_rows() {
+        let mut db = orders_db();
+        let result = db.execute("SELECT amount FROM orders ORDER BY amount LIMIT 2 OFFSET 2").unwrap();
+        assert_eq!(rows_as_strings(&result), vec!["50", "100"]);
+    }
+
+    #[test]
+    fn offset_without_limit_returns_the_remaining_rows() {
+        let mut db = orders_db();
+        let result = db.execute("SELECT amount FROM orders ORDER BY amount OFFSET 3").unwrap();
+        assert_eq!(rows_as_strings(&result), vec!["100", "200"]);
+    }
+
+    #[test]
+    fn distinct_removes_duplicate_rows_and_treats_null_as_equal_to_null() {
+        let mut db = orders_db();
+        let result = db.execute("SELECT DISTINCT amount FROM orders ORDER BY amount").unwrap();
+        assert_eq!(rows_as_strings(&result), vec!["NULL", "50", "100", "200"]);
+    }
+
+    #[test]
+    fn group_by_aggregates_each_group_independently() {
+        let mut db = orders_db();
+        let result = db
+            .execute("SELECT dept, COUNT(*), SUM(amount), MIN(amount), MAX(amount) FROM orders GROUP BY dept ORDER BY dept")
+            .unwrap();
+        assert_eq!(
+            rows_as_strings(&result),
+            vec!["eng,2,300,100,200", "hr,1,NULL,NULL,NULL", "sales,2,50,50,50"]
+        );
+    }
+
+    #[test]
+    fn count_star_on_an_empty_table_still_returns_one_row_with_zero() {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE t (x BIGINT)").unwrap();
+        let result = db.execute("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(rows_as_strings(&result), vec!["0"]);
+    }
+
+    #[test]
+    fn group_by_on_an_empty_table_returns_no_groups() {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE t (x TEXT)").unwrap();
+        let result = db.execute("SELECT x, COUNT(*) FROM t GROUP BY x").unwrap();
+        assert!(result.rows().is_empty());
+    }
+
+    #[test]
+    fn having_filters_groups_after_aggregation() {
+        let mut db = orders_db();
+        let result =
+            db.execute("SELECT dept, COUNT(*) FROM orders GROUP BY dept HAVING COUNT(*) > 1 ORDER BY dept").unwrap();
+        assert_eq!(rows_as_strings(&result), vec!["eng,2", "sales,2"]);
+    }
+
+    #[test]
+    fn group_by_having_order_by_and_limit_compose_together() {
+        let mut db = orders_db();
+        let result = db
+            .execute(
+                "SELECT dept, SUM(amount) FROM orders GROUP BY dept HAVING SUM(amount) IS NOT NULL \
+                 ORDER BY dept DESC LIMIT 1",
+            )
+            .unwrap();
+        // `HAVING`が`hr`(SUM=NULL)を落とし、残る2グループ(eng・sales)のうち、
+        // `ORDER BY dept DESC LIMIT 1`が辞書順で後ろの`sales`だけを残す。
+        assert_eq!(rows_as_strings(&result), vec!["sales,50"]);
+    }
+
+    #[test]
+    fn where_filters_rows_before_grouping() {
+        let mut db = orders_db();
+        let result = db
+            .execute("SELECT dept, COUNT(*) FROM orders WHERE amount IS NOT NULL GROUP BY dept ORDER BY dept")
+            .unwrap();
+        // `amount IS NOT NULL`が`hr`の1行(amount=NULL)を落としてから集約するため、
+        // `hr`はグループごと消える。
+        assert_eq!(rows_as_strings(&result), vec!["eng,2", "sales,1"]);
+    }
+
+    #[test]
+    fn where_cannot_reference_an_aggregate() {
+        let mut db = orders_db();
+        let result = db.execute("SELECT dept FROM orders WHERE COUNT(*) > 1");
+        assert!(matches!(result, Err(DbError::Bind { .. })));
+    }
+
+    #[test]
+    fn explain_shows_every_new_operator_in_composition_order() {
+        let mut db = orders_db();
+        let result = db
+            .execute(
+                "EXPLAIN SELECT dept, COUNT(*) FROM orders WHERE amount IS NOT NULL \
+                 GROUP BY dept HAVING COUNT(*) > 1 ORDER BY dept LIMIT 5",
+            )
+            .unwrap();
+        assert_eq!(
+            result.to_string(),
+            "QUERY PLAN\n----------\n\
+             Limit(limit=5)\n  \
+             └─ Sort(dept ASC)\n    \
+             └─ Projection(dept, COUNT(*))\n      \
+             └─ Filter(COUNT(*) > 1)\n        \
+             └─ Aggregate(group_by=[dept], calls=[COUNT(*)])\n          \
+             └─ Filter(amount IS NOT NULL)\n            \
+             └─ SeqScan(orders)\n\
+             (7 rows)"
+        );
+    }
+
+    #[test]
+    fn select_distinct_composes_after_projection_and_before_order_by() {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE t (a BIGINT, b BIGINT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (1, 20), (2, 30)").unwrap();
+        // 射影が`a`だけを残すため、元は別々の行だった(1,10)と(1,20)が
+        // DISTINCTの時点では同じ行(a=1)になり、1行にまとまる。
+        let result = db.execute("SELECT DISTINCT a FROM t ORDER BY a").unwrap();
+        assert_eq!(rows_as_strings(&result), vec!["1", "2"]);
+    }
+
+    // ---- ORDER BYの隠し列(SELECTの対象式に無い式を参照する場合) ----
+
+    #[test]
+    fn order_by_can_reference_a_column_not_in_the_select_list() {
+        // `SELECT name FROM t ORDER BY id`という最頻出パターン。`id`は`SELECT`の
+        // 対象式に無いが、隠し列として並べ替えにだけ使われ、結果には現れない。
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE t (name TEXT, id BIGINT)").unwrap();
+        db.execute("INSERT INTO t VALUES ('b', 2), ('a', 1), ('c', 3)").unwrap();
+
+        let result = db.execute("SELECT name FROM t ORDER BY id").unwrap();
+        assert_eq!(result.schema().columns().len(), 1);
+        assert_eq!(result.schema().columns()[0].name, "name");
+        assert_eq!(rows_as_strings(&result), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn order_by_can_reference_an_aggregate_not_in_the_select_list() {
+        let mut db = orders_db();
+        let result = db.execute("SELECT dept FROM orders GROUP BY dept ORDER BY COUNT(*) DESC, dept").unwrap();
+        assert_eq!(result.schema().columns().len(), 1);
+        // `eng`・`sales`はどちらも2件、`hr`は1件。件数の降順、同数はdept昇順。
+        assert_eq!(rows_as_strings(&result), vec!["eng", "sales", "hr"]);
+    }
+
+    #[test]
+    fn order_by_matching_the_select_list_does_not_duplicate_the_column() {
+        // `ORDER BY dept`の`dept`が射影の`dept`と同じ式なら、新しい隠し列を
+        // 増やさずその列をそのまま並べ替えに使う(「射影に同名の出力列が
+        // あればそれが優先される」という優先順位)。
+        let mut db = orders_db();
+        let explain = db.execute("EXPLAIN SELECT dept FROM orders ORDER BY dept").unwrap();
+        // トリム用の`Projection`が2重に積まれていないことを、`Projection`が
+        // 1回しか現れないことで確認する。
+        let projection_count = explain.to_string().matches("Projection(").count();
+        assert_eq!(projection_count, 1);
+    }
+
+    #[test]
+    fn order_by_with_distinct_on_a_non_selected_column_is_rejected() {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE t (name TEXT, id BIGINT)").unwrap();
+        db.execute("INSERT INTO t VALUES ('a', 1)").unwrap();
+        let result = db.execute("SELECT DISTINCT name FROM t ORDER BY id");
+        assert!(matches!(result, Err(DbError::Bind { .. })));
+    }
+
+    #[test]
+    fn explain_shows_the_extended_projection_and_the_trim_projection() {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE t (name TEXT, id BIGINT)").unwrap();
+        let result = db.execute("EXPLAIN SELECT name FROM t ORDER BY id").unwrap();
+        assert_eq!(
+            result.to_string(),
+            "QUERY PLAN\n----------\n\
+             Projection(name)\n  \
+             └─ Sort(id ASC)\n    \
+             └─ Projection(name, id)\n      \
+             └─ SeqScan(t)\n\
+             (4 rows)"
+        );
     }
 }

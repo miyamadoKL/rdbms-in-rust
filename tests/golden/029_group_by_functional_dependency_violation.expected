@@ -1,0 +1,3 @@
+CREATE TABLE
+
+ERROR: 行1列14: 名前解決エラー: 列'amount'はGROUP BYの列か集約関数の引数としてのみ使用できます

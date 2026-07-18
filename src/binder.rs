@@ -51,17 +51,18 @@
 use std::collections::HashSet;
 
 use crate::ast::{
-    Assignment, BinaryOperator, CreateTableStatement, DeleteStatement, DropTableStatement, Expr,
-    FromClause, Ident, InsertStatement, SelectItem, SelectStatement, Statement, UnaryOperator,
-    UpdateStatement,
+    AggregateFunc, Assignment, BinaryOperator, CreateTableStatement, DeleteStatement,
+    DropTableStatement, Expr, FromClause, Ident, InsertStatement, SelectItem, SelectStatement,
+    Statement, UnaryOperator, UpdateStatement,
 };
 use crate::catalog::{Catalog, TableInfo};
 use crate::error::{DbError, DbResult};
-use crate::eval::FunctionRegistry;
+use crate::eval::{FunctionRegistry, eval_bound_expr};
 use crate::ids::TableId;
 use crate::lexer::{self, Span};
+use crate::logical_plan;
 use crate::storage::Storage;
-use crate::types::{DataType, Schema};
+use crate::types::{Column, DataType, Schema};
 
 /// テーブル名から[`TableInfo`]を引ける、カタログの抽象。
 ///
@@ -138,12 +139,78 @@ impl BoundTableRef {
 /// `JOIN`で複数テーブルの`FROM`が導入されたときに、この型をそのまま使い
 /// 回せるようにするためである。[`Binder::resolve_column`]の曖昧列検出も、
 /// この`Vec`の要素数に関係なく動く形で書いてある。
+///
+/// `aggregate`が`Some`の場合、`projection`と`having`は`FROM`の列を直接指す
+/// `ColumnRef`をもう含まない。集約が絡む`SELECT`では、`GROUP BY`の列と集約
+/// 関数の呼び出しだけが下流(`HAVING`・射影・`ORDER BY`)から参照できる値の
+/// 全てであり、`Binder::bind_select`はこの2種類を[`BoundAggregate::schema`]の
+/// 列として並べ直したうえで、`projection`・`having`の式木に含まれる該当箇所を
+/// その列への`ColumnRef`(`table_ordinal = 0`)へ書き換える(`Binder::rewrite_for_aggregate`
+/// 参照)。`order_by`も同様に、常に`projection`が生成する出力列を指す
+/// (「`ORDER BY`はどの範囲を束縛するか」節を参照)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundSelect {
     pub tables: Vec<BoundTableRef>,
+    /// `SELECT DISTINCT`が指定されていたかどうか(第21章)。
+    pub distinct: bool,
+    /// `SELECT`が生成する行の列。末尾の`hidden_column_count`個は、`SELECT`が
+    /// 宣言した出力には含まれない**隠し列**である(第21章、`Binder::bind_select`
+    /// の「`ORDER BY`はどの範囲を束縛するか」を参照)。
     pub projection: Vec<BoundSelectItem>,
+    /// `projection`のうち、末尾から数えて隠し列である個数。`0`なら`projection`
+    /// はすべて`SELECT`の対象式であり、`LogicalPlan::build_select`は末尾を
+    /// 切り落とす`Projection`を積まない。
+    pub hidden_column_count: usize,
     pub predicate: Option<BoundExpr>,
+    /// `GROUP BY`または集約関数の呼び出しを含む`SELECT`であれば`Some`
+    /// (第21章)。`GROUP BY`が無くても`SELECT COUNT(*) FROM t`のように
+    /// 集約関数だけを使う`SELECT`はここが`Some`になる(空の`Vec`を持つ
+    /// `group_by`で、テーブル全体を1個のグループとして扱う)。`ORDER BY`だけに
+    /// 集約関数呼び出しが現れる場合(`GROUP BY`も`HAVING`も無い`SELECT`に対する
+    /// `ORDER BY COUNT(*)`)も、この`SELECT`全体を集約クエリとして扱う。
+    pub aggregate: Option<BoundAggregate>,
+    /// `HAVING`(第21章)。`aggregate`が`Some`の場合のみ`Some`になりうる
+    /// (`Binder::bind_select`が、`HAVING`の存在自体を集約`SELECT`である
+    /// ことの条件に含めているため)。
+    pub having: Option<BoundExpr>,
+    /// `ORDER BY`(第21章)。各要素は`projection`(隠し列を含む)の列を指す
+    /// `ColumnRef`として束縛される。
+    pub order_by: Vec<BoundOrderByItem>,
+    /// `LIMIT`(第21章)。行を伴わない定数式として束縛の時点で評価し切った値
+    /// (`Binder::eval_row_count_expr`)を持つ。
+    pub limit: Option<usize>,
+    /// `OFFSET`(第21章)。`limit`と同じ理由で束縛の時点で評価済み。
+    pub offset: Option<usize>,
     pub span: Span,
+}
+
+/// 束縛済みの`ORDER BY`要素1個(第21章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundOrderByItem {
+    pub expr: BoundExpr,
+    pub desc: bool,
+}
+
+/// 束縛済みの集約情報(第21章)。
+///
+/// `group_by`はグループ化キーを計算するための式で、`FROM`の列を直接参照する
+/// (集約前の行に対して評価する)。`calls`は`SELECT`・`HAVING`のどこかに現れた
+/// 集約関数呼び出しを、最初に現れた順に重複無く集めたもの。`schema`は
+/// `group_by`の列(先頭から`group_by.len()`列)に`calls`の列(残り)を続けた、
+/// この演算子が生成する行の列構成である。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundAggregate {
+    pub group_by: Vec<BoundExpr>,
+    pub calls: Vec<AggregateCall>,
+    pub schema: Schema,
+}
+
+/// 集約関数の呼び出し1個(第21章)。`arg`は`FROM`の列を直接参照する式で、
+/// `None`は`COUNT(*)`だけを表す。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregateCall {
+    pub func: AggregateFunc,
+    pub arg: Option<Box<BoundExpr>>,
 }
 
 /// 束縛済みの射影対象1個。`*`はここに来る前に個々の列参照へ展開済みなので、
@@ -211,6 +278,19 @@ pub enum BoundExpr {
         data_type: DataType,
         span: Span,
     },
+    /// 集約関数呼び出し(第21章)。`arg`が`None`なのは`COUNT(*)`だけ。
+    ///
+    /// `Binder::bind_select`は、集約が絡む`SELECT`ではこのノードを
+    /// `BoundAggregate`の1列への`ColumnRef`へ書き換える(`rewrite_for_aggregate`)。
+    /// そのため、`physical_plan`の`Executor`(`FilterExec`・`ProjectionExec`等)が
+    /// 実際に評価する式木に、この`Aggregate`ノードが残ることは無い。残るのは
+    /// `AggregateCall`(集約演算子自身がグループごとに計算する)としてだけである。
+    Aggregate {
+        func: AggregateFunc,
+        arg: Option<Box<BoundExpr>>,
+        data_type: DataType,
+        span: Span,
+    },
     Paren {
         expr: Box<BoundExpr>,
         span: Span,
@@ -237,6 +317,7 @@ impl BoundExpr {
             | BoundExpr::UnaryOp { data_type, .. }
             | BoundExpr::BinaryOp { data_type, .. }
             | BoundExpr::FunctionCall { data_type, .. }
+            | BoundExpr::Aggregate { data_type, .. }
             | BoundExpr::Cast { data_type, .. } => Some(*data_type),
             BoundExpr::IsNull { .. } => Some(DataType::Boolean),
             BoundExpr::Paren { expr, .. } => expr.data_type(),
@@ -255,6 +336,7 @@ impl BoundExpr {
             | BoundExpr::BinaryOp { span, .. }
             | BoundExpr::IsNull { span, .. }
             | BoundExpr::FunctionCall { span, .. }
+            | BoundExpr::Aggregate { span, .. }
             | BoundExpr::Paren { span, .. }
             | BoundExpr::Cast { span, .. } => *span,
         }
@@ -324,7 +406,7 @@ impl<'a> Binder<'a> {
     /// AST(`Statement`)をBound AST(`BoundStatement`)へ変換する。
     pub fn bind(&self, statement: Statement) -> DbResult<BoundStatement> {
         match statement {
-            Statement::Select(select) => self.bind_select(select).map(BoundStatement::Select),
+            Statement::Select(select) => self.bind_select(*select).map(BoundStatement::Select),
             Statement::CreateTable(create) => Ok(BoundStatement::CreateTable(create)),
             Statement::DropTable(drop) => self.bind_drop_table(drop),
             Statement::Insert(insert) => self.bind_insert(insert).map(BoundStatement::Insert),
@@ -406,16 +488,309 @@ impl<'a> Binder<'a> {
         }
 
         let predicate = match &select.where_clause {
+            Some(expr) => {
+                let bound = self.bind_predicate(expr, &tables)?;
+                if bound_contains_aggregate(&bound) {
+                    return Err(self.error_at(
+                        bound.span(),
+                        "集約関数はWHEREでは使えません(集約はWHEREによる絞り込みの後に計算されます)".to_string(),
+                    ));
+                }
+                Some(bound)
+            }
+            None => None,
+        };
+
+        let group_by = select
+            .group_by
+            .iter()
+            .map(|expr| {
+                let bound = self.bind_expr(expr, &tables)?;
+                if bound_contains_aggregate(&bound) {
+                    return Err(self.error_at(bound.span(), "GROUP BYの中では集約関数は使えません".to_string()));
+                }
+                Ok(bound)
+            })
+            .collect::<DbResult<Vec<_>>>()?;
+
+        let raw_having = match &select.having {
             Some(expr) => Some(self.bind_predicate(expr, &tables)?),
+            None => None,
+        };
+
+        // `ORDER BY`が新しく集約関数を持ち込む場合(`GROUP BY`も`HAVING`も無い
+        // `SELECT`に対する`ORDER BY COUNT(*)`のような書き方)も、この`SELECT`を
+        // 集約クエリとして扱う。構文木(`ast::Expr`)の時点で判定できるため、
+        // まだ束縛していない`select.order_by`をそのまま調べる。
+        let is_aggregate = !group_by.is_empty()
+            || raw_having.is_some()
+            || projection.iter().any(|item| bound_contains_aggregate(&item.expr))
+            || select.order_by.iter().any(|item| ast_expr_contains_aggregate(&item.expr));
+
+        let (mut aggregate, mut projection, having) = if is_aggregate {
+            let mut aggregate = self.build_aggregate(group_by);
+            let projection = projection
+                .into_iter()
+                .map(|item| {
+                    let expr = self.rewrite_for_aggregate(item.expr, &mut aggregate)?;
+                    Ok(BoundSelectItem { expr, output_name: item.output_name })
+                })
+                .collect::<DbResult<Vec<_>>>()?;
+            let having = match raw_having {
+                Some(expr) => Some(self.rewrite_for_aggregate(expr, &mut aggregate)?),
+                None => None,
+            };
+            (Some(aggregate), projection, having)
+        } else {
+            (None, projection, None)
+        };
+
+        // `ORDER BY`の各式は、まず`SELECT`の対象式(`projection`)の中に同じ式が
+        // 無いかを探し、あればその列をそのまま並べ替えのキーに使う(「射影に
+        // 同名の出力列があればそれが優先される」という名前解決の優先順位)。
+        // 見つからなければ、新しい列として`projection`の末尾に**隠し列**として
+        // 追加する。隠し列は`SELECT`が宣言した出力には含まれず、並べ替えの
+        // ためだけに`Sort`まで運ばれたあと、`LogicalPlan::build_select`が積む
+        // 最後の`Projection`(トリム)で取り除かれる(詳細はモジュール冒頭の
+        // 「`ORDER BY`はどの範囲を束縛するか」を参照)。
+        let visible_len = projection.len();
+        let mut order_by = Vec::with_capacity(select.order_by.len());
+        for item in &select.order_by {
+            let index = match aggregate.as_mut() {
+                Some(aggregate) => {
+                    self.resolve_order_by_in_aggregate_scope(&item.expr, &tables, aggregate, &mut projection)?
+                }
+                None => self.resolve_order_by_in_plain_scope(&item.expr, &tables, &mut projection)?,
+            };
+            if select.distinct && index >= visible_len {
+                return Err(self.error_at(
+                    item.expr.span(),
+                    "DISTINCTを伴うSELECTでは、ORDER BYはSELECTの対象式だけを参照できます".to_string(),
+                ));
+            }
+            let target = &projection[index];
+            order_by.push(BoundOrderByItem {
+                expr: BoundExpr::ColumnRef {
+                    table_ordinal: 0,
+                    column_index: index,
+                    name: target.output_name.clone(),
+                    data_type: target.expr.data_type().unwrap_or(DataType::Text),
+                    span: item.expr.span(),
+                },
+                desc: item.desc,
+            });
+        }
+        let hidden_column_count = projection.len() - visible_len;
+
+        let limit = match &select.limit {
+            Some(expr) => Some(self.eval_row_count_expr(expr, "LIMIT")?),
+            None => None,
+        };
+        let offset = match &select.offset {
+            Some(expr) => Some(self.eval_row_count_expr(expr, "OFFSET")?),
             None => None,
         };
 
         Ok(BoundSelect {
             tables,
+            distinct: select.distinct,
             projection,
             predicate,
+            aggregate,
+            having,
+            order_by,
+            hidden_column_count,
+            limit,
+            offset,
             span: select.span,
         })
+    }
+
+    /// `group_by`から、集約結果の列構成の先頭部分(グループ化キー)だけを
+    /// 確定させた[`BoundAggregate`]を作る。集約関数の呼び出し(`calls`)は
+    /// まだ1つも登録されていない状態で始まり、[`Binder::rewrite_for_aggregate`]
+    /// が`projection`・`having`・`ORDER BY`を書き換える過程で、新しい呼び出しに
+    /// 出会うたびに追記されていく。
+    fn build_aggregate(&self, group_by: Vec<BoundExpr>) -> BoundAggregate {
+        let columns = group_by
+            .iter()
+            .map(|expr| {
+                let data_type = expr.data_type().unwrap_or(DataType::Text);
+                Column::new(logical_plan::fmt_bound_expr(expr), data_type, true)
+            })
+            .collect();
+        BoundAggregate { group_by, calls: Vec::new(), schema: Schema::new(columns) }
+    }
+
+    /// `expr`の中で、`aggregate.group_by`の式全体と一致する部分式、または
+    /// 集約関数呼び出し(`BoundExpr::Aggregate`)を、`aggregate.schema`の対応する
+    /// 列への`ColumnRef`へ置き換える。
+    ///
+    /// 一致するかどうかは式の構造を表す文字列表現(`logical_plan::fmt_bound_expr`、
+    /// `Span`を含まないため書かれた位置に関係なく同じ式なら同じ文字列になる)を
+    /// 比較して判定し、一致すればそれ以上式の内部には再帰しない。`GROUP BY
+    /// a + b`のもとで`SELECT a + b`と書いた場合、`a + b`全体が1つのグループ化
+    /// キーとして一致するため、内部の`a`・`b`を個別に検査する必要が無い(むしろ
+    /// `a`・`b`を個別に検査すると、集約後にはもう存在しない`FROM`の生の列参照
+    /// として誤って拒否してしまう)。
+    ///
+    /// 一致しない`ColumnRef`は、`GROUP BY`にも集約関数の中にも現れない、
+    /// 集約後の値が定まらない列参照であり、標準SQLの「関数従属性」の違反として
+    /// エラーにする(`SELECT name FROM t GROUP BY dept`のような文が典型)。
+    ///
+    /// 集約関数呼び出しは、`aggregate.calls`の中にまだ同じ呼び出しが無ければ
+    /// 新しい列として追記する。この関数は`projection`・`having`・`ORDER BY`の
+    /// 書き換えに共通して使われるため、`SELECT dept, COUNT(*) FROM t GROUP BY
+    /// dept ORDER BY COUNT(*) DESC`のように、`ORDER BY`だけに現れる集約呼び出し
+    /// も、`projection`に現れる呼び出しと同じ扱いで`aggregate.schema`の列になる。
+    fn rewrite_for_aggregate(&self, expr: BoundExpr, aggregate: &mut BoundAggregate) -> DbResult<BoundExpr> {
+        let key = logical_plan::fmt_bound_expr(&expr);
+        if let Some(slot) = aggregate.group_by.iter().position(|g| logical_plan::fmt_bound_expr(g) == key) {
+            return Ok(self.slot_column_ref(slot, &aggregate.schema, expr.span()));
+        }
+
+        match expr {
+            BoundExpr::Aggregate { func, arg, span, .. } => {
+                let existing = aggregate.calls.iter().position(|call| logical_plan::fmt_aggregate_call(call) == key);
+                let slot = match existing {
+                    Some(index) => aggregate.group_by.len() + index,
+                    None => {
+                        let data_type = self.check_aggregate_arg_type(func, arg.as_deref(), span)?;
+                        let label = format!(
+                            "{}({})",
+                            func.name(),
+                            arg.as_deref().map(logical_plan::fmt_bound_expr).unwrap_or_else(|| "*".to_string())
+                        );
+                        let nullable = !matches!(func, AggregateFunc::Count);
+                        aggregate.schema.columns_mut().push(Column::new(label, data_type, nullable));
+                        aggregate.calls.push(AggregateCall { func, arg });
+                        aggregate.group_by.len() + aggregate.calls.len() - 1
+                    }
+                };
+                Ok(self.slot_column_ref(slot, &aggregate.schema, span))
+            }
+            BoundExpr::ColumnRef { span, name, .. } => Err(self.error_at(
+                span,
+                format!("列'{name}'はGROUP BYの列か集約関数の引数としてのみ使用できます"),
+            )),
+            BoundExpr::IntLiteral { .. }
+            | BoundExpr::StringLiteral { .. }
+            | BoundExpr::BoolLiteral { .. }
+            | BoundExpr::NullLiteral { .. } => Ok(expr),
+            BoundExpr::UnaryOp { op, expr, data_type, span } => {
+                let expr = self.rewrite_for_aggregate(*expr, aggregate)?;
+                Ok(BoundExpr::UnaryOp { op, expr: Box::new(expr), data_type, span })
+            }
+            BoundExpr::BinaryOp { op, lhs, rhs, data_type, span } => {
+                let lhs = self.rewrite_for_aggregate(*lhs, aggregate)?;
+                let rhs = self.rewrite_for_aggregate(*rhs, aggregate)?;
+                Ok(BoundExpr::BinaryOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs), data_type, span })
+            }
+            BoundExpr::IsNull { expr, negated, span } => {
+                let expr = self.rewrite_for_aggregate(*expr, aggregate)?;
+                Ok(BoundExpr::IsNull { expr: Box::new(expr), negated, span })
+            }
+            BoundExpr::FunctionCall { name, args, data_type, span } => {
+                let args =
+                    args.into_iter().map(|arg| self.rewrite_for_aggregate(arg, aggregate)).collect::<DbResult<Vec<_>>>()?;
+                Ok(BoundExpr::FunctionCall { name, args, data_type, span })
+            }
+            BoundExpr::Paren { expr, span } => {
+                let expr = self.rewrite_for_aggregate(*expr, aggregate)?;
+                Ok(BoundExpr::Paren { expr: Box::new(expr), span })
+            }
+            BoundExpr::Cast { expr, data_type, span } => {
+                let expr = self.rewrite_for_aggregate(*expr, aggregate)?;
+                Ok(BoundExpr::Cast { expr: Box::new(expr), data_type, span })
+            }
+        }
+    }
+
+    fn slot_column_ref(&self, slot: usize, schema: &Schema, span: Span) -> BoundExpr {
+        let column = &schema.columns()[slot];
+        BoundExpr::ColumnRef {
+            table_ordinal: 0,
+            column_index: slot,
+            name: column.name.clone(),
+            data_type: column.data_type,
+            span,
+        }
+    }
+
+    /// `ORDER BY`の式を、集約を伴わない`SELECT`のスコープ(`tables`、`WHERE`や
+    /// 元の`projection`と同じ)で束縛する。
+    ///
+    /// `projection`(`SELECT`の対象式)の中にすでに同じ式(`logical_plan::fmt_bound_expr`
+    /// による構造の一致)があれば、新しい列を増やさずその列を指す添字を返す。
+    /// 無ければ、`projection`の末尾に隠し列として追加してその添字を返す
+    /// (`Binder::bind_select`のドキュメント参照)。
+    fn resolve_order_by_in_plain_scope(
+        &self,
+        expr: &Expr,
+        tables: &[BoundTableRef],
+        projection: &mut Vec<BoundSelectItem>,
+    ) -> DbResult<usize> {
+        let bound = self.bind_expr(expr, tables)?;
+        let key = logical_plan::fmt_bound_expr(&bound);
+        if let Some(index) = projection.iter().position(|item| logical_plan::fmt_bound_expr(&item.expr) == key) {
+            return Ok(index);
+        }
+        let output_name = self.sql[expr.span().start..expr.span().end].to_string();
+        projection.push(BoundSelectItem { expr: bound, output_name });
+        Ok(projection.len() - 1)
+    }
+
+    /// `resolve_order_by_in_plain_scope`の集約クエリ版。`expr`を`tables`(`HAVING`
+    /// と同じスコープ、集約関数呼び出しを含んでよい)で束縛したうえで、
+    /// `Binder::rewrite_for_aggregate`に通す。まだ`projection`にも`having`にも
+    /// 現れていない集約関数呼び出し(`ORDER BY COUNT(*) DESC`のような)であれば、
+    /// この呼び出しの中で`aggregate.schema`へ新しい列として追記される。
+    fn resolve_order_by_in_aggregate_scope(
+        &self,
+        expr: &Expr,
+        tables: &[BoundTableRef],
+        aggregate: &mut BoundAggregate,
+        projection: &mut Vec<BoundSelectItem>,
+    ) -> DbResult<usize> {
+        let bound = self.bind_expr(expr, tables)?;
+        let rewritten = self.rewrite_for_aggregate(bound, aggregate)?;
+        let key = logical_plan::fmt_bound_expr(&rewritten);
+        if let Some(index) = projection.iter().position(|item| logical_plan::fmt_bound_expr(&item.expr) == key) {
+            return Ok(index);
+        }
+        let output_name = self.sql[expr.span().start..expr.span().end].to_string();
+        projection.push(BoundSelectItem { expr: rewritten, output_name });
+        Ok(projection.len() - 1)
+    }
+
+    /// `LIMIT`・`OFFSET`の式を束縛し、その場で評価して非負の`usize`にする。
+    ///
+    /// `LIMIT`・`OFFSET`は特定の行を参照しない定数式であり(標準SQLも実行時に
+    /// 行ごとに変わる値を許さない)、`Binder`はこれを`tables`を持たない空の
+    /// スコープで束縛する。これにより`LIMIT id`のような列参照は、構文としては
+    /// 書けても「列'id'が見つかりません」という束縛エラーになる。値は
+    /// `eval_bound_expr`でこの場で評価してしまい、以後(`LogicalPlan`・
+    /// `PhysicalPlan`)は評価済みの`usize`として持ち回る。行に依存しない値を
+    /// 実行のたびに再評価する理由が無いためである。
+    fn eval_row_count_expr(&self, expr: &Expr, clause: &str) -> DbResult<usize> {
+        let bound = self.bind_expr(expr, &[])?;
+        match bound.data_type() {
+            Some(DataType::BigInt) => {}
+            other => {
+                return Err(self.error_at(
+                    bound.span(),
+                    format!("{clause}はBIGINTを返す式である必要があります: {}", describe_type(other)),
+                ));
+            }
+        }
+        let span = bound.span();
+        let value = eval_bound_expr(&bound, self.functions, None).map_err(|err| self.wrap_eval_error(err, span))?;
+        match value {
+            crate::types::Value::BigInt(n) if n >= 0 => Ok(n as usize),
+            crate::types::Value::BigInt(n) => Err(self.error_at(span, format!("{clause}に負の値は指定できません: {n}"))),
+            crate::types::Value::Null => Err(self.error_at(span, format!("{clause}にNULLは指定できません"))),
+            _ => unreachable!("data_type()の検査でBIGINT以外は既に弾いている"),
+        }
     }
 
     fn bind_from(&self, from: Option<&FromClause>) -> DbResult<Vec<BoundTableRef>> {
@@ -608,6 +983,67 @@ impl<'a> Binder<'a> {
                     .map_err(|err| self.wrap_eval_error(err, *span))?;
                 Ok(BoundExpr::FunctionCall { name: canonical_name, args: bound_args, data_type, span: *span })
             }
+            Expr::Aggregate { func, arg, span } => self.bind_aggregate(*func, arg.as_deref(), *span, tables),
+        }
+    }
+
+    /// 集約関数呼び出しを束縛する。`arg`(`COUNT(*)`なら`None`)は`tables`の
+    /// 列を直接参照する式として`bind_expr`で束縛したうえで、その中にさらに
+    /// 集約関数が現れていないか(`SUM(COUNT(x))`のような入れ子)を検査する。
+    /// SQLは集約関数の入れ子を許さない。集約は「複数行を1行へ畳み込む」
+    /// 演算であり、`COUNT(x)`の結果はすでに1つのグループにつき1個の値なので、
+    /// それをさらに`SUM`で畳み込む対象(複数行)がその場に存在しないからである。
+    fn bind_aggregate(
+        &self,
+        func: AggregateFunc,
+        arg: Option<&Expr>,
+        span: Span,
+        tables: &[BoundTableRef],
+    ) -> DbResult<BoundExpr> {
+        let bound_arg = match arg {
+            Some(expr) => {
+                let bound = self.bind_expr(expr, tables)?;
+                if bound_contains_aggregate(&bound) {
+                    return Err(self.error_at(bound.span(), "集約関数は入れ子にできません".to_string()));
+                }
+                Some(Box::new(bound))
+            }
+            None => None,
+        };
+        let data_type = self.check_aggregate_arg_type(func, bound_arg.as_deref(), span)?;
+        Ok(BoundExpr::Aggregate { func, arg: bound_arg, data_type, span })
+    }
+
+    /// 集約関数が引数に課す型制約を検査し、戻り値の`DataType`を決める。
+    ///
+    /// `COUNT`は引数の型を問わない(`COUNT(*)`は引数を持たず、`COUNT(x)`は
+    /// `x`が`NULL`かどうかしか見ない)ので常に`BIGINT`を返す。`SUM`は
+    /// このSQLサブセットが算術演算を`BIGINT`同士にしか許していない(第8章)のと
+    /// 揃え、`BIGINT`の列にのみ使える。`MIN`・`MAX`は比較演算(第8章)が
+    /// `BIGINT`・`TEXT`・`BOOLEAN`のどの型同士でも定義されているのに合わせ、
+    /// 型を問わず引数の型をそのまま返す(引数が型を持たない`NULL`単体の場合は
+    /// `projection_schema`の他の箇所と同じ規則で`TEXT`を代用する)。
+    fn check_aggregate_arg_type(
+        &self,
+        func: AggregateFunc,
+        arg: Option<&BoundExpr>,
+        span: Span,
+    ) -> DbResult<DataType> {
+        match func {
+            AggregateFunc::Count => Ok(DataType::BigInt),
+            AggregateFunc::Sum => {
+                let arg = arg.expect("ParserはSUMに必ず引数を1個持たせる");
+                if let Some(data_type) = arg.data_type()
+                    && data_type != DataType::BigInt
+                {
+                    return Err(self.error_at(span, format!("SUMはBIGINTに対してのみ使えます: {data_type}が渡されました")));
+                }
+                Ok(DataType::BigInt)
+            }
+            AggregateFunc::Min | AggregateFunc::Max => {
+                let arg = arg.expect("ParserはMIN/MAXに必ず引数を1個持たせる");
+                Ok(arg.data_type().unwrap_or(DataType::Text))
+            }
         }
     }
 
@@ -790,6 +1226,52 @@ fn describe_type(data_type: Option<DataType>) -> String {
     match data_type {
         Some(t) => t.to_string(),
         None => "NULL".to_string(),
+    }
+}
+
+/// `expr`の式木のどこかに`BoundExpr::Aggregate`が現れるかどうか。
+///
+/// `WHERE`・`GROUP BY`に集約関数が使えないことの検査(`Binder::bind_select`)と、
+/// 集約関数の引数の中にさらに集約関数が現れていないこと(入れ子の禁止、
+/// `Binder::bind_aggregate`)の両方で使う共通の判定である。
+fn bound_contains_aggregate(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::Aggregate { .. } => true,
+        BoundExpr::IntLiteral { .. }
+        | BoundExpr::StringLiteral { .. }
+        | BoundExpr::BoolLiteral { .. }
+        | BoundExpr::NullLiteral { .. }
+        | BoundExpr::ColumnRef { .. } => false,
+        BoundExpr::UnaryOp { expr, .. } => bound_contains_aggregate(expr),
+        BoundExpr::BinaryOp { lhs, rhs, .. } => bound_contains_aggregate(lhs) || bound_contains_aggregate(rhs),
+        BoundExpr::IsNull { expr, .. } => bound_contains_aggregate(expr),
+        BoundExpr::FunctionCall { args, .. } => args.iter().any(bound_contains_aggregate),
+        BoundExpr::Paren { expr, .. } => bound_contains_aggregate(expr),
+        BoundExpr::Cast { expr, .. } => bound_contains_aggregate(expr),
+    }
+}
+
+/// `expr`(構文解析直後の`ast::Expr`、まだ束縛していない)の式木のどこかに
+/// `Expr::Aggregate`が現れるかどうか。
+///
+/// `Binder::bind_select`が「この`SELECT`を集約クエリとして扱うか」を判定する
+/// 材料の1つとして使う。`ORDER BY`はまだ束縛していない(束縛は`projection`が
+/// 確定してから行う、モジュール冒頭の説明を参照)ため、`bound_contains_aggregate`
+/// (`BoundExpr`版)ではなくこちらのAST版を使う。
+fn ast_expr_contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Aggregate { .. } => true,
+        Expr::IntLiteral { .. }
+        | Expr::StringLiteral { .. }
+        | Expr::BoolLiteral { .. }
+        | Expr::NullLiteral { .. }
+        | Expr::ColumnRef { .. } => false,
+        Expr::UnaryOp { expr, .. } => ast_expr_contains_aggregate(expr),
+        Expr::BinaryOp { lhs, rhs, .. } => ast_expr_contains_aggregate(lhs) || ast_expr_contains_aggregate(rhs),
+        Expr::IsNull { expr, .. } => ast_expr_contains_aggregate(expr),
+        Expr::FunctionCall { args, .. } => args.iter().any(ast_expr_contains_aggregate),
+        Expr::Paren { expr, .. } => ast_expr_contains_aggregate(expr),
+        Expr::Cast { expr, .. } => ast_expr_contains_aggregate(expr),
     }
 }
 
@@ -981,5 +1463,251 @@ mod tests {
         let catalog = users_catalog();
         let bound = bind("CREATE TABLE t (a BIGINT)", &catalog).unwrap();
         assert!(matches!(bound, BoundStatement::CreateTable(_)));
+    }
+
+    // ---- 第21章: ORDER BY / LIMIT / OFFSET / DISTINCT / GROUP BY / HAVING / 集約 ----
+
+    fn orders_catalog() -> Catalog {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(
+                "orders",
+                Schema::new(vec![
+                    Column::new("dept", DataType::Text, true),
+                    Column::new("amount", DataType::BigInt, true),
+                ]),
+            )
+            .unwrap();
+        catalog
+    }
+
+    fn bind_select_orders(sql: &str) -> BoundSelect {
+        let catalog = orders_catalog();
+        match bind(sql, &catalog).unwrap() {
+            BoundStatement::Select(select) => select,
+            other => panic!("Selectを期待したが{other:?}が返った"),
+        }
+    }
+
+    fn bind_err_orders(sql: &str) -> DbError {
+        let catalog = orders_catalog();
+        bind(sql, &catalog).unwrap_err()
+    }
+
+    #[test]
+    fn select_without_group_by_or_aggregate_has_no_aggregate_info() {
+        let select = bind_select_orders("SELECT dept, amount FROM orders");
+        assert!(select.aggregate.is_none());
+    }
+
+    #[test]
+    fn count_star_alone_is_an_aggregate_query_without_group_by() {
+        let select = bind_select_orders("SELECT COUNT(*) FROM orders");
+        let aggregate = select.aggregate.unwrap();
+        assert!(aggregate.group_by.is_empty());
+        assert_eq!(aggregate.calls.len(), 1);
+        assert_eq!(aggregate.schema.columns().len(), 1);
+    }
+
+    #[test]
+    fn group_by_and_aggregate_calls_become_output_schema_columns() {
+        let select = bind_select_orders("SELECT dept, COUNT(*), SUM(amount) FROM orders GROUP BY dept");
+        let aggregate = select.aggregate.unwrap();
+        assert_eq!(aggregate.group_by.len(), 1);
+        assert_eq!(aggregate.calls.len(), 2);
+        let names: Vec<&str> = aggregate.schema.columns().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["dept", "COUNT(*)", "SUM(amount)"]);
+    }
+
+    #[test]
+    fn duplicate_aggregate_calls_share_one_output_slot() {
+        // `COUNT(*)`が`SELECT`に2回現れても、`AggregateExec`が二重に計算しない
+        // よう出力列は1列にまとめる。
+        let select = bind_select_orders("SELECT COUNT(*), COUNT(*) FROM orders");
+        let aggregate = select.aggregate.unwrap();
+        assert_eq!(aggregate.calls.len(), 1);
+        assert_eq!(aggregate.schema.columns().len(), 1);
+        // 2つの射影項目はどちらも同じ列(添字0)を指す。
+        for item in &select.projection {
+            match &item.expr {
+                BoundExpr::ColumnRef { column_index, .. } => assert_eq!(*column_index, 0),
+                other => panic!("書き換え後はColumnRefになるはずが{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn projecting_a_non_grouped_column_is_a_functional_dependency_violation() {
+        let err = bind_err_orders("SELECT dept, amount FROM orders GROUP BY dept");
+        assert!(matches!(err, DbError::Bind { .. }));
+    }
+
+    #[test]
+    fn having_can_reference_an_aggregate_not_in_the_select_list() {
+        let select = bind_select_orders("SELECT dept FROM orders GROUP BY dept HAVING COUNT(*) > 1");
+        let aggregate = select.aggregate.unwrap();
+        // `HAVING`だけに現れた`COUNT(*)`も、`dept`に続く出力列として確保される。
+        assert_eq!(aggregate.calls.len(), 1);
+        assert!(select.having.is_some());
+    }
+
+    #[test]
+    fn having_referencing_a_non_grouped_column_is_rejected() {
+        let err = bind_err_orders("SELECT dept FROM orders GROUP BY dept HAVING amount > 1");
+        assert!(matches!(err, DbError::Bind { .. }));
+    }
+
+    #[test]
+    fn nested_aggregate_is_rejected() {
+        let err = bind_err_orders("SELECT SUM(COUNT(*)) FROM orders");
+        assert!(matches!(err, DbError::Bind { .. }));
+    }
+
+    #[test]
+    fn aggregate_in_where_is_rejected() {
+        let err = bind_err_orders("SELECT dept FROM orders WHERE COUNT(*) > 1");
+        assert!(matches!(err, DbError::Bind { .. }));
+    }
+
+    #[test]
+    fn aggregate_in_group_by_is_rejected() {
+        let err = bind_err_orders("SELECT dept FROM orders GROUP BY COUNT(*)");
+        assert!(matches!(err, DbError::Bind { .. }));
+    }
+
+    #[test]
+    fn sum_requires_a_bigint_argument() {
+        let err = bind_err_orders("SELECT SUM(dept) FROM orders");
+        assert!(matches!(err, DbError::Bind { .. }));
+    }
+
+    #[test]
+    fn min_max_accept_any_comparable_type() {
+        let select = bind_select_orders("SELECT MIN(dept), MAX(dept) FROM orders");
+        let aggregate = select.aggregate.unwrap();
+        assert_eq!(aggregate.schema.columns()[0].data_type, DataType::Text);
+    }
+
+    #[test]
+    fn count_star_requires_no_argument_but_others_do() {
+        // `Parser`がすでに`SUM(*)`を構文エラーとして拒否する(この章の構文検査)。
+        let statement = crate::parser::parse_statement("SELECT SUM(*) FROM orders");
+        assert!(statement.is_err());
+    }
+
+    #[test]
+    fn order_by_matching_the_select_list_resolves_to_that_column() {
+        let select = bind_select_orders("SELECT dept FROM orders ORDER BY dept DESC");
+        assert_eq!(select.order_by.len(), 1);
+        assert!(select.order_by[0].desc);
+        match &select.order_by[0].expr {
+            BoundExpr::ColumnRef { table_ordinal, column_index, .. } => {
+                assert_eq!(*table_ordinal, 0);
+                assert_eq!(*column_index, 0);
+            }
+            other => panic!("ColumnRefを期待したが{other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_referencing_a_column_outside_the_select_list_adds_a_hidden_column() {
+        // `SELECT name FROM t ORDER BY id`という最頻出パターン。`id`は`SELECT`の
+        // 対象式には無いが、`projection`の末尾に隠し列として追加され、束縛自体は
+        // 成功する。
+        let select = bind_select_orders("SELECT dept FROM orders ORDER BY amount");
+        assert_eq!(select.hidden_column_count, 1);
+        assert_eq!(select.projection.len(), 2);
+        assert_eq!(select.projection[1].output_name, "amount");
+        match &select.order_by[0].expr {
+            BoundExpr::ColumnRef { column_index, .. } => assert_eq!(*column_index, 1),
+            other => panic!("ColumnRefを期待したが{other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_matching_an_existing_projection_item_does_not_add_a_hidden_column() {
+        // 「射影に同名の出力列があればそれが優先される」という優先順位。
+        let select = bind_select_orders("SELECT dept FROM orders ORDER BY dept");
+        assert_eq!(select.hidden_column_count, 0);
+        assert_eq!(select.projection.len(), 1);
+        match &select.order_by[0].expr {
+            BoundExpr::ColumnRef { column_index, .. } => assert_eq!(*column_index, 0),
+            other => panic!("ColumnRefを期待したが{other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_can_write_a_fresh_aggregate_call_not_in_the_select_list() {
+        // `ORDER BY COUNT(*) DESC`のように、`SELECT`の対象式に無い集約呼び出しも
+        // 隠し列として`Aggregate`の出力へ追加される。
+        let select = bind_select_orders("SELECT dept FROM orders GROUP BY dept ORDER BY COUNT(*) DESC");
+        let aggregate = select.aggregate.unwrap();
+        assert_eq!(aggregate.calls.len(), 1);
+        assert_eq!(select.hidden_column_count, 1);
+        assert!(select.order_by[0].desc);
+    }
+
+    #[test]
+    fn order_by_aggregate_already_in_select_list_does_not_add_a_hidden_column() {
+        let select = bind_select_orders("SELECT dept, COUNT(*) FROM orders GROUP BY dept ORDER BY COUNT(*) DESC");
+        assert_eq!(select.hidden_column_count, 0);
+        assert_eq!(select.projection.len(), 2);
+        match &select.order_by[0].expr {
+            BoundExpr::ColumnRef { column_index, .. } => assert_eq!(*column_index, 1),
+            other => panic!("ColumnRefを期待したが{other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_introducing_an_aggregate_promotes_the_query_to_aggregate_even_without_group_by() {
+        // `GROUP BY`も`HAVING`も無い`SELECT`でも、`ORDER BY`に集約関数が
+        // 現れた時点でこの`SELECT`全体が集約クエリになる。グループ化キーの
+        // 無い集約に対しては、テーブル全体が1個のグループになるため、
+        // グループ化されていない`dept`列を射影に含めることはできない
+        // (関数従属性の違反)。
+        let err = bind_err_orders("SELECT dept FROM orders ORDER BY COUNT(*) DESC");
+        assert!(matches!(err, DbError::Bind { .. }));
+    }
+
+    #[test]
+    fn order_by_with_distinct_cannot_add_a_hidden_column() {
+        // `DISTINCT`を伴う`SELECT`は、隠し列を経由した`ORDER BY`を許さない
+        // (どの`amount`の値を残すかが、`DISTINCT`で行が1つに畳まれた時点で
+        // 定まらなくなるため、PostgreSQLと同じ制約を採用する)。
+        let err = bind_err_orders("SELECT DISTINCT dept FROM orders ORDER BY amount");
+        assert!(matches!(err, DbError::Bind { .. }));
+    }
+
+    #[test]
+    fn order_by_with_distinct_matching_the_select_list_is_still_allowed() {
+        let select = bind_select_orders("SELECT DISTINCT dept FROM orders ORDER BY dept");
+        assert_eq!(select.hidden_column_count, 0);
+    }
+
+    #[test]
+    fn limit_and_offset_are_evaluated_to_constants_at_bind_time() {
+        let select = bind_select_orders("SELECT dept FROM orders LIMIT 1 + 1 OFFSET 3");
+        assert_eq!(select.limit, Some(2));
+        assert_eq!(select.offset, Some(3));
+    }
+
+    #[test]
+    fn negative_limit_is_rejected() {
+        let err = bind_err_orders("SELECT dept FROM orders LIMIT -1");
+        assert!(matches!(err, DbError::Bind { .. }));
+    }
+
+    #[test]
+    fn limit_referencing_a_column_is_rejected() {
+        let err = bind_err_orders("SELECT dept FROM orders LIMIT amount");
+        assert!(matches!(err, DbError::Bind { .. }));
+    }
+
+    #[test]
+    fn distinct_flag_is_propagated() {
+        let select = bind_select_orders("SELECT DISTINCT dept FROM orders");
+        assert!(select.distinct);
+        let select = bind_select_orders("SELECT dept FROM orders");
+        assert!(!select.distinct);
     }
 }

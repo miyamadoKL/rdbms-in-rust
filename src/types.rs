@@ -21,7 +21,12 @@ pub enum DataType {
 /// 1つのセルが持つ実際の値。
 ///
 /// `Null` はどの`DataType`にも属さない特別な値であり、列の型とは独立に存在する。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Eq`・`Hash`を導出しているのは、第21章の`DISTINCT`・`GROUP BY`が行(または
+/// グループ化キー)の一致をハッシュテーブルで判定するためである。`Value`が
+/// 持つ4つのvariantはどれも(浮動小数点数のような)部分順序・非反射的な等価性の
+/// 問題を持たないため、`PartialEq`をそのまま`Eq`へ強めても安全である。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     /// NULL値。型を持たない。
     Null,
@@ -91,6 +96,36 @@ impl Value {
             None => column.nullable,
             Some(dt) => dt == column.data_type,
         }
+    }
+}
+
+/// `Value`同士を、`ORDER BY`(第21章の`SortExec`)と集約関数`MIN`/`MAX`
+/// (第21章の`HashAggregateExec`)が使う全順序で比較する。
+///
+/// 比較演算子(`=`・`<`等、[`crate::eval::eval_compare`])が実装するSQLの
+/// 三値論理とは異なる順序である。三値論理の比較は`NULL`が絡むと常に
+/// `UNKNOWN`(比較不能)を返すが、`ORDER BY`は`NULL`を含む列に対しても行の
+/// 並び順を一意に決めなければならない。この関数は`NULL`をどの値よりも
+/// 小さいとみなす全順序を採用する。結果として、`ASC`ソートでは`NULL`が
+/// 先頭に、`DESC`ソートでは末尾に来る(SQLiteの既定の並び順と一致する。
+/// 詳細は第21章の本文を参照)。
+///
+/// `NULL`以外の値同士は、それぞれの型が持つ`Ord`(`BIGINT`は数値順、`TEXT`は
+/// バイト列としての辞書順、`BOOLEAN`は`false < true`)で比較する。異なる型
+/// 同士の組み合わせは、`Binder`(第17章)がすでに式の型を静的に確定させて
+/// おり、同じ式は常に同じ型の値を返すため、この関数へは到達しない。
+pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        (Value::BigInt(x), Value::BigInt(y)) => x.cmp(y),
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
+        _ => unreachable!(
+            "Binderが式の型を静的に確定させているため、compare_valuesに異なる型同士が渡ることはない"
+        ),
     }
 }
 
@@ -169,6 +204,13 @@ impl Schema {
     /// 列の並びを返す。
     pub fn columns(&self) -> &[Column] {
         &self.columns
+    }
+
+    /// 列の並びを可変で返す。第21章の`Binder`が、集約クエリの出力列構成
+    /// (`aggregate.schema`)へ新しい集約関数呼び出しの列を後から追記するために使う
+    /// (`Binder::rewrite_for_aggregate`参照)。
+    pub fn columns_mut(&mut self) -> &mut Vec<Column> {
+        &mut self.columns
     }
 
     /// 列数を返す。

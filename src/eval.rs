@@ -60,6 +60,10 @@ pub fn eval_expr(expr: &Expr, functions: &FunctionRegistry, row: Option<&Row>) -
                 .collect::<DbResult<Vec<_>>>()?;
             functions.call(name, &values)
         }
+        Expr::Aggregate { .. } => Err(DbError::Eval(
+            "集約関数(COUNT/SUM/MIN/MAX)は複数行にまたがる文脈(SELECTの対象式・HAVING・ORDER BY)でのみ使えます"
+                .to_string(),
+        )),
     }
 }
 
@@ -110,6 +114,16 @@ pub fn eval_bound_expr(expr: &BoundExpr, functions: &FunctionRegistry, row: Opti
                 .map(|arg| eval_bound_expr(arg, functions, row))
                 .collect::<DbResult<Vec<_>>>()?;
             functions.call(name, &values)
+        }
+        BoundExpr::Aggregate { .. } => {
+            // `Binder::bind_select`は、集約が絡む`SELECT`では`BoundExpr::Aggregate`を
+            // 常に`AggregateExec`の出力列への`ColumnRef`へ書き換える(第21章)。
+            // このアームに到達するのは、その不変条件が破れた場合の最終防衛線であり、
+            // `executor::predicate_matches`が型不一致に対して持つ最終防衛線
+            // (`crate::binder`モジュール冒頭のドキュメント参照)と同じ位置づけである。
+            Err(DbError::Eval(
+                "集約関数はAggregate演算子でのみ計算されます(Binderが値へ書き換え忘れています)".to_string(),
+            ))
         }
     }
 }
