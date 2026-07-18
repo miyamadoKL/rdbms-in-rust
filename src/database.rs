@@ -614,6 +614,19 @@ mod tests {
         db
     }
 
+    /// `sql`を実行し、`DbError::Eval`のメッセージ文字列を取り出す。それ以外の
+    /// 結果(成功、または`Eval`以外のエラー)ならテストを失敗させる。
+    /// 空テーブルと非空テーブルでの同じ型エラーの文言を比較するテスト
+    /// (`..._is_rejected_with_the_same_error_on_empty_and_non_empty_tables`)が
+    /// 共通して使う。
+    fn expect_eval_error_message(db: &mut Database, sql: &str) -> String {
+        match db.execute(sql) {
+            Err(DbError::Eval(message)) => message,
+            Ok(_) => panic!("{sql:?}は失敗するはずだったが成功した"),
+            Err(other) => panic!("DbError::Evalを期待したが{other}が返った"),
+        }
+    }
+
     #[test]
     fn insert_adds_a_row() {
         let mut db = users_db();
@@ -759,6 +772,79 @@ mod tests {
         assert!(matches!(result, Err(DbError::Eval(_))));
     }
 
+    #[test]
+    fn select_where_null_succeeds_with_no_rows() {
+        // `WHERE NULL`は型エラーではない。`NULL`はUNKNOWNであり、`TRUE`にならない
+        // という理由で正しく「0行」に絞り込まれるべきで、`WHERE 1`のような
+        // 型違反とは区別しなければならない。`infer_type`が`NULL`リテラルに対して
+        // `None`(型が定まらない)を返し、`check_predicate_type`が`None`を
+        // `Some(Boolean)`と同じく許可するのはこのため。
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        let result = db.execute("SELECT id FROM users WHERE NULL").unwrap();
+        assert!(result.rows().is_empty());
+    }
+
+    #[test]
+    fn select_where_1_and_2_is_rejected_with_the_same_error_on_empty_and_non_empty_tables() {
+        // `1 AND 2`はトップレベルの演算子(`AND`)だけを見ると`Boolean`を返す形を
+        // しているため、`AND`の被演算子の型まで再帰的に検査しないと、空テーブルでは
+        // 素通りしてしまう(非空テーブルでは`eval_expr`が行ごとに`1`をBOOLEANとして
+        // 扱えず実行時エラーになる、という非対称が生じる)。`infer_type`が`AND`の
+        // 両辺を再帰的に検査するようになったことで、空・非空どちらでも同じ文言の
+        // エラーになることを確認する。
+        let mut empty_db = users_db();
+        let empty_message = expect_eval_error_message(&mut empty_db, "SELECT id FROM users WHERE 1 AND 2");
+
+        let mut populated_db = users_db();
+        populated_db
+            .execute("INSERT INTO users VALUES (1, 'Alice')")
+            .unwrap();
+        let populated_message =
+            expect_eval_error_message(&mut populated_db, "SELECT id FROM users WHERE 1 AND 2");
+
+        assert_eq!(empty_message, populated_message);
+    }
+
+    #[test]
+    fn select_where_not_1_is_rejected_with_the_same_error_on_empty_and_non_empty_tables() {
+        let mut empty_db = users_db();
+        let empty_message = expect_eval_error_message(&mut empty_db, "SELECT id FROM users WHERE NOT 1");
+
+        let mut populated_db = users_db();
+        populated_db
+            .execute("INSERT INTO users VALUES (1, 'Alice')")
+            .unwrap();
+        let populated_message =
+            expect_eval_error_message(&mut populated_db, "SELECT id FROM users WHERE NOT 1");
+
+        assert_eq!(empty_message, populated_message);
+    }
+
+    #[test]
+    fn select_where_abs_of_text_equals_1_is_rejected_with_the_same_error_on_empty_and_non_empty_tables()
+     {
+        // `abs('x') = 1`は、比較演算子(`=`)自身は正しい形をしていても、`abs`の
+        // 引数の型が誤っている。関数の引数型検査(`FunctionRegistry::arg_types`)を
+        // `infer_type`から呼ぶことで、この誤りも空・非空どちらのテーブルでも
+        // 同じ文言のエラーとして検出できることを確認する。
+        let mut empty_db = users_db();
+        let empty_message =
+            expect_eval_error_message(&mut empty_db, "SELECT id FROM users WHERE abs('x') = 1");
+
+        let mut populated_db = users_db();
+        populated_db
+            .execute("INSERT INTO users VALUES (1, 'Alice')")
+            .unwrap();
+        let populated_message = expect_eval_error_message(
+            &mut populated_db,
+            "SELECT id FROM users WHERE abs('x') = 1",
+        );
+
+        assert_eq!(empty_message, populated_message);
+    }
+
     // ---- UPDATE ----
 
     #[test]
@@ -823,6 +909,17 @@ mod tests {
         assert!(matches!(result, Err(DbError::Eval(_))));
     }
 
+    #[test]
+    fn update_where_null_succeeds_with_no_rows_updated() {
+        // `select_where_null_succeeds_with_no_rows`と同じ理由で、`WHERE NULL`は
+        // 型エラーではなく、単に0行にマッチする。
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        let result = db.execute("UPDATE users SET name = 'x' WHERE NULL").unwrap();
+        assert_eq!(result.to_string(), "UPDATE 0");
+    }
+
     // ---- DELETE ----
 
     #[test]
@@ -852,6 +949,18 @@ mod tests {
         let mut db = users_db();
         let result = db.execute("DELETE FROM users WHERE 1");
         assert!(matches!(result, Err(DbError::Eval(_))));
+    }
+
+    #[test]
+    fn delete_where_null_succeeds_with_no_rows_deleted() {
+        // `select_where_null_succeeds_with_no_rows`と同じ理由で、`WHERE NULL`は
+        // 型エラーではなく、単に0行にマッチする。
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        let result = db.execute("DELETE FROM users WHERE NULL").unwrap();
+        assert_eq!(result.to_string(), "DELETE 0");
+        assert_eq!(db.execute("SELECT * FROM users").unwrap().rows().len(), 2);
     }
 
     #[test]

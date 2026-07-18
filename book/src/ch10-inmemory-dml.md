@@ -370,15 +370,20 @@ fn check_predicate_type(
     schema: &Schema,
     functions: &FunctionRegistry,
 ) -> DbResult<()> {
-    let data_type = infer_type(predicate, schema, functions)?;
-    if data_type != DataType::Boolean {
-        return Err(DbError::Eval(format!(
-            "WHERE句はBOOLEANを返す式である必要があります: 式の型は{data_type}です"
-        )));
+    match infer_type(predicate, schema, functions)? {
+        Some(DataType::Boolean) | None => Ok(()),
+        Some(other) => Err(DbError::Eval(format!(
+            "WHERE句はBOOLEANを返す式である必要があります: 式の型は{other}です"
+        ))),
     }
-    Ok(())
 }
 ```
+
+`infer_type`の戻り値は`DataType`ではなく`Option<DataType>`です。
+`None`は「型が定まらない」ことを表し、`NULL`リテラル単体だけがこれに当たります。
+`WHERE NULL`は`WHERE 1`とは違って型の誤りではありません。
+`NULL`はSQLの三値論理におけるUNKNOWNであり、`predicate_matches`が`FALSE`と同じく「一致しなかった」側に振り分ける、れっきとした正しい述語です。
+そのため`check_predicate_type`は、`Some(DataType::Boolean)`だけでなく`None`も受理します。
 
 `predicate_matches`と`check_predicate_type`は役割が違います。
 `check_predicate_type`は「`predicate`という式が返す型」を静的に検査する事前チェックで、行の有無に関係なく必ず1回だけ実行されます。
@@ -391,6 +396,13 @@ minidb> SELECT id FROM users WHERE 1;
 
 `users`が空のときも、この`エラー`は変わりません。
 `check_predicate_type`は行を見ないので、行が0件であることに影響されないからです。
+
+`check_predicate_type`が実際に頼っている`infer_type`は、トップレベルの演算子の型だけでなく、被演算子の型も式木全体にわたって再帰的に検査します。
+これが無いと、`WHERE 1 AND 2`のような式で新しい非対称が生まれます。
+`AND`という演算子自身は`BOOLEAN`を返す形をしているため、被演算子(`1`と`2`)の型を見ない検査だと、この式は「型はBOOLEAN」という誤った判定になってしまいます。
+その結果、空のテーブルでは(`check_predicate_type`が素通しするので)エラーにならず0行が返る一方、行を持つテーブルでは(行ごとの`eval_expr`が`1`をBOOLEANとして扱えず失敗する)実行時エラーになる、という食い違いが起こります。
+`infer_type`が`AND`の両辺の型まで検査することで、`WHERE 1 AND 2`は空でも非空でもどちらのテーブルに対しても同じ`エラー`になります。
+`WHERE NOT 1`(単項`NOT`の被演算子の型)や`WHERE abs('x') = 1`(関数`abs`の引数の型)も同じ理由で式木全体の検査が必要で、`infer_type`の再帰呼び出しがこれらすべてをまとめて検査します。
 
 Filter演算子は、`守るべき不変条件`の1番目を、`check_predicate_type`と`predicate_matches`の2段構えでコードにしています。
 
@@ -454,56 +466,191 @@ fn resolve_items(table_schema: &Schema, items: &[SelectItem], sql: &str) -> Vec<
 
 この章の`project`は、行を1行も評価せずに出力列の型を決める`infer_type`という関数を使い、この問題を避けます。
 
+`infer_type`は、片方が`None`(型未定の`NULL`)でもう片方が型違反というエラーメッセージを組み立てるときに、次の小さなヘルパーを使います。
+
 ```rust
-fn infer_type(expr: &Expr, schema: &Schema, functions: &FunctionRegistry) -> DbResult<DataType> {
+fn describe_type(data_type: Option<DataType>) -> String {
+    match data_type {
+        Some(t) => t.to_string(),
+        None => "NULL".to_string(),
+    }
+}
+```
+
+`Option<DataType>`をそのまま`{:?}`で表示すると、以前の章で避けたのと同じ理由(`Some(BigInt)`のようなRustの内部表現が漏れる)で問題になります。
+`describe_type`は`Some`ならSQLの型名を、`None`なら`NULL`という文字列を返し、エラーメッセージの両辺を同じ形式で表示します。
+
+```rust
+fn infer_type(
+    expr: &Expr,
+    schema: &Schema,
+    functions: &FunctionRegistry,
+) -> DbResult<Option<DataType>> {
     match expr {
-        Expr::IntLiteral { .. } => Ok(DataType::BigInt),
-        Expr::StringLiteral { .. } => Ok(DataType::Text),
-        Expr::BoolLiteral { .. } => Ok(DataType::Boolean),
-        // `NULL`単体の型については、この関数のドキュメントコメントを参照。
-        Expr::NullLiteral { .. } => Ok(DataType::Text),
+        Expr::IntLiteral { .. } => Ok(Some(DataType::BigInt)),
+        Expr::StringLiteral { .. } => Ok(Some(DataType::Text)),
+        Expr::BoolLiteral { .. } => Ok(Some(DataType::Boolean)),
+        Expr::NullLiteral { .. } => Ok(None),
         Expr::ColumnRef { name, .. } => schema
             .column(name)
-            .map(|column| column.data_type)
+            .map(|column| Some(column.data_type))
             .ok_or_else(|| DbError::Eval(format!("列'{name}'が見つかりません"))),
-        Expr::UnaryOp { op, expr, .. } => match op {
-            UnaryOperator::Negate => infer_type(expr, schema, functions),
-            UnaryOperator::Not => Ok(DataType::Boolean),
-        },
-        Expr::BinaryOp { op, .. } => match op {
-            // 両辺の型が正しいかどうかの検査自体は`eval_expr`の役目であり、
-            // ここでは演算子の種類だけから出力の型を決める。
+        Expr::UnaryOp { op, expr, .. } => {
+            let operand = infer_type(expr, schema, functions)?;
+            match op {
+                UnaryOperator::Negate => {
+                    if let Some(data_type) = operand
+                        && data_type != DataType::BigInt
+                    {
+                        return Err(DbError::Eval(format!(
+                            "単項-はBIGINTに対してのみ使えます: {data_type}が渡されました"
+                        )));
+                    }
+                    Ok(Some(DataType::BigInt))
+                }
+                UnaryOperator::Not => {
+                    if let Some(data_type) = operand
+                        && data_type != DataType::Boolean
+                    {
+                        return Err(DbError::Eval(format!(
+                            "論理演算はBOOLEANまたはNULLに対してのみ使えます: {data_type}が渡されました"
+                        )));
+                    }
+                    Ok(Some(DataType::Boolean))
+                }
+            }
+        }
+        Expr::BinaryOp { op, lhs, rhs, .. } => match op {
             BinaryOperator::Add
             | BinaryOperator::Subtract
             | BinaryOperator::Multiply
-            | BinaryOperator::Divide => Ok(DataType::BigInt),
+            | BinaryOperator::Divide => {
+                let l = infer_type(lhs, schema, functions)?;
+                let r = infer_type(rhs, schema, functions)?;
+                let l_ok = l.is_none() || l == Some(DataType::BigInt);
+                let r_ok = r.is_none() || r == Some(DataType::BigInt);
+                if !l_ok || !r_ok {
+                    return Err(DbError::Eval(format!(
+                        "算術演算はBIGINT同士にのみ使えます: {}と{}",
+                        describe_type(l),
+                        describe_type(r)
+                    )));
+                }
+                Ok(Some(DataType::BigInt))
+            }
             BinaryOperator::Eq
             | BinaryOperator::NotEq
             | BinaryOperator::Lt
             | BinaryOperator::LtEq
             | BinaryOperator::Gt
-            | BinaryOperator::GtEq
-            | BinaryOperator::And
-            | BinaryOperator::Or => Ok(DataType::Boolean),
+            | BinaryOperator::GtEq => {
+                let l = infer_type(lhs, schema, functions)?;
+                let r = infer_type(rhs, schema, functions)?;
+                let ok = match (l, r) {
+                    (None, _) | (_, None) => true,
+                    (Some(a), Some(b)) => a == b,
+                };
+                if !ok {
+                    return Err(DbError::Eval(format!(
+                        "比較演算は同じ型同士にのみ使えます: {}と{}",
+                        describe_type(l),
+                        describe_type(r)
+                    )));
+                }
+                Ok(Some(DataType::Boolean))
+            }
+            BinaryOperator::And | BinaryOperator::Or => {
+                // 実際の`eval_binary`(`eval`モジュール)がlhsを先に評価してから
+                // rhsを評価するのに合わせ、こちらもlhsを先に検査する。
+                let l = infer_type(lhs, schema, functions)?;
+                if let Some(data_type) = l
+                    && data_type != DataType::Boolean
+                {
+                    return Err(DbError::Eval(format!(
+                        "論理演算はBOOLEANまたはNULLに対してのみ使えます: {data_type}が渡されました"
+                    )));
+                }
+                let r = infer_type(rhs, schema, functions)?;
+                if let Some(data_type) = r
+                    && data_type != DataType::Boolean
+                {
+                    return Err(DbError::Eval(format!(
+                        "論理演算はBOOLEANまたはNULLに対してのみ使えます: {data_type}が渡されました"
+                    )));
+                }
+                Ok(Some(DataType::Boolean))
+            }
         },
-        Expr::IsNull { .. } => Ok(DataType::Boolean),
-        Expr::Cast { type_name, .. } => DataType::from_sql_name(&type_name.name)
-            .ok_or_else(|| DbError::Eval(format!("未知の型名です: {}", type_name.name))),
-        Expr::FunctionCall { name, .. } => functions.return_type(name),
+        Expr::IsNull { expr, .. } => {
+            // 被演算子の型は問わないが、被演算子自身が無効な式(未知の関数呼び出し
+            // など)でないことは検査する。`eval_expr`もIS NULLを評価する前に
+            // 被演算子を評価してエラーを伝播させるのと同じ順序。
+            infer_type(expr, schema, functions)?;
+            Ok(Some(DataType::Boolean))
+        }
+        Expr::Cast { expr, type_name, .. } => {
+            infer_type(expr, schema, functions)?;
+            DataType::from_sql_name(&type_name.name)
+                .map(Some)
+                .ok_or_else(|| DbError::Eval(format!("未知の型名です: {}", type_name.name)))
+        }
+        Expr::FunctionCall { name, args, .. } => {
+            let arg_types = functions.arg_types(name)?;
+            let canonical_name = name.to_ascii_lowercase();
+            if args.len() != arg_types.len() {
+                return Err(DbError::Eval(format!(
+                    "{canonical_name}は引数を{}個取ります(渡されたのは{}個です)",
+                    arg_types.len(),
+                    args.len()
+                )));
+            }
+            for (arg, expected) in args.iter().zip(arg_types) {
+                let actual = infer_type(arg, schema, functions)?;
+                if let Some(actual_type) = actual
+                    && actual_type != *expected
+                {
+                    return Err(DbError::Eval(format!(
+                        "{canonical_name}は{expected}を引数に取ります: {actual_type}が渡されました"
+                    )));
+                }
+            }
+            functions.return_type(name).map(Some)
+        }
         Expr::Paren { expr, .. } => infer_type(expr, schema, functions),
     }
 }
 ```
 
 `infer_type`は式のASTと`table_schema`だけを見て、行の値には一度も触れません。
-リテラルはそのリテラルが表す型を、列参照は`schema`に定義された型を、算術演算(`+ - * /`、単項`-`)は`BigInt`を、比較演算や論理演算、`IS [NOT] NULL`は`Boolean`を、`CAST`は`type`が指す型を、それぞれ返します。
+戻り値は`DataType`ではなく`Option<DataType>`です。
+`None`は「型が定まらない」ことを表し、`NULL`リテラル単体だけがこれに当たります。
+それ以外の式は必ず`Some`を返します。
+
+以前のこの章では、`infer_type`はトップレベルの演算子の種類だけを見て出力の型を決め、被演算子の型検査は`eval_expr`に任せていました。
+しかしそれでは、`predicate_matches`の節で見た`WHERE 1 AND 2`のような非対称が生まれます。
+そこで、演算子と関数それぞれが被演算子に課す型制約を、`infer_type`自身が再帰的に検査するように直しました。
+単項`-`は被演算子が`BigInt`か`None`(型未定の`NULL`)であることを、単項`NOT`と`AND`/`OR`は被演算子が`Boolean`か`None`であることを、算術演算は両辺が`BigInt`か`None`であることを、比較演算は両辺が同じ型か、どちらかが`None`であることを、関数呼び出しは`FunctionRegistry`に登録された引数の個数と型(`functions.arg_types(name)`)を、それぞれ検査します。
+違反があれば、`eval_expr`が実際にその式を評価したときに返すのと同じ文言の`DbError::Eval`を返すため、`WHERE 1 AND 2`や`WHERE NOT 1`、`WHERE abs('x') = 1`は、空のテーブルでも行を持つテーブルでも同じ`エラー`になります。
+`IS [NOT] NULL`だけは被演算子の型を問いません(ただし被演算子自身の式は再帰的に検査するので、`abs('x') IS NULL`のような無効な式はここでも検出されます)。
+
+出力の型は、被演算子が`None`かどうかに関係なく常に固定です。
+例えば`1 + NULL`は実行結果こそ`predicate_matches`の節で見たとおり常に`NULL`ですが、これを`SELECT`すれば型は`BigInt`と決まります(`Value::Null`は`nullable`な列であればどんな`DataType`にも適合するため、実際の値が`NULL`でも問題は起きません)。
 関数呼び出しは、`FunctionRegistry`に登録された戻り値の型(`functions.return_type(name)`)をそのまま返すので、`abs(x)`の型は`abs`の戻り値の型(`BigInt`)だけから決まり、`x`の1行目が`NULL`かどうかには依存しません。
 先ほどの`SELECT abs(x) FROM t`は、この章では`x`が`NULL`の行を含んでいても、常に`BigInt`列として実行できます。
-`NULL`リテラル単体だけは例外で、`Value::Null`がどの`DataType`にも属さないのと同じ理由で型を持たないため、`TEXT`を仮の型として割り当てます。
+`None`のまま上へ伝わるのは、`NULL`リテラル自身と、それを素通しするだけの括弧`(...)`だけです。
+`project`は、この`None`を`DataType::Text`のプレースホルダーへ変換してから列の型に使います(`SELECT NULL FROM t`のような、リテラル`NULL`だけが列を構成する場合の折衷案です)。
+`CAST(expr AS type)`は`expr`自身を再帰的に検査するだけで、`expr`の型と`type`の組み合わせが`eval_cast`の対応表に載っているかどうかまでは検査しません。
+この組み合わせの妥当性は値に依存しないため原理的には静的に検査できますが、この章のスコープには含めていません(`CAST(1 AS BOOLEAN)`のような対応外の組み合わせは、今までどおり実行時に`eval_cast`がエラーにします)。
 
 計算結果の`nullable`は常に`true`にしています。
 行ごとに`NULL`になったりならなかったりしうる式の`nullable`を、静的な型推論だけで`false`と決め打ってしまうと、実際に`NULL`が出てきた行で`Tuple::new`のスキーマ検査がその`NULL`を不当に拒否してしまうからです。
 列参照そのものであれば`table_schema`の`nullable`をそのまま使えるので、この問題は起きません。
+
+「行の有無に関係なく同じ不変条件を保証する」という`check_predicate_type`の主張は、`infer_type`が式木のすべてのノードを再帰的に検査する以上、この章が対応する式の範囲では成り立ちます。
+ただし`CAST`の対応表のように、この章が意図的にスコープ外とした検査は含まれません。
+また、ゼロ除算や整数オーバーフローのように、値そのもの(行のデータ)に依存する失敗は、型だけからは判定できないため対象外です。
+`WHERE id / 0 = 1`は、空のテーブルなら`check_predicate_type`を通過して0行で成功しますが、`id`列を持つ行があれば`eval_expr`の段階でゼロ除算のエラーになります。
+これは型の非対称ではなく、行データが無ければ判定しようがないという当然の違いであり、この章で解消する対象ではありません。
 名前解決を伴う本格的な型検査は、第17章のBinderが引き継ぎます。
 
 ## `UPDATE`と`DELETE`を実装する

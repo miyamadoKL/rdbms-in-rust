@@ -45,27 +45,33 @@ fn predicate_matches(value: Value) -> DbResult<bool> {
     }
 }
 
-/// `predicate`が`BOOLEAN`を返す式であることを、行を1件も評価せずに`infer_type`で
-/// 静的に検査する。
+/// `predicate`が`BOOLEAN`を返す式(または型が定まらない`NULL`)であることを、
+/// 行を1件も評価せずに`infer_type`で静的に検査する。
 ///
 /// `predicate_matches`は行ごとに評価した`Value`を見て初めて型の誤りに気づくため、
 /// テーブルが空で行ループが1度も回らない場合(`SELECT/UPDATE/DELETE ... WHERE 1`を
 /// 空テーブルに対して実行するなど)は`predicate_matches`が一度も呼ばれず、
 /// `WHERE 1`のような書き誤りを見逃してしまう。`filter`・`update`・`delete`は、
 /// 行ループに入る前にこの関数を呼ぶことで、行の有無に関わらず同じ不変条件
-/// (「`WHERE`句は`BOOLEAN`を返す式でなければならない」)を保証する。
+/// (「`WHERE`句は`BOOLEAN`か`NULL`を返す式でなければならない」)を保証する。
+///
+/// `infer_type`は`predicate`の式木全体を再帰的に検査するため、`WHERE 1 AND 2`や
+/// `WHERE NOT 1`、`WHERE abs('x') = 1`のように、トップレベルの演算子だけを見ても
+/// 気づけない被演算子の型違反も、ここで一度に検出できる。`WHERE NULL`は
+/// `infer_type`が`None`(型が定まらない)を返すが、これは`NULL`という有効な
+/// `UNKNOWN`述語(0行にマッチする)であって型エラーではないため、`Some(Boolean)`
+/// と同じく許可する。
 fn check_predicate_type(
     predicate: &Expr,
     schema: &Schema,
     functions: &FunctionRegistry,
 ) -> DbResult<()> {
-    let data_type = infer_type(predicate, schema, functions)?;
-    if data_type != DataType::Boolean {
-        return Err(DbError::Eval(format!(
-            "WHERE句はBOOLEANを返す式である必要があります: 式の型は{data_type}です"
-        )));
+    match infer_type(predicate, schema, functions)? {
+        Some(DataType::Boolean) | None => Ok(()),
+        Some(other) => Err(DbError::Eval(format!(
+            "WHERE句はBOOLEANを返す式である必要があります: 式の型は{other}です"
+        ))),
     }
-    Ok(())
 }
 
 /// Sequential Scan演算子。テーブルの全行を、格納順のまま複製して返す。
@@ -113,9 +119,10 @@ pub fn filter(
 /// 使うため常に正確である。計算結果(`id + 1`のような式)の型は、行を実際に
 /// 評価せず、式のASTと`table_schema`だけから`infer_type`が静的に決める
 /// (1行目がNULLだったり、テーブルが空だったりしても型がぶれない)。
-/// この場合の`nullable`は、行ごとに`NULL`になったりならなかったりしうる
-/// ため、常に`true`とする。名前解決を伴う本格的な型検査は第17章のBinderで
-/// 置き換える。
+/// `infer_type`が型を決められない式(`NULL`単体など、`None`を返す式)は、
+/// `DataType::Text`をプレースホルダーとして使う。この場合の`nullable`は、
+/// 行ごとに`NULL`になったりならなかったりしうるため、常に`true`とする。
+/// 名前解決を伴う本格的な型検査は第17章のBinderで置き換える。
 pub fn project(
     table_schema: &Schema,
     functions: &FunctionRegistry,
@@ -136,7 +143,9 @@ pub fn project(
             continue;
         }
 
-        let data_type = infer_type(expr, table_schema, functions)?;
+        // `infer_type`が型を決められない(`None`を返す)式は`TEXT`で代用する。
+        // このプレースホルダーの理由は`infer_type`のドキュメントコメント参照。
+        let data_type = infer_type(expr, table_schema, functions)?.unwrap_or(DataType::Text);
         out_columns.push(Column::new(name.clone(), data_type, true));
     }
     let out_schema = Schema::new(out_columns);
@@ -153,56 +162,196 @@ pub fn project(
     Ok((out_schema, out_rows))
 }
 
-/// 式の出力`DataType`を、行を実際に評価せず、式のASTと`schema`だけから静的に決める。
+/// エラーメッセージ用に`Option<DataType>`を表示する。`None`(型が定まらない、
+/// `NULL`リテラルなど)は`NULL`と表示する。
+fn describe_type(data_type: Option<DataType>) -> String {
+    match data_type {
+        Some(t) => t.to_string(),
+        None => "NULL".to_string(),
+    }
+}
+
+/// 式の出力型を、行を実際に評価せず、式のASTと`schema`だけから静的に決める。
 ///
-/// `project`が`SELECT`の出力列の型を決めるのに使う。ルールは次のとおり。
-/// - 整数・文字列・真偽値リテラルは、そのリテラルが表す型。
-/// - `NULL`リテラル単体は`DataType::Text`とする。`Value::Null`はどの`DataType`
-///   にも属さない(`Value::data_type`が`None`を返す)ため本来型を持たないが、
-///   出力列は必ず何らかの`DataType`を持たねばならないので、便宜上`TEXT`を
-///   割り当てる。`NULL`を含む式の本格的な型推論・伝播は第17章のBinderの
-///   仕事とし、ここでは意図的にこの折衷案にとどめる。
-/// - 列参照は、`schema`に定義された、その列の型。
-/// - 算術演算(`+ - * /`、単項`-`)は`BigInt`。
-/// - 比較演算・論理演算(`AND` `OR` `NOT`)・`IS [NOT] NULL`は`Boolean`。
-/// - `CAST(expr AS type)`は`type`が指す型。
-/// - 関数呼び出しは、`functions`に登録された戻り値の型。
-/// - 括弧`(expr)`は中身の式の型。
-fn infer_type(expr: &Expr, schema: &Schema, functions: &FunctionRegistry) -> DbResult<DataType> {
+/// 戻り値は`Option<DataType>`で、`None`は「型が定まらない」ことを表す。
+/// `NULL`リテラル単体だけがこれに当たる(`Value::Null`がどの`DataType`にも
+/// 属さない、つまり`Value::data_type`が`None`を返すのと同じ考え方)。
+/// それ以外の式は必ず`Some`を返す。`NULL`が被演算子として現れても、演算子
+/// 自身の出力の「型」は`NULL`かどうかに関係なく決まる(例えば`1 + NULL`は
+/// 実行結果こそ常に`NULL`だが、これを`SELECT`すれば`BIGINT`型の列になり、
+/// `Value::Null`は`nullable`な列であればどんな`DataType`にも適合するため
+/// 問題は起きない)。`None`まで遡って伝播するのは、`NULL`リテラル自身と、
+/// それを素通りさせるだけの`(...)`(括弧)だけである。
+///
+/// `project`が`SELECT`の出力列の型を決めるのに使うだけでなく、`check_predicate_type`
+/// が`WHERE`句の型を検査するのにも使う。単に出力型を決めるだけでなく、各演算子・
+/// 関数がその被演算子に課す型制約を式木全体にわたって再帰的に検査し、違反があれば
+/// `eval_expr`が実際にその式を評価したときに返すのと同じ文言の`DbError::Eval`を
+/// 返す。この検査は行を1件も評価せずに式のASTと`schema`だけから完結するため、
+/// テーブルが空でも、行を持っていても、同じ結果になる。
+///
+/// - 整数・文字列・真偽値リテラルは、そのリテラルが表す型(`Some`)。
+/// - `NULL`リテラル単体は型が定まらない(`None`)。
+/// - 列参照は、`schema`に定義された、その列の型(`Some`)。列は必ず宣言された
+///   型を持つため、`nullable`かどうかに関係なく`Some`になる。
+/// - 単項`-`は、被演算子が`BigInt`または`None`でなければエラー。出力は
+///   常に`Some(BigInt)`。
+/// - 単項`NOT`は、被演算子が`Boolean`または`None`でなければエラー。出力は
+///   常に`Some(Boolean)`。
+/// - 算術演算(`+ - * /`)は、両辺が`BigInt`または`None`でなければエラー。
+///   出力は常に`Some(BigInt)`。
+/// - 比較演算(`= <> < <= > >=`)は、両辺が同じ型か、どちらかが`None`でなければ
+///   エラー。出力は常に`Some(Boolean)`。
+/// - 論理演算(`AND` `OR`)は、両辺が`Boolean`または`None`でなければエラー。
+///   出力は常に`Some(Boolean)`。
+/// - `IS [NOT] NULL`は、被演算子の型を問わない(ただし被演算子自身の式は
+///   再帰的に検査する)。出力は常に`Some(Boolean)`。
+/// - `CAST(expr AS type)`は、`expr`自身を再帰的に検査するだけで、`expr`と
+///   `type`の組み合わせが`eval_cast`の対応表に載っているかどうかまでは
+///   検査しない(この組み合わせの妥当性は値に依存しないため原理的には静的に
+///   検査できるが、この章のスコープには含めない)。出力は常に`type`が指す
+///   型(`Some`)。`CAST(NULL AS type)`も`type`を返す(`eval_cast`が`NULL`を
+///   そのまま`NULL`として通すのと同じ理由で、`CAST`の宣言上の型は入力の
+///   `NULL`らしさに影響されない)。
+/// - 関数呼び出しは、`functions`に登録された引数の個数・型を検査してから、
+///   登録された戻り値の型(`Some`)を返す。各引数は、宣言された型または
+///   `None`でなければエラー。
+/// - 括弧`(expr)`は中身の式の型・検査をそのまま引き継ぐ。
+fn infer_type(
+    expr: &Expr,
+    schema: &Schema,
+    functions: &FunctionRegistry,
+) -> DbResult<Option<DataType>> {
     match expr {
-        Expr::IntLiteral { .. } => Ok(DataType::BigInt),
-        Expr::StringLiteral { .. } => Ok(DataType::Text),
-        Expr::BoolLiteral { .. } => Ok(DataType::Boolean),
-        // `NULL`単体の型については、この関数のドキュメントコメントを参照。
-        Expr::NullLiteral { .. } => Ok(DataType::Text),
+        Expr::IntLiteral { .. } => Ok(Some(DataType::BigInt)),
+        Expr::StringLiteral { .. } => Ok(Some(DataType::Text)),
+        Expr::BoolLiteral { .. } => Ok(Some(DataType::Boolean)),
+        Expr::NullLiteral { .. } => Ok(None),
         Expr::ColumnRef { name, .. } => schema
             .column(name)
-            .map(|column| column.data_type)
+            .map(|column| Some(column.data_type))
             .ok_or_else(|| DbError::Eval(format!("列'{name}'が見つかりません"))),
-        Expr::UnaryOp { op, expr, .. } => match op {
-            UnaryOperator::Negate => infer_type(expr, schema, functions),
-            UnaryOperator::Not => Ok(DataType::Boolean),
-        },
-        Expr::BinaryOp { op, .. } => match op {
-            // 両辺の型が正しいかどうかの検査自体は`eval_expr`の役目であり、
-            // ここでは演算子の種類だけから出力の型を決める。
+        Expr::UnaryOp { op, expr, .. } => {
+            let operand = infer_type(expr, schema, functions)?;
+            match op {
+                UnaryOperator::Negate => {
+                    if let Some(data_type) = operand
+                        && data_type != DataType::BigInt
+                    {
+                        return Err(DbError::Eval(format!(
+                            "単項-はBIGINTに対してのみ使えます: {data_type}が渡されました"
+                        )));
+                    }
+                    Ok(Some(DataType::BigInt))
+                }
+                UnaryOperator::Not => {
+                    if let Some(data_type) = operand
+                        && data_type != DataType::Boolean
+                    {
+                        return Err(DbError::Eval(format!(
+                            "論理演算はBOOLEANまたはNULLに対してのみ使えます: {data_type}が渡されました"
+                        )));
+                    }
+                    Ok(Some(DataType::Boolean))
+                }
+            }
+        }
+        Expr::BinaryOp { op, lhs, rhs, .. } => match op {
             BinaryOperator::Add
             | BinaryOperator::Subtract
             | BinaryOperator::Multiply
-            | BinaryOperator::Divide => Ok(DataType::BigInt),
+            | BinaryOperator::Divide => {
+                let l = infer_type(lhs, schema, functions)?;
+                let r = infer_type(rhs, schema, functions)?;
+                let l_ok = l.is_none() || l == Some(DataType::BigInt);
+                let r_ok = r.is_none() || r == Some(DataType::BigInt);
+                if !l_ok || !r_ok {
+                    return Err(DbError::Eval(format!(
+                        "算術演算はBIGINT同士にのみ使えます: {}と{}",
+                        describe_type(l),
+                        describe_type(r)
+                    )));
+                }
+                Ok(Some(DataType::BigInt))
+            }
             BinaryOperator::Eq
             | BinaryOperator::NotEq
             | BinaryOperator::Lt
             | BinaryOperator::LtEq
             | BinaryOperator::Gt
-            | BinaryOperator::GtEq
-            | BinaryOperator::And
-            | BinaryOperator::Or => Ok(DataType::Boolean),
+            | BinaryOperator::GtEq => {
+                let l = infer_type(lhs, schema, functions)?;
+                let r = infer_type(rhs, schema, functions)?;
+                let ok = match (l, r) {
+                    (None, _) | (_, None) => true,
+                    (Some(a), Some(b)) => a == b,
+                };
+                if !ok {
+                    return Err(DbError::Eval(format!(
+                        "比較演算は同じ型同士にのみ使えます: {}と{}",
+                        describe_type(l),
+                        describe_type(r)
+                    )));
+                }
+                Ok(Some(DataType::Boolean))
+            }
+            BinaryOperator::And | BinaryOperator::Or => {
+                // 実際の`eval_binary`(`eval`モジュール)がlhsを先に評価してから
+                // rhsを評価するのに合わせ、こちらもlhsを先に検査する。
+                let l = infer_type(lhs, schema, functions)?;
+                if let Some(data_type) = l
+                    && data_type != DataType::Boolean
+                {
+                    return Err(DbError::Eval(format!(
+                        "論理演算はBOOLEANまたはNULLに対してのみ使えます: {data_type}が渡されました"
+                    )));
+                }
+                let r = infer_type(rhs, schema, functions)?;
+                if let Some(data_type) = r
+                    && data_type != DataType::Boolean
+                {
+                    return Err(DbError::Eval(format!(
+                        "論理演算はBOOLEANまたはNULLに対してのみ使えます: {data_type}が渡されました"
+                    )));
+                }
+                Ok(Some(DataType::Boolean))
+            }
         },
-        Expr::IsNull { .. } => Ok(DataType::Boolean),
-        Expr::Cast { type_name, .. } => DataType::from_sql_name(&type_name.name)
-            .ok_or_else(|| DbError::Eval(format!("未知の型名です: {}", type_name.name))),
-        Expr::FunctionCall { name, .. } => functions.return_type(name),
+        Expr::IsNull { expr, .. } => {
+            // 被演算子の型は問わないが、被演算子自身が無効な式(未知の関数呼び出し
+            // など)でないことは検査する。`eval_expr`もIS NULLを評価する前に
+            // 被演算子を評価してエラーを伝播させるのと同じ順序。
+            infer_type(expr, schema, functions)?;
+            Ok(Some(DataType::Boolean))
+        }
+        Expr::Cast { expr, type_name, .. } => {
+            infer_type(expr, schema, functions)?;
+            DataType::from_sql_name(&type_name.name)
+                .map(Some)
+                .ok_or_else(|| DbError::Eval(format!("未知の型名です: {}", type_name.name)))
+        }
+        Expr::FunctionCall { name, args, .. } => {
+            let arg_types = functions.arg_types(name)?;
+            let canonical_name = name.to_ascii_lowercase();
+            if args.len() != arg_types.len() {
+                return Err(DbError::Eval(format!(
+                    "{canonical_name}は引数を{}個取ります(渡されたのは{}個です)",
+                    arg_types.len(),
+                    args.len()
+                )));
+            }
+            for (arg, expected) in args.iter().zip(arg_types) {
+                let actual = infer_type(arg, schema, functions)?;
+                if let Some(actual_type) = actual
+                    && actual_type != *expected
+                {
+                    return Err(DbError::Eval(format!(
+                        "{canonical_name}は{expected}を引数に取ります: {actual_type}が渡されました"
+                    )));
+                }
+            }
+            functions.return_type(name).map(Some)
+        }
         Expr::Paren { expr, .. } => infer_type(expr, schema, functions),
     }
 }

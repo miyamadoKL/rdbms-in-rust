@@ -334,11 +334,13 @@ fn eval_cast(value: Value, target: DataType) -> DbResult<Value> {
 /// Scalar Functionの実装本体。引数の`Value`列を受け取り、戻り値の`Value`を返す。
 type ScalarFn = Box<dyn Fn(&[Value]) -> DbResult<Value> + Send + Sync>;
 
-/// レジストリに登録された1個のScalar Function。実装本体に加えて、戻り値の
-/// `DataType`を静的に持つ。`project`(第10章の`executor`モジュール)が、
-/// 実際に1行評価する前に`SELECT`の出力列の型を決めるのに使う。
+/// レジストリに登録された1個のScalar Function。実装本体に加えて、引数の個数・
+/// 型と戻り値の`DataType`を静的に持つ。`executor`モジュールの`infer_type`が、
+/// 実際に1行評価する前に、呼び出しの引数の個数・型が正しいかどうかと、
+/// `SELECT`の出力列の型を決めるのに使う。
 struct FunctionEntry {
     func: ScalarFn,
+    arg_types: Vec<DataType>,
     return_type: DataType,
 }
 
@@ -360,18 +362,21 @@ impl FunctionRegistry {
     /// 組み込み関数(`abs`、`length`)だけを登録したレジストリを作る。
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
-        registry.register("abs", DataType::BigInt, builtin_abs);
-        registry.register("length", DataType::BigInt, builtin_length);
+        registry.register("abs", vec![DataType::BigInt], DataType::BigInt, builtin_abs);
+        registry.register("length", vec![DataType::Text], DataType::BigInt, builtin_length);
         registry
     }
 
     /// 関数を1つ登録する。同名の関数がすでにあれば上書きする。
     ///
-    /// `return_type`は、この関数がNULL以外の入力に対して返す`Value`の型。
-    /// 静的な型検査(`executor::infer_type`)がこの値を使う。
+    /// `arg_types`は、この関数がNULL以外の引数に対して期待する各引数の型
+    /// (個数がそのまま引数の個数になる)。`return_type`は、この関数がNULL以外の
+    /// 入力に対して返す`Value`の型。どちらも静的な型検査(`executor::infer_type`)
+    /// が使う。
     pub fn register(
         &mut self,
         name: &str,
+        arg_types: Vec<DataType>,
         return_type: DataType,
         f: impl Fn(&[Value]) -> DbResult<Value> + Send + Sync + 'static,
     ) {
@@ -379,6 +384,7 @@ impl FunctionRegistry {
             name.to_ascii_lowercase(),
             FunctionEntry {
                 func: Box::new(f),
+                arg_types,
                 return_type,
             },
         );
@@ -388,6 +394,15 @@ impl FunctionRegistry {
     pub fn call(&self, name: &str, args: &[Value]) -> DbResult<Value> {
         match self.functions.get(&name.to_ascii_lowercase()) {
             Some(entry) => (entry.func)(args),
+            None => Err(DbError::Eval(format!("未知の関数です: {name}"))),
+        }
+    }
+
+    /// 名前から、この関数が期待する引数の型の並びを引く。登録されていない名前は
+    /// `DbError::Eval`にする。
+    pub fn arg_types(&self, name: &str) -> DbResult<&[DataType]> {
+        match self.functions.get(&name.to_ascii_lowercase()) {
+            Some(entry) => Ok(&entry.arg_types),
             None => Err(DbError::Eval(format!("未知の関数です: {name}"))),
         }
     }
@@ -794,7 +809,7 @@ mod tests {
     #[test]
     fn custom_function_can_be_registered() {
         let mut registry = FunctionRegistry::new();
-        registry.register("answer", DataType::BigInt, |_args| Ok(Value::BigInt(42)));
+        registry.register("answer", vec![], DataType::BigInt, |_args| Ok(Value::BigInt(42)));
         assert_eq!(registry.call("answer", &[]).unwrap(), Value::BigInt(42));
     }
 
@@ -810,6 +825,22 @@ mod tests {
         let registry = FunctionRegistry::with_builtins();
         assert!(matches!(
             registry.return_type("no_such_fn"),
+            Err(DbError::Eval(_))
+        ));
+    }
+
+    #[test]
+    fn arg_types_looks_up_a_registered_functions_declared_argument_types() {
+        let registry = FunctionRegistry::with_builtins();
+        assert_eq!(registry.arg_types("abs").unwrap(), &[DataType::BigInt]);
+        assert_eq!(registry.arg_types("LENGTH").unwrap(), &[DataType::Text]);
+    }
+
+    #[test]
+    fn arg_types_of_unknown_function_is_an_error() {
+        let registry = FunctionRegistry::with_builtins();
+        assert!(matches!(
+            registry.arg_types("no_such_fn"),
             Err(DbError::Eval(_))
         ));
     }
