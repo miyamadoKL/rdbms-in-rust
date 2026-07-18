@@ -356,7 +356,43 @@ minidb> SELECT id FROM users WHERE 1;
 エラー: 評価エラー: WHERE句はBOOLEANまたはNULLを返す式である必要があります: BIGINTが渡されました
 ```
 
-Filter演算子は、`守るべき不変条件`の1番目を、この`predicate_matches`を使ってそのままコードにしただけです。
+ただし、`predicate_matches`だけでこの検査を済ませようとすると、抜け穴が1つ残ります。
+`predicate_matches`は行を1件評価して初めて型を確かめるため、`table`が空で行ループが1度も回らないと、`predicate_matches`自体が1度も呼ばれません。
+つまり、空のテーブルに対する`SELECT id FROM users WHERE 1`は、`WHERE 1`という書き誤りがありながらエラーにならず、0行という(一見正常に見える)結果を返してしまいます。
+
+この抜け穴を塞ぐため、行ループへ入る前に`predicate`の型を静的に検査する`check_predicate_type`を用意し、`filter`、`update`、`delete`の冒頭で呼びます。
+使うのは`infer_type`という関数で、`SELECT`の計算列の型を決めるところ(このあとのProjection演算子の節)でも登場します。
+行を1件も評価せず、式のASTと`schema`だけから`predicate`の型を決められるので、テーブルの行数に関係なく同じ検査ができます。
+
+```rust
+fn check_predicate_type(
+    predicate: &Expr,
+    schema: &Schema,
+    functions: &FunctionRegistry,
+) -> DbResult<()> {
+    let data_type = infer_type(predicate, schema, functions)?;
+    if data_type != DataType::Boolean {
+        return Err(DbError::Eval(format!(
+            "WHERE句はBOOLEANを返す式である必要があります: 式の型は{data_type}です"
+        )));
+    }
+    Ok(())
+}
+```
+
+`predicate_matches`と`check_predicate_type`は役割が違います。
+`check_predicate_type`は「`predicate`という式が返す型」を静的に検査する事前チェックで、行の有無に関係なく必ず1回だけ実行されます。
+一方`predicate_matches`は、行ごとに実際に評価された`Value`を見て「その行にマッチしたか」を判定する実行時の変換で、`check_predicate_type`を通った`predicate`が`BOOLEAN`か`NULL`しか返さないことは保証済みなので、`predicate_matches`の3つ目の分岐(型エラー)は通常は届かない最終防衛線として残しています。
+
+```console
+minidb> SELECT id FROM users WHERE 1;
+エラー: 評価エラー: WHERE句はBOOLEANを返す式である必要があります: 式の型はBIGINTです
+```
+
+`users`が空のときも、この`エラー`は変わりません。
+`check_predicate_type`は行を見ないので、行が0件であることに影響されないからです。
+
+Filter演算子は、`守るべき不変条件`の1番目を、`check_predicate_type`と`predicate_matches`の2段構えでコードにしています。
 
 ```rust
 pub fn filter(
@@ -365,6 +401,7 @@ pub fn filter(
     rows: Vec<Tuple>,
     predicate: &Expr,
 ) -> DbResult<Vec<Tuple>> {
+    check_predicate_type(predicate, schema, functions)?;
     let mut kept = Vec::with_capacity(rows.len());
     for tuple in rows {
         let row = Row::new(schema, &tuple);
@@ -489,6 +526,7 @@ pub struct Assignment {
 ```
 
 Update演算子は、`WHERE`に一致した行(`predicate`が無ければ全行)それぞれに`assignments`を適用します。
+`filter`と同じ理由で、`table`が空でも`WHERE 1`のような書き誤りを見逃さないよう、行ループへ入る前に`predicate`が`Some`なら`check_predicate_type`を呼びます。
 
 ```rust
 pub fn update(
@@ -498,6 +536,9 @@ pub fn update(
     assignments: &[Assignment],
     predicate: Option<&Expr>,
 ) -> DbResult<usize> {
+    if let Some(pred) = predicate {
+        check_predicate_type(pred, schema, functions)?;
+    }
     let mut planned = Vec::new();
     for (index, tuple) in table.rows().iter().enumerate() {
         let row = Row::new(schema, tuple);
@@ -535,6 +576,7 @@ INSERT演算子と同じく、書き換え後の`Tuple`をすべて`planned`に�
 `assignments`の適用中に型検査(`Tuple::new`)が1行でも失敗すれば、それより前に検査を通っていた行も含めて`table`は変更されません。
 
 Delete演算子は、`Filter`演算子と対になる形をしています。
+こちらも`table`が空でも`WHERE 1`を見逃さないよう、行ループへ入る前に`check_predicate_type`を呼びます。
 
 ```rust
 pub fn delete(
@@ -543,6 +585,9 @@ pub fn delete(
     functions: &FunctionRegistry,
     predicate: Option<&Expr>,
 ) -> DbResult<usize> {
+    if let Some(pred) = predicate {
+        check_predicate_type(pred, schema, functions)?;
+    }
     let mut kept = Vec::with_capacity(table.rows().len());
     let mut deleted = 0usize;
     for tuple in table.rows() {
@@ -631,6 +676,20 @@ fn select_where_drops_unknown_rows() {
 }
 ```
 
+`check_predicate_type`が行の有無に関係なく`WHERE 1`を拒否することも、`users`テーブルへ1行も`INSERT`しない状態から狙って確認しています。
+
+```rust
+#[test]
+fn select_where_1_is_rejected_even_on_an_empty_table() {
+    let mut db = users_db();
+    let result = db.execute("SELECT id FROM users WHERE 1");
+    assert!(matches!(result, Err(DbError::Eval(_))));
+}
+```
+
+同じ形のテストを`UPDATE`、`DELETE`にも1つずつ用意しています(`update_where_1_is_rejected_even_on_an_empty_table`、`delete_where_1_is_rejected_even_on_an_empty_table`)。
+`predicate_matches`だけに頼っていた実装では、この3つのテストはどれも「空のテーブルなので0行がマッチした」という誤った成功に倒れてしまい、`check_predicate_type`を先頭に置いて初めて赤くなります。
+
 Golden Testは、これまで1ファイルにつき1文しか置けませんでした(第3章)。
 `CREATE TABLE`と`INSERT`をまたぐ流れは、複数文を実行できる単体テストの役目として書き分ける、という方針を第9章で採っています。
 しかしこの章のDMLは、`CREATE TABLE`で作ったテーブルに`INSERT`してから`SELECT`で覗く、という組み合わせを抜きにして単独では意味を持ちません。
@@ -641,27 +700,34 @@ Golden Testは、これまで1ファイルにつき1文しか置けませんで�
 
 ```rust
 fn split_statements(sql: &str) -> Vec<&str> {
-    let tokens =
-        tokenize(sql).unwrap_or_else(|e| panic!("golden testのSQLをtokenizeできません: {e}"));
+    match tokenize(sql) {
+        Ok(tokens) => split_by_tokens(sql, &tokens),
+        Err(_) => {
+            let text = sql.trim();
+            if text.is_empty() { Vec::new() } else { vec![text] }
+        }
+    }
+}
 
+fn split_by_tokens<'a>(sql: &'a str, tokens: &[Token]) -> Vec<&'a str> {
     let mut statements = Vec::new();
     let mut start = 0usize;
-    for token in &tokens {
+    let mut has_real_token_since_start = false;
+    for token in tokens {
         match token.kind {
             TokenKind::Semicolon => {
-                let text = sql[start..token.span.start].trim();
-                if !text.is_empty() {
-                    statements.push(text);
+                if has_real_token_since_start {
+                    statements.push(sql[start..token.span.start].trim());
                 }
                 start = token.span.end;
+                has_real_token_since_start = false;
             }
             TokenKind::Eof => {
-                let text = sql[start..token.span.start].trim();
-                if !text.is_empty() {
-                    statements.push(text);
+                if has_real_token_since_start {
+                    statements.push(sql[start..token.span.start].trim());
                 }
             }
-            _ => {}
+            _ => has_real_token_since_start = true,
         }
     }
     statements
@@ -670,6 +736,29 @@ fn split_statements(sql: &str) -> Vec<&str> {
 
 各`Token`は元のソース上のバイト範囲を`Span`として持っているので、`Semicolon`トークンに出会うたびに、直前の区切り位置からそのトークンの開始位置までを`sql`からそのままスライスします。
 文字列リテラルやコメントの中身がどんな文字を含んでいても、`tokenize`がその範囲を1つのトークン(または読み飛ばすコメント)として扱う以上、区切りの`TokenKind::Semicolon`として誤検出されることはありません。
+
+この`split_by_tokens`には、区切りの間に実際のトークンが1個も無ければ文として扱わない、という判定が入っています。
+コメントは字句解析の段階でトークンを1個も生成しないため、`SELECT 1; -- trailing`のように最後の`;`の後ろにコメントしか無い場合、その範囲には実トークンが無く、文として`db.execute`に渡されることはありません。
+最初、この判定を`text.trim().is_empty()`(切り出した文字列を`trim`して空かどうか)で行っていましたが、それでは不十分でした。
+コメントの文字自体は空白文字ではないため、`trim`しても`-- trailing`は空文字列にならず、コメントだけの断片を2文目として拾って`db.execute`に渡してしまうという不具合があったからです。
+`has_real_token_since_start`という`bool`で「区切りの間に`Semicolon`、`Eof`以外のトークンが現れたか」を直接追うことで、文字列の見た目ではなく字句解析の結果そのものを根拠に判定するよう直しました。
+
+もう1つ、`tokenize`は成功か失敗かのどちらかしか返さず、閉じない文字列リテラルのようなエラーに遭遇した時点で、そこまでに読めていたトークンも含めてすべて捨ててしまうという性質があります。
+そのため、字句解析器自体が失敗するSQL(閉じない文字列リテラルなど)を期待値にするgoldenケースを素直に書こうとすると、`split_statements`がSpan基準の分割に入る前に`tokenize`自体が失敗し、ファイルを文へ分ける段階でpanicしてしまいます。
+これでは「実行時に字句エラーになる」ことを確かめるgoldenケースが書けません。
+`split_statements`は、`tokenize`が失敗した場合はファイル全体を分割せず1個の文としてそのまま返すフォールバックを取ることでこれに対処します。
+字句解析エラーは、分割を経ずにそのまま渡された文を`db.execute`が評価する際に検出され、期待どおり`ERROR:`付きの結果になります。
+このフォールバックが働くgoldenケースは、壊れた文とその前後を分けて実行する必要が無いよう、1ファイル1文(壊れた文だけ)にとどめる前提とします。
+`tests/golden/020_lex_error_unterminated_string.sql`がこのフォールバックの回帰テストです。
+
+```sql
+SELECT 'unterminated;
+```
+
+```console
+ERROR: 行1列8: 字句エラー: 閉じない文字列リテラルです
+```
+
 `run_sql`は、この`split_statements`が返した文をそのまま`Database`に順に流し込みます。
 
 ```rust
@@ -699,19 +788,33 @@ SELECT 'c;d';
 ```
 
 行コメント、ブロックコメント、文字列リテラルのどれもが`;`を内側に含みますが、`split_statements`はこれらを区切りと誤認せず、`SELECT 'a;b'`と`SELECT 'c;d'`という2文に正しく分けます。
+`tests/golden/021_trailing_comment_only_after_semicolon.sql`は、`has_real_token_since_start`が守る規則(最後の`;`の後ろがコメントだけなら文として扱わない)の回帰テストです。
+
+```sql
+SELECT 1;
+-- trailing comment only, no more statements
+```
+
+この2行は`SELECT 1`という1文にしか分かれず、コメントの行が2文目として`db.execute`に渡されることはありません。
 
 ```console
 $ cargo test
-running 164 tests
+running 192 tests
 test database::tests::insert_select_update_delete_round_trip ... ok
 test database::tests::select_where_drops_unknown_rows ... ok
 test database::tests::update_set_right_hand_side_sees_the_pre_update_row ... ok
 test executor::tests::update_leaves_the_table_untouched_when_a_row_fails_validation ... ok
 ...
-test result: ok. 164 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 192 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
-running 1 test
+running 11 tests
+test split_statements_tests::blank_input_has_no_statements ... ok
+test split_statements_tests::falls_back_to_a_single_statement_when_the_whole_file_fails_to_tokenize ... ok
+test split_statements_tests::ignores_a_trailing_line_comment_after_the_last_semicolon ... ok
+...
 test golden_tests_pass ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 ```
 
 ## SQLiteとのDifferential Testを導入する
@@ -870,7 +973,7 @@ fn predicate_matches(value: Value) -> DbResult<bool> {
 この状態で`select_where_drops_unknown_rows`を実行すると、期待どおり赤くなります。
 
 ```console
-thread 'database::tests::select_where_drops_unknown_rows' panicked at src/database.rs:707:9:
+thread 'database::tests::select_where_drops_unknown_rows' panicked at src/database.rs:739:9:
 assertion `left == right` failed
   left: 2
  right: 1
@@ -883,7 +986,7 @@ assertion `left == right` failed
 同じ壊れ方を、SQLiteとのDifferential Testも独立に検出します。
 
 ```console
-thread 'where_with_null_drops_unknown_rows' panicked at tests/differential.rs:32:5:
+thread 'where_with_null_drops_unknown_rows' panicked at tests/differential.rs:64:5:
 assertion `left == right` failed: minidbとSQLiteの結果が一致しません: ...
   left: [[Integer(1)], [Integer(2)]]
  right: [[Integer(2)]]

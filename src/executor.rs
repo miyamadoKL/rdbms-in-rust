@@ -29,6 +29,12 @@ fn predicate_matches(value: Value) -> DbResult<bool> {
             // 来る`other`は必ず`data_type()`が`Some`を返す値(`BigInt`/`Text`)である。
             // `Option`を`{:?}`でそのまま表示すると`Some(BigInt)`のようにRustの内部
             // 表現が利用者に漏れてしまうため、`unwrap`してSQLの型名だけを見せる。
+            //
+            // なお、この分岐へ実際に到達するのは`check_predicate_type`による事前の
+            // 静的検査をすり抜けたときだけである(通常は起こらない。`infer_type`の
+            // 判定ミスなどに備えた保険)。行の有無に関わらず`WHERE 1`のような式を
+            // 拒否する主経路は`check_predicate_type`であり、こちらは行を実際に評価
+            // した後の最終防衛線に過ぎない。
             let data_type = other
                 .data_type()
                 .expect("BooleanとNullは既に処理済みなのでdata_type()は必ずSomeを返す");
@@ -37,6 +43,29 @@ fn predicate_matches(value: Value) -> DbResult<bool> {
             )))
         }
     }
+}
+
+/// `predicate`が`BOOLEAN`を返す式であることを、行を1件も評価せずに`infer_type`で
+/// 静的に検査する。
+///
+/// `predicate_matches`は行ごとに評価した`Value`を見て初めて型の誤りに気づくため、
+/// テーブルが空で行ループが1度も回らない場合(`SELECT/UPDATE/DELETE ... WHERE 1`を
+/// 空テーブルに対して実行するなど)は`predicate_matches`が一度も呼ばれず、
+/// `WHERE 1`のような書き誤りを見逃してしまう。`filter`・`update`・`delete`は、
+/// 行ループに入る前にこの関数を呼ぶことで、行の有無に関わらず同じ不変条件
+/// (「`WHERE`句は`BOOLEAN`を返す式でなければならない」)を保証する。
+fn check_predicate_type(
+    predicate: &Expr,
+    schema: &Schema,
+    functions: &FunctionRegistry,
+) -> DbResult<()> {
+    let data_type = infer_type(predicate, schema, functions)?;
+    if data_type != DataType::Boolean {
+        return Err(DbError::Eval(format!(
+            "WHERE句はBOOLEANを返す式である必要があります: 式の型は{data_type}です"
+        )));
+    }
+    Ok(())
 }
 
 /// Sequential Scan演算子。テーブルの全行を、格納順のまま複製して返す。
@@ -53,13 +82,15 @@ pub fn seq_scan(table: &MemTable) -> Vec<Tuple> {
 /// なった行も、`TRUE`ではないので落ちる。`NULL`の行を「一致しなかった」側に
 /// 含めるこの規則、および`BOOLEAN`でも`NULL`でもない値(`WHERE 1`など)を
 /// エラーにする規則は、`predicate_matches`が`update`・`delete`とも共通して
-/// 適用する。
+/// 適用する。`rows`が空でも`WHERE 1`のような書き誤りを見逃さないよう、行
+/// ループへ入る前に`check_predicate_type`で`predicate`の型を静的に検査する。
 pub fn filter(
     schema: &Schema,
     functions: &FunctionRegistry,
     rows: Vec<Tuple>,
     predicate: &Expr,
 ) -> DbResult<Vec<Tuple>> {
+    check_predicate_type(predicate, schema, functions)?;
     let mut kept = Vec::with_capacity(rows.len());
     for tuple in rows {
         let row = Row::new(schema, &tuple);
@@ -283,6 +314,9 @@ fn expand_to_schema(
 /// `Insert`演算子と同様、書き換え後の`Tuple`をすべて`planned`に集め終えてから
 /// 一括で`table`へ反映する。行の途中で型検査に失敗した場合、それより前に
 /// 検査を通っていた行も含めて、`table`は一切変更されない。
+///
+/// `table`が空でも`WHERE 1`のような書き誤りを見逃さないよう、行ループへ入る前に
+/// `check_predicate_type`で`predicate`の型を静的に検査する(`filter`と同じ理由)。
 pub fn update(
     table: &mut MemTable,
     schema: &Schema,
@@ -290,6 +324,9 @@ pub fn update(
     assignments: &[Assignment],
     predicate: Option<&Expr>,
 ) -> DbResult<usize> {
+    if let Some(pred) = predicate {
+        check_predicate_type(pred, schema, functions)?;
+    }
     let mut planned = Vec::new();
     for (index, tuple) in table.rows().iter().enumerate() {
         let row = Row::new(schema, tuple);
@@ -324,12 +361,18 @@ pub fn update(
 /// 行)を新しい`Vec`へ集め終えてから`table`へ書き戻す。集め終える前に評価が
 /// 失敗すれば、その時点で`table`はまだ元のままなので、失敗した`DELETE`が
 /// 一部の行だけ消してしまうことはない。
+///
+/// `table`が空でも`WHERE 1`のような書き誤りを見逃さないよう、行ループへ入る前に
+/// `check_predicate_type`で`predicate`の型を静的に検査する(`filter`と同じ理由)。
 pub fn delete(
     table: &mut MemTable,
     schema: &Schema,
     functions: &FunctionRegistry,
     predicate: Option<&Expr>,
 ) -> DbResult<usize> {
+    if let Some(pred) = predicate {
+        check_predicate_type(pred, schema, functions)?;
+    }
     let mut kept = Vec::with_capacity(table.rows().len());
     let mut deleted = 0usize;
     for tuple in table.rows() {
@@ -428,6 +471,19 @@ mod tests {
         let schema = users_schema();
         let functions = FunctionRegistry::with_builtins();
         let rows = vec![tuple(1, Some("Alice"))];
+
+        let result = filter(&schema, &functions, rows, &expr("1"));
+        assert!(matches!(result, Err(DbError::Eval(_))));
+    }
+
+    #[test]
+    fn filter_rejects_a_non_boolean_predicate_even_on_an_empty_table() {
+        // 行が1件も無いと`predicate_matches`は一度も呼ばれないため、
+        // `check_predicate_type`による事前の静的検査が無いと`WHERE 1`のような
+        // 書き誤りが空テーブルに対しては素通りしてしまう。
+        let schema = users_schema();
+        let functions = FunctionRegistry::with_builtins();
+        let rows: Vec<Tuple> = Vec::new();
 
         let result = filter(&schema, &functions, rows, &expr("1"));
         assert!(matches!(result, Err(DbError::Eval(_))));
@@ -660,6 +716,29 @@ mod tests {
         assert_eq!(table.rows()[1].values()[0], Value::BigInt(2));
     }
 
+    #[test]
+    fn update_rejects_a_non_boolean_predicate_even_on_an_empty_table() {
+        // `filter`と同じ理由で、`table`が空だと行ループが1度も回らないため、
+        // `check_predicate_type`による事前検査が無いと`WHERE 1`が素通りする。
+        let schema = users_schema();
+        let functions = FunctionRegistry::with_builtins();
+        let mut table = MemTable::new();
+
+        let assignments = vec![Assignment {
+            column: ident("name"),
+            value: expr("'Carol'"),
+            span: Span::new(0, 0),
+        }];
+        let result = update(
+            &mut table,
+            &schema,
+            &functions,
+            &assignments,
+            Some(&expr("1")),
+        );
+        assert!(matches!(result, Err(DbError::Eval(_))));
+    }
+
     // ---- Delete ----
 
     #[test]
@@ -687,5 +766,17 @@ mod tests {
         let count = delete(&mut table, &schema, &functions, None).unwrap();
         assert_eq!(count, 2);
         assert!(table.rows().is_empty());
+    }
+
+    #[test]
+    fn delete_rejects_a_non_boolean_predicate_even_on_an_empty_table() {
+        // `filter`と同じ理由で、`table`が空だと行ループが1度も回らないため、
+        // `check_predicate_type`による事前検査が無いと`WHERE 1`が素通りする。
+        let schema = users_schema();
+        let functions = FunctionRegistry::with_builtins();
+        let mut table = MemTable::new();
+
+        let result = delete(&mut table, &schema, &functions, Some(&expr("1")));
+        assert!(matches!(result, Err(DbError::Eval(_))));
     }
 }

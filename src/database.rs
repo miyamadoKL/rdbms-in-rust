@@ -749,6 +749,16 @@ mod tests {
         assert_eq!(result.schema().columns()[0].data_type, DataType::BigInt);
     }
 
+    #[test]
+    fn select_where_1_is_rejected_even_on_an_empty_table() {
+        // `users`が空だと`filter`の行ループが1度も回らないため、行を評価して
+        // 初めて気づく検査だけでは`WHERE 1`のような書き誤りを見逃してしまう。
+        // `check_predicate_type`による事前の静的検査がその穴を塞ぐ。
+        let mut db = users_db();
+        let result = db.execute("SELECT id FROM users WHERE 1");
+        assert!(matches!(result, Err(DbError::Eval(_))));
+    }
+
     // ---- UPDATE ----
 
     #[test]
@@ -804,6 +814,15 @@ mod tests {
         assert_eq!(selected.rows()[0].values(), &[Value::BigInt(1)]);
     }
 
+    #[test]
+    fn update_where_1_is_rejected_even_on_an_empty_table() {
+        // `select_where_1_is_rejected_even_on_an_empty_table`と同じ理由で、
+        // `users`が空でも`UPDATE ... WHERE 1`は静的検査で拒否される。
+        let mut db = users_db();
+        let result = db.execute("UPDATE users SET name = 'x' WHERE 1");
+        assert!(matches!(result, Err(DbError::Eval(_))));
+    }
+
     // ---- DELETE ----
 
     #[test]
@@ -824,6 +843,15 @@ mod tests {
         let result = db.execute("DELETE FROM users").unwrap();
         assert_eq!(result.to_string(), "DELETE 2");
         assert!(db.execute("SELECT * FROM users").unwrap().rows().is_empty());
+    }
+
+    #[test]
+    fn delete_where_1_is_rejected_even_on_an_empty_table() {
+        // `select_where_1_is_rejected_even_on_an_empty_table`と同じ理由で、
+        // `users`が空でも`DELETE ... WHERE 1`は静的検査で拒否される。
+        let mut db = users_db();
+        let result = db.execute("DELETE FROM users WHERE 1");
+        assert!(matches!(result, Err(DbError::Eval(_))));
     }
 
     #[test]
