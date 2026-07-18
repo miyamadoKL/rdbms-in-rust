@@ -36,8 +36,11 @@
 //! 特定する手段そのものが両者で異なるため、共通化すると分岐だらけの抽象が
 //! 必要になる。
 
+use std::collections::HashSet;
+
 use crate::ast::Expr;
 use crate::binder::{BoundAssignment, BoundExpr};
+use crate::constraints;
 use crate::error::{DbError, DbResult};
 use crate::eval::{FunctionRegistry, eval_bound_expr, eval_expr};
 use crate::ids::{RecordId, TableId};
@@ -101,6 +104,7 @@ pub fn insert(
     rows: &[Vec<Expr>],
 ) -> DbResult<usize> {
     let planned = plan_insert_rows(schema, functions, columns, rows)?;
+    constraints::check_uniqueness(schema, table.rows().iter(), &planned)?;
     let count = planned.len();
     table.rows_mut().extend(planned);
     Ok(count)
@@ -126,6 +130,17 @@ pub fn storage_insert(
     rows: &[Vec<Expr>],
 ) -> DbResult<usize> {
     let planned = plan_insert_rows(schema, functions, columns, rows)?;
+    // `PRIMARY KEY`・`UNIQUE`を持たないテーブルでは、既存の全行をわざわざ
+    // 読んで`decode_tuple`し直すコストが無駄になる。`unique_constrained_columns`
+    // が空ならこの走査そのものを丸ごと省く。
+    if schema.unique_constrained_columns().next().is_some() {
+        let mut existing = Vec::with_capacity(planned.len());
+        for entry in storage.scan(table_id)? {
+            let (_, bytes) = entry?;
+            existing.push(decode_tuple(schema, &bytes)?);
+        }
+        constraints::check_uniqueness(schema, existing.iter(), &planned)?;
+    }
     let count = planned.len();
     for tuple in planned {
         let bytes = encode_tuple(schema, &tuple);
@@ -230,6 +245,21 @@ pub fn update(
         planned.push((index, Tuple::new(schema, new_values)?));
     }
 
+    // 一意性は、更新される行の新しい値(`candidates`)が、更新されない行
+    // (`others`)および更新される行同士のどちらとも重複しないことで検査する。
+    // 更新される行自身の更新前の値は`others`に含めない。含めてしまうと、
+    // `UPDATE users SET id = id WHERE id = 1`のような「値を変えない更新」まで
+    // 自分自身との衝突として誤検出してしまう。
+    let planned_indices: HashSet<usize> = planned.iter().map(|(index, _)| *index).collect();
+    let candidates: Vec<Tuple> = planned.iter().map(|(_, tuple)| tuple.clone()).collect();
+    let others = table
+        .rows()
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !planned_indices.contains(index))
+        .map(|(_, tuple)| tuple);
+    constraints::check_uniqueness(schema, others, &candidates)?;
+
     let count = planned.len();
     for (index, new_tuple) in planned {
         table.rows_mut()[index] = new_tuple;
@@ -257,6 +287,7 @@ pub fn storage_update(
     predicate: Option<&BoundExpr>,
 ) -> DbResult<usize> {
     let mut planned: Vec<(RecordId, Tuple)> = Vec::new();
+    let mut others: Vec<Tuple> = Vec::new();
     for entry in storage.scan(table_id)? {
         let (rid, bytes) = entry?;
         let tuple = decode_tuple(schema, &bytes)?;
@@ -266,6 +297,7 @@ pub fn storage_update(
             Some(pred) => predicate_matches(eval_bound_expr(pred, functions, Some(&row))?)?,
         };
         if !matched {
+            others.push(tuple);
             continue;
         }
 
@@ -275,6 +307,12 @@ pub fn storage_update(
         }
         planned.push((rid, Tuple::new(schema, new_values)?));
     }
+
+    // `update`(MemTable版)と同じ理由で、更新されない行(`others`)だけを
+    // 比較相手にする。`others`はすでに上のループで、更新される行を除いて
+    // 集め終えている。
+    let candidates: Vec<Tuple> = planned.iter().map(|(_, tuple)| tuple.clone()).collect();
+    constraints::check_uniqueness(schema, others.iter(), &candidates)?;
 
     let count = planned.len();
     for (rid, new_tuple) in planned {

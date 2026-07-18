@@ -123,6 +123,33 @@ pub enum DbError {
     /// `next_table_id`がすでに`u64::MAX`で、これ以上安全に加算できないエラー。
     #[error("これ以上テーブルを作成できません: TableIdの上限(u64::MAX)に達しました")]
     TableIdSpaceExhausted,
+
+    /// `CREATE TABLE`の列定義に、`PRIMARY KEY`が2列以上に指定されたエラー(第20章)。
+    /// このSQLサブセットは単一列の`PRIMARY KEY`だけに対応する。複合`PRIMARY KEY`
+    /// (複数列の組で一意性を課す構文)は演習課題として読者に残す。
+    #[error("PRIMARY KEYは1列にのみ指定できます(複合PRIMARY KEYはこの章の範囲外です)")]
+    MultiplePrimaryKeys,
+
+    /// `INSERT`または`UPDATE`が、`PRIMARY KEY`列に既存の行(または同じ文の
+    /// 別の行)と同じ値を書き込もうとしたエラー(第20章)。
+    #[error("PRIMARY KEY制約違反です: 列'{column}'の値{value}が重複しています")]
+    PrimaryKeyViolation {
+        /// 違反した列の名前。
+        column: String,
+        /// 重複していた値の表示(`Value`の利用者向け表示形式)。
+        value: String,
+    },
+
+    /// `INSERT`または`UPDATE`が、`UNIQUE`列に既存の行(または同じ文の
+    /// 別の行)と同じ値を書き込もうとしたエラー(第20章)。`NULL`同士は
+    /// 重複とみなさない(`crate::constraints`のドキュメント参照)。
+    #[error("UNIQUE制約違反です: 列'{column}'の値{value}が重複しています")]
+    UniqueViolation {
+        /// 違反した列の名前。
+        column: String,
+        /// 重複していた値の表示(`Value`の利用者向け表示形式)。
+        value: String,
+    },
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

@@ -268,24 +268,46 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// 列定義の型名に続く列制約(`NOT NULL`・`PRIMARY KEY`・`UNIQUE`)を、
+    /// 現れる限り任意の順序・任意の個数だけ読む(第20章)。同じ制約が複数回
+    /// 現れても構文としては受理し、`Database::execute_create_table`が実際に
+    /// 意味のある組み合わせかどうかを検査する(複合`PRIMARY KEY`の拒否など)。
     fn parse_column_def(&mut self) -> DbResult<ColumnDef> {
         let name = self.expect_ident()?;
         let type_name = self.expect_ident()?;
         let mut end = type_name.span.end;
 
-        let not_null = if let TokenKind::Keyword(Keyword::Not) = self.peek_kind() {
-            self.advance();
-            end = self.expect_keyword(Keyword::Null, "NULL")?.end;
-            true
-        } else {
-            false
-        };
+        let mut not_null = false;
+        let mut primary_key = false;
+        let mut unique = false;
+
+        loop {
+            match self.peek_kind() {
+                TokenKind::Keyword(Keyword::Not) => {
+                    self.advance();
+                    end = self.expect_keyword(Keyword::Null, "NULL")?.end;
+                    not_null = true;
+                }
+                TokenKind::Keyword(Keyword::Primary) => {
+                    self.advance();
+                    end = self.expect_keyword(Keyword::Key, "KEY")?.end;
+                    primary_key = true;
+                }
+                TokenKind::Keyword(Keyword::Unique) => {
+                    end = self.advance().span.end;
+                    unique = true;
+                }
+                _ => break,
+            }
+        }
 
         Ok(ColumnDef {
             span: Span::new(name.span.start, end),
             name,
             type_name,
             not_null,
+            primary_key,
+            unique,
         })
     }
 
@@ -1054,6 +1076,41 @@ mod tests {
                 assert!(create.columns[0].not_null);
                 assert_eq!(create.columns[1].name.name, "name");
                 assert!(!create.columns[1].not_null);
+            }
+            other => panic!("CREATE TABLE文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_primary_key_and_unique_column_constraints() {
+        let statement = parse_statement(
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT UNIQUE, name TEXT)",
+        )
+        .unwrap();
+        match statement {
+            Statement::CreateTable(create) => {
+                assert!(create.columns[0].primary_key);
+                assert!(!create.columns[0].unique);
+                assert!(create.columns[1].unique);
+                assert!(!create.columns[1].primary_key);
+                assert!(!create.columns[2].primary_key);
+                assert!(!create.columns[2].unique);
+            }
+            other => panic!("CREATE TABLE文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_column_constraints_in_any_order() {
+        // `NOT NULL`・`PRIMARY KEY`・`UNIQUE`はどの順序で書いても構文として
+        // 受理する。
+        let statement =
+            parse_statement("CREATE TABLE t (id BIGINT UNIQUE NOT NULL PRIMARY KEY)").unwrap();
+        match statement {
+            Statement::CreateTable(create) => {
+                assert!(create.columns[0].not_null);
+                assert!(create.columns[0].primary_key);
+                assert!(create.columns[0].unique);
             }
             other => panic!("CREATE TABLE文を期待したが{other:?}が返った"),
         }

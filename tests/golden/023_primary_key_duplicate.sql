@@ -1,0 +1,3 @@
+CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT);
+INSERT INTO users VALUES (1, 'Alice');
+INSERT INTO users VALUES (1, 'Bob');

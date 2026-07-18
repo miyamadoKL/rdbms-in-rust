@@ -126,6 +126,12 @@ pub struct ColumnDef {
     pub type_name: Ident,
     /// `NOT NULL`が指定されていたかどうか。
     pub not_null: bool,
+    /// `PRIMARY KEY`が指定されていたかどうか(第20章)。単一列のみに対応し、
+    /// 同じ`CREATE TABLE`の複数の列に指定された場合の扱いは`Database`側
+    /// (`execute_create_table`)が検査する。
+    pub primary_key: bool,
+    /// `UNIQUE`が指定されていたかどうか(第20章)。
+    pub unique: bool,
     pub span: Span,
 }
 

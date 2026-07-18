@@ -5,7 +5,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 
 ## 目次
 
-現在執筆済みなのは[はじめに](book/src/index.md)と第1〜18章のみで、第19章以降は準備中です。
+現在執筆済みなのは[はじめに](book/src/index.md)と第1〜20章のみで、第21章以降は準備中です。
 
 ### 第0部 設計と開発環境
 
@@ -37,7 +37,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 - [第17章 Binderと名前解決](book/src/ch17-binder.md)
 - [第18章 関係代数とLogical Plan](book/src/ch18-logical-plan.md)
 - [第19章 Physical PlanとVolcano Executor](book/src/ch19-volcano-executor.md)
-- 第20章 制約
+- [第20章 制約](book/src/ch20-constraints.md)
 - 第21章 Sort、Limit、Distinct、Aggregate
 - 第22章 Joinアルゴリズム
 - 第23章 B+Tree I: 検索、挿入、分割

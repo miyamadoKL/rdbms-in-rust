@@ -94,6 +94,20 @@ impl Value {
     }
 }
 
+impl std::fmt::Display for Value {
+    /// 利用者向けの表示形式。`QueryResult`の表形式出力(`database`モジュール)と
+    /// 一意性制約違反のエラーメッセージ(`crate::constraints`、第20章)の
+    /// どちらも、この実装を共有する。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Null => write!(f, "NULL"),
+            Value::Boolean(b) => write!(f, "{b}"),
+            Value::BigInt(n) => write!(f, "{n}"),
+            Value::Text(s) => write!(f, "{s}"),
+        }
+    }
+}
+
 /// テーブルの1列を表す。名前、型、NULLを許すかどうかを持つ。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Column {
@@ -103,16 +117,40 @@ pub struct Column {
     pub data_type: DataType,
     /// NULLを許すかどうか。`false`なら`Value::Null`を格納できない。
     pub nullable: bool,
+    /// `PRIMARY KEY`が指定されているかどうか(第20章)。`true`なら`nullable`は
+    /// 必ず`false`になる(`Column::with_primary_key`参照)。この列に対しては
+    /// 一意性の検査(挿入・更新時の走査ベース検査)も課される。
+    pub primary_key: bool,
+    /// `UNIQUE`が指定されているかどうか(第20章)。`NULL`同士は重複とみなさない
+    /// (SQL標準の扱いに合わせる。詳細は`crate::constraints`のドキュメント参照)。
+    pub unique: bool,
 }
 
 impl Column {
-    /// 新しい列定義を作る。
+    /// 新しい列定義を作る。`PRIMARY KEY`・`UNIQUE`のどちらも持たない列として
+    /// 作られる。それぞれ`with_primary_key`・`with_unique`で追加する。
     pub fn new(name: impl Into<String>, data_type: DataType, nullable: bool) -> Self {
         Column {
             name: name.into(),
             data_type,
             nullable,
+            primary_key: false,
+            unique: false,
         }
+    }
+
+    /// この列を`PRIMARY KEY`にする。`PRIMARY KEY`は`NOT NULL`を含意するため、
+    /// `nullable`も`false`へ強制する。
+    pub fn with_primary_key(mut self) -> Self {
+        self.primary_key = true;
+        self.nullable = false;
+        self
+    }
+
+    /// この列を`UNIQUE`にする。
+    pub fn with_unique(mut self) -> Self {
+        self.unique = true;
+        self
     }
 }
 
@@ -141,6 +179,12 @@ impl Schema {
     /// 列が1つも無いかどうか。
     pub fn is_empty(&self) -> bool {
         self.columns.is_empty()
+    }
+
+    /// `PRIMARY KEY`または`UNIQUE`が指定された列を、Schema上の索引と一緒に
+    /// 返すイテレータ(第20章)。`crate::constraints`の一意性検査が使う。
+    pub fn unique_constrained_columns(&self) -> impl Iterator<Item = (usize, &Column)> {
+        self.columns.iter().enumerate().filter(|(_, c)| c.primary_key || c.unique)
     }
 
     /// 列名から列の索引を引く。見つからなければ`None`を返す。

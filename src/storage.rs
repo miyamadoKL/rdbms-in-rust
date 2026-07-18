@@ -41,13 +41,45 @@
 //!     name:           u8 × name_len
 //!     column_count:   u16
 //!     columns × column_count:
-//!         col_name_len: u16
-//!         col_name:     u8 × col_name_len
-//!         data_type:    u8 (0=BOOLEAN, 1=BIGINT, 2=TEXT)
-//!         nullable:     u8 (0 または 1)
+//!         col_name_len:  u16
+//!         col_name:      u8 × col_name_len
+//!         data_type:     u8 (0=BOOLEAN, 1=BIGINT, 2=TEXT)
+//!         nullable:      u8 (0 または 1)
+//!         primary_key:   u8 (0 または 1) ※第20章で追加
+//!         unique:        u8 (0 または 1) ※第20章で追加
 //!     page_count:     u32
 //!     page_ids:       u64 × page_count
 //! ```
+//!
+//! # 第20章での変更: 列ごとの制約バイトを追加する
+//!
+//! `PRIMARY KEY`・`UNIQUE`(第20章)は`Column`に持たせる情報が2つ増えたため、
+//! 列ごとのレコードの末尾(`nullable`の直後)に`primary_key`・`unique`という
+//! 2バイトを追加した。この章より前に`Storage::create`で作られたファイルは
+//! この2バイトを持たないため、この章のコードで`Storage::open`しようとすると
+//! `nullable`の直後で次の列(または`page_count`)を読もうとして境界がずれ、
+//! `DbError::CorruptCatalog`になる。
+//!
+//! ページ構造そのもの(File Header・Pageの`checksum`・`FORMAT_VERSION`、
+//! [`crate::page`])はこの章でも変えていない。`Page::decode`が検証する
+//! `FORMAT_VERSION`は「ページというバイト列の外枠(ヘッダ・checksum・
+//! `payload`のサイズ)が読めるか」だけを保証する番号であり、Catalogページの
+//! `payload`の中身(このモジュールが独自に手書きしているバイナリレイアウト)
+//! までは関知しない。したがって、`payload`内のレイアウトを変えるたびに
+//! `FORMAT_VERSION`を上げる方針は採らない。採ってしまうと、`payload`の中身に
+//! 一切関心のない`page`モジュールが、他のモジュール(このモジュールや、将来
+//! 増えるページ種別)の内部レイアウト変更のたびに変更を強いられることになる。
+//!
+//! 代わりに、この教材はそもそも「異なる章のコードでビルドしたデータベース
+//! ファイル間の互換性」を約束していない。各章は`git`タグで区切られた
+//! 1つのスナップショットであり、`Storage::open`が読めるのは同じ章の
+//! `Storage::create`(または、レイアウトを変えていない章)が書いたファイルに
+//! 限られる。この章のように`payload`のレイアウトを変える場合は、モジュール
+//! 冒頭のコメント(このセクション)へ変更内容を書き残すことで、読者が
+//! 「なぜ前の章で作ったファイルをこの章のコードで開けなくなったか」を
+//! たどれるようにする。これは新しい方針ではなく、第15章でこのモジュールが
+//! 生まれたときから変わっていない前提を、初めて実際に変更が起きたこの章で
+//! 明文化しただけである。
 //!
 //! `next_table_id`は、第9章の`Catalog`が`next_table_id: u64`をメモリ上だけに
 //! 持っていたのと同じ役割を、再起動をまたいで担う。これを永続化しないと、
@@ -744,6 +776,8 @@ fn encode_catalog(
             out.extend_from_slice(col_name_bytes);
             out.push(data_type_to_u8(column.data_type));
             out.push(u8::from(column.nullable));
+            out.push(u8::from(column.primary_key));
+            out.push(u8::from(column.unique));
         }
 
         out.extend_from_slice(&(entry.page_ids.len() as u32).to_le_bytes());
@@ -786,16 +820,17 @@ fn decode_catalog(bytes: &[u8]) -> DbResult<DecodedCatalog> {
             let col_name_len = take_u16(&mut cursor, "列名の長さ")? as usize;
             let col_name = take_string(&mut cursor, col_name_len, "列名")?;
             let data_type = data_type_from_u8(take_u8(&mut cursor, "data_type")?)?;
-            let nullable = match take_u8(&mut cursor, "nullable")? {
-                0 => false,
-                1 => true,
-                other => {
-                    return Err(DbError::CorruptCatalog(format!(
-                        "nullableは0か1である必要がありますが{other}でした"
-                    )));
-                }
-            };
-            columns.push(Column::new(col_name, data_type, nullable));
+            let nullable = take_bool(&mut cursor, "nullable")?;
+            let primary_key = take_bool(&mut cursor, "primary_key")?;
+            let unique = take_bool(&mut cursor, "unique")?;
+            let mut column = Column::new(col_name, data_type, nullable);
+            if primary_key {
+                column = column.with_primary_key();
+            }
+            if unique {
+                column = column.with_unique();
+            }
+            columns.push(column);
         }
 
         let page_count = take_u32(&mut cursor, "page_count")? as usize;
@@ -850,6 +885,19 @@ fn take<'a>(bytes: &mut &'a [u8], n: usize, what: &str) -> DbResult<&'a [u8]> {
 
 fn take_u8(bytes: &mut &[u8], what: &str) -> DbResult<u8> {
     Ok(take(bytes, 1, what)?[0])
+}
+
+/// `0`または`1`の1バイトを`bool`として読む。それ以外の値は
+/// `DbError::CorruptCatalog`にする。`nullable`・`primary_key`・`unique`
+/// (第20章で追加)が共通して使う。
+fn take_bool(bytes: &mut &[u8], what: &str) -> DbResult<bool> {
+    match take_u8(bytes, what)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(DbError::CorruptCatalog(format!(
+            "{what}は0か1である必要がありますが{other}でした"
+        ))),
+    }
 }
 
 fn take_u16(bytes: &mut &[u8], what: &str) -> DbResult<u16> {

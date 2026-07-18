@@ -1,0 +1,5 @@
+CREATE TABLE
+
+INSERT 1
+
+ERROR: PRIMARY KEY制約違反です: 列'id'の値1が重複しています

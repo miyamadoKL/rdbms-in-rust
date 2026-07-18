@@ -30,7 +30,7 @@
 - [第17章 Binderと名前解決](ch17-binder.md)
 - [第18章 関係代数とLogical Plan](ch18-logical-plan.md)
 - [第19章 Physical PlanとVolcano Executor](ch19-volcano-executor.md)
-- [第20章 制約]()
+- [第20章 制約](ch20-constraints.md)
 - [第21章 Sort、Limit、Distinct、Aggregate]()
 - [第22章 Joinアルゴリズム]()
 - [第23章 B+Tree I: 検索、挿入、分割]()

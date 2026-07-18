@@ -67,6 +67,42 @@ fn assert_same_result(setup: &[&str], query: &str) {
     );
 }
 
+/// `setup`の各文をminidbと`rusqlite`の両方に順に実行してから、
+/// `failing_statement`を両方で実行し、どちらもエラーになることだけを
+/// 確認する(第20章、`PRIMARY KEY`/`UNIQUE`違反の比較用)。
+///
+/// エラーの文言そのもの(`assert_same_result`が行毎の値まで突き合わせるのとは
+/// 対照的)は比較しない。minidbは`エラー: PRIMARY KEY制約違反です: 列'id'の値1が
+/// 重複しています`、SQLiteは`UNIQUE constraint failed: users.id`のように、
+/// 両エンジンのエラーメッセージの語彙・形式は最初から一致する設計になっておらず、
+/// 実装依存の文字列を比較しても意味のある差分検出にならない。この章で
+/// 両エンジンに共通して要求できるのは「制約違反の文は実行されず、エラーとして
+/// 拒否される」という意味論だけなので、比較もその1点に絞る。
+fn assert_both_error(setup: &[&str], failing_statement: &str) {
+    let mut minidb = Database::memory();
+    for statement in setup {
+        minidb
+            .execute(statement)
+            .unwrap_or_else(|e| panic!("minidbでの実行に失敗しました: {statement}: {e}"));
+    }
+    let minidb_result = minidb.execute(failing_statement);
+    assert!(
+        minidb_result.is_err(),
+        "minidbは{failing_statement:?}を制約違反として拒否するはずでした"
+    );
+
+    let conn = Connection::open_in_memory().expect("インメモリのSQLite接続を開けません");
+    for statement in setup {
+        conn.execute(statement, [])
+            .unwrap_or_else(|e| panic!("SQLiteでの実行に失敗しました: {statement}: {e}"));
+    }
+    let sqlite_result = conn.execute(failing_statement, []);
+    assert!(
+        sqlite_result.is_err(),
+        "SQLiteは{failing_statement:?}を制約違反として拒否するはずでした"
+    );
+}
+
 /// minidbで`setup`・`query`を実行し、結果行を`DiffValue`へ変換して返す。
 /// あわせて、SQLite側の`0`/`1`をBOOLEANとして読み替えるために使う、
 /// `query`が返す各列の`DataType`も返す。
@@ -315,5 +351,54 @@ fn boolean_column_is_reconciled_against_sqlite_zero_one() {
             "INSERT INTO flags VALUES (1, TRUE), (2, FALSE)",
         ],
         "SELECT id, active FROM flags",
+    );
+}
+
+#[test]
+fn primary_key_duplicate_is_rejected_by_both_engines() {
+    assert_both_error(
+        &[
+            "CREATE TABLE users (id BIGINT PRIMARY KEY NOT NULL, name TEXT)",
+            "INSERT INTO users VALUES (1, 'Alice')",
+        ],
+        "INSERT INTO users VALUES (1, 'Bob')",
+    );
+}
+
+#[test]
+fn unique_duplicate_is_rejected_by_both_engines() {
+    assert_both_error(
+        &[
+            "CREATE TABLE users (id BIGINT NOT NULL, email TEXT UNIQUE)",
+            "INSERT INTO users VALUES (1, 'a@example.com')",
+        ],
+        "INSERT INTO users VALUES (2, 'a@example.com')",
+    );
+}
+
+#[test]
+fn primary_key_null_is_rejected_by_both_engines_when_declared_not_null() {
+    // SQLiteは`INTEGER PRIMARY KEY`(型名が正確に`INTEGER`である場合に限る)を
+    // rowidの別名として扱い、その場合だけNULLを「次のrowidを自動採番する」
+    // 特別な値として受理する。さらにSQLiteでは、`PRIMARY KEY`単体は標準SQLとは
+    // 異なりNOT NULLを含意しない(明示的な`NOT NULL`が無いと非rowidのPRIMARY
+    // KEY列にもNULLが入る)。このSQLサブセットの`BIGINT PRIMARY KEY`は
+    // rowidの別名にはならないが、SQLite側の「PRIMARY KEYはNOT NULLを含意
+    // しない」という緩さは残るため、`NOT NULL`を明示した列で比較し、
+    // どちらの実装依存の差異も踏まないようにする。
+    assert_both_error(
+        &["CREATE TABLE users (id BIGINT PRIMARY KEY NOT NULL, name TEXT)"],
+        "INSERT INTO users (name) VALUES ('Alice')",
+    );
+}
+
+#[test]
+fn update_into_a_duplicate_primary_key_is_rejected_by_both_engines() {
+    assert_both_error(
+        &[
+            "CREATE TABLE users (id BIGINT PRIMARY KEY NOT NULL, name TEXT)",
+            "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')",
+        ],
+        "UPDATE users SET id = 1 WHERE id = 2",
     );
 }

@@ -216,6 +216,7 @@ impl Database {
     fn execute_create_table(&mut self, create: &CreateTableStatement) -> DbResult<QueryResult> {
         let mut columns = Vec::with_capacity(create.columns.len());
         let mut seen_names = std::collections::HashSet::with_capacity(create.columns.len());
+        let mut primary_key_count = 0;
         for column_def in &create.columns {
             if !seen_names.insert(column_def.name.name.as_str()) {
                 return Err(DbError::DuplicateColumn(column_def.name.name.clone()));
@@ -224,7 +225,18 @@ impl Database {
                 || DbError::Eval(format!("未知の型名です: {}", column_def.type_name.name)),
             )?;
             let nullable = !column_def.not_null;
-            columns.push(Column::new(column_def.name.name.clone(), data_type, nullable));
+            let mut column = Column::new(column_def.name.name.clone(), data_type, nullable);
+            if column_def.primary_key {
+                primary_key_count += 1;
+                column = column.with_primary_key();
+            }
+            if column_def.unique {
+                column = column.with_unique();
+            }
+            columns.push(column);
+        }
+        if primary_key_count > 1 {
+            return Err(DbError::MultiplePrimaryKeys);
         }
 
         let schema = Schema::new(columns);
@@ -534,7 +546,7 @@ impl std::fmt::Display for QueryResult {
             let row = tuple
                 .values()
                 .iter()
-                .map(format_value)
+                .map(Value::to_string)
                 .collect::<Vec<_>>()
                 .join(" | ");
             writeln!(f, "{row}")?;
@@ -542,16 +554,6 @@ impl std::fmt::Display for QueryResult {
 
         let row_word = if self.rows.len() == 1 { "row" } else { "rows" };
         write!(f, "({} {row_word})", self.rows.len())
-    }
-}
-
-/// `Value`をユーザー向けの表示形式に変換する。
-fn format_value(value: &Value) -> String {
-    match value {
-        Value::Null => "NULL".to_string(),
-        Value::Boolean(b) => b.to_string(),
-        Value::BigInt(n) => n.to_string(),
-        Value::Text(s) => s.clone(),
     }
 }
 
@@ -1328,6 +1330,119 @@ mod tests {
             .unwrap();
         let result = db.execute("UPDATE users SET name = 'x' WHERE NULL").unwrap();
         assert_eq!(result.to_string(), "UPDATE 0");
+    }
+
+    // ---- PRIMARY KEY / UNIQUE(第20章) ----
+
+    fn users_with_constraints_db() -> Database {
+        let mut db = Database::memory();
+        db.execute(
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT UNIQUE, name TEXT)",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn create_table_rejects_multiple_primary_keys() {
+        let mut db = Database::memory();
+        let result = db.execute("CREATE TABLE t (a BIGINT PRIMARY KEY, b BIGINT PRIMARY KEY)");
+        assert!(matches!(result, Err(DbError::MultiplePrimaryKeys)));
+        assert!(db.catalog().table("t").is_none());
+    }
+
+    #[test]
+    fn primary_key_column_is_not_nullable_even_without_not_null() {
+        let mut db = users_with_constraints_db();
+        let result = db.execute("INSERT INTO users (email) VALUES ('a@example.com')");
+        // `id`列挙げは省略していないが値がNULLになる: `PRIMARY KEY`は
+        // `NOT NULL`を含意するため、明示的な`NOT NULL`が無くても拒否される。
+        assert!(matches!(result, Err(DbError::SchemaMismatch(_))));
+    }
+
+    #[test]
+    fn insert_rejects_primary_key_duplicate_against_existing_row() {
+        let mut db = users_with_constraints_db();
+        db.execute("INSERT INTO users VALUES (1, 'a@example.com', 'Alice')")
+            .unwrap();
+        let result = db.execute("INSERT INTO users VALUES (1, 'b@example.com', 'Bob')");
+        assert!(matches!(result, Err(DbError::PrimaryKeyViolation { column, .. }) if column == "id"));
+        // 違反した行は挿入されない。
+        assert_eq!(db.execute("SELECT id FROM users").unwrap().rows().len(), 1);
+    }
+
+    #[test]
+    fn insert_rejects_unique_duplicate_against_existing_row() {
+        let mut db = users_with_constraints_db();
+        db.execute("INSERT INTO users VALUES (1, 'a@example.com', 'Alice')")
+            .unwrap();
+        let result = db.execute("INSERT INTO users VALUES (2, 'a@example.com', 'Bob')");
+        assert!(matches!(result, Err(DbError::UniqueViolation { column, .. }) if column == "email"));
+    }
+
+    #[test]
+    fn insert_rejects_duplicate_within_the_same_statement() {
+        // 同じINSERT文の中の2行同士でも一意性を検査する。
+        let mut db = users_with_constraints_db();
+        let result = db.execute(
+            "INSERT INTO users VALUES (1, 'a@example.com', 'Alice'), (2, 'a@example.com', 'Bob')",
+        );
+        assert!(matches!(result, Err(DbError::UniqueViolation { column, .. }) if column == "email"));
+        // Statement Rollback: 文全体が無効になり、1件も挿入されない。
+        assert!(db.execute("SELECT id FROM users").unwrap().rows().is_empty());
+    }
+
+    #[test]
+    fn insert_allows_multiple_null_unique_values() {
+        // UNIQUE列のNULL同士は重複とみなさない(SQL標準の扱い)。
+        let mut db = users_with_constraints_db();
+        db.execute("INSERT INTO users VALUES (1, NULL, 'Alice')").unwrap();
+        let result = db.execute("INSERT INTO users VALUES (2, NULL, 'Bob')");
+        assert!(result.is_ok());
+        assert_eq!(db.execute("SELECT id FROM users").unwrap().rows().len(), 2);
+    }
+
+    #[test]
+    fn update_rejects_primary_key_duplicate() {
+        let mut db = users_with_constraints_db();
+        db.execute("INSERT INTO users VALUES (1, 'a@example.com', 'Alice'), (2, 'b@example.com', 'Bob')")
+            .unwrap();
+        let result = db.execute("UPDATE users SET id = 1 WHERE id = 2");
+        assert!(matches!(result, Err(DbError::PrimaryKeyViolation { column, .. }) if column == "id"));
+        // 検査に失敗した行は書き換わらない。
+        let bob = db.execute("SELECT id FROM users WHERE name = 'Bob'").unwrap();
+        assert_eq!(bob.rows()[0].values()[0], Value::BigInt(2));
+    }
+
+    #[test]
+    fn update_does_not_conflict_with_its_own_previous_value() {
+        // 自分自身の更新前の値との比較で誤って衝突を報告しない
+        // (`UPDATE ... SET id = id`は常に成功するべき)。
+        let mut db = users_with_constraints_db();
+        db.execute("INSERT INTO users VALUES (1, 'a@example.com', 'Alice')")
+            .unwrap();
+        let result = db.execute("UPDATE users SET id = 1 WHERE id = 1");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn update_statement_rollback_leaves_earlier_rows_untouched_on_later_violation() {
+        // 複数行を書き換えるUPDATEの後半の行が制約に違反した場合、前半の行の
+        // 変更も一切残らないことを確認する(Statement Rollback)。
+        let mut db = users_with_constraints_db();
+        db.execute(
+            "INSERT INTO users VALUES (1, 'a@example.com', 'Alice'), (2, 'b@example.com', 'Bob'), (3, 'c@example.com', 'Carol')",
+        )
+        .unwrap();
+        // id=1とid=2をどちらも'a@example.com'へ書き換えようとする更新。
+        // 2行目を処理した時点で1行目との重複が判明し、文全体が失敗する。
+        let result = db.execute("UPDATE users SET email = 'a@example.com' WHERE id <= 2");
+        assert!(matches!(result, Err(DbError::UniqueViolation { .. })));
+
+        let alice = db.execute("SELECT email FROM users WHERE id = 1").unwrap();
+        assert_eq!(alice.rows()[0].values(), &[Value::Text("a@example.com".to_string())]);
+        let bob = db.execute("SELECT email FROM users WHERE id = 2").unwrap();
+        assert_eq!(bob.rows()[0].values(), &[Value::Text("b@example.com".to_string())]);
     }
 
     // ---- DELETE ----

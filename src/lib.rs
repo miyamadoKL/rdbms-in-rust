@@ -30,12 +30,16 @@
 //! `Executor::next()`で1行ずつ引っ張り出すVolcano型のPull実行を行う
 //! `physical_plan`が加わる。`database`の実行経路は構文解析→名前解決→
 //! 論理計画→物理計画→実行という5段階になり、`EXPLAIN`で`PhysicalPlan`の
-//! 木を確認できるようになる。
+//! 木を確認できるようになる。第20章では、`CREATE TABLE`の列制約に`PRIMARY
+//! KEY`・`UNIQUE`が加わり、その一意性を走査ベースで検査する`constraints`が
+//! 加わる。`INSERT`・`UPDATE`は、対象行すべての検査を終えるまで書き込みを
+//! 一切始めないStatement Rollbackの対象に、この一意性検査も含めるようになる。
 
 pub mod ast;
 pub mod binder;
 pub mod buffer_pool;
 pub mod catalog;
+pub mod constraints;
 pub mod database;
 pub mod disk_manager;
 pub mod error;
