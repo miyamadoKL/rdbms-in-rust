@@ -332,6 +332,10 @@ pub struct HeapFile {
 
 ```rust
 pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
+    if bytes.len() > max_len_for_fresh_page(PAGE_PAYLOAD_SIZE) {
+        return Err(DbError::TupleTooLarge(bytes.len()));
+    }
+
     for &page_id in &self.page_ids {
         let mut guard = self.pool.write_page(page_id)?;
         if let Some(slot) = SlottedPage::open(guard.data_mut())?.insert(bytes) {
@@ -349,6 +353,9 @@ pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
     Ok(RecordId::new(page_id, slot))
 }
 ```
+
+先頭の事前検査(第12章の`max_len_for_fresh_page`)は第13章から変わっていません。
+これがないと、失敗するだけの`insert`のたびに`allocate_page`が呼ばれ、`BufferPool`を経由するようになったこの章でもファイルは同じように肥大化します。
 
 `guard.data_mut()`を`SlottedPage::open`に渡して書き換えれば、それで作業は終わりです。
 `guard`がスコープを抜ける(このループの各反復の終わり、または関数の終わり)ときに、`PageWriteGuard`の`Drop`がpinを外すと同時にdirty flagを立てます。
@@ -410,6 +417,10 @@ pub fn update(&mut self, rid: RecordId, bytes: &[u8]) -> DbResult<Option<RecordI
     };
     if !occupied {
         return Ok(None);
+    }
+
+    if bytes.len() > max_len_for_fresh_page(PAGE_PAYLOAD_SIZE) {
+        return Err(DbError::TupleTooLarge(bytes.len()));
     }
 
     {

@@ -103,6 +103,11 @@ pub enum DbError {
     /// Meta/Catalogページを指すRID)エラー。
     #[error("不正なRecordIdです: {0}")]
     InvalidRecordId(String),
+
+    /// `Storage::create_table`が新しい`TableId`を割り当てようとしたが、
+    /// `next_table_id`がすでに`u64::MAX`で、これ以上安全に加算できないエラー。
+    #[error("これ以上テーブルを作成できません: TableIdの上限(u64::MAX)に達しました")]
+    TableIdSpaceExhausted,
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

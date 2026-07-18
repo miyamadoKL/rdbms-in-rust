@@ -28,9 +28,12 @@
 //! 動かすだけで新たに確保しないため、そもそも失敗しうる操作ではない)。
 //! `open`は、すでにこの条件を満たしている`payload`を読み書きする入口であり、
 //! 妥当な初期状態から始めて`insert`・`update`だけを経由してきたバイト列で
-//! あればこの条件は常に保たれる。`open`自身もヘッダーがこの条件と`payload`の
-//! 大きさに対して妥当かどうかを検証し、破損した(あるいは別のPageTypeの)
-//! バイト列を渡された場合は`DbError::CorruptPage`を返す。
+//! あればこの条件は常に保たれる。`open`自身は、その前提を無条件には信用しない。
+//! ヘッダーがこの条件と`payload`の大きさに対して妥当かどうかに加え、
+//! 各スロットの`status`が既知の値であること、Occupiedなスロットの
+//! タプルデータ範囲がTuple Data領域に収まり、かつ互いに重なっていないことまで
+//! 検証し、破損した(あるいは別のPageTypeの)バイト列を渡された場合は
+//! `DbError::CorruptPage`を返す(検証の詳細は`validate_header`を参照)。
 
 use crate::error::{DbError, DbResult};
 use crate::ids::SlotId;
@@ -90,14 +93,14 @@ impl<'a> SlottedPage<'a> {
 
     /// すでにSlotted Pageとして初期化済みの`payload`をそのまま読み書きする。
     ///
-    /// ヘッダーの`slot_count`・`tuple_data_start`が、この`payload`の大きさに
-    /// 対して妥当な範囲(不変条件`SLOTTED_HEADER_SIZE + slot_count *
-    /// SLOT_ENTRY_SIZE <= tuple_data_start <= payload.len()`)に収まっているかを
-    /// 確認し、収まっていなければ`DbError::CorruptPage`を返す。それ以外の
-    /// スロットの中身(各エントリの`offset`・`length`・`status`)はいっさい
-    /// 解釈も書き換えもしない。`init`していないスライス(全バイト0を含む)に
-    /// 対して呼ぶと、ヘッダーが`slot_count = 0, tuple_data_start = 0`と
-    /// 解釈され、この検証は通る(以後の`insert`が常に空き領域不足で失敗する)。
+    /// `payload`の大きさ・ヘッダー(`slot_count`、`tuple_data_start`)・
+    /// 各スロットの`status`・Occupiedなスロットのタプルデータ範囲を検証し、
+    /// いずれかが妥当でなければ`DbError::CorruptPage`を返す(検証の詳細は
+    /// `validate_header`を参照)。検証を通過した`payload`に対しては、以後の
+    /// メソッドがスライス添字アクセスでpanicすることはない。`init`していない
+    /// スライス(全バイト0を含む)に対して呼ぶと、ヘッダーが
+    /// `slot_count = 0, tuple_data_start = 0`と解釈され、この検証は通る
+    /// (以後の`insert`が常に空き領域不足で失敗する)。
     pub fn open(payload: &'a mut [u8]) -> DbResult<Self> {
         validate_header(payload)?;
         Ok(SlottedPage { payload })
@@ -289,6 +292,21 @@ impl<'a> SlottedPage<'a> {
     }
 }
 
+/// スロット0件の(空の)`payload`へ、新しいタプルとして挿入できる最大バイト数。
+///
+/// `SlottedPage::try_insert`が新規スロットを1つ追加する際の判定
+/// (`directory_end(1) + len > tuple_data_start`。空の`payload`では
+/// `tuple_data_start == payload_len`)を、ページの中身にいっさい触れずに
+/// 事前計算するためのヘルパーである。呼び出し側(`HeapFile::insert`・
+/// `Storage::insert`)は、これを使って実際にページを確保・初期化する前に
+/// `bytes.len()`がそもそも収まりうるかを判定できる。ここで弾いておかないと、
+/// 収まらないと分かるのが`SlottedPage::init(..).insert(bytes)`を呼んだ後に
+/// なり、その時点ではすでにFree Page Listからページを1枚取り出したり、
+/// `BufferPool::allocate_page`でファイルを1ページ伸ばしたりした後である。
+pub fn max_len_for_fresh_page(payload_len: usize) -> usize {
+    payload_len.saturating_sub(SLOTTED_HEADER_SIZE + SLOT_ENTRY_SIZE)
+}
+
 /// Slot DirectoryとTuple Dataの境界(`payload`先頭からのバイト数)。
 ///
 /// `SlottedPage`と`SlottedPageRef`の両方から、`payload`が可変か不変かに
@@ -307,28 +325,104 @@ fn read_header(payload: &[u8]) -> (u16, u16) {
     (slot_count, tuple_data_start)
 }
 
-/// `payload`のヘッダー(`slot_count`、`tuple_data_start`)が、この章の不変条件
-/// (`SLOTTED_HEADER_SIZE + slot_count * SLOT_ENTRY_SIZE <= tuple_data_start
-/// <= payload.len()`)を満たしているかを検証する。
+/// `payload`のヘッダーとSlot Directory全体が、この章の不変条件を満たしているかを
+/// 検証する。
 ///
 /// `SlottedPage::open`と`SlottedPageRef::open`の両方が使う共通ロジックで、
 /// 破損した(あるいは他のPageTypeの)バイト列を`payload`としてそのまま渡された
 /// 場合に、以後のスライス添字アクセスでpanicする代わりに`DbError::CorruptPage`
-/// を返せるようにする。
+/// を返せるようにする。検証は次の4段階からなる。
+///
+/// 1. `payload`自体が最低でもヘッダー(`SLOTTED_HEADER_SIZE`バイト)を持つこと。
+///    これより短いと、ヘッダーを読む`read_header`自身がスライス添字でpanicする。
+/// 2. ヘッダーの`slot_count`・`tuple_data_start`が、この章の不変条件
+///    (`SLOTTED_HEADER_SIZE + slot_count * SLOT_ENTRY_SIZE <= tuple_data_start
+///    <= payload.len()`)を満たすこと。
+/// 3. 各スロットの`status`が`1`(Occupied)か`2`(Tombstone)のどちらかであること。
+///    それ以外の値は`status`・`get`の`match`が`unreachable!`でpanicする原因になる。
+/// 4. `status`が`Occupied`のスロットについて、`offset`と`length`が指す範囲
+///    `[offset, offset + length)`がTuple Data領域(`[tuple_data_start,
+///    payload.len())`)に収まっていること。これが無いと`get`・`compact`の
+///    スライス添字アクセスがpanicしうる。`Tombstone`のスロットは、`compact`が
+///    生きているスロットだけを詰め直す際に古い`offset`・`length`をそのまま
+///    残す(このモジュールの`compact`を参照)ため、`tuple_data_start`より手前を
+///    指していても壊れているとは言えず、この検証の対象に含めない。実際、
+///    `Tombstone`の`offset`・`length`は`get`・`compact`のどちらからも
+///    参照されず、`payload`へのスライス添字アクセスには使われない。
+///
+/// Occupiedなスロット同士のタプルデータ範囲が重なっていないかも、4の検証と
+/// 合わせてここで確認する。範囲の重なりはスライス添字アクセスのpanicには
+/// つながらない(それぞれの範囲は単独では`payload`に収まっている)が、2つの
+/// タプルが同じバイト列を指すという意味の壊れ方であり、後段のロジックが
+/// 気づかずに読み進めると誤ったデータを返しかねない。この検査はOccupiedな
+/// スロットを`offset`でソートしてから隣接する範囲だけを比べる
+/// `O(slot_count log slot_count)`で行う。1ページに収まるスロット数は最大でも
+/// 500程度(`PAGE_PAYLOAD_SIZE / SLOT_ENTRY_SIZE`)なので、`open`のたびに
+/// 毎回この検査を行ってもコストは無視できる。
 fn validate_header(payload: &[u8]) -> DbResult<()> {
+    if payload.len() < SLOTTED_HEADER_SIZE {
+        return Err(DbError::CorruptPage(format!(
+            "payloadがヘッダー({SLOTTED_HEADER_SIZE}バイト)より小さいです: {}バイト",
+            payload.len()
+        )));
+    }
+
     let (slot_count, tuple_data_start) = read_header(payload);
-    if tuple_data_start as usize > payload.len() {
+    let tuple_data_start = tuple_data_start as usize;
+    if tuple_data_start > payload.len() {
         return Err(DbError::CorruptPage(format!(
             "tuple_data_start({tuple_data_start})がpayloadの大きさ({})を超えています",
             payload.len()
         )));
     }
-    if directory_end(slot_count) > tuple_data_start as usize {
+    if directory_end(slot_count) > tuple_data_start {
         return Err(DbError::CorruptPage(format!(
             "Slot Directoryの終端({})がtuple_data_start({tuple_data_start})を超えています",
             directory_end(slot_count)
         )));
     }
+
+    let mut occupied_ranges: Vec<(usize, usize)> = Vec::new();
+    for i in 0..slot_count {
+        // iはslot_count未満であり、read_slot_entryはその範囲を`None`にしない。
+        let (offset, length, status) = read_slot_entry(payload, SlotId(i))
+            .expect("iはslot_count未満なのでread_slot_entryは必ずSomeを返す");
+        match status {
+            STATUS_OCCUPIED => {
+                let start = offset as usize;
+                // offset・lengthはどちらもu16なので、この加算はusizeの範囲で
+                // 決してoverflowしない。
+                let end = start + length as usize;
+                if start < tuple_data_start || end > payload.len() {
+                    return Err(DbError::CorruptPage(format!(
+                        "スロット{i}(Occupied)のタプルデータ範囲[{start}, {end})が\
+                         Tuple Data領域[{tuple_data_start}, {})からはみ出しています",
+                        payload.len()
+                    )));
+                }
+                occupied_ranges.push((start, end));
+            }
+            STATUS_TOMBSTONE => {}
+            other => {
+                return Err(DbError::CorruptPage(format!(
+                    "スロット{i}のstatusが不正です: {other}\
+                     (1(Occupied)か2(Tombstone)である必要があります)"
+                )));
+            }
+        }
+    }
+
+    occupied_ranges.sort_unstable_by_key(|&(start, _)| start);
+    for pair in occupied_ranges.windows(2) {
+        let (_, prev_end) = pair[0];
+        let (next_start, _) = pair[1];
+        if next_start < prev_end {
+            return Err(DbError::CorruptPage(
+                "複数のOccupiedスロットのタプルデータ範囲が重なっています".to_string(),
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -363,9 +457,9 @@ pub struct SlottedPageRef<'a> {
 impl<'a> SlottedPageRef<'a> {
     /// すでにSlotted Pageとして初期化済みの`payload`を読み取り専用で開く。
     ///
-    /// `SlottedPage::open`と同様にヘッダーの妥当性を検証し、範囲を外れていれば
-    /// `DbError::CorruptPage`を返す。それ以外のスロットの内容は解釈するだけで
-    /// 書き換えない。
+    /// `SlottedPage::open`と同じ検証(`validate_header`を参照)を行い、
+    /// 妥当でなければ`DbError::CorruptPage`を返す。それ以外のスロットの内容は
+    /// 解釈するだけで書き換えない。
     pub fn open(payload: &'a [u8]) -> DbResult<Self> {
         validate_header(payload)?;
         Ok(SlottedPageRef { payload })
@@ -439,6 +533,98 @@ mod tests {
         payload[2..4].copy_from_slice(&0u16.to_le_bytes()); // tuple_data_start
         assert!(matches!(
             SlottedPage::open(&mut payload),
+            Err(DbError::CorruptPage(_))
+        ));
+    }
+
+    #[test]
+    fn open_rejects_a_payload_shorter_than_the_header_instead_of_panicking() {
+        // 空のpayload(ヘッダーの4バイトすら無い)。read_headerがそのまま
+        // 読もうとするとスライス添字でpanicする。
+        assert!(matches!(
+            SlottedPageRef::open(&[]),
+            Err(DbError::CorruptPage(_))
+        ));
+        let mut empty: Vec<u8> = Vec::new();
+        assert!(matches!(
+            SlottedPage::open(&mut empty),
+            Err(DbError::CorruptPage(_))
+        ));
+    }
+
+    #[test]
+    fn open_rejects_an_occupied_slot_whose_range_overruns_the_payload() {
+        // ヘッダー自体(slot_count・tuple_data_startの関係)は妥当だが、
+        // スロット0がOccupiedのまま、その[offset, offset+length)がpayloadの
+        // 末尾をはみ出している。openを通してしまうと、後続のgetがスライス
+        // 添字アクセスでpanicする。
+        let mut payload = fresh_payload();
+        payload[0..2].copy_from_slice(&1u16.to_le_bytes()); // slot_count = 1
+        let tuple_data_start = (PAGE_PAYLOAD_SIZE - 10) as u16;
+        payload[2..4].copy_from_slice(&tuple_data_start.to_le_bytes());
+        // スロット0: offset=tuple_data_start、length=10のはずが、lengthを
+        // 大きく偽ってpayloadの外へはみ出させる。
+        let base = SLOTTED_HEADER_SIZE;
+        payload[base..base + 2].copy_from_slice(&tuple_data_start.to_le_bytes()); // offset
+        payload[base + 2..base + 4].copy_from_slice(&100u16.to_le_bytes()); // length
+        payload[base + 4] = 1; // status = Occupied
+
+        assert!(matches!(
+            SlottedPageRef::open(&payload),
+            Err(DbError::CorruptPage(_))
+        ));
+        assert!(matches!(
+            SlottedPage::open(&mut payload),
+            Err(DbError::CorruptPage(_))
+        ));
+    }
+
+    #[test]
+    fn open_rejects_a_slot_with_an_unknown_status_instead_of_panicking() {
+        // ヘッダーもタプルデータ範囲も妥当だが、スロット0のstatusが
+        // 1(Occupied)でも2(Tombstone)でもない未知の値。これを素通りさせると
+        // statusやgetのmatchがunreachable!でpanicする。
+        let mut payload = fresh_payload();
+        payload[0..2].copy_from_slice(&1u16.to_le_bytes()); // slot_count = 1
+        let tuple_data_start = (PAGE_PAYLOAD_SIZE - 10) as u16;
+        payload[2..4].copy_from_slice(&tuple_data_start.to_le_bytes());
+        let base = SLOTTED_HEADER_SIZE;
+        payload[base..base + 2].copy_from_slice(&tuple_data_start.to_le_bytes()); // offset
+        payload[base + 2..base + 4].copy_from_slice(&10u16.to_le_bytes()); // length
+        payload[base + 4] = 3; // status = 未知の値
+
+        assert!(matches!(
+            SlottedPageRef::open(&payload),
+            Err(DbError::CorruptPage(_))
+        ));
+        assert!(matches!(
+            SlottedPage::open(&mut payload),
+            Err(DbError::CorruptPage(_))
+        ));
+    }
+
+    #[test]
+    fn open_rejects_overlapping_occupied_ranges() {
+        // 2つのOccupiedスロットが、それぞれ単独ではpayloadに収まる範囲だが、
+        // 互いに重なっている(同じバイト列を指している)。
+        let mut payload = fresh_payload();
+        payload[0..2].copy_from_slice(&2u16.to_le_bytes()); // slot_count = 2
+        let tuple_data_start = (PAGE_PAYLOAD_SIZE - 20) as u16;
+        payload[2..4].copy_from_slice(&tuple_data_start.to_le_bytes());
+
+        let slot0_base = SLOTTED_HEADER_SIZE;
+        payload[slot0_base..slot0_base + 2].copy_from_slice(&tuple_data_start.to_le_bytes());
+        payload[slot0_base + 2..slot0_base + 4].copy_from_slice(&15u16.to_le_bytes());
+        payload[slot0_base + 4] = 1; // status = Occupied
+
+        let slot1_base = SLOTTED_HEADER_SIZE + SLOT_ENTRY_SIZE;
+        let overlapping_offset = tuple_data_start + 5; // slot0の範囲の途中から始まる。
+        payload[slot1_base..slot1_base + 2].copy_from_slice(&overlapping_offset.to_le_bytes());
+        payload[slot1_base + 2..slot1_base + 4].copy_from_slice(&10u16.to_le_bytes());
+        payload[slot1_base + 4] = 1; // status = Occupied
+
+        assert!(matches!(
+            SlottedPageRef::open(&payload),
             Err(DbError::CorruptPage(_))
         ));
     }

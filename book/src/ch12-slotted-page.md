@@ -134,8 +134,17 @@ Slot Directoryという間接参照は、この安定性のためにあります
 新しく作った`payload`には`SlottedPage::init`を、すでにSlotted Pageとして書き込み済みの`payload`には`SlottedPage::open`を使います。
 `open`は`DbResult<Self>`を返します。
 `init`から始まり、この章の操作だけを経由してきた`payload`であれば不変条件は保たれているはずですが、`open`はその前提を無条件には信用しません。
-ヘッダーの`slot_count`と`tuple_data_start`がこの`payload`の大きさに対して妥当な範囲(不変条件`SLOTTED_HEADER_SIZE + slot_count * SLOT_ENTRY_SIZE <= tuple_data_start <= payload.len()`)に収まっているかを検証し、収まっていなければ`DbError::CorruptPage`を返します。
+検証は4段階です。
+
+1. `payload`自体が最低でもヘッダー(`SLOTTED_HEADER_SIZE`バイト)を持つこと。これより短いと、ヘッダーを読む処理自体がスライス添字でpanicします。
+2. ヘッダーの`slot_count`と`tuple_data_start`がこの`payload`の大きさに対して妥当な範囲(不変条件`SLOTTED_HEADER_SIZE + slot_count * SLOT_ENTRY_SIZE <= tuple_data_start <= payload.len()`)に収まっていること。
+3. 各スロットの`status`が`1`(Occupied)か`2`(Tombstone)のどちらかであること。それ以外の値は、`status`や`get`の内部の`match`をpanicさせる原因になります。
+4. `status`が`Occupied`のスロットについて、`offset`と`length`が指す範囲がTuple Data領域(`[tuple_data_start, payload.len())`)に収まっていること、かつOccupiedなスロット同士のタプルデータ範囲が互いに重なっていないこと。
+
+いずれかを満たさなければ`DbError::CorruptPage`を返します。
 検証を怠ると、破損した(あるいは`Data`以外の`PageType`の)バイト列を`payload`として渡されたとき、以後のスライス添字アクセスがそのままpanicしてしまいます。
+`Tombstone`のスロットの`offset`と`length`は4の検証対象に含めません。
+`compact`(後述)は生きているスロットだけを詰め直す際、`Tombstone`の`offset`と`length`をそのまま残す(値を書き換えない)ため、`tuple_data_start`より手前を指していても壊れているとは言えず、`get`と`compact`のどちらからも参照されないからです。
 読み取り専用の`SlottedPageRef::open`(第14章で登場)も同じ検証を行います。
 
 ```rust
@@ -208,6 +217,21 @@ fn try_insert(&mut self, bytes: &[u8]) -> Option<SlotId> {
 コンパクションを行ってもなお空き領域が足りない場合、`insert`は`None`を返します。
 このページには、物理的にそのタプルを置く場所がありません。
 呼び出し側(第13章のHeap File)は、この`None`を「このページはもう使えない、別のページを探す」という合図として扱うことになります。
+
+呼び出し側にとって、この`None`が返ってくるのがいつも都合のよいタイミングとは限りません。
+`bytes`自体が、空の1ページにすら収まらないほど大きい場合を考えます。
+第13章のHeap Fileは、既存のページで`None`を受け取るたびに次のページを試し、最後に新しいページを1枚割り当ててからようやくその`bytes`が入らないと分かります。
+この時点で、失敗するだけの`insert`のためにページを1枚確保してしまっています。
+そこで、実際にページへ触れる前に「そもそも入りうるかどうか」を計算だけで判定できる関数を用意しておきます。
+
+```rust
+pub fn max_len_for_fresh_page(payload_len: usize) -> usize {
+    payload_len.saturating_sub(SLOTTED_HEADER_SIZE + SLOT_ENTRY_SIZE)
+}
+```
+
+これは、スロット0件の(空の)`payload`へ新しいスロットを1つ追加する際の`try_insert`の判定(`directory_end(1) + len > tuple_data_start`、空の`payload`では`tuple_data_start == payload_len`)を、`payload`にいっさい触れずに計算し直したものです。
+第13章以降のHeap FileとStorageの`insert`と`update`は、実際にページを確保して初期化する前にこの関数で`bytes.len()`を検査し、収まりえないと分かればその場で`DbError::TupleTooLarge`を返します。
 
 ## 削除はTombstoneにとどめる
 

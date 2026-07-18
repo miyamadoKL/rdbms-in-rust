@@ -78,15 +78,49 @@ fn a_failed_update_over_sql_leaves_the_original_row_readable() {
     db.execute("CREATE TABLE users (id BIGINT NOT NULL, name TEXT)")
         .unwrap();
     db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+    db.flush().unwrap();
+    let file_size_before = std::fs::metadata(&path).unwrap().len();
 
     // 空の1ページにも収まらないほど長いTEXTへのUPDATEはTupleTooLargeで失敗する。
+    // 失敗するUPDATEを繰り返しても、ファイルサイズは1バイトも増えないはず
+    // (事前検査が無いと、失敗のたびにページが1枚ずつ確保されファイルが
+    // 際限なく肥大化する)。
     let too_long = "x".repeat(minidb::PAGE_PAYLOAD_SIZE + 1);
-    let result = db.execute(&format!("UPDATE users SET name = '{too_long}' WHERE id = 1"));
-    assert!(result.is_err());
+    for _ in 0..3 {
+        let result = db.execute(&format!("UPDATE users SET name = '{too_long}' WHERE id = 1"));
+        assert!(result.is_err());
+    }
+    db.flush().unwrap();
 
     let alice = db.execute("SELECT name FROM users WHERE id = 1").unwrap();
     assert_eq!(alice.rows().len(), 1);
     assert_eq!(alice.rows()[0].values(), &[Value::Text("Alice".to_string())]);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), file_size_before);
+
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn a_failed_insert_over_sql_does_not_grow_the_file() {
+    // UPDATEと同じ回帰を、executor::storage_insert経由のINSERT自体でも確認する。
+    let path = temp_db_path("insert-fails-no-growth");
+    let mut db = Database::open(&path).unwrap();
+    db.execute("CREATE TABLE users (id BIGINT NOT NULL, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+    db.flush().unwrap();
+    let file_size_before = std::fs::metadata(&path).unwrap().len();
+
+    let too_long = "y".repeat(minidb::PAGE_PAYLOAD_SIZE + 1);
+    for _ in 0..3 {
+        let result = db.execute(&format!("INSERT INTO users VALUES (2, '{too_long}')"));
+        assert!(result.is_err());
+    }
+    db.flush().unwrap();
+
+    let rows = db.execute("SELECT id FROM users").unwrap();
+    assert_eq!(rows.rows().len(), 1);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), file_size_before);
 
     std::fs::remove_file(&path).unwrap();
 }

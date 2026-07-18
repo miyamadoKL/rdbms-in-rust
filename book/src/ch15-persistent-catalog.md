@@ -385,7 +385,11 @@ pub fn create_table(&mut self, name: &str, schema: Schema) -> DbResult<TableId> 
     }
 
     let id = TableId(self.next_table_id);
-    self.next_table_id += 1;
+    let next_table_id = self
+        .next_table_id
+        .checked_add(1)
+        .ok_or(DbError::TableIdSpaceExhausted)?;
+    self.next_table_id = next_table_id;
     self.tables.insert(
         id,
         TableEntry {
@@ -400,12 +404,16 @@ pub fn create_table(&mut self, name: &str, schema: Schema) -> DbResult<TableId> 
 
     if let Err(err) = self.persist_catalog() {
         self.tables.remove(&id);
-        self.next_table_id -= 1;
+        self.next_table_id = id.0;
         return Err(err);
     }
     Ok(id)
 }
 ```
+
+`self.next_table_id += 1`ではなく`checked_add(1)`を使っているのは、`next_table_id`が`u64::MAX`のときに素朴な加算だとオーバーフローするからです。
+debugビルドではpanicし、releaseビルドでは`0`へ巻き戻って`TableId`の一意性が壊れます。
+`Storage::open`が`next_table_id == u64::MAX`のカタログをすでに`DbError::CorruptCatalog`として拒む(次の節を参照)ため、通常この分岐に到達するのは`u64::MAX`回`create_table`を呼び続けた場合に限られますが、その防御をすり抜けてメモリ上だけで`next_table_id`が`u64::MAX`に達した場合の二重の備えとして`checked_add`を使っています。
 
 `TableInfo`は第9章の`Catalog`がすでに持っていた型(`id`、`name`、`schema`)をそのまま再利用しています。
 `insert`、`get`、`update`、`delete`は`TableId`を受け取り、名前からの解決は呼び出し側(次章で`Database`が担う想定)に任せる作りにしてあります。
@@ -416,6 +424,9 @@ pub fn create_table(&mut self, name: &str, schema: Schema) -> DbResult<TableId> 
 ```rust
 pub fn insert(&mut self, table_id: TableId, bytes: &[u8]) -> DbResult<RecordId> {
     let needed = bytes.len();
+    if needed > max_len_for_fresh_page(PAGE_PAYLOAD_SIZE) {
+        return Err(DbError::TupleTooLarge(needed));
+    }
     let existing_page_ids = self.table_entry(table_id)?.page_ids.clone();
 
     if let Some(page_id) = self.fsm.find_candidate(&existing_page_ids, needed)
@@ -438,7 +449,12 @@ pub fn insert(&mut self, table_id: TableId, bytes: &[u8]) -> DbResult<RecordId> 
                 }
                 return Ok(rid);
             }
-            None => return Err(DbError::TupleTooLarge(needed)),
+            None => {
+                // 上の事前検査により、通常はここに到達しない。万一到達しても、
+                // 取り出したページをFree Page Listへ戻しておく。
+                self.free_pages.push(page_id);
+                return Err(DbError::TupleTooLarge(needed));
+            }
         }
     }
 
@@ -451,7 +467,12 @@ pub fn insert(&mut self, table_id: TableId, bytes: &[u8]) -> DbResult<RecordId> 
 }
 ```
 
-探索は3段階です。
+探索の前に、`bytes`が空の1ページにも収まらないほど大きくないかを`max_len_for_fresh_page`(第12章)で確認します。
+この事前検査が無いと、失敗するだけの`insert`を何度呼んでも、そのたびにFree Page Listからページを1枚取り出したきり戻さない、あるいは`allocate_page`でファイルを1ページ伸ばしてしまいます。
+同じ大きすぎる値を繰り返し`insert`しようとするコードがあれば、ファイルサイズが際限なく肥大化するということです。
+この検査を最初に置いたことで、後続の3段階のどれにも進まないうちに`DbError::TupleTooLarge`を返せます。
+
+探索そのものは3段階です。
 まずFree Space Mapに、このテーブルの持ちページの中から空きの見積もりが十分なものを教えてもらいます。
 見つからなければ、Free Page Listに再利用待ちのページがあればそれをもらいます。
 それも無ければ、`BufferPool::allocate_page`でファイルへ新しいページを1枚追加します。
@@ -564,7 +585,7 @@ assert!(matches!(err, DbError::CorruptCatalog(_)));
 そうなったファイルは、以後`DiskManager::open`のMagic Number検証にすら通らなくなり、二度と開けません。
 
 `Storage::open`は、`decode_catalog`が返した状態を`fsm`へ組み立てる前に、この種の矛盾をまとめて検証します。
-確認するのは、参照している`PageId`が実際のページ数の範囲内にあること、Meta(`PageId(0)`)とCatalog(`PageId(1)`)という予約ページを指していないこと、あるページが複数のテーブル(または`free_pages`)に同時に属していないこと、そのページが実際に`PageType::Data`であること、テーブル定義の側では`TableId`とテーブル名が重複しておらず`next_table_id`より小さいこと、の5点です。
+確認するのは、`next_table_id`が`u64::MAX`ではないこと(`u64::MAX`のままだと、次の`create_table`が`self.next_table_id`への加算でオーバーフローします)、参照している`PageId`が実際のページ数の範囲内にあること、Meta(`PageId(0)`)とCatalog(`PageId(1)`)という予約ページを指していないこと、あるページが複数のテーブル(または`free_pages`)に同時に属していないこと、そのページが実際に`PageType::Data`であること、テーブル定義の側では`TableId`とテーブル名が重複しておらず`next_table_id`より小さいこと、の6点です。
 1つ目の実験がバイト列そのものの整合性(checksum)を、2つ目の実験がバイト列の**構造**の整合性(宣言された長さと実際の残りバイト数の対応)を、3つ目の実験がバイト列の**意味**の整合性(参照しているページとテーブル定義が矛盾なく成り立つこと)を、それぞれ別の層で検証しているとわかります。
 Catalogページというたった1枚のページの安全性は、この3段の検査が揃って初めて成り立っています。
 

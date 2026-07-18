@@ -354,6 +354,10 @@ pub fn open(disk: DiskManager) -> Self {
 
 ```rust
 pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
+    if bytes.len() > max_len_for_fresh_page(PAGE_PAYLOAD_SIZE) {
+        return Err(DbError::TupleTooLarge(bytes.len()));
+    }
+
     for &page_id in &self.page_ids {
         let mut page = self.disk.read_page(page_id)?;
         if let Some(slot) = SlottedPage::open(page.payload_mut())?.insert(bytes) {
@@ -379,6 +383,9 @@ pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
 
 どのページにも入らなければ、新しいページを1枚割り当てて`SlottedPage::init`し、そこへ挿入します。
 新しいページに`init`した直後ですら`bytes`が入らない場合、それは`bytes`自体がページの`payload`に対して大きすぎることを意味するので、`DbError::TupleTooLarge`を返します。
+とはいえ、その判定のために毎回ページを1枚確保してから確かめるのは無駄です。
+先頭の`max_len_for_fresh_page(PAGE_PAYLOAD_SIZE)`(第12章)による事前検査が、`bytes`自体が空の1ページにも収まらないと分かっている場合はどのページにも触れずに`TupleTooLarge`を返すので、後段の`ok_or`はそこをすり抜けた(通常は起こらない)場合の保険にすぎません。
+この事前検査が無いと、大きすぎる`bytes`を繰り返し`insert`しようとするたびに`allocate_page`が呼ばれ、ファイルが1ページずつ際限なく肥大化してしまいます。
 
 `get`と`delete`は、`SlottedPage`の対応するメソッドをそのまま呼び出す薄い実装です。
 
@@ -401,6 +408,10 @@ pub fn update(&mut self, rid: RecordId, bytes: &[u8]) -> DbResult<Option<RecordI
         SlottedPage::open(page.payload_mut())?.status(rid.slot_id) == Some(SlotStatus::Occupied);
     if !occupied {
         return Ok(None);
+    }
+
+    if bytes.len() > max_len_for_fresh_page(PAGE_PAYLOAD_SIZE) {
+        return Err(DbError::TupleTooLarge(bytes.len()));
     }
 
     if SlottedPage::open(page.payload_mut())?.update(rid.slot_id, bytes) {
@@ -437,6 +448,9 @@ pub fn update(&mut self, rid: RecordId, bytes: &[u8]) -> DbResult<Option<RecordI
 これは受け入れられない振る舞いです。
 挿入を先に試すことで、挿入が失敗した時点では元の行がまだ手つかずのまま残ります。
 挿入が成功したあとの削除がもし失敗したとき(この章の設計ではシングルスレッド前提のため通常は起こりませんが)は、直前に挿入した新しい行を削除してロールバックしたうえで異常として報告します。
+
+`self.insert(bytes)`を呼ぶ前に`max_len_for_fresh_page`で`bytes`の大きさを検査しているのも、`insert`と同じ理由です。
+検査せずに`self.insert(bytes)`だけへ任せても最終的には`TupleTooLarge`で失敗しますが、そこへたどり着くまでに、まずページ内更新(`SlottedPage::update`)がコンパクションを試みるだけ無駄な書き戻しをしてしまいます。
 
 この移動が起きると、返される`RecordId`は元の`rid`とは別の値になります。
 `HeapFile::update`は、`RecordId`を移動後も固定するための間接参照(たとえば「移動先を指すポインタを元の場所に残す」といった仕組み)を導入しないという設計を選んでいます。

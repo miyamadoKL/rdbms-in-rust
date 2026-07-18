@@ -90,7 +90,7 @@ use crate::free_space_map::FreeSpaceMap;
 use crate::heap_file::Scan;
 use crate::ids::{PageId, RecordId, TableId};
 use crate::page::{PAGE_PAYLOAD_SIZE, PageType};
-use crate::slotted_page::{SlotStatus, SlottedPage, SlottedPageRef};
+use crate::slotted_page::{SlotStatus, SlottedPage, SlottedPageRef, max_len_for_fresh_page};
 use crate::types::{Column, DataType, Schema};
 
 /// Catalogページの定位置。ページ0はFile Header(第11章)が占有しているため、
@@ -276,6 +276,15 @@ impl Storage {
     /// 新しいテーブルを登録する。
     ///
     /// 同名のテーブルがすでに存在する場合は`DbError::DuplicateTable`を返す。
+    /// `next_table_id`がすでに`u64::MAX`で次の`TableId`を安全に割り当てられない
+    /// 場合は`DbError::TableIdSpaceExhausted`を返す(`u64`のオーバーフローに
+    /// よってdebugビルドでpanicする、releaseビルドで0へ巻き戻って`TableId`の
+    /// 一意性が壊れる、のどちらも避けるため)。`Storage::open`の
+    /// `validate_table_metadata`がCatalogページの`next_table_id`が
+    /// `u64::MAX`であることをすでに`DbError::CorruptCatalog`として拒否している
+    /// ため、通常この分岐に到達するのは`u64::MAX`回`create_table`を呼び続けた
+    /// 場合に限られる。ここでの`checked_add`は、その防御をすり抜けて
+    /// メモリ上だけで`next_table_id`が`u64::MAX`に達した場合の二重の備えである。
     /// カタログの永続化(`persist_catalog`)に失敗した場合(たとえば
     /// `DbError::CatalogTooLarge`)は、メモリ上の登録も取り消す。カタログに
     /// 書き出せていないテーブルをメモリ上にだけ存在させておくと、次の操作で
@@ -286,7 +295,11 @@ impl Storage {
         }
 
         let id = TableId(self.next_table_id);
-        self.next_table_id += 1;
+        let next_table_id = self
+            .next_table_id
+            .checked_add(1)
+            .ok_or(DbError::TableIdSpaceExhausted)?;
+        self.next_table_id = next_table_id;
         self.tables.insert(
             id,
             TableEntry {
@@ -301,7 +314,7 @@ impl Storage {
 
         if let Err(err) = self.persist_catalog() {
             self.tables.remove(&id);
-            self.next_table_id -= 1;
+            self.next_table_id = id.0;
             return Err(err);
         }
         Ok(id)
@@ -351,8 +364,18 @@ impl Storage {
     /// ページも巻き戻さない。どのテーブルにも属さない、書き込み済みだが
     /// カタログには載っていないページとして残る。これはこの章が採用する
     /// 素朴な割り切りである。
+    ///
+    /// `bytes`が空の1ページにも収まらないほど大きい(`max_len_for_fresh_page`
+    /// 参照)場合は、上記の3段階のいずれにも進まず`DbError::TupleTooLarge`を
+    /// 即座に返す。この事前検査が無いと、失敗するだけの`insert`のたびに
+    /// Free Page Listからページを取り出したきり戻さない、あるいは
+    /// `allocate_page`でファイルを1ページ伸ばしてしまい、同じ大きすぎる値を
+    /// 何度も`insert`しようとするコードがファイルサイズを際限なく肥大化させる。
     pub fn insert(&mut self, table_id: TableId, bytes: &[u8]) -> DbResult<RecordId> {
         let needed = bytes.len();
+        if needed > max_len_for_fresh_page(PAGE_PAYLOAD_SIZE) {
+            return Err(DbError::TupleTooLarge(needed));
+        }
         let existing_page_ids = self.table_entry(table_id)?.page_ids.clone();
 
         if let Some(page_id) = self.fsm.find_candidate(&existing_page_ids, needed)
@@ -375,7 +398,14 @@ impl Storage {
                     }
                     return Ok(rid);
                 }
-                None => return Err(DbError::TupleTooLarge(needed)),
+                None => {
+                    // 上の事前検査により`bytes`は空の1ページには必ず収まるはず
+                    // なので、通常はここに到達しない。万一到達しても、
+                    // Free Page Listから取り出したページを取り戻し損ねて
+                    // 宙に浮かせないよう、必ず押し戻しておく。
+                    self.free_pages.push(page_id);
+                    return Err(DbError::TupleTooLarge(needed));
+                }
             }
         }
 
@@ -409,6 +439,10 @@ impl Storage {
     /// 判断である。逆に「削除してから挿入する」順序だと、挿入が
     /// `DbError::TupleTooLarge`や`DbError::CatalogTooLarge`で失敗したときに
     /// 元の行がすでに消えてしまい、失敗した`UPDATE`が行の消失につながる。
+    ///
+    /// `bytes`が空の1ページにも収まらないほど大きい場合は、`insert`と同じく
+    /// どのページも変更せずに`DbError::TupleTooLarge`を返す(`insert`の
+    /// ドキュメントを参照)。
     pub fn update(
         &mut self,
         table_id: TableId,
@@ -423,6 +457,10 @@ impl Storage {
         };
         if !occupied {
             return Ok(None);
+        }
+
+        if bytes.len() > max_len_for_fresh_page(PAGE_PAYLOAD_SIZE) {
+            return Err(DbError::TupleTooLarge(bytes.len()));
         }
 
         {
@@ -592,11 +630,21 @@ impl Storage {
 /// ある検査(範囲・予約ページ・共有・`PageType`)は`Storage::open`側の
 /// `claim_page`が担う。
 ///
+/// - `next_table_id`が`u64::MAX`ではないこと。`u64::MAX`のままだと、次の
+///   `create_table`が`TableId(self.next_table_id)`を払い出した直後の
+///   `self.next_table_id += 1`でオーバーフローする(debugビルドではpanic、
+///   releaseビルドでは0へ巻き戻って`TableId`の一意性が壊れる)。
 /// - 各テーブルの`TableId`が`next_table_id`未満であること(そうでなければ、
 ///   次に`create_table`したテーブルが同じ`TableId`を再利用してしまう)。
 /// - テーブル名が重複していないこと(`TableId`自体の重複は`decode_catalog`が
 ///   デコードの時点で検出済み)。
 fn validate_table_metadata(decoded: &DecodedCatalog) -> DbResult<()> {
+    if decoded.next_table_id == u64::MAX {
+        return Err(DbError::CorruptCatalog(
+            "next_table_idがu64::MAXです(これ以上TableIdを割り当てられません)".to_string(),
+        ));
+    }
+
     let mut seen_names = std::collections::HashSet::new();
     for entry in decoded.tables.values() {
         if entry.info.id.0 >= decoded.next_table_id {
@@ -1134,6 +1182,44 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_a_catalog_whose_next_table_id_is_u64_max() {
+        // next_table_id=u64::MAX、table_count=0という、checksum・構造ともに
+        // 正常なカタログ。これをそのまま受理すると、次のcreate_tableが
+        // TableId(u64::MAX)を払い出した直後にnext_table_idへの加算で
+        // オーバーフローする(debugビルドはpanic、releaseビルドは0へ巻き戻って
+        // TableIdの一意性が壊れる)。
+        let path = temp_path("next-table-id-u64-max");
+        Storage::create(&path).unwrap();
+
+        let tables: HashMap<TableId, TableEntry> = HashMap::new();
+        let bytes = encode_catalog(u64::MAX, &tables, &[]);
+        write_catalog_payload(&path, &bytes);
+
+        let err = expect_err(Storage::open(&path));
+        assert!(matches!(err, DbError::CorruptCatalog(_)));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn create_table_rejects_when_next_table_id_would_overflow() {
+        // Storage::openの検証をすり抜けてメモリ上だけでnext_table_idが
+        // u64::MAXに達した場合でも、create_table自身のchecked_addが
+        // オーバーフローをTableIdSpaceExhaustedとして検出する(二重の備え)。
+        let path = temp_path("create-table-overflow");
+        let mut storage = Storage::create(&path).unwrap();
+        storage.next_table_id = u64::MAX;
+
+        let err = expect_err(storage.create_table("a", users_schema()));
+        assert!(matches!(err, DbError::TableIdSpaceExhausted));
+        // 失敗した場合、next_table_idもテーブル一覧も変化しない。
+        assert_eq!(storage.next_table_id, u64::MAX);
+        assert!(storage.tables.is_empty());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn open_rejects_duplicate_table_names() {
         let path = temp_path("duplicate-table-name");
         Storage::create(&path).unwrap();
@@ -1390,6 +1476,10 @@ mod tests {
         let a = storage.create_table("a", users_schema()).unwrap();
 
         let rid = storage.insert(a, b"original").unwrap();
+        storage.flush().unwrap();
+        let page_ids_before = storage.tables.get(&a).unwrap().page_ids.clone();
+        let page_count_before = storage.pool.page_count();
+        let file_size_before = std::fs::metadata(&path).unwrap().len();
 
         // 空の1ページにも収まらないほど大きい値へのupdateは、まず新しい場所への
         // insertを試み、それがTupleTooLargeで失敗する。旧行を先に消していれば
@@ -1398,8 +1488,94 @@ mod tests {
         let too_big = vec![b'x'; PAGE_PAYLOAD_SIZE + 1];
         let err = expect_err(storage.update(a, rid, &too_big));
         assert!(matches!(err, DbError::TupleTooLarge(_)));
+        storage.flush().unwrap();
 
         assert_eq!(storage.get(a, rid).unwrap(), Some(b"original".to_vec()));
+        // 失敗したupdateは、insert前の事前検査で弾かれるべきであり、新しい
+        // ページを確保してはならない(page_ids・page_count・ファイルサイズが
+        // すべて変わらない)。
+        assert_eq!(storage.tables.get(&a).unwrap().page_ids, page_ids_before);
+        assert_eq!(storage.pool.page_count(), page_count_before);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), file_size_before);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn insert_that_is_too_large_does_not_grow_the_file() {
+        let path = temp_path("insert-too-large-no-growth");
+        let mut storage = Storage::create(&path).unwrap();
+        let a = storage.create_table("a", users_schema()).unwrap();
+        let rid = storage.insert(a, b"small").unwrap();
+        storage.flush().unwrap();
+
+        let page_ids_before = storage.tables.get(&a).unwrap().page_ids.clone();
+        let page_count_before = storage.pool.page_count();
+        let file_size_before = std::fs::metadata(&path).unwrap().len();
+
+        // 空の1ページにも収まらないほど大きいinsertを繰り返しても、新しい
+        // ページを確保してはならない。事前検査が無いと、失敗するinsertの
+        // たびにFree Page Listの消費やallocate_pageでファイルが肥大化する。
+        let too_big = vec![b'x'; PAGE_PAYLOAD_SIZE + 1];
+        for _ in 0..3 {
+            let err = expect_err(storage.insert(a, &too_big));
+            assert!(matches!(err, DbError::TupleTooLarge(_)));
+        }
+        storage.flush().unwrap();
+
+        assert_eq!(storage.tables.get(&a).unwrap().page_ids, page_ids_before);
+        assert_eq!(storage.pool.page_count(), page_count_before);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), file_size_before);
+        assert!(storage.free_pages.is_empty());
+        assert_eq!(storage.get(a, rid).unwrap(), Some(b"small".to_vec()));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_too_large_insert_does_not_leak_a_page_popped_from_the_free_page_list() {
+        // dropしたテーブルが残したFree Page Listのページを、失敗する
+        // insertが取り出したきり戻さずに宙へ浮かせないことを確認する。
+        let path = temp_path("free-page-not-leaked");
+        let mut storage = Storage::create(&path).unwrap();
+        let a = storage.create_table("a", users_schema()).unwrap();
+        storage.insert(a, &vec![b'x'; 3000]).unwrap();
+        storage.drop_table("a").unwrap();
+        assert_eq!(storage.free_pages.len(), 1);
+        let freed_page = storage.free_pages[0];
+
+        let b = storage.create_table("b", users_schema()).unwrap();
+        let too_big = vec![b'y'; PAGE_PAYLOAD_SIZE + 1];
+        let err = expect_err(storage.insert(b, &too_big));
+        assert!(matches!(err, DbError::TupleTooLarge(_)));
+
+        // Free Page Listのページは、失敗したinsertに取られたままにならず
+        // そのまま残っている。
+        assert_eq!(storage.free_pages, vec![freed_page]);
+        assert!(storage.tables.get(&b).unwrap().page_ids.is_empty());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_5013_byte_update_does_not_grow_the_file_when_it_cannot_fit_anywhere() {
+        // レビューで再現された具体的なケース: 5013バイトのUPDATEが失敗しても
+        // ファイルサイズが増えないことを、ページサイズの単位(4096バイト)で
+        // 直接確認する。
+        let path = temp_path("5013-byte-update-no-growth");
+        let mut storage = Storage::create(&path).unwrap();
+        let a = storage.create_table("a", users_schema()).unwrap();
+        let rid = storage.insert(a, b"x").unwrap();
+        storage.flush().unwrap();
+        let file_size_before = std::fs::metadata(&path).unwrap().len();
+
+        let too_big = vec![b'z'; 5013];
+        assert!(too_big.len() > PAGE_PAYLOAD_SIZE);
+        let err = expect_err(storage.update(a, rid, &too_big));
+        assert!(matches!(err, DbError::TupleTooLarge(_)));
+        storage.flush().unwrap();
+
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), file_size_before);
 
         std::fs::remove_file(&path).unwrap();
     }

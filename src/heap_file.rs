@@ -59,8 +59,8 @@
 use crate::buffer_pool::BufferPool;
 use crate::error::{DbError, DbResult};
 use crate::ids::{PageId, RecordId, SlotId};
-use crate::page::PageType;
-use crate::slotted_page::{SlotStatus, SlottedPage, SlottedPageRef};
+use crate::page::{PAGE_PAYLOAD_SIZE, PageType};
+use crate::slotted_page::{SlotStatus, SlottedPage, SlottedPageRef, max_len_for_fresh_page};
 
 /// 複数ページにまたがる1つのテーブルを表す。
 pub struct HeapFile {
@@ -100,10 +100,19 @@ impl HeapFile {
     ///
     /// 既存のページを先頭から順に試し、`SlottedPage::insert`が入る場所を
     /// 見つけられた最初のページへ書き込む。どのページにも入らなければ、
-    /// 新しいページを1枚割り当ててそこへ書き込む。新しいページに`SlottedPage::init`
-    /// した直後ですら`bytes`が入らない場合は、`bytes`がページの`payload`に対して
-    /// 大きすぎるということなので`DbError::TupleTooLarge`を返す。
+    /// 新しいページを1枚割り当ててそこへ書き込む。
+    ///
+    /// `bytes`が空の1ページにも収まらないほど大きい(`max_len_for_fresh_page`
+    /// 参照)場合は、どのページも読み書きせず、新しいページも確保せずに
+    /// `DbError::TupleTooLarge`を返す。この事前検査が無いと、失敗するだけの
+    /// `insert`のたびに`allocate_page`でファイルを1ページ伸ばしてしまい、
+    /// 同じ大きすぎる値を何度も`insert`しようとするコードがファイルサイズを
+    /// 際限なく肥大化させる。
     pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
+        if bytes.len() > max_len_for_fresh_page(PAGE_PAYLOAD_SIZE) {
+            return Err(DbError::TupleTooLarge(bytes.len()));
+        }
+
         for &page_id in &self.page_ids {
             let mut guard = self.pool.write_page(page_id)?;
             if let Some(slot) = SlottedPage::open(guard.data_mut())?.insert(bytes) {
@@ -153,6 +162,10 @@ impl HeapFile {
     /// つながる。`SlottedPage::update`自身は収まらないときに対象を書き換えずに
     /// `false`を返す(該当箇所のドキュメントを参照)ため、ページ内更新の失敗では
     /// この問題は起きない。問題が起きうるのはページをまたぐ移動のときだけである。
+    ///
+    /// `bytes`が空の1ページにも収まらないほど大きい場合は、`insert`と同じく
+    /// どのページも変更せずに`DbError::TupleTooLarge`を返す(`insert`の
+    /// ドキュメントを参照)。
     pub fn update(&mut self, rid: RecordId, bytes: &[u8]) -> DbResult<Option<RecordId>> {
         // 対象が存在するかどうかは読み取り専用のGuardで確かめる。存在しない
         // 場合にまで`write_page`でpinしてdirty扱いにしてしまうと、evict時の
@@ -163,6 +176,10 @@ impl HeapFile {
         };
         if !occupied {
             return Ok(None);
+        }
+
+        if bytes.len() > max_len_for_fresh_page(PAGE_PAYLOAD_SIZE) {
+            return Err(DbError::TupleTooLarge(bytes.len()));
         }
 
         {
@@ -362,6 +379,9 @@ mod tests {
         let mut heap = open_heap(&path);
 
         let rid = heap.insert(b"original").unwrap();
+        heap.flush().unwrap();
+        let page_ids_before = heap.page_ids().to_vec();
+        let size_before = std::fs::metadata(&path).unwrap().len();
 
         // 空の1ページにも収まらないほど大きい値へのupdateは、まず新しい場所への
         // insertを試み、それがTupleTooLargeで失敗する。旧行を先に消していれば
@@ -370,8 +390,40 @@ mod tests {
         let too_big = vec![b'x'; crate::page::PAGE_PAYLOAD_SIZE + 1];
         let err = heap.update(rid, &too_big).unwrap_err();
         assert!(matches!(err, DbError::TupleTooLarge(_)));
+        heap.flush().unwrap();
 
         assert_eq!(heap.get(rid).unwrap(), Some(b"original".to_vec()));
+        // 失敗したupdateは、insert前の事前検査で弾かれるべきであり、新しい
+        // ページを確保してはならない(ページ数・ファイルサイズが変わらない)。
+        assert_eq!(heap.page_ids(), page_ids_before.as_slice());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size_before);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn insert_that_is_too_large_does_not_grow_the_file() {
+        let path = temp_path("insert-too-large-no-growth");
+        let mut heap = open_heap(&path);
+
+        let rid = heap.insert(b"small").unwrap();
+        heap.flush().unwrap();
+        let page_ids_before = heap.page_ids().to_vec();
+        let size_before = std::fs::metadata(&path).unwrap().len();
+
+        // 空の1ページにも収まらないほど大きいinsertを繰り返しても、
+        // 新しいページを確保してはならない。事前検査が無いと、失敗する
+        // insertのたびにallocate_pageでファイルが1ページずつ伸びてしまう。
+        let too_big = vec![b'x'; crate::page::PAGE_PAYLOAD_SIZE + 1];
+        for _ in 0..3 {
+            let err = heap.insert(&too_big).unwrap_err();
+            assert!(matches!(err, DbError::TupleTooLarge(_)));
+        }
+        heap.flush().unwrap();
+
+        assert_eq!(heap.page_ids(), page_ids_before.as_slice());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size_before);
+        assert_eq!(heap.get(rid).unwrap(), Some(b"small".to_vec()));
 
         std::fs::remove_file(&path).unwrap();
     }
