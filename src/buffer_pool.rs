@@ -57,12 +57,13 @@
 //! Latchで扱う。
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::disk_manager::DiskManager;
 use crate::error::{DbError, DbResult};
-use crate::ids::PageId;
+use crate::ids::{Lsn, PageId};
 use crate::page::{Page, PageType};
+use crate::wal::WalWriter;
 
 /// 1フレームが保持するページ本体。`None`は「まだどのページも読み込んでいない
 /// 空きフレーム」を表す。
@@ -82,6 +83,13 @@ struct FrameMeta {
     dirty: bool,
     /// Clock置換の参照ビット。
     referenced: bool,
+    /// **Page LSN**(第33章)。このページへの変更のうち、対応するWALレコードが
+    /// 存在する最新のものの`Lsn`。`Lsn(0)`は「WALに追跡された変更がまだ無い」
+    /// ことを表す番兵で、`crate::wal::Lsn`が実際に払い出す最小値(`Lsn(1)`)と
+    /// 衝突しない。dirtyなページをディスクへ書き戻す直前、この値までWALが
+    /// 同期済みであることを保証する(`BufferPool::flush_frame`・`evict`の
+    /// ドキュメントを参照)。
+    page_lsn: Lsn,
 }
 
 impl FrameMeta {
@@ -91,6 +99,7 @@ impl FrameMeta {
             pin_count: 0,
             dirty: false,
             referenced: false,
+            page_lsn: Lsn(0),
         }
     }
 }
@@ -106,6 +115,13 @@ struct Inner {
     clock_hand: usize,
     hits: u64,
     misses: u64,
+    /// WALファースト不変条件(第33章)を強制するために参照するWAL。
+    /// `crate::storage::Storage`が`create`・`open`のあとで
+    /// [`BufferPool::attach_wal`]を呼び、テーブル本体用の`BufferPool`にだけ
+    /// 結線する(索引ごとの`BufferPool`には結線しない、本文「この章が
+    /// 対象にする範囲」を参照)。`None`のままなら、このBufferPoolは
+    /// 第14章までと同じ、WALを一切意識しない書き戻しを行う。
+    wal: Option<Arc<Mutex<WalWriter>>>,
 }
 
 /// `read_page`・`write_page`のヒット/ミス回数。
@@ -143,6 +159,7 @@ impl BufferPool {
                 clock_hand: 0,
                 hits: 0,
                 misses: 0,
+                wal: None,
             }),
         }
     }
@@ -150,6 +167,37 @@ impl BufferPool {
     /// このBufferPoolが保持できるフレーム数。
     pub fn capacity(&self) -> usize {
         self.frames.len()
+    }
+
+    /// このBufferPoolにWALを結線し、以後dirtyなページの書き戻し前に
+    /// WALファースト不変条件を強制するようにする(第33章)。
+    ///
+    /// `Storage::create`・`Storage::open`が、テーブル本体用の`BufferPool`に
+    /// 対してだけ1回呼ぶ。呼ばなければ、このBufferPoolは第14章までと同じ
+    /// 挙動のままになる(索引専用の`BufferPool`はこの章では呼ばない、
+    /// モジュール冒頭の`Inner::wal`のドキュメントを参照)。
+    pub fn attach_wal(&self, wal: Arc<Mutex<WalWriter>>) {
+        self.lock_inner().wal = Some(wal);
+    }
+
+    /// `id`のページが今このBufferPoolに読み込まれていれば、その**Page LSN**
+    /// (第33章)を`lsn`まで引き上げる(すでにより新しい`lsn`が記録されていれば
+    /// 何もしない)。
+    ///
+    /// `crate::storage::Storage`の`insert`・`update`・`delete`が、対応する
+    /// WALレコードを`append`した直後に呼ぶ。呼び出し時点でそのページは
+    /// 直前の書き込みによって必ずこのBufferPoolに読み込まれているはずなので、
+    /// 見つからない場合は何もしない(呼び出し側のバグを示す可能性はあるが、
+    /// このメソッド自身は`&self`しか取らない薄い更新であり、ここで
+    /// panicするほどの不変条件はまだ無い)。
+    pub fn bump_page_lsn(&self, id: PageId, lsn: Lsn) {
+        let mut inner = self.lock_inner();
+        if let Some(&frame_id) = inner.page_table.get(&id) {
+            let meta = &mut inner.meta[frame_id];
+            if lsn > meta.page_lsn {
+                meta.page_lsn = lsn;
+            }
+        }
     }
 
     /// このBufferPoolが管理する`DiskManager`の現在のページ数(Metaページを含む)。
@@ -256,7 +304,25 @@ impl BufferPool {
     /// `Inner`のロックとフレームのロックを同時に持たない(モジュール冒頭の
     /// 説明を参照)。呼び出し側がすでにこのフレームをpinしているGuardを
     /// 保持したまま呼ぶと、フレームのロック待ちで止まるので注意すること。
+    ///
+    /// # WALファースト不変条件の強制
+    ///
+    /// 実際にページを書き戻す(`self.disk.write_page`)前に、このフレームの
+    /// Page LSNを読み、WALが結線されていれば[`WalWriter::sync_up_to`]を呼ぶ。
+    /// これにより、このページに反映されている変更を表すWALレコードは、
+    /// ページ自身よりも必ず先にディスクへ同期される。WALのロックとフレームの
+    /// ロックはこの手順の中で同時に保持しない(WALの同期を終えてから
+    /// フレームをロックする)ため、`WalWriter`側の処理が長くかかっても
+    /// このBufferPoolの他の操作をブロックしない。
     fn flush_frame(&self, frame_id: usize) -> DbResult<()> {
+        let (page_lsn, wal) = {
+            let inner = self.lock_inner();
+            (inner.meta[frame_id].page_lsn, inner.wal.clone())
+        };
+        if let Some(wal) = wal {
+            wal.lock().unwrap_or_else(|p| p.into_inner()).sync_up_to(page_lsn)?;
+        }
+
         let frame = self.lock_frame(frame_id);
         if let Some(page) = frame.page.as_ref() {
             self.disk.write_page(page)?;
@@ -305,6 +371,7 @@ impl BufferPool {
             pin_count: 0,
             dirty: false,
             referenced: false,
+            page_lsn: Lsn(0),
         };
         inner.page_table.insert(id, frame_id);
         Ok(frame_id)
@@ -317,8 +384,11 @@ impl BufferPool {
     /// フレームを見つける、という古典的なClockアルゴリズムの動作を、この
     /// 上限が保証する。この範囲でevict候補が見つからなければ、全フレームが
     /// pin中だということなので`DbError::BufferPoolFull`を返す。
+    /// dirtyなフレームを書き戻す直前にWALファースト不変条件を強制する点は
+    /// [`BufferPool::flush_frame`]と同じである(`Inner::wal`のドキュメントを参照)。
     fn evict(&self, inner: &mut Inner) -> DbResult<usize> {
         let capacity = self.frames.len();
+        let wal = inner.wal.clone();
         for _ in 0..2 * capacity {
             let i = inner.clock_hand;
             inner.clock_hand = (inner.clock_hand + 1) % capacity;
@@ -333,7 +403,12 @@ impl BufferPool {
             }
 
             let evicted_id = meta.occupant.take().expect("occupantはSomeであることを確認済み");
-            if meta.dirty {
+            let dirty = meta.dirty;
+            let page_lsn = meta.page_lsn;
+            if dirty {
+                if let Some(wal) = &wal {
+                    wal.lock().unwrap_or_else(|p| p.into_inner()).sync_up_to(page_lsn)?;
+                }
                 let frame = self.lock_frame(i);
                 if let Some(page) = frame.page.as_ref() {
                     self.disk.write_page(page)?;
@@ -640,5 +715,88 @@ mod tests {
         drop(g2);
         drop(g3);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    fn wal_temp_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "minidb-buffer-pool-wal-test-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        path.push(unique);
+        path
+    }
+
+    /// WALファースト不変条件(第33章)の核心: `attach_wal`したBufferPoolが
+    /// dirtyなページを書き戻す(evictする、または`flush_page`を呼ぶ)前に、
+    /// そのページのPage LSNまでWALが必ず同期されている。
+    #[test]
+    fn flush_page_syncs_the_wal_up_to_the_pages_page_lsn_before_writing_it_back() {
+        let db_path = temp_path("wal-first-flush");
+        let wal_path = wal_temp_path("wal-first-flush");
+        let disk = disk_with_pages(&db_path, 1);
+        let pool = BufferPool::new(disk, 4);
+        let wal = Arc::new(Mutex::new(WalWriter::open(&wal_path).unwrap()));
+        pool.attach_wal(wal.clone());
+
+        let lsn = {
+            let mut w = wal.lock().unwrap();
+            w.append_begin(crate::ids::TransactionId(1))
+        };
+        {
+            let mut g = pool.write_page(PageId(1)).unwrap();
+            g.data_mut()[0..5].copy_from_slice(b"alice");
+        }
+        pool.bump_page_lsn(PageId(1), lsn);
+
+        // まだ`sync_up_to`を誰も呼んでいないので、WALはまだこのlsnまで
+        // 同期されていない。
+        assert!(wal.lock().unwrap().durable_lsn() < lsn);
+
+        pool.flush_page(PageId(1)).unwrap();
+
+        // `flush_page`がページを書き戻す前に、必ずこのlsnまでWALを
+        // 同期しているはず。
+        assert!(wal.lock().unwrap().durable_lsn() >= lsn);
+
+        std::fs::remove_file(&db_path).unwrap();
+        std::fs::remove_file(&wal_path).unwrap();
+    }
+
+    /// [`flush_page_syncs_the_wal_up_to_the_pages_page_lsn_before_writing_it_back`]
+    /// と同じ不変条件を、`flush_page`ではなくClock置換によるevict経路
+    /// (`BufferPool::evict`)でも確認する。
+    #[test]
+    fn eviction_syncs_the_wal_up_to_the_evicted_pages_page_lsn_before_writing_it_back() {
+        let db_path = temp_path("wal-first-evict");
+        let wal_path = wal_temp_path("wal-first-evict");
+        let disk = disk_with_pages(&db_path, 2);
+        let pool = BufferPool::new(disk, 1);
+        let wal = Arc::new(Mutex::new(WalWriter::open(&wal_path).unwrap()));
+        pool.attach_wal(wal.clone());
+
+        let lsn = {
+            let mut w = wal.lock().unwrap();
+            w.append_begin(crate::ids::TransactionId(1))
+        };
+        {
+            let mut g = pool.write_page(PageId(1)).unwrap();
+            g.data_mut()[0..5].copy_from_slice(b"alice");
+        }
+        pool.bump_page_lsn(PageId(1), lsn);
+        assert!(wal.lock().unwrap().durable_lsn() < lsn);
+
+        // 容量1のプールへpage 2を読み込むと、page 1がevictされ書き戻される。
+        {
+            let _g2 = pool.read_page(PageId(2)).unwrap();
+        }
+        assert!(wal.lock().unwrap().durable_lsn() >= lsn);
+
+        std::fs::remove_file(&db_path).unwrap();
+        std::fs::remove_file(&wal_path).unwrap();
     }
 }

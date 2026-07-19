@@ -91,7 +91,7 @@ use crate::catalog::{Catalog, TableInfo};
 use crate::error::{DbError, DbResult};
 use crate::eval::FunctionRegistry;
 use crate::executor;
-use crate::ids::{TableId, TransactionId};
+use crate::ids::{Lsn, TableId, TransactionId};
 use crate::lock_manager::{LockKey, LockManager, LockMode, LockResult};
 use crate::logical_plan::{self, DeleteNode, InsertNode, LogicalPlan, UpdateNode};
 use crate::physical_plan::{
@@ -105,6 +105,7 @@ use crate::storage::Storage;
 use crate::storage_mem::MemStorage;
 use crate::transaction::{self, TransactionContext, TransactionState};
 use crate::types::{Column, DataType, Schema, Tuple, Value};
+use crate::wal::WalCursor;
 
 /// テーブル定義と行を実際に保持する場所。
 ///
@@ -252,6 +253,17 @@ impl Database {
                 storage.flush()?;
                 storage.sync()
             }
+        }
+    }
+
+    /// これまでにWALへ書いた全レコードを、開発者が目視で確認できる文字列へ
+    /// 整形して返す(第33章)。Memoryバックエンドは常に空の`Vec`を返す
+    /// (WALを持たない)。`Storage::wal_dump`の薄い委譲であり、詳しくは
+    /// そちらのドキュメントを参照。
+    pub fn wal_dump(&self) -> Vec<String> {
+        match &self.backend {
+            Backend::Memory { .. } => Vec::new(),
+            Backend::Disk { storage } => storage.wal_dump(),
         }
     }
 
@@ -454,6 +466,7 @@ impl Database {
             Some(tx) if tx.state == TransactionState::Aborted => Err(aborted_error(tx.victim_of_deadlock)),
             Some(_) => {
                 let tx = self.tx.take().expect("直前のmatchでSomeを確認済み");
+                wal_commit_if_disk(&self.backend, tx.id, tx.wal_last_lsn)?;
                 self.lock_manager.release_all(tx.id);
                 Ok(QueryResult::command("COMMIT"))
             }
@@ -469,7 +482,7 @@ impl Database {
         };
         match &mut self.backend {
             Backend::Memory { storage, .. } => transaction::apply_undo_memory(storage, tx.undo_log),
-            Backend::Disk { storage } => transaction::apply_undo_disk(storage, tx.undo_log)?,
+            Backend::Disk { storage } => wal_rollback_if_disk(storage, tx.id, tx.wal_last_lsn)?,
         }
         self.lock_manager.release_all(tx.id);
         Ok(QueryResult::command("ROLLBACK"))
@@ -592,11 +605,13 @@ impl Database {
             self.harness_contexts.insert(handle.0, ctx);
             return Err(err);
         }
+        wal_commit_if_disk(&self.backend, ctx.id, ctx.wal_last_lsn)?;
         self.lock_manager.release_all(ctx.id);
         Ok(())
     }
 
-    /// `handle`が指すトランザクションが積んだ`undo_log`を逆順に適用し、
+    /// `handle`が指すトランザクションが積んだ`undo_log`(Memoryバックエンド)
+    /// またはWALの`prev_lsn`連鎖(Diskバックエンド、第33章)を逆順に適用し、
     /// `BEGIN`(`begin_tx`)以降の変更を取り消す。
     pub fn rollback_tx(&mut self, handle: TxHandle) -> DbResult<()> {
         let ctx = self
@@ -605,7 +620,7 @@ impl Database {
             .expect("TxHandleはすでにcommit_tx・rollback_tx済み、または他のDatabaseのものです");
         match &mut self.backend {
             Backend::Memory { storage, .. } => transaction::apply_undo_memory(storage, ctx.undo_log),
-            Backend::Disk { storage } => transaction::apply_undo_disk(storage, ctx.undo_log)?,
+            Backend::Disk { storage } => wal_rollback_if_disk(storage, ctx.id, ctx.wal_last_lsn)?,
         }
         self.lock_manager.release_all(ctx.id);
         Ok(())
@@ -903,19 +918,19 @@ impl Database {
     /// 対応表へ戻す、など)を書いているため、ここでスロットの形を変えると
     /// その前提が壊れる。この関数は中身(`state`・`undo_log`)だけを書き換える。
     fn abort_transaction(&mut self, victim: TransactionId) -> DbResult<()> {
-        let undo_log = if let Some(tx) = &mut self.tx
+        let (undo_log, wal_last_lsn) = if let Some(tx) = &mut self.tx
             && tx.id == victim
         {
-            std::mem::take(&mut tx.undo_log)
+            (std::mem::take(&mut tx.undo_log), tx.wal_last_lsn)
         } else if let Some(ctx) = self.harness_contexts.get_mut(&victim) {
-            std::mem::take(&mut ctx.undo_log)
+            (std::mem::take(&mut ctx.undo_log), ctx.wal_last_lsn)
         } else {
             return Ok(());
         };
 
         match &mut self.backend {
             Backend::Memory { storage, .. } => transaction::apply_undo_memory(storage, undo_log),
-            Backend::Disk { storage } => transaction::apply_undo_disk(storage, undo_log)?,
+            Backend::Disk { storage } => wal_rollback_if_disk(storage, victim, wal_last_lsn)?,
         }
         self.lock_manager.release_all(victim);
 
@@ -1353,25 +1368,27 @@ impl Database {
             self.acquire_lock_or_detect_deadlock(owner, LockKey::Table(table_id), LockMode::Exclusive)?;
         }
 
-        let mut undo = Vec::new();
-        let result = match &mut self.backend {
+        match &mut self.backend {
             Backend::Memory { storage, .. } => {
+                let mut undo = Vec::new();
                 let mem_table =
                     storage.table_mut(table_id).expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::insert(mem_table, table_id, &schema, &self.functions, columns.as_deref(), &values.rows, &mut undo)
+                let result = executor::insert(
+                    mem_table,
+                    table_id,
+                    &schema,
+                    &self.functions,
+                    columns.as_deref(),
+                    &values.rows,
+                    &mut undo,
+                );
+                self.record_undo(undo);
+                result
             }
-            Backend::Disk { storage } => executor::storage_insert(
-                storage,
-                table_id,
-                &schema,
-                &self.functions,
-                columns.as_deref(),
-                &values.rows,
-                &mut undo,
-            ),
-        };
-        self.record_undo(undo);
-        result
+            Backend::Disk { storage } => run_disk_dml(storage, &mut self.tx, &mut self.next_txn_id, |storage, wal| {
+                executor::storage_insert(storage, table_id, &schema, &self.functions, columns.as_deref(), &values.rows, wal)
+            }),
+        }
     }
 
     /// `UPDATE`を実行する。`executor::update`(または`executor::storage_update`)
@@ -1401,25 +1418,27 @@ impl Database {
         };
         self.acquire_write_locks(owner, table_id, &schema, predicate.as_ref())?;
 
-        let mut undo = Vec::new();
-        let result = match &mut self.backend {
+        match &mut self.backend {
             Backend::Memory { storage, .. } => {
+                let mut undo = Vec::new();
                 let mem_table =
                     storage.table_mut(table_id).expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::update(mem_table, table_id, &schema, &self.functions, &assignments, predicate.as_ref(), &mut undo)
+                let result = executor::update(
+                    mem_table,
+                    table_id,
+                    &schema,
+                    &self.functions,
+                    &assignments,
+                    predicate.as_ref(),
+                    &mut undo,
+                );
+                self.record_undo(undo);
+                result
             }
-            Backend::Disk { storage } => executor::storage_update(
-                storage,
-                table_id,
-                &schema,
-                &self.functions,
-                &assignments,
-                predicate.as_ref(),
-                &mut undo,
-            ),
-        };
-        self.record_undo(undo);
-        result
+            Backend::Disk { storage } => run_disk_dml(storage, &mut self.tx, &mut self.next_txn_id, |storage, wal| {
+                executor::storage_update(storage, table_id, &schema, &self.functions, &assignments, predicate.as_ref(), wal)
+            }),
+        }
     }
 
     /// `DELETE FROM`を実行する。`executor::delete`(または`executor::storage_delete`)
@@ -1439,19 +1458,19 @@ impl Database {
         };
         self.acquire_write_locks(owner, table_id, &schema, predicate.as_ref())?;
 
-        let mut undo = Vec::new();
-        let result = match &mut self.backend {
+        match &mut self.backend {
             Backend::Memory { storage, .. } => {
+                let mut undo = Vec::new();
                 let mem_table =
                     storage.table_mut(table_id).expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::delete(mem_table, table_id, &schema, &self.functions, predicate.as_ref(), &mut undo)
+                let result = executor::delete(mem_table, table_id, &schema, &self.functions, predicate.as_ref(), &mut undo);
+                self.record_undo(undo);
+                result
             }
-            Backend::Disk { storage } => {
-                executor::storage_delete(storage, table_id, &schema, &self.functions, predicate.as_ref(), &mut undo)
-            }
-        };
-        self.record_undo(undo);
-        result
+            Backend::Disk { storage } => run_disk_dml(storage, &mut self.tx, &mut self.next_txn_id, |storage, wal| {
+                executor::storage_delete(storage, table_id, &schema, &self.functions, predicate.as_ref(), wal)
+            }),
+        }
     }
 
     /// `ANALYZE [テーブル名]`を実行する(第27章)。
@@ -1699,6 +1718,96 @@ fn find_cycle_containing(
 /// 明示的な`ROLLBACK`後)は従来どおり`DbError::TransactionAborted`を返す。
 fn aborted_error(victim_of_deadlock: bool) -> DbError {
     if victim_of_deadlock { DbError::DeadlockDetected } else { DbError::TransactionAborted }
+}
+
+/// Diskバックエンドの`INSERT`・`UPDATE`・`DELETE`を、WALのトランザクション
+/// 境界で挟んで実行する(第33章)。
+///
+/// `tx`が`Some`(`BEGIN`済みの明示的トランザクション)であれば、この関数は
+/// `Commit`・`Abort`のどちらも書かない(`COMMIT`・`ROLLBACK`自体のWAL処理は
+/// `Database::execute_commit`・`execute_rollback`が別途行う)。`Begin`は、
+/// 実際に1件でも書き込みが起きた時点で[`WalCursor`]が遅延して書く
+/// (`crate::wal::WalCursor`のドキュメントを参照)。
+///
+/// `tx`が`None`(Autocommit)であれば、この1文だけのための使い捨て
+/// トランザクションIDを`next_txn_id`から採番する。`f`が1件でも書き込んで
+/// いれば(`prev_lsn`が`None`のままでなければ)、成功時は`Commit`レコードを
+/// 書いてから[`crate::wal::WalWriter::sync`]で同期し、それが終わるまで
+/// `run_disk_dml`自体が返らない。これが「`COMMIT`応答前にログを同期する」と
+/// いう規律を、明示的な`BEGIN`を伴わない1文にも及ぼす部分である
+/// (本文「Autocommitの1文も、それ自体が耐久性を持つ」を参照)。失敗時は
+/// `Abort`レコードを書くだけで同期はしない(失敗した文の変更を耐久化する
+/// 意味が無いため)。
+fn run_disk_dml<F>(
+    storage: &mut Storage,
+    tx: &mut Option<TransactionContext>,
+    next_txn_id: &mut u64,
+    f: F,
+) -> DbResult<usize>
+where
+    F: FnOnce(&mut Storage, &mut WalCursor) -> DbResult<usize>,
+{
+    let wal = storage.wal().clone();
+    let autocommit = tx.is_none();
+    let txn_id = tx.as_ref().map(|ctx| ctx.id).unwrap_or_else(|| {
+        let id = TransactionId(*next_txn_id);
+        *next_txn_id += 1;
+        id
+    });
+
+    let mut local_prev_lsn: Option<Lsn> = None;
+    let prev_lsn: &mut Option<Lsn> = match tx.as_mut() {
+        Some(ctx) => &mut ctx.wal_last_lsn,
+        None => &mut local_prev_lsn,
+    };
+
+    let result = {
+        let mut cursor = WalCursor::new(&wal, txn_id, prev_lsn);
+        f(storage, &mut cursor)
+    };
+
+    if autocommit && let Some(last_lsn) = *prev_lsn {
+        let mut w = wal.lock().unwrap_or_else(|p| p.into_inner());
+        match &result {
+            Ok(_) => {
+                w.append_commit(txn_id, Some(last_lsn));
+                w.sync()?;
+            }
+            Err(_) => {
+                w.append_abort(txn_id, Some(last_lsn));
+            }
+        }
+    }
+    result
+}
+
+/// `tx.wal_last_lsn`が`Some`(=このトランザクションが1件でもWALへ書いて
+/// いた)なら、`Commit`レコードを書いて同期する(第33章、`execute_commit`・
+/// `commit_tx`が使う)。`None`(読み取りだけで終わったトランザクション)なら
+/// 何もしない。
+fn wal_commit_if_disk(backend: &Backend, tx_id: TransactionId, wal_last_lsn: Option<Lsn>) -> DbResult<()> {
+    let Backend::Disk { storage } = backend else { return Ok(()) };
+    let Some(last_lsn) = wal_last_lsn else { return Ok(()) };
+    let mut w = storage.wal().lock().unwrap_or_else(|p| p.into_inner());
+    w.append_commit(tx_id, Some(last_lsn));
+    w.sync()?;
+    Ok(())
+}
+
+/// `ROLLBACK`(および、Victim SelectionによるAbort)がDiskバックエンドの
+/// WALに対して行う後始末(第33章)。`wal_last_lsn`が指す連鎖を
+/// `crate::transaction::apply_wal_undo_disk`で逆順に適用してから、
+/// `Abort`レコードを書く(`Some`のときだけ。`None`なら何も書いていないので
+/// 取り消す変更も無い)。`Abort`は`COMMIT`と違って同期を待たない
+/// (本文「ROLLBACKの同期は待たない」を参照)。
+fn wal_rollback_if_disk(storage: &mut Storage, tx_id: TransactionId, wal_last_lsn: Option<Lsn>) -> DbResult<()> {
+    transaction::apply_wal_undo_disk(storage, wal_last_lsn)?;
+    if let Some(last_lsn) = wal_last_lsn {
+        let mut w = storage.wal().lock().unwrap_or_else(|p| p.into_inner());
+        w.append_abort(tx_id, Some(last_lsn));
+        w.flush()?;
+    }
+    Ok(())
 }
 
 fn collect_scan_tables(plan: &LogicalPlan, tables: &mut Vec<TableId>) {

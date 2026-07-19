@@ -25,6 +25,17 @@ pub struct TableId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransactionId(pub u64);
 
+/// WAL(第33章、`crate::wal`)のログレコードを指す、単調増加の番号
+/// (**Log Sequence Number**)。
+///
+/// `0`は「まだ何も書いていない」ことを表す番兵として予約し、実際に書いた
+/// レコードには`1`から順に割り当てる(`crate::wal::WalWriter`)。`Ord`を
+/// 導出しているのは、あるページの変更を表すログがどこまでディスクへ届いて
+/// いるか(`crate::buffer_pool`のPage LSN)を、ログの現在の書き込み位置と
+/// 比較するためである。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Lsn(pub u64);
+
 /// Slotted Page(第12章)内の1スロットを指す識別子。
 ///
 /// `PageId`とは異なり、この番号はページの外では意味を持たない。あるページの

@@ -79,6 +79,7 @@ pub mod storage_mem;
 pub mod transaction;
 pub mod tuple_codec;
 pub mod types;
+pub mod wal;
 
 pub use ast::{Expr, IsolationLevel, Statement};
 pub use binder::{Binder, BoundExpr, BoundStatement, CatalogLookup};
@@ -91,7 +92,7 @@ pub use error::{DbError, DbResult};
 pub use eval::{FunctionRegistry, eval_expr};
 pub use free_space_map::FreeSpaceMap;
 pub use heap_file::{HeapFile, Scan};
-pub use ids::{PageId, RecordId, SlotId, TableId, TransactionId};
+pub use ids::{Lsn, PageId, RecordId, SlotId, TableId, TransactionId};
 pub use index::IndexInfo;
 pub use lexer::{Keyword, Span, Token, TokenKind, tokenize};
 pub use logical_plan::LogicalPlan;
@@ -109,6 +110,7 @@ pub use storage_mem::{MemStorage, MemTable};
 pub use transaction::TransactionState;
 pub use tuple_codec::{decode_tuple, encode_tuple};
 pub use types::{Column, DataType, Row, Schema, Tuple, Value};
+pub use wal::{LogRecord, LogRecordType, WalWriter};
 
 /// 簡易ログ出力マクロ(依存追加を避けるため `eprintln!` を薄くラップするだけ)。
 ///

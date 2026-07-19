@@ -61,6 +61,7 @@ use crate::storage_mem::MemTable;
 use crate::transaction::UndoRecord;
 use crate::tuple_codec::{decode_tuple, encode_tuple};
 use crate::types::{Row, Schema, Tuple, Value};
+use crate::wal::WalCursor;
 
 /// `WHERE`・`SET`の`predicate`が評価された結果を、SQLの三値論理に従って
 /// 「その行にマッチしたかどうか」の`bool`へ変換する。
@@ -122,7 +123,7 @@ pub fn insert(
     constraints::check_uniqueness(schema, table.rows().iter(), &planned)?;
     let count = planned.len();
     for tuple in &planned {
-        undo.push(UndoRecord::Insert { table_id, tuple: tuple.clone(), rid: None });
+        undo.push(UndoRecord::Insert { table_id, tuple: tuple.clone() });
     }
     table.rows_mut().extend(planned);
     Ok(count)
@@ -178,14 +179,14 @@ pub fn insert(
 /// `index_insert_row`自身がそれより前に成功していた索引への反映を巻き戻す
 /// 処理と対になる)。この行より前に処理した行(同じ`INSERT`文の中の他の行)は、
 /// モジュールドキュメントに書いた既存の割り切りのとおり巻き戻さない。
-pub fn storage_insert(
+pub(crate) fn storage_insert(
     storage: &mut Storage,
     table_id: TableId,
     schema: &Schema,
     functions: &FunctionRegistry,
     columns: Option<&[usize]>,
     rows: &[Vec<Expr>],
-    undo: &mut Vec<UndoRecord>,
+    wal: &mut WalCursor,
 ) -> DbResult<usize> {
     let planned = plan_insert_rows(schema, functions, columns, rows)?;
     if schema.unique_constrained_columns().next().is_some() {
@@ -204,7 +205,13 @@ pub fn storage_insert(
             let _ = storage.delete(table_id, rid);
             return Err(err);
         }
-        undo.push(UndoRecord::Insert { table_id, tuple, rid: Some(rid) });
+        // WALファースト不変条件(第33章): このタプルの変更を表すレコードを
+        // 書き、そのLsnをこのページのPage LSNへ反映してから次へ進む。
+        // `storage.insert`はすでにページへ書き込み済みだが、その変更が
+        // ディスクへ届くのは、このLsnまでWALが同期されてからでなければ
+        // ならない(`crate::buffer_pool`モジュール冒頭を参照)。
+        let lsn = wal.append_insert(table_id, rid, bytes);
+        storage.stamp_page_lsn(rid.page_id, lsn);
     }
     Ok(count)
 }
@@ -324,7 +331,7 @@ pub fn update(
 
     let count = planned.len();
     for (index, old_tuple, new_tuple) in planned {
-        undo.push(UndoRecord::Update { table_id, old: old_tuple, new: new_tuple.clone(), old_rid: None, new_rid: None });
+        undo.push(UndoRecord::Update { table_id, old: old_tuple, new: new_tuple.clone() });
         table.rows_mut()[index] = new_tuple;
     }
     Ok(count)
@@ -379,14 +386,14 @@ pub fn update(
 /// `BufferPool`のI/Oエラーのような無関係な理由でなお失敗する余地は残る
 /// (まれな経路の保険)。いずれの段階が失敗しても、Heap・索引を更新前の
 /// 内容(`old_tuple`、ただし物理的な位置は`new_rid`)へ戻してからエラーを返す。
-pub fn storage_update(
+pub(crate) fn storage_update(
     storage: &mut Storage,
     table_id: TableId,
     schema: &Schema,
     functions: &FunctionRegistry,
     assignments: &[BoundAssignment],
     predicate: Option<&BoundExpr>,
-    undo: &mut Vec<UndoRecord>,
+    wal: &mut WalCursor,
 ) -> DbResult<usize> {
     let mut planned: Vec<(RecordId, Tuple, Tuple)> = Vec::new();
     for entry in storage.scan(table_id)? {
@@ -447,13 +454,14 @@ pub fn storage_update(
             return Err(err);
         }
 
-        undo.push(UndoRecord::Update {
-            table_id,
-            old: old_tuple,
-            new: new_tuple,
-            old_rid: Some(old_rid),
-            new_rid: Some(new_rid),
-        });
+        // WALファースト不変条件(第33章): 更新後の位置(`new_rid`、ページを
+        // またいで移動していれば元とは別のページ)のPage LSNへ、この
+        // レコードのLsnを反映する。`storage_insert`と同じ理由。
+        let lsn = wal.append_update(table_id, old_rid, new_rid, old_bytes, new_bytes);
+        storage.stamp_page_lsn(new_rid.page_id, lsn);
+        if old_rid.page_id != new_rid.page_id {
+            storage.stamp_page_lsn(old_rid.page_id, lsn);
+        }
     }
     Ok(count)
 }
@@ -489,7 +497,7 @@ pub fn delete(
 
     let deleted = deleted_tuples.len();
     for tuple in deleted_tuples {
-        undo.push(UndoRecord::Delete { table_id, tuple, rid: None });
+        undo.push(UndoRecord::Delete { table_id, tuple });
     }
     *table.rows_mut() = kept;
     Ok(deleted)
@@ -505,13 +513,13 @@ pub fn delete(
 /// 集め終える前に評価が失敗すれば`storage`はまだ何も変更されていない。
 /// 第24章から、削除する行ごとに`storage.index_delete_row`を呼び、
 /// `table_id`の全索引からその行のエントリを取り除く(Index Maintenance)。
-pub fn storage_delete(
+pub(crate) fn storage_delete(
     storage: &mut Storage,
     table_id: TableId,
     schema: &Schema,
     functions: &FunctionRegistry,
     predicate: Option<&BoundExpr>,
-    undo: &mut Vec<UndoRecord>,
+    wal: &mut WalCursor,
 ) -> DbResult<usize> {
     let mut to_delete: Vec<(RecordId, Tuple)> = Vec::new();
     for entry in storage.scan(table_id)? {
@@ -529,9 +537,13 @@ pub fn storage_delete(
 
     let count = to_delete.len();
     for (rid, tuple) in to_delete {
+        let before_image = encode_tuple(schema, &tuple);
         storage.delete(table_id, rid)?;
         storage.index_delete_row(table_id, &tuple, rid)?;
-        undo.push(UndoRecord::Delete { table_id, tuple, rid: Some(rid) });
+        // WALファースト不変条件(第33章): `storage_insert`・`storage_update`
+        // と同じ理由で、Deleteレコードを書いてからPage LSNを反映する。
+        let lsn = wal.append_delete(table_id, rid, before_image);
+        storage.stamp_page_lsn(rid.page_id, lsn);
     }
     Ok(count)
 }
@@ -576,7 +588,19 @@ mod tests {
     use crate::ast::Statement;
     use crate::binder::{Binder, BoundStatement};
     use crate::catalog::Catalog;
+    use crate::ids::{Lsn, TransactionId};
     use crate::types::{Column, DataType};
+    use std::sync::{Arc, Mutex};
+
+    /// `storage_insert`・`storage_update`・`storage_delete`のテストが、毎回
+    /// 新しい使い捨てのトランザクション(`TransactionId(1)`)としてWALレコードを
+    /// 書くための部品を用意する。返り値をそれぞれ`let (wal, mut prev_lsn) = ...`
+    /// と受けてから`WalCursor::new(&wal, TransactionId(1), &mut prev_lsn)`を
+    /// 組み立てる(戻り値自身が借用を含むため、この関数では`WalCursor`まで
+    /// 組み立てきれない)。
+    fn wal_cursor_parts(storage: &Storage) -> (Arc<Mutex<crate::wal::WalWriter>>, Option<Lsn>) {
+        (storage.wal().clone(), None)
+    }
 
     fn users_schema() -> Schema {
         Schema::new(vec![
@@ -831,10 +855,11 @@ mod tests {
         let functions = FunctionRegistry::with_builtins();
 
         let rows = vec![vec![expr("1"), expr("'Alice'")], vec![expr("2"), expr("'Bob'")]];
-        let mut undo = Vec::new();
-        let count = storage_insert(&mut storage, table_id, &schema, &functions, None, &rows, &mut undo).unwrap();
+        let (wal, mut prev_lsn) = wal_cursor_parts(&storage);
+        let mut wal_cursor = WalCursor::new(&wal, TransactionId(1), &mut prev_lsn);
+        let count = storage_insert(&mut storage, table_id, &schema, &functions, None, &rows, &mut wal_cursor).unwrap();
         assert_eq!(count, 2);
-        assert_eq!(undo.len(), 2);
+        assert!(prev_lsn.is_some(), "2行挿入したのでWALレコードが書かれているはず");
 
         let scanned = scan_all(&storage, table_id, &schema).unwrap();
         assert_eq!(scanned.len(), 2);
@@ -852,7 +877,9 @@ mod tests {
 
         // 1行目は妥当だが、2行目は`id`(NOT NULL)にNULLを渡していて失敗する。
         let rows = vec![vec![expr("1"), expr("'Alice'")], vec![expr("NULL"), expr("'Bob'")]];
-        let result = storage_insert(&mut storage, table_id, &schema, &functions, None, &rows, &mut Vec::new());
+        let (wal, mut prev_lsn) = wal_cursor_parts(&storage);
+        let mut wal_cursor = WalCursor::new(&wal, TransactionId(1), &mut prev_lsn);
+        let result = storage_insert(&mut storage, table_id, &schema, &functions, None, &rows, &mut wal_cursor);
         assert!(result.is_err());
         assert!(scan_all(&storage, table_id, &schema).unwrap().is_empty());
 
@@ -864,6 +891,8 @@ mod tests {
         let (path, mut storage, table_id) = users_storage("update");
         let schema = users_schema();
         let functions = FunctionRegistry::with_builtins();
+        let (wal, mut prev_lsn) = wal_cursor_parts(&storage);
+        let mut wal_cursor = WalCursor::new(&wal, TransactionId(1), &mut prev_lsn);
         storage_insert(
             &mut storage,
             table_id,
@@ -871,18 +900,16 @@ mod tests {
             &functions,
             None,
             &[vec![expr("1"), expr("'Alice'")], vec![expr("2"), expr("'Bob'")]],
-            &mut Vec::new(),
+            &mut wal_cursor,
         )
         .unwrap();
 
         let assignments = bound_assignments("name = 'Carol'");
         let predicate = bound_predicate("id = 1");
-        let mut undo = Vec::new();
         let count =
-            storage_update(&mut storage, table_id, &schema, &functions, &assignments, Some(&predicate), &mut undo)
+            storage_update(&mut storage, table_id, &schema, &functions, &assignments, Some(&predicate), &mut wal_cursor)
                 .unwrap();
         assert_eq!(count, 1);
-        assert_eq!(undo.len(), 1);
 
         let scanned = scan_all(&storage, table_id, &schema).unwrap();
         assert_eq!(scanned.len(), 2);
@@ -897,6 +924,8 @@ mod tests {
         let (path, mut storage, table_id) = users_storage("delete");
         let schema = users_schema();
         let functions = FunctionRegistry::with_builtins();
+        let (wal, mut prev_lsn) = wal_cursor_parts(&storage);
+        let mut wal_cursor = WalCursor::new(&wal, TransactionId(1), &mut prev_lsn);
         storage_insert(
             &mut storage,
             table_id,
@@ -904,15 +933,13 @@ mod tests {
             &functions,
             None,
             &[vec![expr("1"), expr("'Alice'")], vec![expr("2"), expr("'Bob'")]],
-            &mut Vec::new(),
+            &mut wal_cursor,
         )
         .unwrap();
 
         let predicate = bound_predicate("id = 1");
-        let mut undo = Vec::new();
-        let count = storage_delete(&mut storage, table_id, &schema, &functions, Some(&predicate), &mut undo).unwrap();
+        let count = storage_delete(&mut storage, table_id, &schema, &functions, Some(&predicate), &mut wal_cursor).unwrap();
         assert_eq!(count, 1);
-        assert_eq!(undo.len(), 1);
 
         let scanned = scan_all(&storage, table_id, &schema).unwrap();
         assert_eq!(scanned.len(), 1);
@@ -1026,7 +1053,9 @@ mod tests {
 
         // 事前に妥当な行を1件入れておく(既存の行・索引が変化しないことを
         // 確認する対象)。
-        storage_insert(&mut storage, table_id, &schema, &functions, None, &[vec![expr("true"), expr("'seed'")]], &mut Vec::new())
+        let (wal, mut prev_lsn) = wal_cursor_parts(&storage);
+        let mut wal_cursor = WalCursor::new(&wal, TransactionId(1), &mut prev_lsn);
+        storage_insert(&mut storage, table_id, &schema, &functions, None, &[vec![expr("true"), expr("'seed'")]], &mut wal_cursor)
             .unwrap();
 
         let huge_payload = oversized_payload();
@@ -1034,7 +1063,7 @@ mod tests {
             vec![expr("false"), expr("'ok'")],
             vec![expr("true"), expr(&format!("'{huge_payload}'"))],
         ];
-        let err = storage_insert(&mut storage, table_id, &schema, &functions, None, &rows, &mut Vec::new()).unwrap_err();
+        let err = storage_insert(&mut storage, table_id, &schema, &functions, None, &rows, &mut wal_cursor).unwrap_err();
         assert!(matches!(err, DbError::BTreeKeyTooLarge(_)));
 
         let scanned = scan_all(&storage, table_id, &schema).unwrap();
@@ -1064,14 +1093,16 @@ mod tests {
         // このテーブルの唯一の行にする。ページには他の行が無いため、
         // `payload`をそのページの残り容量いっぱいまで書き換えても
         // (索引の制約さえ無ければ)`RecordId`を変えずに収まる。
-        storage_insert(&mut storage, table_id, &schema, &functions, None, &[vec![expr("true"), expr("'alice'")]], &mut Vec::new())
+        let (wal, mut prev_lsn) = wal_cursor_parts(&storage);
+        let mut wal_cursor = WalCursor::new(&wal, TransactionId(1), &mut prev_lsn);
+        storage_insert(&mut storage, table_id, &schema, &functions, None, &[vec![expr("true"), expr("'alice'")]], &mut wal_cursor)
             .unwrap();
         let before = scan_all(&storage, table_id, &schema).unwrap();
 
         let huge_payload = oversized_payload();
         let assignments = flag_bound_assignments(&format!("payload = '{huge_payload}'"));
         let predicate = flag_bound_predicate("flag = TRUE");
-        let err = storage_update(&mut storage, table_id, &schema, &functions, &assignments, Some(&predicate), &mut Vec::new())
+        let err = storage_update(&mut storage, table_id, &schema, &functions, &assignments, Some(&predicate), &mut wal_cursor)
             .unwrap_err();
         assert!(matches!(err, DbError::BTreeKeyTooLarge(_)));
 
@@ -1107,13 +1138,15 @@ mod tests {
             vec![expr("true"), expr(&format!("'{filler_payload}'"))],
             vec![expr("false"), expr("'small'")],
         ];
-        storage_insert(&mut storage, table_id, &schema, &functions, None, &rows, &mut Vec::new()).unwrap();
+        let (wal, mut prev_lsn) = wal_cursor_parts(&storage);
+        let mut wal_cursor = WalCursor::new(&wal, TransactionId(1), &mut prev_lsn);
+        storage_insert(&mut storage, table_id, &schema, &functions, None, &rows, &mut wal_cursor).unwrap();
         let before = scan_all(&storage, table_id, &schema).unwrap();
 
         let huge_payload = oversized_payload();
         let assignments = flag_bound_assignments(&format!("payload = '{huge_payload}'"));
         let predicate = flag_bound_predicate("flag = FALSE");
-        let err = storage_update(&mut storage, table_id, &schema, &functions, &assignments, Some(&predicate), &mut Vec::new())
+        let err = storage_update(&mut storage, table_id, &schema, &functions, &assignments, Some(&predicate), &mut wal_cursor)
             .unwrap_err();
         assert!(matches!(err, DbError::BTreeKeyTooLarge(_)));
 

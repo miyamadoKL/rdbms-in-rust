@@ -1,42 +1,40 @@
-//! トランザクション境界と、メモリ上のUndo(第30章)。
+//! トランザクション境界と、Memoryバックエンド向けのメモリ上Undo(第30章)。
 //!
 //! この章の`Database`は、`BEGIN`から`COMMIT`または`ROLLBACK`までの間に実行した
 //! 複数の文を1つのトランザクションとして扱う。`ROLLBACK`が取り消すべき内容を
 //! 覚えておく仕組みが、この章の[`UndoRecord`]と[`TransactionContext`]である。
 //!
-//! # メモリ上のUndoは、この章限りの実装である
+//! # 第33章での書き直し: `UndoRecord`はMemoryバックエンド専用になった
 //!
-//! `INSERT`・`UPDATE`・`DELETE`が行った変更を、逆操作(挿入の逆は削除、削除の
-//! 逆は再挿入、更新の逆は旧値への復元)としてプロセスのメモリ上に積んでおき、
-//! `ROLLBACK`が届いたら逆順に適用する。この方式はディスクに何も書かないため、
-//! `ROLLBACK`の後にプロセスごとクラッシュすれば、コミットしたつもりの変更も
-//! 未コミットの変更も等しく消える。これは第33章で解決する話であり、この章では
-//! 触れない。第33章では、この`UndoRecord`は「ページを書き換える前に、その
-//! 変更を表すログをディスクへ先に書く」というWrite-Ahead Loggingの仕組みに
-//! 置き換わる。具体的には、この章の`UndoRecord`が値として持っている「更新前の
-//! 内容」が、WALの**Before Image**として一般化され、ログレコード自身が
-//! ディスク上に永続化される。この章の実装は、その最終形に至る前の、書き直しを
-//! 前提にした最初の実装である。
+//! この章を書いた時点([`UndoRecord`]が`Insert`・`Update`・`Delete`という
+//! DMLの逆操作を1件ずつ持つ設計)では、Diskバックエンドもこの`UndoRecord`を
+//! `RecordId`つきで記録し、`ROLLBACK`のたびに逆順適用していた
+//! (`apply_undo_disk`)。この方式はプロセスのメモリ上にしか変更を残さないため、
+//! `ROLLBACK`の直後にプロセスがクラッシュすれば実害は無いが、`Active`な
+//! トランザクションの途中でクラッシュすれば、それまでの変更が`backend`に
+//! どこまで反映されていたかを知る手段が無く、Undoの記録ごと失われた。
 //!
-//! # `RecordId`はDiskバックエンドだけが持つ
-//!
-//! Diskバックエンド(`Storage`)は、行の位置を[`RecordId`](第13章)で指す。
-//! Memoryバックエンド(`MemStorage`)は`RecordId`という概念を持たず、行は
-//! `Vec<Tuple>`の並びでしかない。[`UndoRecord`]の`rid`フィールドが
-//! `Option<RecordId>`なのはこのためで、Diskバックエンドの記録では必ず
-//! `Some`、Memoryバックエンドの記録では常に`None`になる。Memoryバックエンドの
-//! 逆操作は、`RecordId`の代わりに`Tuple`の値そのものの一致で対象行を探す
-//! (`apply_undo_memory`)。
+//! 第33章は、この欠落をWrite-Ahead Loggingで埋めた。Diskバックエンドの
+//! `INSERT`・`UPDATE`・`DELETE`は、もう`UndoRecord`を積まない。代わりに
+//! `crate::wal::WalWriter`へBefore/After Imageを持つログレコードを直接書き、
+//! `ROLLBACK`はその`prev_lsn`連鎖を逆順にたどって取り消す
+//! ([`apply_wal_undo_disk`])。`UndoRecord`という型自体は、ディスクに何も
+//! 書かないMemoryバックエンド(`MemStorage`、`RecordId`という概念を持たず、
+//! 行は`Vec<Tuple>`の並びでしかない)向けの、この章由来の実装として残した。
+//! Memoryバックエンドはそもそも永続化しないデータベースであり、WALを持ち込む
+//! 動機(クラッシュをまたいだ復元)自体が無いため、この章の設計をそのまま
+//! 維持するという線引きを選んだ。
 
 use std::collections::HashMap;
 
 use crate::ast::IsolationLevel;
 use crate::error::DbResult;
-use crate::ids::{RecordId, TableId, TransactionId};
+use crate::ids::{Lsn, RecordId, TableId, TransactionId};
 use crate::storage::Storage;
 use crate::storage_mem::MemStorage;
-use crate::tuple_codec::encode_tuple;
+use crate::tuple_codec::decode_tuple;
 use crate::types::Tuple;
+use crate::wal::LogRecordType;
 
 /// トランザクションの状態。
 ///
@@ -58,23 +56,16 @@ pub enum TransactionState {
     Aborted,
 }
 
-/// 1回のDML操作を打ち消すための逆操作1件。
-///
-/// `table_id`はどのテーブルに対する操作かを、`rid`はDiskバックエンドでの
-/// 位置(モジュール冒頭を参照)を表す。
+/// 1回のDML操作を打ち消すための逆操作1件(Memoryバックエンド専用、
+/// モジュール冒頭「第33章での書き直し」を参照)。
 #[derive(Debug, Clone)]
 pub enum UndoRecord {
     /// この行が挿入された。取り消すには削除する。
-    Insert { table_id: TableId, tuple: Tuple, rid: Option<RecordId> },
+    Insert { table_id: TableId, tuple: Tuple },
     /// この行が削除された。取り消すには再挿入する。
-    Delete { table_id: TableId, tuple: Tuple, rid: Option<RecordId> },
+    Delete { table_id: TableId, tuple: Tuple },
     /// この行が`old`から`new`へ更新された。取り消すには`new`を`old`へ戻す。
-    ///
-    /// Diskバックエンドでは、`Storage::update`が新しい値をページに収めきれず
-    /// 別のページへ移動させることがある(第15章)。`old_rid`は更新前の位置、
-    /// `new_rid`は更新後の位置であり、両方とも記録しておかないと逆操作の
-    /// 対象を特定できない(`apply_undo_disk`のドキュメントを参照)。
-    Update { table_id: TableId, old: Tuple, new: Tuple, old_rid: Option<RecordId>, new_rid: Option<RecordId> },
+    Update { table_id: TableId, old: Tuple, new: Tuple },
 }
 
 /// 1本のトランザクションが持つ状態。
@@ -99,6 +90,15 @@ pub(crate) struct TransactionContext {
     /// `DbError::DeadlockDetected`(デッドロックのVictim)のどちらを返すかを
     /// 決める(`crate::database`の該当箇所を参照)。
     pub victim_of_deadlock: bool,
+    /// Diskバックエンド(第33章)で、このトランザクションが直近に書いた
+    /// WALレコードの`Lsn`。`None`は「まだ1件も書いていない」(`BEGIN`直後、
+    /// またはこのトランザクションが一度も書き込みを行っていない)ことを表す。
+    /// 次に書くレコードの`prev_lsn`に使うと同時に、`ROLLBACK`が
+    /// `crate::transaction::apply_wal_undo_disk`で逆操作をたどる起点にもなる。
+    /// Memoryバックエンドでは常に`None`のまま使われない
+    /// (`undo_log`がMemoryバックエンド専用であるのと対称的に、こちらは
+    /// Diskバックエンド専用のフィールドである)。
+    pub wal_last_lsn: Option<Lsn>,
 }
 
 impl TransactionContext {
@@ -109,6 +109,7 @@ impl TransactionContext {
             undo_log: Vec::new(),
             isolation_level,
             victim_of_deadlock: false,
+            wal_last_lsn: None,
         }
     }
 }
@@ -127,19 +128,19 @@ impl TransactionContext {
 pub(crate) fn apply_undo_memory(storage: &mut MemStorage, undo_log: Vec<UndoRecord>) {
     for record in undo_log.into_iter().rev() {
         match record {
-            UndoRecord::Insert { table_id, tuple, .. } => {
+            UndoRecord::Insert { table_id, tuple } => {
                 if let Some(table) = storage.table_mut(table_id)
                     && let Some(pos) = table.rows().iter().position(|t| t.values() == tuple.values())
                 {
                     table.rows_mut().remove(pos);
                 }
             }
-            UndoRecord::Delete { table_id, tuple, .. } => {
+            UndoRecord::Delete { table_id, tuple } => {
                 if let Some(table) = storage.table_mut(table_id) {
                     table.rows_mut().push(tuple);
                 }
             }
-            UndoRecord::Update { table_id, old, new, .. } => {
+            UndoRecord::Update { table_id, old, new } => {
                 if let Some(table) = storage.table_mut(table_id)
                     && let Some(pos) = table.rows().iter().position(|t| t.values() == new.values())
                 {
@@ -150,26 +151,34 @@ pub(crate) fn apply_undo_memory(storage: &mut MemStorage, undo_log: Vec<UndoReco
     }
 }
 
-/// Diskバックエンド(`Storage`)に対して、`undo_log`を逆順に適用する。
+/// Diskバックエンドに対して、WALの`prev_lsn`連鎖を逆順にたどりながら
+/// Undoを適用する(第33章)。
+///
+/// `last_lsn`は`TransactionContext::wal_last_lsn`(このトランザクションが
+/// 直近に書いたレコード)。そこから`prev_lsn`を`Begin`レコードに行き着くまで
+/// たどり、たどった順(=このトランザクションが実際に書き込んだ順とちょうど
+/// 逆順、LIFO)にInsert・Update・Deleteの逆操作を適用する。`Begin`レコード
+/// 自身は逆操作を持たないため、そこに行き着いたら止まる。
 ///
 /// # `RecordId`の付け替え(`remap`)が要る理由
 ///
 /// 同じ行を同じトランザクション内で複数回`UPDATE`すると、1回目の更新が
 /// `RecordId`を`r1`から`r2`へ動かし、2回目の更新がさらに`r2`から`r3`へ
 /// 動かす、ということが起こりうる(`Storage::update`がページに収まりきらない
-/// 新しい値を書くたびに、別ページへ移動させるため)。各`UndoRecord::Update`は
-/// それぞれの更新が起きた**時点の**`old_rid`・`new_rid`しか知らないので、
-/// LIFO順に逆操作を適用していくと、2回目の更新の逆操作(`r3`→`r2`相当の
-/// 書き戻し)が終わった直後に、1回目の更新の逆操作が「`r2`から書き戻す」と
-/// 記録されたとおりに動こうとしても、2回目の逆操作が`r2`をさらに別の
-/// `RecordId`へ動かしているかもしれない。`remap`は、逆操作の適用中に実際に
-/// 起きた`RecordId`の付け替えを`old_rid → 実際の適用先`として覚えておき、
-/// 次の(時系列でより古い)逆操作が参照する`rid`を、適用する直前に`remap`を
-/// たどって現在の実際の位置へ解決する。ページ内で書き換えが収まり
-/// `RecordId`が変わらなかった場合は、`old_rid == 実際の適用先`になるが、
-/// この場合は`remap`へ何も追加しない。追加してしまうと`rid`が自分自身を
-/// 指すエントリになり、`resolve`が無限ループする(実装時に実際に踏んだ
-/// バグで、`cargo test`がハングして初めて気づいた)。
+/// 新しい値を書くたびに、別ページへ移動させるため)。各`Update`レコードは
+/// それぞれの更新が起きた**時点の**`old_rid`・`rid`(更新後の位置)しか
+/// 知らないので、LIFO順に逆操作を適用していくと、2回目の更新の逆操作
+/// (`r3`→`r2`相当の書き戻し)が終わった直後に、1回目の更新の逆操作が
+/// 「`r2`から書き戻す」と記録されたとおりに動こうとしても、2回目の逆操作が
+/// `r2`をさらに別の`RecordId`へ動かしているかもしれない。`remap`は、
+/// 逆操作の適用中に実際に起きた`RecordId`の付け替えを`old_rid → 実際の
+/// 適用先`として覚えておき、次の(時系列でより古い)逆操作が参照する
+/// `rid`を、適用する直前に`remap`をたどって現在の実際の位置へ解決する。
+/// ページ内で書き換えが収まり`RecordId`が変わらなかった場合は、
+/// `old_rid == 実際の適用先`になるが、この場合は`remap`へ何も追加しない。
+/// 追加してしまうと`rid`が自分自身を指すエントリになり、`resolve`が
+/// 無限ループする(第30章の実装時に実際に踏んだバグで、`cargo test`が
+/// ハングして初めて気づいた。この章もそのままの`remap`・`resolve`を使う)。
 ///
 /// # 索引の整合性
 ///
@@ -182,18 +191,39 @@ pub(crate) fn apply_undo_memory(storage: &mut MemStorage, undo_log: Vec<UndoReco
 ///
 /// この適用の途中で(たとえば`BufferPool`のI/Oエラーによって)失敗すると、
 /// トランザクションの一部だけが取り消された中途半端な状態が残る。この章は
-/// この失敗経路を閉じない。第15章・第20章がすでに明文化した「正直なギャップ」
-/// と同じ割り切りであり、閉じるには第33章のWrite-Ahead Loggingと第34章の
-/// Crash Recoveryが要る。
-pub(crate) fn apply_undo_disk(storage: &mut Storage, undo_log: Vec<UndoRecord>) -> DbResult<()> {
+/// この失敗経路を閉じない。第15章・第20章がすでに明文化した「正直な
+/// ギャップ」と同じ割り切りであり、閉じるには第34章のCrash Recoveryが要る。
+pub(crate) fn apply_wal_undo_disk(
+    storage: &mut Storage,
+    last_lsn: Option<Lsn>,
+) -> DbResult<()> {
+    // Undo対象のレコードをすべて先に集めてから`storage`を書き換える。
+    // `WalWriter`のロックを`storage`の書き換えと同時に握り続けないための
+    // 順序であり、意味的な違いは無い(`crate::wal::WalWriter::record`は
+    // 参照を返すだけで、これまでに`append`したレコードは書き換わらない)。
+    let records = {
+        let wal = storage.wal().lock().unwrap_or_else(|p| p.into_inner());
+        let mut records = Vec::new();
+        let mut current = last_lsn;
+        while let Some(lsn) = current {
+            let record = wal
+                .record(lsn)
+                .expect("wal_last_lsn・prev_lsnは常にWalWriterへ記録済みのLsnを指す")
+                .clone();
+            if record.record_type == LogRecordType::Begin {
+                break;
+            }
+            current = record.prev_lsn;
+            records.push(record);
+        }
+        records
+    };
+
     let mut remap: HashMap<RecordId, RecordId> = HashMap::new();
 
     fn resolve(remap: &HashMap<RecordId, RecordId>, rid: RecordId) -> RecordId {
         let mut current = rid;
         while let Some(&next) = remap.get(&current) {
-            // `next == current`(ページ内で収まり`RecordId`が変わらなかった
-            // 更新)は付け替えが無かったことを意味する。ここで止めないと、
-            // 自己参照のエントリを無限にたどり続けてしまう。
             if next == current {
                 break;
             }
@@ -202,46 +232,52 @@ pub(crate) fn apply_undo_disk(storage: &mut Storage, undo_log: Vec<UndoRecord>) 
         current
     }
 
-    for record in undo_log.into_iter().rev() {
-        match record {
-            UndoRecord::Insert { table_id, tuple, rid } => {
-                let rid = rid.expect("Diskバックエンドの UndoRecord::Insert は必ずridを持つ");
+    for record in records {
+        let table_id = record.table_id.expect("Insert/Update/DeleteレコードのWALは必ずtable_idを持つ");
+        let schema = storage
+            .tables()
+            .find(|info| info.id == table_id)
+            .expect("Undoの対象テーブルはDROP TABLEされていない前提")
+            .schema
+            .clone();
+
+        match record.record_type {
+            LogRecordType::Insert => {
+                let rid = record.rid.expect("InsertレコードのWALは必ずridを持つ");
+                let after = record.after_image.expect("InsertレコードのWALは必ずafter_imageを持つ");
+                let tuple = decode_tuple(&schema, &after)?;
                 let actual = resolve(&remap, rid);
                 storage.delete(table_id, actual)?;
                 storage.index_delete_row(table_id, &tuple, actual)?;
             }
-            UndoRecord::Delete { table_id, tuple, rid } => {
-                let rid = rid.expect("Diskバックエンドの UndoRecord::Delete は必ずridを持つ");
-                let schema = storage
-                    .tables()
-                    .find(|info| info.id == table_id)
-                    .expect("Undoの対象テーブルはDROP TABLEされていない前提")
-                    .schema
-                    .clone();
-                let bytes = encode_tuple(&schema, &tuple);
-                let new_rid = storage.insert(table_id, &bytes)?;
+            LogRecordType::Delete => {
+                let rid = record.rid.expect("DeleteレコードのWALは必ずridを持つ");
+                let before = record.before_image.expect("DeleteレコードのWALは必ずbefore_imageを持つ");
+                let tuple = decode_tuple(&schema, &before)?;
+                let new_rid = storage.insert(table_id, &before)?;
                 storage.index_insert_row(table_id, &tuple, new_rid)?;
                 if new_rid != rid {
                     remap.insert(rid, new_rid);
                 }
             }
-            UndoRecord::Update { table_id, old, new, old_rid, new_rid } => {
-                let old_rid = old_rid.expect("Diskバックエンドの UndoRecord::Update は必ずold_ridを持つ");
-                let new_rid = new_rid.expect("Diskバックエンドの UndoRecord::Update は必ずnew_ridを持つ");
+            LogRecordType::Update => {
+                let new_rid = record.rid.expect("UpdateレコードのWALは必ずrid(更新後の位置)を持つ");
+                let old_rid = record.old_rid.expect("UpdateレコードのWALは必ずold_rid(更新前の位置)を持つ");
+                let before = record.before_image.expect("UpdateレコードのWALは必ずbefore_imageを持つ");
+                let after = record.after_image.expect("UpdateレコードのWALは必ずafter_imageを持つ");
+                let old_tuple = decode_tuple(&schema, &before)?;
+                let new_tuple = decode_tuple(&schema, &after)?;
+
                 let actual = resolve(&remap, new_rid);
-                let schema = storage
-                    .tables()
-                    .find(|info| info.id == table_id)
-                    .expect("Undoの対象テーブルはDROP TABLEされていない前提")
-                    .schema
-                    .clone();
-                let old_bytes = encode_tuple(&schema, &old);
-                let result_rid = storage.update(table_id, actual, &old_bytes)?.unwrap_or(actual);
-                storage.index_delete_row(table_id, &new, actual)?;
-                storage.index_insert_row(table_id, &old, result_rid)?;
+                let result_rid = storage.update(table_id, actual, &before)?.unwrap_or(actual);
+                storage.index_delete_row(table_id, &new_tuple, actual)?;
+                storage.index_insert_row(table_id, &old_tuple, result_rid)?;
                 if old_rid != result_rid {
                     remap.insert(old_rid, result_rid);
                 }
+            }
+            LogRecordType::Begin | LogRecordType::Commit | LogRecordType::Abort => {
+                unreachable!("Begin・Commit・Abortはこのループへ集める前に取り除いている")
             }
         }
     }

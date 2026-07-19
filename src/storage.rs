@@ -288,6 +288,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::btree::BTree;
 use crate::buffer_pool::BufferPool;
@@ -296,13 +297,14 @@ use crate::disk_manager::DiskManager;
 use crate::error::{DbError, DbResult};
 use crate::free_space_map::FreeSpaceMap;
 use crate::heap_file::Scan;
-use crate::ids::{PageId, RecordId, TableId};
+use crate::ids::{Lsn, PageId, RecordId, TableId};
 use crate::index::IndexInfo;
 use crate::page::{PAGE_PAYLOAD_SIZE, PageType};
 use crate::slotted_page::{SlotStatus, SlottedPage, SlottedPageRef, max_len_for_fresh_page};
 use crate::statistics::{Bucket, ColumnStats, HISTOGRAM_BUCKET_COUNT, MCV_MAX_ENTRIES, TableStats};
 use crate::tuple_codec::decode_tuple;
 use crate::types::{Column, DataType, Schema, Tuple, Value, compare_values};
+use crate::wal::WalWriter;
 
 /// Catalogページの定位置。ページ0はFile Header(第11章)が占有しているため、
 /// 空いている最初の番号を使う。
@@ -341,6 +343,15 @@ fn index_file_path(db_path: &Path, index_name: &str) -> PathBuf {
     PathBuf::from(os_string)
 }
 
+/// `db_path`のWALファイル(第33章)のパスを組み立てる。索引ファイル
+/// ([`index_file_path`])と同じ命名の流儀で、本体のデータファイルとは
+/// 別のファイル`<db_path>.wal`に置く。
+fn wal_file_path(db_path: &Path) -> PathBuf {
+    let mut os_string = db_path.as_os_str().to_os_string();
+    os_string.push(".wal");
+    PathBuf::from(os_string)
+}
+
 /// テーブル定義とデータページの両方を1つのファイルへ永続化するストレージエンジン。
 pub struct Storage {
     /// このストレージ本体(テーブル定義・データページ)のファイルパス。
@@ -357,6 +368,14 @@ pub struct Storage {
     /// `ANALYZE`で収集された統計情報(第27章)。キーは`TableId`。`ANALYZE`を
     /// 一度も実行していないテーブルはここに現れない。
     stats: HashMap<TableId, TableStats>,
+    /// このテーブル本体用のWAL(第33章)。`<path>.wal`という専用ファイルを持ち、
+    /// `pool`(テーブル本体の`BufferPool`)に[`BufferPool::attach_wal`]で
+    /// 結線してある。`Database`は`Storage::wal`経由でこの`Arc`を共有し、
+    /// `BEGIN`・`COMMIT`・`ROLLBACK`のログレコードを直接書く
+    /// (`crate::database`、`crate::transaction::apply_wal_undo_disk`)。
+    /// 索引ごとの`BTree`は別々の`BufferPool`を持つが、そちらにはWALを結線
+    /// しない(モジュール冒頭「この章が対象にする範囲」を参照)。
+    wal: Arc<Mutex<WalWriter>>,
 }
 
 impl Storage {
@@ -384,6 +403,9 @@ impl Storage {
             "新規ファイルで最初に確保されるページは常にCatalogページの定位置になる"
         );
 
+        let wal = Arc::new(Mutex::new(WalWriter::open(wal_file_path(&path_buf))?));
+        pool.attach_wal(wal.clone());
+
         let storage = Storage {
             path: path_buf,
             pool,
@@ -393,6 +415,7 @@ impl Storage {
             fsm: FreeSpaceMap::new(),
             indexes: HashMap::new(),
             stats: HashMap::new(),
+            wal,
         };
         storage.persist_catalog()?;
         Ok(storage)
@@ -490,6 +513,9 @@ impl Storage {
             indexes.insert(info.name.clone(), IndexEntry { info, btree });
         }
 
+        let wal = Arc::new(Mutex::new(WalWriter::open(wal_file_path(&path_buf))?));
+        pool.attach_wal(wal.clone());
+
         Ok(Storage {
             path: path_buf,
             pool,
@@ -499,6 +525,7 @@ impl Storage {
             fsm,
             indexes,
             stats: decoded.stats,
+            wal,
         })
     }
 
@@ -539,6 +566,36 @@ impl Storage {
             entry.btree.sync()?;
         }
         Ok(())
+    }
+
+    /// このテーブル本体用のWAL(第33章)への共有ハンドル。
+    ///
+    /// `crate::database::Database`が`BEGIN`・`COMMIT`・`ROLLBACK`の
+    /// Begin・Commit・Abortレコードを直接書き、`crate::executor`の
+    /// `storage_insert`・`storage_update`・`storage_delete`がInsert・Update・
+    /// Deleteレコードを書く(`crate::wal::WalCursor`経由)ときに使う。
+    pub(crate) fn wal(&self) -> &Arc<Mutex<WalWriter>> {
+        &self.wal
+    }
+
+    /// `page_id`のPage LSN(第33章)を`lsn`まで引き上げる。
+    ///
+    /// `insert`・`update`・`delete`で書き込んだページの`PageId`に対して、
+    /// 対応するWALレコードを`append`した直後に呼ぶ薄い委譲であり、
+    /// `crate::buffer_pool::BufferPool::bump_page_lsn`を呼ぶだけである。
+    pub(crate) fn stamp_page_lsn(&self, page_id: PageId, lsn: Lsn) {
+        self.pool.bump_page_lsn(page_id, lsn);
+    }
+
+    /// これまでにWALへ書いた全レコードを、開発者が目視で確認できる文字列へ
+    /// 整形して返す(第33章、`crate::wal::WalWriter::dump`)。
+    ///
+    /// この章はCrash Recovery(第34章)をまだ実装しないため、WALの中身を
+    /// 自動で読み戻す経路が無い。「WALファースト不変条件を守って書いた
+    /// レコードが、実際にディスクへ残っている」ことを確認するための、
+    /// この章の開発用ダンプである。
+    pub fn wal_dump(&self) -> Vec<String> {
+        self.wal.lock().unwrap_or_else(|p| p.into_inner()).dump()
     }
 
     /// テーブル名から`TableInfo`を引く。見つからなければ`None`を返す。
