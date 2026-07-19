@@ -1430,8 +1430,15 @@ fn validate_table_metadata(decoded: &DecodedCatalog) -> DbResult<()> {
 ///   列の型と一致し、出現回数が`0`より大きく非NULL行数以下であり、出現回数が
 ///   降順(`crate::statistics::ColumnStats::mcv`の契約)に並んでいること。
 /// * Histogramのバケツ数が上限([`HISTOGRAM_BUCKET_COUNT`])以下で、各バケツの
-///   境界の型が列の型と一致し、`lower <= upper`であり、バケツどうしが昇順に
-///   (重ならずに)並んでいること。
+///   境界の型が列の型と一致し、`lower <= upper`であり、隣接するバケツどうしが
+///   `前のバケツのupper < 次のバケツのlower`という**厳密な**昇順(`<=`ではなく
+///   `<`)に並んでいること。`crate::estimator::equality_selectivity_within_non_null`
+///   は「同じ値を含むHistogramバケツは必ず1個」という不変条件に依存しており
+///   (`crate::statistics`モジュールの説明を参照)、`previous_upper ==
+///   bucket.lower`(隣接バケツが境界の値を共有する)を許すと、その値の行が
+///   2つのバケツに分かれて数えられ、選択率を過小評価してしまう(第4部4巡目
+///   レビュー対応。値`1`を1行ずつ持つ同一境界の2バケツを許した場合、
+///   `v = 1`の選択率が期待値`0.10`に対して`0.05`になる再現がある)。
 /// * MCV・Histogramの値・境界がすべて`Min`/`Max`の範囲に収まっていること。
 /// * MCVの出現回数の合計とHistogramのバケツ行数の合計を足すと、ちょうど
 ///   非NULL行数(`row_count - null_count`)に一致すること
@@ -1442,6 +1449,16 @@ fn validate_table_metadata(decoded: &DecodedCatalog) -> DbResult<()> {
 /// 登録しようとしている1テーブルぶんだけを検査する[`validate_one_table_stats`]
 /// を使い、違反を`DbError::InvalidStats`として返す(モジュール冒頭の説明、
 /// および`DbError::InvalidStats`のドキュメントを参照)。
+///
+/// `previous_upper < bucket.lower`という検査を追加する前は、隣接バケツが
+/// 境界の値を共有する統計(このブランチの開発途中、Histogramが同値の
+/// 連続runをバケツ境界で分割していた時期のコミットでのみ生成されえた形式、
+/// 第4部3巡目レビュー対応より前)も、構文的には妥当なCatalogページとして
+/// 永続化・再オープンできてしまっていた。この検査により、そのような
+/// カタログを再オープンしようとすると`DbError::CorruptCatalog`として
+/// 決定的に拒否されるようになる。章をまたいだファイル互換性を約束しない
+/// という、このモジュールが一貫して採っている方針(モジュール冒頭を参照)の
+/// 範囲内の変更である。
 fn validate_stats_metadata(tables: &HashMap<TableId, TableEntry>, stats: &HashMap<TableId, TableStats>) -> DbResult<()> {
     for (&table_id, table_stats) in stats {
         validate_one_table_stats(tables, table_id, table_stats)?;
@@ -1579,10 +1596,21 @@ fn validate_column_stats_metadata(
         if !within_min_max(&bucket.lower) || !within_min_max(&bucket.upper) {
             return Err(corrupt("Histogramのバケツ境界がMin/Maxの範囲外です".to_string()));
         }
+        // `previous_upper < bucket.lower`という**厳密な**分離を要求する
+        // (`<=`ではない)。`crate::estimator::equality_selectivity_within_non_null`
+        // は「同じ値を含むHistogramバケツは必ず1個」という不変条件に依存して
+        // おり(`crate::statistics`モジュールの説明を参照)、隣接バケツの
+        // 境界が`previous_upper == bucket.lower`(同じ値を共有する)ことを
+        // 許すと、その値の行の一部が前のバケツに、残りが次のバケツに
+        // 分かれて数えられてしまう。値`1`を1行ずつ持つ同一境界の2バケツ
+        // (`[..., 1]`と`[1, ...]`)を許してしまうと、`v = 1`の選択率は
+        // 見つかった最初のバケツの1行分だけを見て見積もることになり、
+        // 実際の2行の半分(0.05 対 期待値0.10)になる(第4部4巡目レビュー
+        // 対応)。
         if let Some(previous_upper) = previous_upper
-            && compare_values(previous_upper, &bucket.lower) == Ordering::Greater
+            && compare_values(previous_upper, &bucket.lower) != Ordering::Less
         {
-            return Err(corrupt("Histogramのバケツが昇順に並んでいません".to_string()));
+            return Err(corrupt("Histogramのバケツが厳密な昇順(前のバケツのupperより大きいlower)に並んでいません".to_string()));
         }
         if bucket.row_count == 0 {
             return Err(corrupt("Histogramのバケツのrow_countが0です".to_string()));
@@ -2469,6 +2497,78 @@ mod tests {
         let stats = TableStats { row_count: 100, columns: vec![column] };
         let err = expect_err(storage.set_table_stats(table_id, stats));
         assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// codexレビュー4巡目の再現: 値`1`を1行ずつ持つ、同一境界(`lower == upper
+    /// == 1`)の2バケツ。`crate::estimator::equality_selectivity_within_non_null`
+    /// は「同じ値を含むHistogramバケツは必ず1個」という不変条件に依存して
+    /// おり(`crate::statistics`モジュールの説明を参照)、この2バケツを
+    /// 許すと`v = 1`の選択率が最初の1バケツぶんの1行だけを見て見積もられ、
+    /// 実際の2行の半分(期待値0.10に対して0.05)になる。
+    fn column_stats_with_a_duplicate_bucket_boundary() -> ColumnStats {
+        ColumnStats {
+            null_count: 0,
+            distinct_count: 1,
+            min: Some(Value::BigInt(1)),
+            max: Some(Value::BigInt(1)),
+            mcv: Vec::new(),
+            histogram: vec![
+                Bucket { lower: Value::BigInt(1), upper: Value::BigInt(1), row_count: 1 },
+                Bucket { lower: Value::BigInt(1), upper: Value::BigInt(1), row_count: 1 },
+            ],
+        }
+    }
+
+    #[test]
+    fn set_table_stats_rejects_adjacent_buckets_that_share_the_same_boundary_value() {
+        let path = temp_path("stats-bucket-duplicate-boundary");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        let stats = TableStats { row_count: 2, columns: vec![column_stats_with_a_duplicate_bucket_boundary()] };
+        let err = expect_err(storage.set_table_stats(table_id, stats));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn open_rejects_a_catalog_whose_adjacent_buckets_share_the_same_boundary_value() {
+        // set_table_statsは常にvalidate_one_table_statsを通すため、この不整合は
+        // `open_rejects_a_catalog_whose_stats_reference_a_missing_table`と同じ
+        // 手順で、カタログのバイト列を直接組み立てて再現する。この形式
+        // (バケツ境界がバケツ間で重複しうる統計)は、この教材のブランチの
+        // 途中コミット(第4部3巡目レビュー対応より前)でのみ生成されえた
+        // ものであり、リリース済みの章のファイル形式ではない。章をまたいだ
+        // ファイル互換性を約束しない方針(モジュール冒頭を参照)の範囲内で、
+        // この検証強化により再オープン時に決定的に`CorruptCatalog`として
+        // 拒否されることを確認する(第4部4巡目レビュー対応)。
+        let path = temp_path("stats-open-bucket-duplicate-boundary");
+        Storage::create(&path).unwrap();
+
+        let mut tables = HashMap::new();
+        let table_id = TableId(0);
+        tables.insert(
+            table_id,
+            TableEntry { info: TableInfo { id: table_id, name: "t".to_string(), schema: one_bigint_schema() }, page_ids: Vec::new() },
+        );
+
+        let mut stats = HashMap::new();
+        stats.insert(table_id, TableStats { row_count: 2, columns: vec![column_stats_with_a_duplicate_bucket_boundary()] });
+
+        let encoded = encode_catalog(1, &tables, &[], &[], &stats);
+        let mut payload = vec![0u8; PAGE_PAYLOAD_SIZE];
+        payload[..encoded.len()].copy_from_slice(&encoded);
+
+        let mut page = Page::new(CATALOG_PAGE_ID, PageType::Catalog);
+        page.payload_mut().copy_from_slice(&payload);
+        let bytes = page.encode();
+
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        file.write_all(&bytes).unwrap();
+
+        let err = expect_err(Storage::open(&path));
+        assert!(matches!(err, DbError::CorruptCatalog(_)), "err={err:?}");
         std::fs::remove_file(&path).unwrap();
     }
 
