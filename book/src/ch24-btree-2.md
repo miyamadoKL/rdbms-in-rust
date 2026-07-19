@@ -1048,7 +1048,7 @@ assert_eq!(mem_err.to_string(), disk_err.to_string());
 
 ```console
 $ cargo test --lib
-test result: ok. 575 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out
+test result: ok. 577 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out
 ```
 
 ## 演習問題
