@@ -1263,8 +1263,8 @@ pub fn estimate_rows(plan: &PhysicalPlan, stats: &dyn StatsLookup) -> u64 {
             let total = table_row_count(stats, scan.table_id);
             let column_stats = column_stats_of(stats, scan.table_id, &scan.column_name, &scan.schema);
             let selectivity = match &scan.kind {
-                IndexScanKind::Point(value) => estimator::estimate_equality_selectivity(column_stats, value),
-                IndexScanKind::Range { lower, upper } => range_selectivity_of_bounds(column_stats, lower, upper),
+                IndexScanKind::Point(value) => estimator::estimate_equality_selectivity(column_stats, total, value),
+                IndexScanKind::Range { lower, upper } => range_selectivity_of_bounds(column_stats, total, lower, upper),
             };
             ((total as f64) * selectivity).round().max(0.0) as u64
         }
@@ -1289,14 +1289,20 @@ pub fn estimate_rows(plan: &PhysicalPlan, stats: &dyn StatsLookup) -> u64 {
             // 場合でも先頭の1本だけを見るのは単純化だが、`AND`で連結された
             // 複数の等値条件は同じかそれ以上に選択的になるはずなので、
             // 先頭キーだけを見た見積もりは「選択されすぎない」側の安全な近似になる。
-            let key_ndv = join.keys.first().map(|(left_key, right_key)| {
-                let left_ndv = column_owner_stats(left_key, &join.left, stats).map(|c| c.distinct_count).filter(|&n| n > 0);
-                let right_ndv = column_owner_stats(right_key, &join.right, stats).map(|c| c.distinct_count).filter(|&n| n > 0);
-                (left_ndv, right_ndv)
+            let key_stats = join.keys.first().map(|(left_key, right_key)| {
+                let left = column_owner_stats(left_key, &join.left, stats).filter(|(c, _)| c.distinct_count > 0);
+                let right = column_owner_stats(right_key, &join.right, stats).filter(|(c, _)| c.distinct_count > 0);
+                (left, right)
             });
-            match key_ndv {
-                Some((Some(left_ndv), Some(right_ndv))) => {
-                    estimator::estimate_join_row_count(left_rows, right_rows, left_ndv, right_ndv)
+            match key_stats {
+                Some((Some((left_col, left_table_rows)), Some((right_col, right_table_rows)))) => {
+                    // 結合キーが`NULL`の行は等号で一致しないため、
+                    // `estimate_join_row_count`には非NULL行数だけを渡す
+                    // (`null_count`/`left_table_rows`から求めた列全体の
+                    // NULL率を、Join直前の推定行数へ独立性の仮定で適用する)。
+                    let left_non_null = apply_non_null_fraction(left_rows, left_col.null_count, left_table_rows);
+                    let right_non_null = apply_non_null_fraction(right_rows, right_col.null_count, right_table_rows);
+                    estimator::estimate_join_row_count(left_non_null, right_non_null, left_col.distinct_count, right_col.distinct_count)
                 }
                 _ => fallback_join_row_count(left_rows, right_rows),
             }
@@ -1306,14 +1312,18 @@ pub fn estimate_rows(plan: &PhysicalPlan, stats: &dyn StatsLookup) -> u64 {
             let inner_rows = table_row_count(stats, join.table_id);
             let column_stats = column_stats_of(stats, join.table_id, &join.column_name, &join.schema);
             let inner_ndv = column_stats.map(|c| c.distinct_count).unwrap_or(inner_rows).max(1);
-            estimator::estimate_join_row_count(left_rows, inner_rows, left_rows.max(1), inner_ndv)
+            let inner_non_null = match column_stats {
+                Some(c) => apply_non_null_fraction(inner_rows, c.null_count, inner_rows),
+                None => inner_rows,
+            };
+            estimator::estimate_join_row_count(left_rows, inner_non_null, left_rows.max(1), inner_ndv)
         }
         PhysicalPlan::Aggregate(aggregate) => {
             let input_rows = estimate_rows(&aggregate.input, stats);
             let group_ndvs: Vec<u64> = aggregate
                 .group_by
                 .iter()
-                .map(|expr| column_owner_stats(expr, &aggregate.input, stats).map(|c| c.distinct_count).unwrap_or(input_rows).max(1))
+                .map(|expr| column_owner_stats(expr, &aggregate.input, stats).map(|(c, _)| c.distinct_count).unwrap_or(input_rows).max(1))
                 .collect();
             estimator::estimate_aggregate_row_count(&group_ndvs, input_rows)
         }
@@ -1352,16 +1362,17 @@ fn column_stats_of<'a>(
 /// [`IndexScanKind::Range`]の下限・上限の両方から選択率を見積もる。上限・
 /// 下限のうち指定されている側だけ[`estimator::estimate_range_selectivity`]を
 /// 呼び、両方指定されていれば独立性を仮定した積(`estimate_and_selectivity`)を
-/// 取る。
-fn range_selectivity_of_bounds(stats: Option<&ColumnStats>, lower: &Bound<Value>, upper: &Bound<Value>) -> f64 {
+/// 取る。`row_count`は対象テーブルの行数(全行基準の選択率を求めるために
+/// `estimate_range_selectivity`が必要とする、モジュール冒頭を参照)。
+fn range_selectivity_of_bounds(stats: Option<&ColumnStats>, row_count: u64, lower: &Bound<Value>, upper: &Bound<Value>) -> f64 {
     let lower_sel = match lower {
-        Bound::Included(v) => Some(estimator::estimate_range_selectivity(stats, estimator::RangeOp::Ge, v)),
-        Bound::Excluded(v) => Some(estimator::estimate_range_selectivity(stats, estimator::RangeOp::Gt, v)),
+        Bound::Included(v) => Some(estimator::estimate_range_selectivity(stats, row_count, estimator::RangeOp::Ge, v)),
+        Bound::Excluded(v) => Some(estimator::estimate_range_selectivity(stats, row_count, estimator::RangeOp::Gt, v)),
         Bound::Unbounded => None,
     };
     let upper_sel = match upper {
-        Bound::Included(v) => Some(estimator::estimate_range_selectivity(stats, estimator::RangeOp::Le, v)),
-        Bound::Excluded(v) => Some(estimator::estimate_range_selectivity(stats, estimator::RangeOp::Lt, v)),
+        Bound::Included(v) => Some(estimator::estimate_range_selectivity(stats, row_count, estimator::RangeOp::Le, v)),
+        Bound::Excluded(v) => Some(estimator::estimate_range_selectivity(stats, row_count, estimator::RangeOp::Lt, v)),
         Bound::Unbounded => None,
     };
     match (lower_sel, upper_sel) {
@@ -1379,6 +1390,19 @@ fn range_selectivity_of_bounds(stats: Option<&ColumnStats>, lower: &Bound<Value>
 /// (外部キー側の値がすべて異なる典型的な結合)を想定した単純化である。
 fn fallback_join_row_count(left_rows: u64, right_rows: u64) -> u64 {
     estimator::estimate_join_row_count(left_rows, right_rows, left_rows.max(1), right_rows.max(1))
+}
+
+/// `rows`件のうち、`null_count`/`table_row_count`から求めた列のNULL率を
+/// 差し引いた非NULL行数を見積もる。
+///
+/// `rows`は結合直前の(`Filter`等を経た後の)推定行数、`null_count`・
+/// `table_row_count`は`ANALYZE`が観測したテーブル全体でのNULL率であり、
+/// 両者が指す母集団は厳密には異なりうる。`rows`のうち述語で絞り込まれた
+/// 部分と、列がNULLである部分が独立に決まるという仮定(この章の他の推定式と
+/// 同じ独立性の仮定)のもとで、そのNULL率を`rows`へそのまま適用する。
+fn apply_non_null_fraction(rows: u64, null_count: u64, table_row_count: u64) -> u64 {
+    let non_null = 1.0 - estimator::null_fraction(null_count, table_row_count);
+    ((rows as f64) * non_null).round().max(0.0) as u64
 }
 
 /// `plan`の列`column_index`が、どのテーブルのどの列に由来するかを解決する。
@@ -1426,26 +1450,32 @@ fn resolve_join_column(left: &PhysicalPlan, right: &PhysicalPlan, column_index: 
     }
 }
 
-/// [`BoundExpr::ColumnRef`]から、その列が由来するテーブルの[`ColumnStats`]を
-/// 引く。列参照でない式、または由来を解決できない式には`None`を返す。
-fn column_owner_stats<'a>(expr: &BoundExpr, plan: &PhysicalPlan, stats: &'a dyn StatsLookup) -> Option<&'a ColumnStats> {
+/// [`BoundExpr::ColumnRef`]から、その列が由来するテーブルの[`ColumnStats`]と、
+/// そのテーブルの行数(`TableStats::row_count`)を引く。列参照でない式、
+/// または由来を解決できない式には`None`を返す。行数を併せて返すのは、
+/// `estimate_equality_selectivity`・`estimate_range_selectivity`が全行基準の
+/// 選択率(モジュール冒頭、`estimator`の説明を参照)を計算するために必要な
+/// ためである。
+fn column_owner_stats<'a>(expr: &BoundExpr, plan: &PhysicalPlan, stats: &'a dyn StatsLookup) -> Option<(&'a ColumnStats, u64)> {
     let BoundExpr::ColumnRef { column_index, .. } = expr else { return None };
     let (table_id, local_index) = resolve_column_owner(plan, *column_index)?;
-    stats.table_stats(table_id)?.columns.get(local_index)
+    let table_stats = stats.table_stats(table_id)?;
+    table_stats.columns.get(local_index).map(|c| (c, table_stats.row_count))
 }
 
 /// `predicate`(`plan`を子に持つ`Filter`の述語)の選択率を見積もる。
 ///
-/// 対応するのは、`col <op> 定数`(`=`・`<>`・`<`・`<=`・`>`・`>=`)の形の比較と、
-/// `AND`・`OR`・`NOT`による組み合わせだけである。列参照が定数と比較されて
-/// いない述語(`col1 = col2`、関数呼び出しを含む式など)は、この章の推定式が
-/// 対応する範囲の外にあるため、[`estimator::DEFAULT_INEQ_SEL`]にフォールバック
-/// する。
+/// 対応するのは、`col <op> 定数`(`=`・`<>`・`<`・`<=`・`>`・`>=`)の形の比較、
+/// `col IS [NOT] NULL`、`AND`・`OR`・`NOT`による組み合わせだけである。列参照が
+/// 定数と比較されていない述語(`col1 = col2`、関数呼び出しを含む式など)は、
+/// この章の推定式が対応する範囲の外にあるため、
+/// [`estimator::DEFAULT_INEQ_SEL`]にフォールバックする。
 pub fn predicate_selectivity(predicate: &BoundExpr, plan: &PhysicalPlan, stats: &dyn StatsLookup) -> f64 {
     match predicate {
         BoundExpr::Paren { expr, .. } => predicate_selectivity(expr, plan, stats),
         BoundExpr::UnaryOp { op: UnaryOperator::Not, expr, .. } => {
-            estimator::estimate_not_selectivity(predicate_selectivity(expr, plan, stats))
+            let known_fraction = operand_non_null_fraction(expr, plan, stats);
+            estimator::estimate_not_selectivity(known_fraction, predicate_selectivity(expr, plan, stats))
         }
         BoundExpr::BinaryOp { op: BinaryOperator::And, lhs, rhs, .. } => {
             estimator::estimate_and_selectivity(predicate_selectivity(lhs, plan, stats), predicate_selectivity(rhs, plan, stats))
@@ -1454,6 +1484,14 @@ pub fn predicate_selectivity(predicate: &BoundExpr, plan: &PhysicalPlan, stats: 
             estimator::estimate_or_selectivity(predicate_selectivity(lhs, plan, stats), predicate_selectivity(rhs, plan, stats))
         }
         BoundExpr::BinaryOp { op, lhs, rhs, .. } => comparison_selectivity(*op, lhs, rhs, plan, stats),
+        BoundExpr::IsNull { expr, negated: false, .. } => {
+            let (column_stats, row_count) = column_owner_stats(expr, plan, stats).unzip();
+            estimator::estimate_is_null_selectivity(column_stats, row_count.unwrap_or(estimator::DEFAULT_ROW_COUNT_ESTIMATE))
+        }
+        BoundExpr::IsNull { expr, negated: true, .. } => {
+            let (column_stats, row_count) = column_owner_stats(expr, plan, stats).unzip();
+            estimator::estimate_is_not_null_selectivity(column_stats, row_count.unwrap_or(estimator::DEFAULT_ROW_COUNT_ESTIMATE))
+        }
         _ => estimator::DEFAULT_INEQ_SEL,
     }
 }
@@ -1467,15 +1505,77 @@ fn comparison_selectivity(op: BinaryOperator, lhs: &BoundExpr, rhs: &BoundExpr, 
         (None, Some(value)) => (rhs, flip_comparison(op), value),
         (None, None) => return estimator::DEFAULT_INEQ_SEL,
     };
-    let column_stats = column_owner_stats(column_expr, plan, stats);
+    let (column_stats, row_count) = match column_owner_stats(column_expr, plan, stats) {
+        Some((c, rc)) => (Some(c), rc),
+        None => (None, estimator::DEFAULT_ROW_COUNT_ESTIMATE),
+    };
     match op {
-        BinaryOperator::Eq => estimator::estimate_equality_selectivity(column_stats, &value),
-        BinaryOperator::NotEq => estimator::estimate_not_selectivity(estimator::estimate_equality_selectivity(column_stats, &value)),
-        BinaryOperator::Lt => estimator::estimate_range_selectivity(column_stats, estimator::RangeOp::Lt, &value),
-        BinaryOperator::LtEq => estimator::estimate_range_selectivity(column_stats, estimator::RangeOp::Le, &value),
-        BinaryOperator::Gt => estimator::estimate_range_selectivity(column_stats, estimator::RangeOp::Gt, &value),
-        BinaryOperator::GtEq => estimator::estimate_range_selectivity(column_stats, estimator::RangeOp::Ge, &value),
+        BinaryOperator::Eq => estimator::estimate_equality_selectivity(column_stats, row_count, &value),
+        BinaryOperator::NotEq => {
+            // `<>`は`NOT(=)`と同じ「UNKNOWNを除外した補数」で見積もる
+            // (`estimator::estimate_not_selectivity`のドキュメントを参照)。
+            let eq_sel = estimator::estimate_equality_selectivity(column_stats, row_count, &value);
+            let known_fraction = known_fraction_of_comparison(column_stats, row_count, &value);
+            estimator::estimate_not_selectivity(known_fraction, eq_sel)
+        }
+        BinaryOperator::Lt => estimator::estimate_range_selectivity(column_stats, row_count, estimator::RangeOp::Lt, &value),
+        BinaryOperator::LtEq => estimator::estimate_range_selectivity(column_stats, row_count, estimator::RangeOp::Le, &value),
+        BinaryOperator::Gt => estimator::estimate_range_selectivity(column_stats, row_count, estimator::RangeOp::Gt, &value),
+        BinaryOperator::GtEq => estimator::estimate_range_selectivity(column_stats, row_count, estimator::RangeOp::Ge, &value),
         _ => estimator::DEFAULT_INEQ_SEL,
+    }
+}
+
+/// `col <op> value`という1個の比較の「被演算子が非NULLである割合」
+/// (=この比較が`UNKNOWN`にならない行の割合)。
+///
+/// `value`自身が`NULL`なら、比較は列の値によらず常に`UNKNOWN`になるため0.0。
+/// 統計が無ければ、列のNULL率が分からないぶん「常に非NULL」(1.0)とみなす。
+/// これは、統計が無いときの`estimate_equality_selectivity`等が
+/// `DEFAULT_EQ_SEL`へ素通しでフォールバックする(NULL率による割引をしない)
+/// ことと整合する。
+fn known_fraction_of_comparison(column_stats: Option<&ColumnStats>, row_count: u64, value: &Value) -> f64 {
+    if value.is_null() {
+        return 0.0;
+    }
+    match column_stats {
+        Some(c) => 1.0 - estimator::null_fraction(c.null_count, row_count),
+        None => 1.0,
+    }
+}
+
+/// `predicate`(`NOT`または`<>`の被演算子)が`UNKNOWN`にならない行の割合。
+///
+/// 3値論理では`AND`・`OR`もオペランドが`UNKNOWN`だと結果が`UNKNOWN`に
+/// なりうる(片方が確定的に`FALSE`/`TRUE`であれば結果が決まる場合を除く)。
+/// この章の推定式はすでに`AND`・`OR`を独立性の仮定で近似しており、その
+/// 近似と同じ考え方(`estimate_and_selectivity`と同じ式)で、「両方の
+/// オペランドが非UNKNOWNである割合」を見積もる。`IS [NOT] NULL`は
+/// 常に非UNKNOWNの述語(`NULL`を渡しても`TRUE`/`FALSE`のどちらかに定まる)
+/// なので1.0を返す。
+fn operand_non_null_fraction(predicate: &BoundExpr, plan: &PhysicalPlan, stats: &dyn StatsLookup) -> f64 {
+    match predicate {
+        BoundExpr::Paren { expr, .. } => operand_non_null_fraction(expr, plan, stats),
+        BoundExpr::UnaryOp { op: UnaryOperator::Not, expr, .. } => operand_non_null_fraction(expr, plan, stats),
+        BoundExpr::BinaryOp { op: BinaryOperator::And, lhs, rhs, .. }
+        | BoundExpr::BinaryOp { op: BinaryOperator::Or, lhs, rhs, .. } => estimator::estimate_and_selectivity(
+            operand_non_null_fraction(lhs, plan, stats),
+            operand_non_null_fraction(rhs, plan, stats),
+        ),
+        BoundExpr::IsNull { .. } => 1.0,
+        BoundExpr::BinaryOp { lhs, rhs, .. } => {
+            let (column_expr, value) = match (literal_value(rhs), literal_value(lhs)) {
+                (Some(value), _) => (lhs.as_ref(), value),
+                (None, Some(value)) => (rhs.as_ref(), value),
+                (None, None) => return 1.0,
+            };
+            let column_stats = column_owner_stats(column_expr, plan, stats);
+            match column_stats {
+                Some((c, row_count)) => known_fraction_of_comparison(Some(c), row_count, &value),
+                None => known_fraction_of_comparison(None, estimator::DEFAULT_ROW_COUNT_ESTIMATE, &value),
+            }
+        }
+        _ => 1.0,
     }
 }
 

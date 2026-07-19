@@ -246,8 +246,47 @@
 //! 索引メタデータと同じ理由で、テーブルは`TableId`の昇順に書き出す。この
 //! セクションを追加したことに伴い、[`CATALOG_LAYOUT_VERSION`]を`1`から`2`へ
 //! 上げてある。
+//!
+//! # 第4部レビュー対応: MCV(最頻値)の追加と、統計の意味検証
+//!
+//! `crate::statistics::ColumnStats`にMCV(最頻値、`mcv`)を追加した
+//! (`crate::statistics`モジュールの説明を参照)ことに伴い、列ごとの
+//! レコードへ`mcv`のセクションを追加する。既存の`bucket_count`・`buckets`の
+//! 直前に挿入する(`min`・`max`の直後)。
+//!
+//! ```text
+//! columns × column_count:
+//!     null_count:     u64
+//!     distinct_count: u64
+//!     min:            Value
+//!     max:            Value
+//!     mcv_count:      u16
+//!     mcv × mcv_count:
+//!         value: Value
+//!         count: u64
+//!     bucket_count:   u16
+//!     buckets × bucket_count:
+//!         lower:     Value
+//!         upper:     Value
+//!         row_count: u64
+//! ```
+//!
+//! フィールドを列の途中に挿入する以上、既存のフィールドをすべて後ろへ
+//! ずらすことになるため、[`CATALOG_LAYOUT_VERSION`]を`2`から`3`へ上げてある。
+//!
+//! この変更と合わせて、`decode_catalog`が構文的に復元した統計情報が、
+//! 対応するテーブル定義と意味的に整合しているか(列数・型が一致するか、
+//! `null_count`が`row_count`を超えていないか、バケツの境界が昇順に並んで
+//! いるか等)を検査する`validate_stats_metadata`を追加した。`decode_catalog`
+//! 自身が検出するのは、統計に紐づく`TableId`の重複だけであり、テーブル定義
+//! との整合性までは検査していなかった(このセクションの追加前から存在した
+//! 欠落)。`validate_stats_metadata`は`Storage::open`(カタログを復元する経路)
+//! と、`Storage::set_table_stats`(`ANALYZE`が新しい統計を登録する経路)の
+//! 両方から呼ぶ。検査項目の詳細は`validate_stats_metadata`のドキュメントを
+//! 参照。
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::btree::BTree;
@@ -261,9 +300,9 @@ use crate::ids::{PageId, RecordId, TableId};
 use crate::index::IndexInfo;
 use crate::page::{PAGE_PAYLOAD_SIZE, PageType};
 use crate::slotted_page::{SlotStatus, SlottedPage, SlottedPageRef, max_len_for_fresh_page};
-use crate::statistics::{Bucket, ColumnStats, TableStats};
+use crate::statistics::{Bucket, ColumnStats, HISTOGRAM_BUCKET_COUNT, MCV_MAX_ENTRIES, TableStats};
 use crate::tuple_codec::decode_tuple;
-use crate::types::{Column, DataType, Schema, Tuple, Value};
+use crate::types::{Column, DataType, Schema, Tuple, Value, compare_values};
 
 /// Catalogページの定位置。ページ0はFile Header(第11章)が占有しているため、
 /// 空いている最初の番号を使う。
@@ -401,6 +440,7 @@ impl Storage {
         drop(guard);
 
         validate_table_metadata(&decoded)?;
+        validate_stats_metadata(&decoded.tables, &decoded.stats)?;
 
         // Free Space Mapは永続化しない(モジュール冒頭の説明を参照)。カタログから
         // 復元した各ページを1回ずつ読み、意味検証(範囲・予約ページ・共有・
@@ -533,6 +573,12 @@ impl Storage {
     /// Catalogページへ永続化する(第27章)。永続化に失敗した場合は登録を
     /// 取り消す(`Self::create_table`と同じロールバックの方針)。
     pub fn set_table_stats(&mut self, table_id: TableId, stats: TableStats) -> DbResult<()> {
+        if let Err(err) = validate_one_table_stats(&self.tables, table_id, &stats) {
+            let DbError::CorruptCatalog(detail) = err else {
+                unreachable!("validate_one_table_statsは常にCorruptCatalogを返す")
+            };
+            return Err(DbError::InvalidStats(detail));
+        }
         let previous = self.stats.insert(table_id, stats);
         if let Err(err) = self.persist_catalog() {
             match previous {
@@ -1363,6 +1409,176 @@ fn validate_table_metadata(decoded: &DecodedCatalog) -> DbResult<()> {
     Ok(())
 }
 
+/// 統計情報(`crate::statistics::TableStats`)が、対応するテーブル定義と
+/// 意味的に整合しているかを検査する(第4部レビュー対応)。
+///
+/// `decode_catalog`は統計に紐づく`TableId`の重複だけを検査し、`Storage::open`が
+/// 呼ぶ`validate_table_metadata`もテーブル定義自体の整合性(名前の重複など)
+/// しか見ない。どちらも、統計情報の**中身**がテーブル定義や自分自身と矛盾して
+/// いないかは検査していなかった。この関数は`Storage::open`(カタログを復元
+/// する経路)と`Storage::set_table_stats`(`ANALYZE`が新しい統計を登録する
+/// 経路)の両方から呼び、次を検査する。
+///
+/// * 統計に紐づく`TableId`が実在するテーブルを指しているか。
+/// * 列数・列の型が、対応するテーブル定義の`Schema`と一致するか。
+/// * `null_count <= row_count`、`distinct_count <= 非NULL行数`。
+/// * MCVの件数が上限([`MCV_MAX_ENTRIES`])以下で、値が重複せず、値の型が
+///   列の型と一致し、出現回数が`0`より大きく非NULL行数以下であること。
+/// * Histogramのバケツ数が上限([`HISTOGRAM_BUCKET_COUNT`])以下で、各バケツの
+///   境界の型が列の型と一致し、`lower <= upper`であり、バケツどうしが昇順に
+///   (重ならずに)並んでいること。
+/// * MCV・Histogramの値・境界がすべて`Min`/`Max`の範囲に収まっていること。
+/// * MCVの出現回数の合計とHistogramのバケツ行数の合計を足すと、ちょうど
+///   非NULL行数(`row_count - null_count`)に一致すること
+///   (`u64`の加算オーバーフローは`checked_add`で検出する)。
+///
+/// いずれかに違反する場合は`DbError::CorruptCatalog`を返す(`Storage::open`が
+/// 復元したカタログ全体に対して呼ぶ)。`Storage::set_table_stats`は、新しく
+/// 登録しようとしている1テーブルぶんだけを検査する[`validate_one_table_stats`]
+/// を使い、違反を`DbError::InvalidStats`として返す(モジュール冒頭の説明、
+/// および`DbError::InvalidStats`のドキュメントを参照)。
+fn validate_stats_metadata(tables: &HashMap<TableId, TableEntry>, stats: &HashMap<TableId, TableStats>) -> DbResult<()> {
+    for (&table_id, table_stats) in stats {
+        validate_one_table_stats(tables, table_id, table_stats)?;
+    }
+    Ok(())
+}
+
+/// [`validate_stats_metadata`]が1テーブルぶんに対して行う検査。戻り値は常に
+/// `DbError::CorruptCatalog`で、呼び出し側([`Storage::set_table_stats`])が
+/// 必要に応じて`DbError::InvalidStats`へ読み替える。
+fn validate_one_table_stats(tables: &HashMap<TableId, TableEntry>, table_id: TableId, table_stats: &TableStats) -> DbResult<()> {
+    let entry = tables
+        .get(&table_id)
+        .ok_or_else(|| DbError::CorruptCatalog(format!("統計情報のTableId({})に対応するテーブル定義がありません", table_id.0)))?;
+    let columns = entry.info.schema.columns();
+    if table_stats.columns.len() != columns.len() {
+        return Err(DbError::CorruptCatalog(format!(
+            "TableId({})の統計情報の列数({})がテーブル定義の列数({})と一致しません",
+            table_id.0,
+            table_stats.columns.len(),
+            columns.len()
+        )));
+    }
+    for (column, column_stats) in columns.iter().zip(&table_stats.columns) {
+        validate_column_stats_metadata(table_id.0, &column.name, column.data_type, table_stats.row_count, column_stats)?;
+    }
+    Ok(())
+}
+
+/// [`validate_stats_metadata`]が列1個ぶんに対して行う検査。
+fn validate_column_stats_metadata(
+    table_id: u64,
+    column_name: &str,
+    data_type: DataType,
+    row_count: u64,
+    stats: &ColumnStats,
+) -> DbResult<()> {
+    let corrupt = |detail: String| {
+        DbError::CorruptCatalog(format!("TableId({table_id})の列'{column_name}'の統計情報が不正です: {detail}"))
+    };
+
+    if stats.null_count > row_count {
+        return Err(corrupt(format!("null_count({})がrow_count({row_count})を超えています", stats.null_count)));
+    }
+    let non_null_rows = row_count - stats.null_count;
+    if stats.distinct_count > non_null_rows {
+        return Err(corrupt(format!("distinct_count({})が非NULL行数({non_null_rows})を超えています", stats.distinct_count)));
+    }
+
+    if stats.min.is_some() != stats.max.is_some() {
+        return Err(corrupt("MinとMaxの有無が一致しません(非NULLの値が無ければ両方None、あれば両方Someのはず)".to_string()));
+    }
+    for value in stats.min.iter().chain(stats.max.iter()) {
+        if !value_matches_type(value, data_type) {
+            return Err(corrupt(format!("Min/Maxの値の型が列の型({data_type:?})と一致しません: {value:?}")));
+        }
+    }
+    if let (Some(min), Some(max)) = (&stats.min, &stats.max)
+        && compare_values(min, max) == Ordering::Greater
+    {
+        return Err(corrupt(format!("Min({min:?})がMax({max:?})より大きいです")));
+    }
+    let within_min_max = |value: &Value| -> bool {
+        match (&stats.min, &stats.max) {
+            (Some(min), Some(max)) => compare_values(value, min) != Ordering::Less && compare_values(value, max) != Ordering::Greater,
+            _ => false,
+        }
+    };
+
+    if stats.mcv.len() > MCV_MAX_ENTRIES {
+        return Err(corrupt(format!("MCVの件数({})が上限({MCV_MAX_ENTRIES})を超えています", stats.mcv.len())));
+    }
+    let mut seen_mcv_values = HashSet::new();
+    let mut mcv_row_total: u64 = 0;
+    for (value, count) in &stats.mcv {
+        if !value_matches_type(value, data_type) {
+            return Err(corrupt(format!("MCVの値の型が列の型({data_type:?})と一致しません: {value:?}")));
+        }
+        if !within_min_max(value) {
+            return Err(corrupt(format!("MCVの値がMin/Maxの範囲外です: {value:?}")));
+        }
+        if !seen_mcv_values.insert(value) {
+            return Err(corrupt(format!("MCVに同じ値が複数回出現しています: {value:?}")));
+        }
+        if *count == 0 || *count > non_null_rows {
+            return Err(corrupt(format!("MCVの出現回数({count})が非NULL行数({non_null_rows})の範囲外です")));
+        }
+        mcv_row_total =
+            mcv_row_total.checked_add(*count).ok_or_else(|| corrupt("MCVの出現回数の合計がu64の範囲を超えます".to_string()))?;
+    }
+
+    if stats.histogram.len() > HISTOGRAM_BUCKET_COUNT {
+        return Err(corrupt(format!("Histogramのバケツ数({})が上限({HISTOGRAM_BUCKET_COUNT})を超えています", stats.histogram.len())));
+    }
+    let mut histogram_row_total: u64 = 0;
+    let mut previous_upper: Option<&Value> = None;
+    for bucket in &stats.histogram {
+        if !value_matches_type(&bucket.lower, data_type) || !value_matches_type(&bucket.upper, data_type) {
+            return Err(corrupt("Histogramのバケツ境界の型が列の型と一致しません".to_string()));
+        }
+        if compare_values(&bucket.lower, &bucket.upper) == Ordering::Greater {
+            return Err(corrupt(format!("バケツのlower({:?})がupper({:?})より大きいです", bucket.lower, bucket.upper)));
+        }
+        if !within_min_max(&bucket.lower) || !within_min_max(&bucket.upper) {
+            return Err(corrupt("Histogramのバケツ境界がMin/Maxの範囲外です".to_string()));
+        }
+        if let Some(previous_upper) = previous_upper
+            && compare_values(previous_upper, &bucket.lower) == Ordering::Greater
+        {
+            return Err(corrupt("Histogramのバケツが昇順に並んでいません".to_string()));
+        }
+        if bucket.row_count == 0 {
+            return Err(corrupt("Histogramのバケツのrow_countが0です".to_string()));
+        }
+        histogram_row_total = histogram_row_total
+            .checked_add(bucket.row_count)
+            .ok_or_else(|| corrupt("Histogramのバケツのrow_countの合計がu64の範囲を超えます".to_string()))?;
+        previous_upper = Some(&bucket.upper);
+    }
+
+    let total_non_null = mcv_row_total
+        .checked_add(histogram_row_total)
+        .ok_or_else(|| corrupt("MCVとHistogramの行数合計がu64の範囲を超えます".to_string()))?;
+    if total_non_null != non_null_rows {
+        return Err(corrupt(format!(
+            "MCVとHistogramの行数合計({total_non_null})が非NULL行数({non_null_rows})と一致しません"
+        )));
+    }
+
+    Ok(())
+}
+
+/// `value`が`data_type`の列に収まる型かどうか。`Value::Null`はここには渡って
+/// こない前提(`Min`/`Max`は`None`で「値が無い」を表し、MCV・Histogramの
+/// 境界は非NULL値だけを持つ)なので、`Value::Null`は常に不一致として扱う。
+fn value_matches_type(value: &Value, data_type: DataType) -> bool {
+    matches!(
+        (value, data_type),
+        (Value::Boolean(_), DataType::Boolean) | (Value::BigInt(_), DataType::BigInt) | (Value::Text(_), DataType::Text)
+    )
+}
+
 /// `crate::btree::DbError::BTreeUniqueViolation`(列名を持たない、B+Tree自身の
 /// エラー)を、`primary_key`に応じて第20章の`DbError::PrimaryKeyViolation`・
 /// `DbError::UniqueViolation`(列名・値つき)へ翻訳する(第24章)。
@@ -1439,7 +1655,7 @@ const CATALOG_MAGIC: [u8; 8] = *b"MDBCTLG1";
 /// まま「たまたま妥当に見える値」を受理してしまう危険がある
 /// (`is_constraint`フィールドを追加した際に実際に起きた不具合)。
 /// 第27章で統計情報セクションを追加した際、`1`から`2`へ上げた。
-const CATALOG_LAYOUT_VERSION: u32 = 2;
+const CATALOG_LAYOUT_VERSION: u32 = 3;
 
 /// `decode_catalog`が返す、Catalogページから復元した状態。
 struct DecodedCatalog {
@@ -1535,6 +1751,11 @@ fn encode_catalog(
             out.extend_from_slice(&column.distinct_count.to_le_bytes());
             encode_optional_value(&column.min, &mut out);
             encode_optional_value(&column.max, &mut out);
+            out.extend_from_slice(&(column.mcv.len() as u16).to_le_bytes());
+            for (value, count) in &column.mcv {
+                encode_value(value, &mut out);
+                out.extend_from_slice(&count.to_le_bytes());
+            }
             out.extend_from_slice(&(column.histogram.len() as u16).to_le_bytes());
             for bucket in &column.histogram {
                 encode_value(&bucket.lower, &mut out);
@@ -1706,6 +1927,13 @@ fn decode_catalog(bytes: &[u8]) -> DbResult<DecodedCatalog> {
             let distinct_count = take_u64(&mut cursor, "統計のdistinct_count")?;
             let min = decode_optional_value(&mut cursor)?;
             let max = decode_optional_value(&mut cursor)?;
+            let mcv_count = take_u16(&mut cursor, "統計のmcv_count")? as usize;
+            let mut mcv = Vec::new();
+            for _ in 0..mcv_count {
+                let value = decode_value(&mut cursor)?;
+                let count = take_u64(&mut cursor, "統計のmcvのcount")?;
+                mcv.push((value, count));
+            }
             let bucket_count = take_u16(&mut cursor, "統計のbucket_count")? as usize;
             let mut histogram = Vec::new();
             for _ in 0..bucket_count {
@@ -1714,7 +1942,7 @@ fn decode_catalog(bytes: &[u8]) -> DbResult<DecodedCatalog> {
                 let bucket_row_count = take_u64(&mut cursor, "統計のバケツのrow_count")?;
                 histogram.push(Bucket { lower, upper, row_count: bucket_row_count });
             }
-            columns.push(ColumnStats { null_count, distinct_count, min, max, histogram });
+            columns.push(ColumnStats { null_count, distinct_count, min, max, mcv, histogram });
         }
         if stats.insert(table_id, TableStats { row_count, columns }).is_some() {
             return Err(DbError::CorruptCatalog(format!("TableId({})の統計情報が複数回出現しています", table_id.0)));
@@ -1972,6 +2200,211 @@ mod tests {
         let err = expect_err(Storage::open(&path));
         assert!(matches!(err, DbError::CorruptCatalog(_)));
 
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // validate_stats_metadata(第4部レビュー対応)
+    // ------------------------------------------------------------------
+
+    fn one_bigint_schema() -> Schema {
+        Schema::new(vec![Column::new("v", DataType::BigInt, true)])
+    }
+
+    /// テストが違反させたい1点だけを変えられる、境界値として妥当な
+    /// `ColumnStats`(100行、うち10行が非NULLで0〜9の1回ずつ、10バケツ)。
+    fn valid_column_stats() -> ColumnStats {
+        ColumnStats {
+            null_count: 90,
+            distinct_count: 10,
+            min: Some(Value::BigInt(0)),
+            max: Some(Value::BigInt(9)),
+            mcv: Vec::new(),
+            histogram: (0..10).map(|v| Bucket { lower: Value::BigInt(v), upper: Value::BigInt(v), row_count: 1 }).collect(),
+        }
+    }
+
+    fn valid_table_stats() -> TableStats {
+        TableStats { row_count: 100, columns: vec![valid_column_stats()] }
+    }
+
+    #[test]
+    fn set_table_stats_accepts_a_boundary_valid_column() {
+        let path = temp_path("stats-valid");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        storage.set_table_stats(table_id, valid_table_stats()).unwrap();
+        assert_eq!(storage.table_stats(table_id).unwrap().row_count, 100);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_table_stats_rejects_an_unknown_table_id() {
+        let path = temp_path("stats-unknown-table");
+        let mut storage = Storage::create(&path).unwrap();
+        let err = expect_err(storage.set_table_stats(TableId(999), valid_table_stats()));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_table_stats_rejects_a_column_count_mismatch() {
+        let path = temp_path("stats-column-count");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        let stats = TableStats { row_count: 100, columns: vec![valid_column_stats(), valid_column_stats()] };
+        let err = expect_err(storage.set_table_stats(table_id, stats));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_table_stats_rejects_null_count_exceeding_row_count() {
+        let path = temp_path("stats-null-count");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        let mut column = valid_column_stats();
+        column.null_count = 101; // row_count(100)を超える
+        let stats = TableStats { row_count: 100, columns: vec![column] };
+        let err = expect_err(storage.set_table_stats(table_id, stats));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_table_stats_rejects_distinct_count_exceeding_non_null_rows() {
+        let path = temp_path("stats-distinct-count");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        let mut column = valid_column_stats();
+        column.distinct_count = 11; // 非NULL行数(10)を超える
+        let stats = TableStats { row_count: 100, columns: vec![column] };
+        let err = expect_err(storage.set_table_stats(table_id, stats));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_table_stats_rejects_min_greater_than_max() {
+        let path = temp_path("stats-min-max");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        let mut column = valid_column_stats();
+        column.min = Some(Value::BigInt(9));
+        column.max = Some(Value::BigInt(0));
+        let stats = TableStats { row_count: 100, columns: vec![column] };
+        let err = expect_err(storage.set_table_stats(table_id, stats));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_table_stats_rejects_a_column_type_mismatch_in_min_max() {
+        let path = temp_path("stats-type-mismatch");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        let mut column = valid_column_stats();
+        column.min = Some(Value::Text("0".to_string())); // 列の型はBIGINT
+        let stats = TableStats { row_count: 100, columns: vec![column] };
+        let err = expect_err(storage.set_table_stats(table_id, stats));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_table_stats_rejects_a_bucket_count_above_the_limit() {
+        let path = temp_path("stats-bucket-limit");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        let mut column = valid_column_stats();
+        column.histogram.push(Bucket { lower: Value::BigInt(9), upper: Value::BigInt(9), row_count: 0 });
+        // 11バケツはHISTOGRAM_BUCKET_COUNT(10)を超える。
+        let stats = TableStats { row_count: 100, columns: vec![column] };
+        let err = expect_err(storage.set_table_stats(table_id, stats));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_table_stats_rejects_histogram_buckets_out_of_order() {
+        let path = temp_path("stats-bucket-order");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        let mut column = valid_column_stats();
+        column.histogram.swap(0, 1); // バケツの並びが昇順でなくなる
+        let stats = TableStats { row_count: 100, columns: vec![column] };
+        let err = expect_err(storage.set_table_stats(table_id, stats));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_table_stats_rejects_a_bucket_row_count_sum_mismatch() {
+        let path = temp_path("stats-bucket-sum");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        let mut column = valid_column_stats();
+        column.histogram[0].row_count = 2; // 合計が非NULL行数(10)と合わなくなる
+        let stats = TableStats { row_count: 100, columns: vec![column] };
+        let err = expect_err(storage.set_table_stats(table_id, stats));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_table_stats_rejects_too_many_mcv_entries() {
+        let path = temp_path("stats-mcv-limit");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        let mut column = valid_column_stats();
+        column.mcv = (0..=MCV_MAX_ENTRIES as i64).map(|v| (Value::BigInt(v), 1)).collect(); // 11件
+        column.histogram = Vec::new();
+        let stats = TableStats { row_count: 100, columns: vec![column] };
+        let err = expect_err(storage.set_table_stats(table_id, stats));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_table_stats_rejects_a_duplicate_mcv_value() {
+        let path = temp_path("stats-mcv-duplicate");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        let mut column = valid_column_stats();
+        column.mcv = vec![(Value::BigInt(0), 5), (Value::BigInt(0), 3)];
+        column.histogram = vec![Bucket { lower: Value::BigInt(1), upper: Value::BigInt(9), row_count: 2 }];
+        let stats = TableStats { row_count: 100, columns: vec![column] };
+        let err = expect_err(storage.set_table_stats(table_id, stats));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn open_rejects_a_catalog_whose_stats_reference_a_missing_table() {
+        // set_table_statsは常にvalidate_one_table_statsを通すため、この不整合は
+        // Storage::openの経路(encode_catalog/decode_catalogを直接使う)でしか
+        // 再現できない。テーブルを作らずに、統計だけを持つカタログのバイト列を
+        // 直接組み立て、`a_structurally_valid_but_nonsensical_catalog_is_rejected_as_corrupt`
+        // と同じ手順でCatalogページへ書き込む。
+        let path = temp_path("stats-open-missing-table");
+        Storage::create(&path).unwrap();
+
+        let mut stats = HashMap::new();
+        stats.insert(TableId(0), valid_table_stats());
+        let encoded = encode_catalog(1, &HashMap::new(), &[], &[], &stats);
+        let mut payload = vec![0u8; PAGE_PAYLOAD_SIZE];
+        payload[..encoded.len()].copy_from_slice(&encoded);
+
+        let mut page = Page::new(CATALOG_PAGE_ID, PageType::Catalog);
+        page.payload_mut().copy_from_slice(&payload);
+        let bytes = page.encode();
+
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        file.write_all(&bytes).unwrap();
+
+        let err = expect_err(Storage::open(&path));
+        assert!(matches!(err, DbError::CorruptCatalog(_)), "err={err:?}");
         std::fs::remove_file(&path).unwrap();
     }
 

@@ -319,13 +319,12 @@ DPの状態を(コスト, 順序)の組へ増やす実装の複雑さは、こ�
 ## この章の限界: Range Index Scanはまだこの最適化の主役になれない
 
 第28章はすでに、Range Index Scanが実務でどれだけ弱いかを明らかにしていました。
-Histogramのバケツ数は固定`10`個で、境界をまたぐ範囲述語の一致行数は最良でも「バケツ1個ぶん(全体の約10%)」の粒度でしか見積もれません。
-この章のコスト定数(`SEQ_PAGE_COST = 1`、`RANDOM_PAGE_COST = 4`、`CPU_TUPLE_COST = 0.01`、`DEFAULT_ROWS_PER_PAGE = 50`)のもとでは、Range Index Scanが`SeqScan`+`Filter`より安くなるには、見積もり選択率がおよそ1%を下回る必要があります。
-バケツ1個ぶんという10%の下限は、その基準の10倍粗いままです。
+BIGINT列の境界をまたぐ範囲述語は、第4部レビュー対応で線形補間(値がバケツの区間内のどこにあるかを按分する見積もり、第27章)を使うようになったため、値がほぼ一様に分布していれば「バケツ1個ぶん(約10%)」という下限にはもう縛られません。
+それでも、1つのバケツの中身が実際には偏っている(両端に集中している、一部の値だけ極端に多いなど)分布では、線形補間が置いている「バケツの区間内で値は一様に分布している」という前提そのものが崩れ、粗い見積もりが残ります(第28章「この章の限界」)。
 
-つまり、`sort_is_already_satisfied`が実際に`Sort`を省く場面(`cheapest`がRange Index Scanを実際に選んだ場面)は、この教材のコストモデルが現状のままである限り、ほとんど訪れません。
-`output_ordering`と`sort_is_already_satisfied`という仕組みそのものは、`PhysicalPlan`を直接組み立てるテスト(`physical_plan`モジュールの`output_ordering_range_index_scan_returns_the_scanned_column`ほか)で検証済みですが、`ANALYZE`済みの実データから`EXPLAIN`だけでこの効果を再現するのは、この章の時点ではまだ難しいということです。
-Bitmap Index Scan(第28章の演習課題)やより細かいHistogramが加われば、Range Index Scanが選ばれる場面自体が増え、この章のSort省略もそれに応じて働き始めます。
+つまり、`sort_is_already_satisfied`が実際に`Sort`を省く場面(`cheapest`がRange Index Scanを実際に選んだ場面)は、値がほぼ一様に分布する列に対する十分選択的な範囲述語であれば起こりえますが、バケツ内の分布が偏った列では、この教材のコストモデルが現状のままである限り、依然として訪れにくいままです。
+`output_ordering`と`sort_is_already_satisfied`という仕組みそのものは、`PhysicalPlan`を直接組み立てるテスト(`physical_plan`モジュールの`output_ordering_range_index_scan_returns_the_scanned_column`ほか)で検証済みです。
+Bitmap Index Scan(第28章の演習課題)が加われば、バケツ内の分布が偏った列でもRange Index Scanが選ばれる場面が増え、この章のSort省略もそれに応じて働き始めます。
 
 ## 測って確認する: 構文順とDPが選ぶ順序のコスト比較
 
@@ -382,4 +381,4 @@ minidbは、統計情報とコストモデルに基づいて、Scan方式やJoin
 
 1. この章のDPは部分集合ごとにコスト最小の1個しか覚えません。「Physical Properties」の節で触れたとおり、教科書的なInteresting Order DPは(コスト, 出力順序)の組ごとにPareto最適な複数の計画を覚えます。単一列、昇順の順序に限定してよいので、DPの状態を`HashMap<(u32, Option<usize>), DpEntry>`のように順序込みに拡張し、`ORDER BY`を伴うクエリで、単独では最安でない計画が全体としては選ばれる例を作ってください。
 2. `optimize_join_order`は`ON`条件のうち、ちょうど2個のテーブルを参照する項だけをJoin Graphの辺にし、3個以上のテーブルを参照する項は`residual`として最後にまとめて`Filter`で適用します。3個以上のテーブルにまたがる`ON`条件(`a.x + b.y = c.z`のような式)を、DPの拡張ステップに組み込む(その式が参照する全テーブルが揃った時点で評価する)よう設計を変更し、Join Graphを「辺」ではなく「ハイパーエッジ」として扱う実装を検討してください。
-3. 「この章の限界」で見たとおり、この章のコストモデルではRange Index Scanがほとんど選ばれず、Sort省略の効果を`EXPLAIN`で自然に再現するのが難しい状態です。第28章の発展課題であるBitmap Index Scanを実装したうえで、`ORDER BY`を伴う範囲述語のクエリで実際に`Sort`が省略される場面を`EXPLAIN`で再現してください。
+3. 「この章の限界」で見たとおり、バケツ内の分布が偏った列ではRange Index Scanが選ばれにくく、Sort省略の効果を`EXPLAIN`で自然に再現するのが難しいままです。第28章の発展課題であるBitmap Index Scanを実装したうえで、バケツ内の分布が偏った列に対する`ORDER BY`を伴う範囲述語のクエリで実際に`Sort`が省略される場面を`EXPLAIN`で再現してください。

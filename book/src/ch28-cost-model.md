@@ -419,26 +419,29 @@ Projection(customers.name, orders.item) rows=5000 cost=197.10
 
 ## この章の限界: Bitmap ScanがまだIndex Range Scanを補っていない
 
-コストベースの選択には副作用もあります。範囲述語(`amount >= 100 AND amount <= 200`)に対して`EXPLAIN`を取ってみます。
+コストベースの選択には副作用もあります。`amount`が2つの値(`1000`と`2000`)にだけ集中し、残りが`[0, 899]`と`[2001, 4000]`へ均等に散らばる5,000行のテーブルを作り、その間([1400, 1600])を範囲述語で問い合わせます。
 
 ```console
 minidb> CREATE INDEX idx_amount ON orders (amount);
 CREATE INDEX
-minidb> -- amountが10刻みで0から49990まで分布する5,000行を挿入
+minidb> -- amountの大半(4,500行)は[0, 899]と[2001, 4000]に均等分布し、
+minidb> -- 500行だけが1000(250行)と2000(250行)の2値に集中する
 minidb> ANALYZE orders;
 ANALYZE 1
-minidb> EXPLAIN SELECT id FROM orders WHERE amount >= 100 AND amount <= 200;
+minidb> EXPLAIN ANALYZE SELECT id FROM orders WHERE amount >= 1400 AND amount <= 1600;
 QUERY PLAN
 ----------
-Projection(id) rows=238 cost=148.38
-  └─ Filter(amount >= 100 AND amount <= 200) rows=238 cost=146.00
-    └─ SeqScan(orders) rows=5000 cost=96.00
+Projection(id) rows=1288 cost=158.88 actual=0
+  └─ Filter(amount >= 1400 AND amount <= 1600) rows=1288 cost=146.00 actual=0
+    └─ SeqScan(orders) rows=5000 cost=96.00 actual=5000
 (3 rows)
 ```
 
-`idx_amount`という索引が存在するのに、選ばれたのはSeqScanです。実際に一致する行はわずか11件(全体の0.2%)ですが、見積もりは238行まで膨らんでいます。原因は第27章のHistogramの粒度にあります。`HISTOGRAM_BUCKET_COUNT`は固定10個で、バケツの境界をまたぐ範囲述語の一致行数は最良でも「バケツ1個ぶん(全体の約10%)」の粒度でしか見積もれません。
+`amount`が`1000`と`2000`しか取らない以上、`[1400, 1600]`に実際に一致する行は`actual=0`件です。それでも見積もりは`rows=1288`(全体の26%)まで膨らみ、`idx_amount`という索引が存在するのに選ばれたのはSeqScanでした。
 
-`index_scan_cost`は一致行数1件ごとに`RANDOM_PAGE_COST`(Heapページへの`Storage::get`)を払う式である以上、10%程度の一致行数を見積もられたIndex Range Scanは、`SeqScan`の1ページあたりのコストに到底かないません。これは見積もりの粗さだけの問題ではなく、この教材の実装が抱える正直な限界です。実務のRDBMSは、一致する`RecordId`を先にページ順へソートしてからHeapを読む**Bitmap Index Scan**(PostgreSQLにもある方式)を持ち、ランダムアクセスの回数そのものを減らします。この章はBitmap Scanを実装しないため、範囲述語はよほど選択的でない限りSeqScanのままになります。
+原因は、第4部レビュー対応で`bucket_overlap_fraction`(第27章、`crate::estimator`)がBIGINTに対して行うようになった線形補間の前提にあります。この補間は「バケツの`[lower, upper]`区間の中で値が一様に分布している」と仮定して区間内の位置から按分します。`1000`と`2000`という2つの値だけが、ソート順で連続する1つのバケツ(`[1000, 2000]`、500行)に押し込まれているこの分布では、区間の中身は実際には両端に偏っており、中央付近(`1400`〜`1600`)にはそもそも1行もありません。バケツの境界(`lower`と`upper`)だけを見て「区間内は一様」と仮定する限り、この偏りは見積もりに反映しようがありません。
+
+`index_scan_cost`は一致行数1件ごとに`RANDOM_PAGE_COST`(Heapページへの`Storage::get`)を払う式である以上、26%程度の一致行数を見積もられたIndex Range Scanは、`SeqScan`の1ページあたりのコストに到底かないません。これは見積もりの粗さだけの問題ではなく、この教材の実装が抱える正直な限界です。実務のRDBMSは、一致する`RecordId`を先にページ順へソートしてからHeapを読む**Bitmap Index Scan**(PostgreSQLにもある方式)を持ち、ランダムアクセスの回数そのものを減らします。この章はBitmap Scanを実装しないため、範囲述語はよほど選択的でない限りSeqScanのままになります。
 
 ## 到達点
 
@@ -455,10 +458,10 @@ Projection(id) rows=238 cost=148.38
 1. `cost_model::DEFAULT_ROWS_PER_PAGE`と`DEFAULT_INDEX_HEIGHT`は、`Backend::Memory`や統計の無いテーブルに対して使われるフォールバック定数です。`Database::memory`で作ったテーブルに対して`EXPLAIN`を実行し、`cost=`がこのフォールバック値からどう計算されているかを、`seq_scan_cost`と`index_scan_cost`の式を手で辿って確認してください。
 2. 本文の「密な結合」の例は`customer_id`の値域を`customers`の総数に絞ることで作りました。値域を`customers`の総数の2倍、5倍、10倍…と徐々に広げていき、`EXPLAIN`が選ぶプランがHash JoinからIndex Nested Loop Joinへ切り替わる境界がどのあたりにあるかを実測してください。
 3. `cost_model.rs`の`plan_cost`は`Limit`のコストを常に0(子のコストをそのまま返す)として扱っています。これは`LIMIT 5`のような句が、実際には`SeqScan`の全行を読み切る前に止まる場合があることを無視した単純化です。`Limit`の子が`SeqScan`のときに限り、`limit`件を読むために必要な推定ページ数だけのコストにする(全ページを読む前提のコストより小さくする)よう`plan_cost`を改良し、その前後で`EXPLAIN`の`cost=`がどう変わるかをテストで確認してください。
-4. 「この章の限界」で見たとおり、Range Index Scanは`SeqScan`にほとんど勝てません。`estimate_range_selectivity`(第27章)がバケツの端をまたぐ範囲を一律0.5で見積もっている点を、バケツの区間幅と定数の位置から線形補間する(数値型に限る)より精密な見積もりへ改善し、`EXPLAIN`の`cost=`と実際に一致する行数がどれだけ近づくかを確認してください。
+4. 「この章の限界」で見たとおり、線形補間は「バケツの区間内で値が一様に分布している」という仮定に立っており、この仮定が崩れる分布(1つのバケツの中身が両端に偏っているなど)では過大評価が残ります。`HISTOGRAM_BUCKET_COUNT`(第27章)を増やしてバケツを細かくすると、この種の偏りに対する見積もり誤差がどこまで縮むかを実測してください。
 
 ### 発展課題
 
-1. この章はBitmap Index Scanを実装しません。索引から得た`RecordId`をあらかじめHeapページ順にソートしてからHeapを読む`BitmapIndexScanNode`を設計し、そのコスト式(一致行数ではなく、一致行が散らばっている異なるページ数に比例するコスト)を`cost_model.rs`に追加してください。「この章の限界」で見た`amount >= 100 AND amount <= 200`のような範囲述語で、Bitmap Index ScanがSeqScanより安くなる場合があるかを確認してください。
+1. この章はBitmap Index Scanを実装しません。索引から得た`RecordId`をあらかじめHeapページ順にソートしてからHeapを読む`BitmapIndexScanNode`を設計し、そのコスト式(一致行数ではなく、一致行が散らばっている異なるページ数に比例するコスト)を`cost_model.rs`に追加してください。「この章の限界」で見た`amount >= 1400 AND amount <= 1600`のような範囲述語で、Bitmap Index ScanがSeqScanより安くなる場合があるかを確認してください。
 2. `choose_join_plan`は等値結合の鍵が取り出せた場合、`HashJoin`と`IndexNestedLoopJoin`だけを候補にし、`NestedLoopJoin`を候補から外しています。実務のRDBMSでは、内側テーブルが極端に小さい場合(数行程度)、`NestedLoopJoin`が索引の`lookup`コストすら不要な分だけ有利になることがあります。`NestedLoopJoin`も候補に加え、3つの候補からコスト最小を選ぶよう`choose_join_plan`を拡張し、内側テーブルの行数を変えながらどちらが選ばれるかを観察してください。
 3. `cost_model::Cost`は`PartialOrd`だけを持ち、`Ord`は実装していません(`f64`がNaNを持ちうるため)。`cheapest`は`partial_cmp`の`None`を`expect`でpanicに倒すことでこの問題を回避していますが、より安全な設計として、コストが不正な値(NaN、無限大)になりえないことを型で保証する`Cost`の代替実装(例えば固定小数点、あるいは`NonNan`のような検証済みラッパー)を検討し、実装してください。

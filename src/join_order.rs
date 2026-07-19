@@ -567,7 +567,7 @@ mod tests {
     }
 
     fn column_stats(distinct_count: u64) -> ColumnStats {
-        ColumnStats { distinct_count, null_count: 0, min: None, max: None, histogram: Vec::new() }
+        ColumnStats { distinct_count, null_count: 0, min: None, max: None, mcv: Vec::new(), histogram: Vec::new() }
     }
 
     /// `A`(5行)・`B`(5000行)・`C`(5000行)の統計。`b.a_id`のNDV(1000)は
@@ -751,4 +751,3 @@ mod tests {
         assert_eq!(physical_plan::estimate_rows(&physical, &NoStats), DEFAULT_ROW_COUNT_ESTIMATE);
     }
 }
-

@@ -108,6 +108,17 @@ pub enum DbError {
     #[error("破損したカタログです: {0}")]
     CorruptCatalog(String),
 
+    /// `Storage::set_table_stats`(第27章の`ANALYZE`が呼ぶ)に渡された
+    /// `TableStats`が、対応するテーブル定義や自分自身と意味的に矛盾している
+    /// エラー(第4部レビュー対応)。`CorruptCatalog`と検査項目は同じ
+    /// (`validate_stats_metadata`を共有する)だが、こちらは**ディスク上の
+    /// データが壊れている**ことを表す`CorruptCatalog`とは異なり、**これから
+    /// 書き込もうとした入力そのもの**が不正であることを表す。呼び出し側
+    /// (`Database::execute_analyze`)はこの入力検証エラーを、壊れたファイルの
+    /// 復旧が必要な`CorruptCatalog`と区別できる。
+    #[error("統計情報が不正です: {0}")]
+    InvalidStats(String),
+
     /// `Storage`のカタログ(テーブル定義・Free Page List)をエンコードした結果が
     /// Catalogページ1枚(`PAGE_PAYLOAD_SIZE`バイト)に収まらないエラー。
     #[error("カタログがページに収まりません: {0}バイト(上限{1}バイト)")]

@@ -2249,15 +2249,21 @@ mod tests {
                  GROUP BY dept HAVING COUNT(*) > 1 ORDER BY dept LIMIT 5",
             )
             .unwrap();
+        // 統計未収集(ANALYZE未実行)の`amount IS NOT NULL`は、第4部レビュー
+        // 対応前は`IS NOT NULL`を専用に推定せず、既定の不等号選択率
+        // (1/3)へフォールバックしていた。今は`IS NOT NULL`を明示的に見積もり、
+        // 統計が無いときは「NULLは稀だろう」という既定の等値選択率
+        // (`DEFAULT_EQ_SEL`=0.005)をNULL率の代わりに使う(`estimator`モジュールの
+        // 説明を参照)ため、rows=995(1000×(1-0.005))になる。
         assert_eq!(
             result.to_string(),
             "QUERY PLAN\n----------\n\
-             Limit(limit=5) rows=5 cost=55.31\n  \
-             └─ Sort(dept ASC) rows=111 cost=55.31\n    \
-             └─ Projection(dept, COUNT(*)) rows=111 cost=47.77\n      \
-             └─ Filter(COUNT(*) > 1) rows=111 cost=46.66\n        \
-             └─ Aggregate(group_by=[dept], calls=[COUNT(*)]) rows=333 cost=43.33\n          \
-             └─ Filter(amount IS NOT NULL) rows=333 cost=40.00\n            \
+             Limit(limit=5) rows=5 cost=91.03\n  \
+             └─ Sort(dept ASC) rows=332 cost=91.03\n    \
+             └─ Projection(dept, COUNT(*)) rows=332 cost=63.22\n      \
+             └─ Filter(COUNT(*) > 1) rows=332 cost=59.90\n        \
+             └─ Aggregate(group_by=[dept], calls=[COUNT(*)]) rows=995 cost=49.95\n          \
+             └─ Filter(amount IS NOT NULL) rows=995 cost=40.00\n            \
              └─ SeqScan(orders) rows=1000 cost=30.00\n\
              (7 rows)"
         );
@@ -2945,38 +2951,65 @@ mod tests {
     /// 第25章の`choose_access_path`は、Range述語を見つければ常にRange Index
     /// Scanを選んでいた。第28章のコストベース選択では、事情が変わる。
     ///
-    /// `crate::estimator`のHistogramは[`crate::statistics::HISTOGRAM_BUCKET_COUNT`]
-    /// (固定10個)のバケツしか持たないため、バケツの境界をまたぐ範囲述語の
-    /// 一致行数は最良でも「バケツ1個ぶん(全体の約10%)」の粒度でしか
-    /// 見積もれない。`cost_model::index_scan_cost`は一致行数1件ごとに
-    /// `RANDOM_PAGE_COST`(Heapページの`Storage::get`、第25章)を払うため、
-    /// 10%程度の一致行数では、その合計コストが`SeqScan`(1ページあたり
-    /// `SEQ_PAGE_COST`)を大きく上回ってしまう。これは索引付きBitmap Scan
-    /// (一致するRecordIdを先にページ順へソートしてからHeapを読む、
-    /// PostgreSQLにもある方式)を持たないこの教材の実装が抱える、正直な
-    /// 限界である。この章はBitmap Scanを実装しない(章末の演習課題に譲る)ため、
-    /// 範囲述語はよほど選択的でない限りSeqScanのままになる。
+    /// 第4部レビュー対応で`bucket_overlap_fraction`(`crate::estimator`)が
+    /// BIGINTに対して本物の線形補間を行うようになったため、バケツの境界を
+    /// またぐだけの範囲述語(値が一様に近く分布している場合)はもう「バケツ
+    /// 1個ぶん」まで過大評価されない。それでも残る限界は、線形補間自体が
+    /// 「バケツの`[lower, upper]`区間内で値が一様に分布している」という
+    /// 仮定に立っていることである。この仮定は、1つのバケツの中身が実際には
+    /// 両端に偏って分布している(中間がほとんど空)ような分布では崩れる。
+    /// この章はBitmap Index Scan(索引で得た`RecordId`を先にページ順へ
+    /// ソートしてからHeapを読む、PostgreSQLにもある方式。章末の演習課題)を
+    /// 持たないため、線形補間が過大評価する範囲述語はSeqScanのままになる。
     #[test]
-    fn range_predicate_prefers_seq_scan_when_the_range_is_not_selective_enough() {
+    fn range_predicate_prefers_seq_scan_when_the_bucket_interior_is_not_uniform() {
         let path = temp_db_path("index-scan-range");
         let mut db = orders_disk_db(&path);
         db.execute("CREATE INDEX idx_amount ON orders (amount)").unwrap();
-        insert_many_orders(&mut db, 5000);
 
-        // 11行(0.22%)しか一致しない狭い範囲でも、Histogramのバケツ粒度
-        // (10%刻み)のせいで一致行数の見積もりは1バケツぶん(約500行)まで
-        // 膨らみ、SeqScanの方が安く見積もられる。
+        // 5000行(バケツ10個、1バケツ=500行)を仕込む。うち500行だけ、
+        // ソート順で連続する1つのバケツにちょうど収まるよう`amount`を
+        // 1000(250行)と2000(250行)の2値だけに集中させ、残りの4500行は
+        // その外側([0,899]と[2001,4000])に均等に散らばせる。この結果、
+        // 1つのバケツが`[1000, 2000]`という区間を持ちながら、実際の値は
+        // 区間の両端に偏り、中間(1400〜1600)には1行も無い。
+        let mut rows: Vec<String> = Vec::new();
+        for i in 0..2500i64 {
+            let amount = i * 900 / 2500; // [0, 899]
+            rows.push(format!("({i}, {amount}, 'name{i}')"));
+        }
+        for i in 0..250i64 {
+            let id = 2500 + i;
+            rows.push(format!("({id}, 1000, 'name{id}')"));
+        }
+        for i in 0..250i64 {
+            let id = 2750 + i;
+            rows.push(format!("({id}, 2000, 'name{id}')"));
+        }
+        for i in 0..2000i64 {
+            let id = 3000 + i;
+            let amount = 2001 + i; // [2001, 4000]
+            rows.push(format!("({id}, {amount}, 'name{id}')"));
+        }
+        db.execute(&format!("INSERT INTO orders VALUES {}", rows.join(", "))).unwrap();
+        db.execute("ANALYZE orders").unwrap();
+
+        // `amount`が1000か2000の行しか無いため、[1400, 1600]に実際に
+        // 一致する行は無い(actual=0)。それでも線形補間は、バケツ
+        // `[1000, 2000]`の中で値が一様に分布していると仮定するため、
+        // バケツの中央付近を相応の行数(0行ではない)があるものとして見積もる。
         let plan = db
-            .execute("EXPLAIN SELECT id FROM orders WHERE amount >= 100 AND amount <= 200")
+            .execute("EXPLAIN ANALYZE SELECT id FROM orders WHERE amount >= 1400 AND amount <= 1600")
             .unwrap()
             .to_string();
         assert!(plan.contains("SeqScan(orders)"), "plan={plan}");
-        assert!(plan.contains("Filter(amount >= 100 AND amount <= 200)"), "plan={plan}");
+        assert!(plan.contains("Filter(amount >= 1400 AND amount <= 1600)"), "plan={plan}");
+        assert!(plan.contains("actual=0"), "実際に一致する行は無いはず: plan={plan}");
+        assert!(!plan.contains("rows=0 "), "見積もりは0行ではないはず(過大評価が残っている): plan={plan}");
 
-        // 選ばれたアクセスパスが変わっても、結果の行集合は変わらない。
-        let result = db.execute("SELECT id FROM orders WHERE amount >= 100 AND amount <= 200 ORDER BY id").unwrap();
-        let ids: Vec<Value> = result.rows().iter().map(|row| row.values()[0].clone()).collect();
-        assert_eq!(ids, vec![Value::BigInt(10), Value::BigInt(11), Value::BigInt(12), Value::BigInt(13), Value::BigInt(14), Value::BigInt(15), Value::BigInt(16), Value::BigInt(17), Value::BigInt(18), Value::BigInt(19), Value::BigInt(20)]);
+        // 選ばれたアクセスパスが変わっても、結果の行集合は空のまま変わらない。
+        let result = db.execute("SELECT id FROM orders WHERE amount >= 1400 AND amount <= 1600").unwrap();
+        assert!(result.rows().is_empty());
 
         remove_db_and_indexes(&path, &["idx_amount"]);
     }
@@ -3507,6 +3540,117 @@ mod tests {
         assert_eq!(result.rows().len(), 1);
     }
 
+    // ------------------------------------------------------------------
+    // NULLを含む列の選択率推定(第4部レビュー対応、codexの再現ケース)
+    // ------------------------------------------------------------------
+
+    /// 100行のうち90行が`v IS NULL`、残り10行が`v`=0〜9(各1回)という、
+    /// codexレビューが指摘した再現ケースと同じ分布のテーブルを作る。
+    fn null_heavy_table() -> Database {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE t (v BIGINT)").unwrap();
+        let mut rows: Vec<String> = (0..10).map(|v| format!("({v})")).collect();
+        rows.extend(std::iter::repeat_n("(NULL)".to_string(), 90));
+        db.execute(&format!("INSERT INTO t VALUES {}", rows.join(", "))).unwrap();
+        db.execute("ANALYZE t").unwrap();
+        db
+    }
+
+    /// `line`(`explain_lines`の1要素)から`rows=`・`actual=`の数値を取り出す。
+    fn parse_rows_and_actual(line: &str) -> (u64, u64) {
+        let rows = line
+            .split("rows=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("rows=を読めません: {line}"));
+        let actual = line
+            .split("actual=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("actual=を読めません: {line}"));
+        (rows, actual)
+    }
+
+    #[test]
+    fn null_aware_equality_matches_the_actual_row_count() {
+        // v=0: 非NULL率(10/100)×非NULL内での一致割合(1/10)=0.01→1行。
+        let mut db = null_heavy_table();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT v FROM t WHERE v = 0");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (1, 1), "line={}", lines[0]);
+    }
+
+    #[test]
+    fn null_aware_not_equal_excludes_unknown_rows_from_the_complement() {
+        // v<>0: 90行のNULLは比較がUNKNOWNになり、TRUEとしては数えない。
+        // 非NULL率(0.1)からv=0の選択率(0.01)を引いた0.09→9行。
+        let mut db = null_heavy_table();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT v FROM t WHERE v <> 0");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (9, 9), "line={}", lines[0]);
+    }
+
+    #[test]
+    fn null_aware_not_matches_the_not_equal_selectivity() {
+        // NOT(v = 0)は<>と同じ「UNKNOWNを除外した補数」で見積もるため、
+        // v<>0と同じrows=9になるはず。
+        let mut db = null_heavy_table();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT v FROM t WHERE NOT (v = 0)");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (9, 9), "line={}", lines[0]);
+    }
+
+    #[test]
+    fn is_null_selectivity_matches_the_observed_null_fraction() {
+        // v IS NULL: null_count(90)/row_count(100)=0.9→90行。
+        let mut db = null_heavy_table();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT v FROM t WHERE v IS NULL");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (90, 90), "line={}", lines[0]);
+    }
+
+    #[test]
+    fn is_not_null_selectivity_matches_the_observed_non_null_fraction() {
+        // v IS NOT NULL: 1 - 0.9 = 0.1→10行。
+        let mut db = null_heavy_table();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT v FROM t WHERE v IS NOT NULL");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (10, 10), "line={}", lines[0]);
+    }
+
+    #[test]
+    fn equality_against_a_null_literal_never_matches() {
+        // v = NULLはSQLの3値論理で常にUNKNOWNになり、決してTRUEにならない。
+        let mut db = null_heavy_table();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT v FROM t WHERE v = NULL");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (0, 0), "line={}", lines[0]);
+    }
+
+    #[test]
+    fn join_cardinality_excludes_null_keys_from_both_sides() {
+        // a.v = b.vの結合キーにNULLの行を含めると、NULL同士は等号で
+        // 一致しないにもかかわらず結合行数を過大評価してしまう。両側の
+        // 非NULL行数(10ずつ)から見積もれば、実測(10行、各値が1対1で一致)
+        // と一致する。
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE a (v BIGINT)").unwrap();
+        db.execute("CREATE TABLE b (v BIGINT)").unwrap();
+        let mut rows: Vec<String> = (0..10).map(|v| format!("({v})")).collect();
+        rows.extend(std::iter::repeat_n("(NULL)".to_string(), 90));
+        db.execute(&format!("INSERT INTO a VALUES {}", rows.join(", "))).unwrap();
+        db.execute(&format!("INSERT INTO b VALUES {}", rows.join(", "))).unwrap();
+        db.execute("ANALYZE a").unwrap();
+        db.execute("ANALYZE b").unwrap();
+
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT a.v FROM a JOIN b ON a.v = b.v");
+        let join_line = lines.iter().find(|line| line.contains("Join")).expect("Join行が見つかりません");
+        let (rows, actual) = parse_rows_and_actual(join_line);
+        assert_eq!((rows, actual), (10, 10), "line={join_line}");
+    }
+
     #[test]
     fn analyze_stats_survive_a_reopen_of_the_disk_backend() {
         let path = temp_db_path("analyze-persists-across-reopen");
@@ -3664,5 +3808,3 @@ mod tests {
         assert_eq!(result.rows().len(), 4, "rows={:?}", result.rows());
     }
 }
-
-

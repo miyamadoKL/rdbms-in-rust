@@ -63,10 +63,10 @@ dense     m= 32000  matches= 32000  IndexNestedLoopJoin=786.240948ms  HashJoin=4
 `orders`にどんな値がどれだけ分布しているかという、**実データについての情報**が要ります。
 この章はその情報(統計情報)を集める部分を作り、次章(第28章)がその情報を使って初めて「どちらが速いか」に数値で答えます。
 
-## 統計収集: 行数、NULL数、NDV、Min/Max、Histogram
+## 統計収集: 行数、NULL数、NDV、Min/Max、MCV、Histogram
 
 統計情報の型は`src/statistics.rs`に置きます。
-集めるのは、テーブルの行数と、列ごとの4種類の値です。
+集めるのは、テーブルの行数と、列ごとの5種類の値です。
 
 ```rust
 pub struct TableStats {
@@ -79,9 +79,13 @@ pub struct ColumnStats {
     pub distinct_count: u64,
     pub min: Option<Value>,
     pub max: Option<Value>,
+    pub mcv: Vec<(Value, u64)>,
     pub histogram: Vec<Bucket>,
 }
 ```
+
+`mcv`(MCV、Most Common Values)は、出現回数の多い値を個別に(値そのものと実際の頻度の組で)保持するリストです。
+これが要る理由は、等頻度Histogramだけでは特定の値に行が集中する分布をうまく扱えないことにあります(後述の「Histogramは等頻度(equi-depth)を選ぶ」を参照)。
 
 `min`、`max`、`histogram`の対象は、[`crate::types::compare_values`](第21章の`ORDER BY`、`MIN`/`MAX`が使う全順序)で比較できる列すべてです。
 `BOOLEAN`、`BIGINT`、`TEXT`のいずれも、この全順序の上で最小値、最大値、バケツ境界を持てます。
@@ -146,35 +150,92 @@ pub struct Bucket {
 この章は等頻度を選びます。
 理由は、一部の値に行が集中する歪んだ分布での精度です。
 `status`列のように、1000行のうち900行が`0`、残り100行が1〜9のどれかというデータを考えます。
+値の範囲(`0`〜`9`)を等幅に10分割すれば、`0`だけのバケツに90行、残り9個のバケツに1行ずつという、ほとんど意味のないHistogramになります。
+等頻度なら、行数を10個のバケツへ均等に割り振るぶん、この極端な偏りは避けられます。
+PostgreSQLの`ANALYZE`が作る`pg_stats.histogram_bounds`も、同じ理由で等頻度方式を採っています。
+
+もっとも、等頻度そのものにも弱点が残ります。
+1つの値だけで1バケツぶんの目標行数を超えてしまう場合です。
+`status`列と同じ、1000行のうち900行が`0`という分布で確かめます(サンプルを99行に縮めています)。
 
 ```rust
 #[test]
-fn histogram_stays_equal_depth_under_a_skewed_distribution() {
+fn skewed_distribution_moves_the_dominant_value_into_mcv() {
     // 0が90回、1〜9がそれぞれ1回ずつ出現する、値に偏りのある分布。
     let mut values = vec![Value::BigInt(0); 90];
     values.extend((1..10).map(Value::BigInt));
     let stats = collect(&values);
-    let histogram = &stats.columns[0].histogram;
-    // 等幅Histogramなら、値0のバケツに90行すべてが押し込まれる。
-    // 等頻度Histogramでは、行数はどのバケツもほぼ均等(9または10)になる。
-    for bucket in histogram {
-        assert!(bucket.row_count == 9 || bucket.row_count == 10);
-    }
+    let column = &stats.columns[0];
+
+    // 平均バケツ行数は99/10=9.9。0の出現回数(90)はこれを大きく超えるため
+    // MCVに採用され、Histogramには残余の9値(1〜9、各1回)だけが残る。
+    assert_eq!(column.mcv, vec![(Value::BigInt(0), 90)]);
+    let residual_total: u64 = column.histogram.iter().map(|b| b.row_count).sum();
+    assert_eq!(residual_total, 9);
 }
 ```
 
-値の範囲(`0`〜`9`)を等幅に10分割すれば、`0`だけのバケツに90行、残り9個のバケツに1行ずつという、ほとんど意味のないHistogramになります。
-`col = 0`の選択率を「そのバケツの行数の割合」から見積もる仕組みである以上、1つのバケツに大半の行が押し込まれてしまっては、バケツを作った意味がありません。
-等頻度なら、行数の多い`0`のまわりに自然とバケツが密集し(区間の幅が狭くなり)、残りのまばらな値は少ないバケツで間に合います。
-PostgreSQLの`ANALYZE`が作る`pg_stats.histogram_bounds`も、同じ理由で等頻度方式を採っています。
+1バケツあたりの平均行数(99行÷10バケツ≒9.9行)を、値`0`(90行)が大きく超えています。
+`build_equi_depth_histogram`が行数だけを見て機械的に等頻度分割すると、この90行は複数のバケツにまたがります。
+`col = 0`の等値述語は、値`0`を含む**先頭の1バケツだけ**を見て見積もる仕組みなので、90行のうち一部しか数えられていないバケツの行数比率から見積もることになり、実際の90行よりはるかに小さい値を返してしまいます。
 
-バケツの組み立ては、ソート済みの非NULL値を`HISTOGRAM_BUCKET_COUNT`個の区間へ、できるだけ均等に割ります。
+この問題を避けるため、Histogramを組み立てる前に、平均バケツ行数を上回る頻度を持つ値を**MCV**(Most Common Values、最頻値)として個別に抜き出し、Histogramはそれを除いた残りの値だけから組み立てます。
+PostgreSQLの`pg_stats.most_common_vals`と同じ役割分担です。
+
+```rust
+fn extract_mcv(sorted_values: &[Value]) -> (Vec<(Value, u64)>, Vec<Value>) {
+    if sorted_values.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    // ソート済みなので、同じ値は連続して並ぶ。連続run(同じ値の連なり)を
+    // 数えるだけで、値ごとの出現回数が求まる。
+    let mut counts: Vec<(Value, u64)> = Vec::new();
+    for value in sorted_values {
+        match counts.last_mut() {
+            Some((last_value, count)) if last_value == value => *count += 1,
+            _ => counts.push((value.clone(), 1)),
+        }
+    }
+
+    // `build_equi_depth_histogram`が実際に作るバケツ数は
+    // `min(値の総数, HISTOGRAM_BUCKET_COUNT)`である(値の総数がバケツ数
+    // より少なければ、その分だけしかバケツができない)。閾値もこの実際の
+    // バケツ数に対する平均行数で揃える。固定の`HISTOGRAM_BUCKET_COUNT`を
+    // 分母にすると、値の総数がバケツ数を下回る小さな列で「1回しか出現
+    // しない値」まで平均を上回ってしまい、MCVがほぼ全値を飲み込んでしまう。
+    let effective_bucket_count = sorted_values.len().min(HISTOGRAM_BUCKET_COUNT) as f64;
+    let average_bucket_size = sorted_values.len() as f64 / effective_bucket_count;
+    let mut candidates: Vec<(Value, u64)> =
+        counts.iter().filter(|(_, count)| *count as f64 > average_bucket_size).cloned().collect();
+    // 出現回数の降順。同数なら値の昇順(`counts`はソート済みの値順)で決定的に揃える。
+    candidates.sort_by(|(value_a, count_a), (value_b, count_b)| {
+        count_b.cmp(count_a).then_with(|| compare_values(value_a, value_b))
+    });
+    candidates.truncate(MCV_MAX_ENTRIES);
+
+    if candidates.is_empty() {
+        return (Vec::new(), sorted_values.to_vec());
+    }
+
+    let mcv_values: HashSet<&Value> = candidates.iter().map(|(value, _)| value).collect();
+    let residual: Vec<Value> = sorted_values.iter().filter(|value| !mcv_values.contains(value)).cloned().collect();
+    (candidates, residual)
+}
+```
+
+先ほどのテストのとおり、`0`はMCVへ移り、Histogramには残りの1〜9(各1行)だけが残ります。
+等値述語の選択率(`estimate_equality_selectivity`、後述)は、まずMCVに値があればその実際の頻度をそのまま返し、無ければ残余のHistogramへフォールバックします。
+「平均バケツ行数を上回る値どうしの出現回数の合計は非NULL行数を超えられない」という関係上、この閾値を同時に上回る値が`MCV_MAX_ENTRIES`(10)件を超えることは実際には起こりませんが、`ANALYZE`を経由しない統計(後述の`Storage::set_table_stats`)への防御として上限は残してあります。
+
+バケツの組み立ては、ソート済みの(MCVを除いた残余の)非NULL値を`HISTOGRAM_BUCKET_COUNT`個の区間へ、できるだけ均等に割ります。
 
 ```rust
 fn build_equi_depth_histogram(sorted_values: &[Value]) -> Vec<Bucket> {
     if sorted_values.is_empty() {
         return Vec::new();
     }
+
     let total = sorted_values.len();
     let bucket_count = total.min(HISTOGRAM_BUCKET_COUNT);
     let base_size = total / bucket_count;
@@ -183,6 +244,7 @@ fn build_equi_depth_histogram(sorted_values: &[Value]) -> Vec<Bucket> {
     let mut buckets = Vec::with_capacity(bucket_count);
     let mut start = 0;
     for i in 0..bucket_count {
+        // 割り切れない分は、先頭のバケツから1行ずつ多めに配る。
         let size = base_size + usize::from(i < remainder);
         let end = start + size;
         let chunk = &sorted_values[start..end];
@@ -268,6 +330,10 @@ stats × stats_count:
         distinct_count: u64
         min:            Value
         max:            Value
+        mcv_count:      u16
+        mcv × mcv_count:
+            value: Value
+            count: u64
         bucket_count:   u16
         buckets × bucket_count:
             lower:     Value
@@ -304,7 +370,13 @@ fn encode_value(value: &Value, out: &mut Vec<u8>) {
 
 このセクションを追加したことに伴い、`CATALOG_LAYOUT_VERSION`を`1`から`2`へ上げました。
 モジュール冒頭のドキュメントコメント(第24章までの節と同じ形式)にも、この変更を書き残してあります。
-章をまたいだファイル互換性を約束しない方針(第15章から一貫)はそのままで、`CATALOG_MAGIC`と`CATALOG_LAYOUT_VERSION`による判定が、レイアウトの変わった古いカタログを確実に拒否します。
+章をまたいだファイル互換性を約束しない方針(第15章から一貫)はそのままで、`CATALOG_MAGIC`と`CATALOG_LAYOUT_VERSION`による判定が、レイアウトの変わった古いカタログを確実に拒否します(`mcv`セクションを列の途中へ挿入した第4部レビュー対応で、`CATALOG_LAYOUT_VERSION`はさらに`2`から`3`へ上がっています)。
+
+構文的にバイト列を復元できることと、その中身が意味をなすことは別の話です。
+`decode_catalog`が検査するのは統計に紐づく`TableId`の重複だけで、対応するテーブル定義との整合性(列数や型が一致するか、`null_count`が`row_count`を超えていないか、バケツの境界が昇順に並んでいるかなど)までは見ていませんでした。
+これは、`Storage::open`が復元したカタログをそのまま信用してしまう欠落であり、破損したファイルや`Storage::set_table_stats`への不正な入力を、意味の壊れた統計情報のまま受理してしまいます。
+第4部レビュー対応では、この意味検証をまとめて行う`validate_stats_metadata`を追加し、`Storage::open`(カタログを復元する経路、違反は`DbError::CorruptCatalog`)と`Storage::set_table_stats`(`ANALYZE`が新しい統計を登録する経路、違反は`DbError::InvalidStats`)の両方から呼んでいます。
+検査項目(列数と型の一致、`null_count <= row_count`、`distinct_count <= 非NULL行数`、MCVとバケツそれぞれの上限件数、バケツの境界順序、MCVの値やバケツ境界がMin/Maxの範囲や型に収まること、MCVとバケツの行数合計が非NULL行数に一致すること)の詳細は`src/storage.rs`の`validate_stats_metadata`のドキュメントコメントを参照してください。
 
 `ANALYZE`を一度も実行していないテーブルは、統計を持ちません。
 この場合の推定は、選択率の慣用定数にフォールバックします。
@@ -326,42 +398,100 @@ pub const DEFAULT_INEQ_SEL: f64 = 1.0 / 3.0;
 ## Cardinality Estimation: 推定式
 
 推定式は`src/estimator.rs`に集めます。
-どの式も、`Option<&ColumnStats>`(統計が無ければ`None`)を受け取り、選択率(0.0〜1.0の`f64`)または行数を返す、単純な関数です。
+どの式も、`Option<&ColumnStats>`(統計が無ければ`None`)と対象テーブルの行数(`row_count`)を受け取り、選択率(0.0〜1.0の`f64`)または行数を返す、単純な関数です。
+
+選択率が指すのは、一貫して「**対象範囲の全行(`NULL`を含む)**のうち、述語が`TRUE`と評価される行の割合」です。
+SQLは`TRUE`、`FALSE`、`UNKNOWN`の3値論理を使い、`NULL`を含む比較は`UNKNOWN`になります。
+`WHERE`句は`UNKNOWN`の行を`FALSE`と同じく落とすため、選択率は「非NULL行のうち一致する割合」ではなく「全行のうちTRUEになる割合」でなければなりません。
+以下の各推定式は、`null_count`と`row_count`から求めた**NULL率**を使ってこれを見積もります。
 
 ### 等値述語: `col = 定数`
 
-Histogramがあれば、定数が収まるバケツを探し、そのバケツの行数の割合を、バケツ内のDistinct値数(全体のNDVをバケツ数で均等割りした近似)で割ります。
+まず、値が`NULL`(`col = NULL`のような式)であれば、この比較は列の値によらず常に`UNKNOWN`になるため、選択率は0.0です(`v = NULL`は決して`TRUE`になりません)。
+それ以外は、「列が非NULLである割合」と「非NULL行の中での一致割合」の積で見積もります。
 
 ```rust
-pub fn estimate_equality_selectivity(stats: Option<&ColumnStats>, value: &Value) -> f64 {
-    let Some(stats) = stats else { return DEFAULT_EQ_SEL };
-
-    if !stats.histogram.is_empty() {
-        let total_rows: u64 = stats.histogram.iter().map(|b| b.row_count).sum();
-        if total_rows == 0 {
-            return DEFAULT_EQ_SEL;
-        }
-        let bucket_count = stats.histogram.len() as f64;
-        let ndv_per_bucket = (stats.distinct_count as f64 / bucket_count).max(1.0);
-        for bucket in &stats.histogram {
-            if compare_values(value, &bucket.lower) != Ordering::Less && compare_values(value, &bucket.upper) != Ordering::Greater {
-                let bucket_fraction = bucket.row_count as f64 / total_rows as f64;
-                return bucket_fraction / ndv_per_bucket;
-            }
-        }
-        return DEFAULT_EQ_SEL; // どのバケツにも収まらない(観測範囲の外)
+pub fn estimate_equality_selectivity(stats: Option<&ColumnStats>, row_count: u64, value: &Value) -> f64 {
+    if value.is_null() {
+        return 0.0;
     }
-
-    if stats.distinct_count > 0 { 1.0 / stats.distinct_count as f64 } else { DEFAULT_EQ_SEL }
+    let Some(stats) = stats else { return DEFAULT_EQ_SEL };
+    let non_null = 1.0 - null_fraction(stats.null_count, row_count);
+    non_null * equality_selectivity_within_non_null(stats, row_count, value)
 }
 ```
 
-Histogramが無ければ`1 / NDV`(「NDV個の値が一様に分布している」という仮定)、NDVも無ければ`DEFAULT_EQ_SEL`という3段階のフォールバックです。
+「非NULL行の中での一致割合」は、MCV(最頻値)に定数が載っていればその実頻度を、無ければ残余のHistogram(バケツの行数比率を、バケツ内のDistinct値数で割った近似)を、Histogramも無ければ`1 / NDV`を、NDVも無ければ`DEFAULT_EQ_SEL`を使う4段階のフォールバックです。
+
+```rust
+fn equality_selectivity_within_non_null(stats: &ColumnStats, row_count: u64, value: &Value) -> f64 {
+    let non_null_rows = (row_count.saturating_sub(stats.null_count)) as f64;
+    if non_null_rows <= 0.0 {
+        return DEFAULT_EQ_SEL;
+    }
+
+    // MCV(最頻値)に載っている値は、Histogramより先に実頻度で答える
+    // (`crate::statistics`モジュールの説明を参照)。
+    if let Some(&(_, count)) = stats.mcv.iter().find(|(v, _)| v == value) {
+        return (count as f64 / non_null_rows).clamp(0.0, 1.0);
+    }
+
+    if !stats.histogram.is_empty() {
+        // Histogramは、MCVに載った値を除いた残余の非NULL値だけで組み立てて
+        // ある(`crate::statistics::StatsCollector::finish`)。残余のNDVは
+        // 全体のNDVからMCVの件数を引いたものである。
+        let residual_ndv = (stats.distinct_count.saturating_sub(stats.mcv.len() as u64)).max(1) as f64;
+        let bucket_count = stats.histogram.len() as f64;
+        let ndv_per_bucket = (residual_ndv / bucket_count).max(1.0);
+        for bucket in &stats.histogram {
+            if compare_values(value, &bucket.lower) != Ordering::Less && compare_values(value, &bucket.upper) != Ordering::Greater
+            {
+                // `lower == upper == value`は、このバケツの中身が`value`
+                // 1個だけであることを意味する。MCVの採用条件(平均バケツ行数を
+                // 上回ること)ぎりぎりで採用されなかった値は、複数の単一値
+                // バケツにまたがりうる(`crate::statistics`モジュールの
+                // 説明を参照)。この場合はバケツ単位ではなく値単位で数えるため、
+                // 同じ値を持つバケツをすべて合算する。
+                if compare_values(&bucket.lower, &bucket.upper) == Ordering::Equal {
+                    let total_for_value: u64 = stats
+                        .histogram
+                        .iter()
+                        .filter(|b| compare_values(&b.lower, &b.upper) == Ordering::Equal && &b.lower == value)
+                        .map(|b| b.row_count)
+                        .sum();
+                    return (total_for_value as f64 / non_null_rows).clamp(0.0, 1.0);
+                }
+                // バケツ内の行が均等にDistinct値へ散らばっているとみなし、
+                // 1つの値あたりの行数を求める。分母は非NULL行全体(残余だけ
+                // ではない)なので、ここで直接「非NULL行の中での割合」になる。
+                return (bucket.row_count as f64 / ndv_per_bucket / non_null_rows).clamp(0.0, 1.0);
+            }
+        }
+        // どのバケツにも収まらない(観測範囲の外の値)。稀な値として扱う。
+        return DEFAULT_EQ_SEL;
+    }
+
+    if stats.distinct_count > 0 {
+        1.0 / stats.distinct_count as f64
+    } else {
+        DEFAULT_EQ_SEL
+    }
+}
+```
+
+冒頭の例(`status`列、20行中2行が`1`)がまさにこの経路を通ります。
+平均バケツ行数(20行÷10バケツ=2行)を、値`1`の出現回数(2回)は上回らないため、MCVには採用されません。
+残余のequi-depth Histogramは、この2行を(1行ずつの)2個の単一値バケツへ分割します。
+`lower == upper == value`という条件でこの状況を検出し、バケツ単位ではなく値単位で数える(同じ値を持つバケツをすべて合算する)ことで、`col = 1`の選択率は2/20(=`rows=2`)を正しく返します。
+この合算を行わずバケツ単位のまま`ndv_per_bucket`で割ると、2行のうち1バケツぶんの1行しか数えられず、見積もりは半分の`rows=1`まで縮んでしまいます。
 
 ### 範囲述語: `col > / >= / < / <= 定数`
 
-各バケツについて、「そのバケツの両端がどちらも述語を満たすか」で3通りに分けます。
-両端とも満たせばバケツ全体を選択率1.0として数え、両端とも満たさなければ0.0、片方だけ満たすなら「バケツ内で値は一様に分布している」と仮定して0.5とします。
+等値述語と同じ理由で、値が`NULL`なら選択率は0.0です。
+それ以外は「列が非NULLである割合」×「非NULL行の中での選択率」の積で見積もります。
+「非NULL行の中での選択率」は、各バケツについて「そのバケツの両端がどちらも述語を満たすか」を見ます。
+両端とも満たせばバケツ全体を選択率1.0として数え、両端とも満たさなければ0.0です。
+片方だけ満たす(バケツの内部に境界がある)場合、`BIGINT`なら`(value - lower) / (upper - lower)`という線形補間(区間内での`value`の位置の比率)で按分します。
 
 ```rust
 fn bucket_overlap_fraction(op: RangeOp, value: &Value, lower: &Value, upper: &Value) -> f64 {
@@ -377,18 +507,72 @@ fn bucket_overlap_fraction(op: RangeOp, value: &Value, lower: &Value, upper: &Va
     match (satisfies(lower), satisfies(upper)) {
         (true, true) => 1.0,
         (false, false) => 0.0,
-        _ => 0.5,
+        _ => {
+            // バケツの内部に境界がある。`value`がバケツのどの位置にあるかを、
+            // 「lowerからvalueまでの距離」÷「lowerからupperまでの距離」の
+            // 割合として求め、満たす側(`satisfies(upper)`かどうか)に応じて
+            // その割合か、その補数を返す。
+            let position = linear_interpolation_position(value, lower, upper);
+            match position {
+                Some(position) => {
+                    if satisfies(upper) {
+                        // upper側が満たす: valueより上の部分が対象。
+                        (1.0 - position).clamp(0.0, 1.0)
+                    } else {
+                        // lower側が満たす: valueより下の部分が対象。
+                        position.clamp(0.0, 1.0)
+                    }
+                }
+                None => 0.5,
+            }
+        }
     }
 }
 ```
 
-Histogramがあれば、この関数をバケツごとに呼び、行数で重み付けして合計します。
-無ければMin/Maxを1個のバケツとみなして同じ計算をする(線形補間に相当する)というフォールバックで、Min/Maxも無ければ`DEFAULT_INEQ_SEL`です。
-`compare_values`による大小比較だけで組み立ててあるので、数値(`BIGINT`)だけでなく`TEXT`、`BOOLEAN`にもそのまま使えます。
+`linear_interpolation_position`は`BIGINT`どうしの`lower`、`upper`、`value`に対してだけ`Some((value - lower) / (upper - lower))`を返します。
+`TEXT`と`BOOLEAN`は`compare_values`による大小比較(全順序)は持ちますが、2値の「距離」(差)を定義する演算を持ちません。
+`"apple"`と`"banana"`の間に`"apricot"`がどれだけ近いかを測る自然な数値は存在しないため、これらの型は`None`(中点0.5という一様分布の仮定)にとどめます。
+
+Histogramがあれば、`bucket_overlap_fraction`をバケツごとに呼び、行数で重み付けして合計します。
+無ければMin/Maxを1個のバケツとみなして同じ計算をするというフォールバックで、Min/Maxも無ければ`DEFAULT_INEQ_SEL`です。
+
+### `IS NULL` / `IS NOT NULL`
+
+`IS NULL`の選択率は、全行のうち`NULL`である割合、つまり`null_count / row_count`(**NULL率**)そのものです。
+
+```rust
+pub fn null_fraction(null_count: u64, row_count: u64) -> f64 {
+    if row_count == 0 {
+        return 0.0;
+    }
+    (null_count as f64 / row_count as f64).clamp(0.0, 1.0)
+}
+```
+
+`null_fraction`は、前述の`estimate_equality_selectivity`や`estimate_range_selectivity`が「列が非NULLである割合」を求めるためにも使う、共通の関数です。
+
+```rust
+pub fn estimate_is_null_selectivity(stats: Option<&ColumnStats>, row_count: u64) -> f64 {
+    match stats {
+        Some(stats) => null_fraction(stats.null_count, row_count),
+        None => DEFAULT_EQ_SEL,
+    }
+}
+```
+
+`IS NULL`と`IS NOT NULL`は(`UNKNOWN`を経由せず)全行をちょうど2つに分けるため、`IS NOT NULL`の選択率は単純な補数`1 - IS NULLの選択率`で正確に求まります。
+
+```rust
+pub fn estimate_is_not_null_selectivity(stats: Option<&ColumnStats>, row_count: u64) -> f64 {
+    1.0 - estimate_is_null_selectivity(stats, row_count)
+}
+```
 
 ### `AND` / `OR` / `NOT`
 
-`AND`は独立性を仮定した積、`OR`は包除原理、`NOT`は1引く元の値です。
+`AND`は独立性を仮定した積、`OR`は包除原理です。
+`NOT`は単純な「1引く元の値」では済みません。
 
 ```rust
 pub fn estimate_and_selectivity(a: f64, b: f64) -> f64 {
@@ -398,11 +582,22 @@ pub fn estimate_and_selectivity(a: f64, b: f64) -> f64 {
 pub fn estimate_or_selectivity(a: f64, b: f64) -> f64 {
     (1.0 - (1.0 - a) * (1.0 - b)).clamp(0.0, 1.0)
 }
+```
 
-pub fn estimate_not_selectivity(a: f64) -> f64 {
-    (1.0 - a).clamp(0.0, 1.0)
+3値論理では`NOT(UNKNOWN)`も`UNKNOWN`のままで、`WHERE`句はそれを`TRUE`として拾いません。
+したがって`NOT(p)`が`TRUE`になるのは、「`p`が`UNKNOWN`にならない行」のうち「`p`が`FALSE`の行」に限られます。
+`known_fraction`(`p`が`UNKNOWN`にならない行の割合)を引数に取り、その中での補数を返す形にします。
+
+```rust
+pub fn estimate_not_selectivity(known_fraction: f64, selectivity: f64) -> f64 {
+    (known_fraction - selectivity).clamp(0.0, 1.0)
 }
 ```
+
+`known_fraction`は、否定対象の述語の形ごとに変わります(`col <op> 定数`という比較なら列の非NULL率、`IS [NOT] NULL`なら常に1.0、`AND`/`OR`ならその両辺の`known_fraction`の積)。
+呼び出し側の`physical_plan::operand_non_null_fraction`が計算します。
+`<>`(`NotEq`)も`NOT(=)`と同じ式で見積もります。
+これが正しいのは、この教材の式体系では`UNKNOWN`が「比較の被演算子(列か定数)が`NULL`であること」だけから生じ、それ以外の経路(3値論理の`AND`/`OR`が両辺とも確定していないのに結果だけ確定する、といったケース)をこの章の推定範囲(`col <op> 定数`の比較と、その`AND`や`OR`、`NOT`による組み合わせ)が扱わないためです。
 
 `AND`の独立性の仮定(2つの述語が互いに無関係に成り立つ)は、`status`と`amount`のように実際には相関する列の組み合わせでは崩れます。
 この節ではまだ崩れないことにして、崩れる実例は後の節で`EXPLAIN ANALYZE`を使って確かめます。
@@ -421,6 +616,9 @@ pub fn estimate_join_row_count(left_rows: u64, right_rows: u64, left_ndv: u64, r
 結合キーの片方が主キー(NDVが行数と一致する一意な列)であれば、この式は「外側の各行に対して内側がちょうど1行だけ一致する」という主キーと外部キーの結合の典型的な状況にちょうど一致します。
 `HashJoin`は`keys`(等値条件の対の並び、第22章)から結合キー列の実際のNDVを引けるため、`ANALYZE`済みならこの式をそのまま使います。
 `NestedLoopJoin`は任意の条件(等号とは限らない)を持ち、結合キー列を機械的に特定できないため、「値はすべて一意」という最も楽観的な既定値(それぞれの出力行数そのもの)にフォールバックします。
+
+`left_rows`と`right_rows`には、結合キー列が`NULL`の行を含めません。
+`NULL`同士は等号で一致しない(`NULL = NULL`も`UNKNOWN`)ため、`physical_plan::apply_non_null_fraction`が、`ANALYZE`で観測した結合キー列のNULL率を使ってあらかじめ差し引いた非NULL行数を渡します。
 
 ### Aggregate後の行数
 
@@ -540,22 +738,23 @@ PostgreSQLの`EXPLAIN (ANALYZE, ...)`と異なり、この教材はトランザ�
 ```console
 minidb> CREATE TABLE orders (id BIGINT NOT NULL, status BIGINT NOT NULL, amount BIGINT NOT NULL);
 CREATE TABLE
-minidb> -- statusが1の行は必ずamountが5000以上、0の行は必ずamountが50未満になるよう1000行挿入
+minidb> -- statusが1の行(200行)は必ずamountが5000以上、0の行(800行)は必ずamountが10
 minidb> ANALYZE orders;
 ANALYZE 1
 minidb> EXPLAIN ANALYZE SELECT id FROM orders WHERE status = 1 AND amount > 100;
 QUERY PLAN
 ----------
-Projection(id) rows=10 actual=100
-  └─ Filter(status = 1 AND amount > 100) rows=10 actual=100
+Projection(id) rows=40 actual=200
+  └─ Filter(status = 1 AND amount > 100) rows=40 actual=200
     └─ SeqScan(orders) rows=1000 actual=1000
 (3 rows)
 ```
 
-`status = 1`はちょうど100行(全体の10%)に一致し、その100行は`amount`が必ず5000以上なので`amount > 100`も常に成り立ちます。
-実測(`actual=100`)は、この「`status = 1`ならば必ず`amount > 100`」という関係をそのまま反映しています。
+`status = 1`はちょうど200行(全体の20%)に一致し、その200行は`amount`が必ず5000以上なので`amount > 100`も常に成り立ちます。
+実測(`actual=200`)は、この「`status = 1`ならば必ず`amount > 100`」という関係をそのまま反映しています。
 推定式は`estimate_and_selectivity(sel(status = 1), sel(amount > 100))`という積を計算しますが、これは`status`と`amount`が互いに無関係に決まるという仮定のもとでの見積もりです。
-実際には`status = 1`という条件が`amount > 100`をほぼ確定させてしまうため、2つの条件は独立ではなく、積による見積もり(`rows=10`)は実測(`actual=100`)の10分の1にとどまります。
+`sel(status = 1)`(0.2)、`sel(amount > 100)`(残りの800行は`amount = 10`で一致せず、200行は必ず一致するので、こちらも0.2)は、それぞれ単独では実データを正確に反映しています。
+それでも実際には`status = 1`という条件が`amount > 100`をほぼ確定させてしまうため、2つの条件は独立ではなく、積による見積もり(`rows=40`)は実測(`actual=200`)の5分の1にとどまります。
 
 この種のずれは、列同士の相関を持たない統計情報(列ごとのHistogramだけを持ち、列の組み合わせの分布は持たない)を使う限り避けられません。
 複数列の相関を捉えるには、列の組み合わせごとのHistogram(Multi-column Statistics)のような、この章より進んだ統計情報が要ります。
@@ -563,8 +762,8 @@ Projection(id) rows=10 actual=100
 
 ## 到達点
 
-`ANALYZE`はテーブルの行数、列ごとのNULL数、NDV、Min/Max、等頻度Histogramを集め、`Backend::Disk`ではCatalogページへ永続化されます。
-等値、範囲、`AND`、`OR`、`NOT`、Join、`GROUP BY`後の行数という7種類の推定式が、この統計情報(または統計が無いときのデフォルト選択率)から行数を見積もり、`EXPLAIN`の`rows=`として表示されます。
+`ANALYZE`はテーブルの行数、列ごとのNULL数、NDV、Min/Max、MCV、等頻度Histogramを集め、`Backend::Disk`ではCatalogページへ永続化されます(永続化した統計は`validate_stats_metadata`が意味検証したうえで受理します)。
+等値、範囲、`IS NULL`、`IS NOT NULL`、`AND`、`OR`、`NOT`、Join、`GROUP BY`後の行数という9種類の推定式が、この統計情報(または統計が無いときのデフォルト選択率)から行数を見積もり、`EXPLAIN`の`rows=`として表示されます。
 `EXPLAIN ANALYZE`は実際に実行し、`actual=`で実測値と並べます。
 相関する列の例が示すとおり、この推定はいつでも正しいわけではありません。
 
@@ -583,5 +782,5 @@ Projection(id) rows=10 actual=100
 ### 発展課題
 
 1. この章のNDVは`HashSet`による厳密な計算です。HyperLogLogのような近似アルゴリズムを実際に実装し、行数を変えながら真のNDVとの誤差率を測定してください。行数が少ないうちは近似アルゴリズムの固定オーバーヘッド(レジスタ配列のメモリ)のほうが`HashSet`より不利になる分岐点がどこにあるかも確認してください。
-2. `estimate_range_selectivity`のバケツ内一様分布の仮定(`bucket_overlap_fraction`が境界をまたぐバケツを一律0.5とする)を、バケツの区間幅と定数の位置から線形補間する(数値型に限る)より精密な見積もりへ改善し、`HISTOGRAM_BUCKET_COUNT`を変えながら推定誤差がどう変化するかを実測してください。
-3. 本文で触れた列同士の相関(Multi-column Statistics)を、簡易な形(2列の組み合わせごとのNDVだけを追加で持つなど)で実装し、「相関する列」の節で見た`rows=10 actual=100`というずれがどこまで縮まるかを確認してください。
+2. `equality_selectivity_within_non_null`は、残余のHistogramのバケツ内でDistinct値が均等に散らばっていると仮定しています(`ndv_per_bucket`、バケツごとの実際のDistinct値数は記録していません)。`Bucket`にバケツごとのDistinct値数を追加で持たせる設計に変え、値がバケツ内で偏っている分布に対して推定精度がどう変わるかを実測してください。
+3. 本文で触れた列同士の相関(Multi-column Statistics)を、簡易な形(2列の組み合わせごとのNDVだけを追加で持つなど)で実装し、「相関する列」の節で見た`rows=40 actual=200`というずれがどこまで縮まるかを確認してください。
