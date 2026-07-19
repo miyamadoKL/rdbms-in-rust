@@ -3595,6 +3595,61 @@ mod tests {
     }
 
     #[test]
+    fn histogram_does_not_undercount_a_value_split_between_a_singleton_and_a_mixed_bucket() {
+        // codexレビュー3巡目の再現ケース: 出現回数[15,14,12,11,10,9,8,7,7,6,6]
+        // (値0〜10)+一意値42件(合計147行)というテーブルをANALYZEする。
+        // MCV_MAX_ENTRIES(10)件の上限により、0〜9(10個)はMCVへ移るが、
+        // 11個目の値`10`(出現回数6)は残余のequi-depth Histogramに残る。
+        // `10`をすべての一意値より小さくしてあるため、ソート順で`10`の
+        // 6行はまとまって先頭に並ぶ。`build_equi_depth_histogram`が同値の
+        // 連続runをバケツ境界で分割しない実装であれば、この6行は1個の
+        // 単一値バケツに収まり、`v = 10`の見積もりは実測と一致するはず。
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE t (v BIGINT)").unwrap();
+        let mut rows: Vec<String> = Vec::new();
+        for (v, count) in [15, 14, 12, 11, 10, 9, 8, 7, 7, 6, 6].into_iter().enumerate() {
+            rows.extend(std::iter::repeat_n(format!("({v})"), count));
+        }
+        rows.extend((1000..1042).map(|v| format!("({v})")));
+        assert_eq!(rows.len(), 147);
+        db.execute(&format!("INSERT INTO t VALUES {}", rows.join(", "))).unwrap();
+        db.execute("ANALYZE t").unwrap();
+
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT v FROM t WHERE v = 10");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (6, 6), "line={}", lines[0]);
+    }
+
+    #[test]
+    fn a_histogram_with_unequal_bucket_sizes_survives_validate_stats_metadata_and_a_reopen() {
+        // 同値の連続runをバケツ境界で分割しない実装(第4部3巡目レビュー対応)は、
+        // バケツの行数がもう均等ではないことを意味する。`Storage::set_table_stats`
+        // (`validate_one_table_stats`、`Storage::open`時の`validate_stats_metadata`)
+        // がこの不均等なバケツ行数を「壊れた統計」と誤検知しないことを、
+        // `Backend::Disk`での`ANALYZE`と再オープンの両方で確認する。
+        let path = temp_db_path("histogram-unequal-buckets-disk");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE t (v BIGINT)").unwrap();
+            let mut rows: Vec<String> = Vec::new();
+            for (v, count) in [15, 14, 12, 11, 10, 9, 8, 7, 7, 6, 6].into_iter().enumerate() {
+                rows.extend(std::iter::repeat_n(format!("({v})"), count));
+            }
+            rows.extend((1000..1042).map(|v| format!("({v})")));
+            db.execute(&format!("INSERT INTO t VALUES {}", rows.join(", "))).unwrap();
+            db.execute("ANALYZE t").unwrap();
+            db.flush().unwrap();
+        }
+
+        let mut reopened = Database::open(&path).unwrap();
+        let lines = explain_lines(&mut reopened, "EXPLAIN ANALYZE SELECT v FROM t WHERE v = 10");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (6, 6), "line={}", lines[0]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn null_aware_equality_matches_the_actual_row_count() {
         // v=0: 非NULL率(10/100)×非NULL内での一致割合(1/10)=0.01→1行。
         let mut db = null_heavy_table();

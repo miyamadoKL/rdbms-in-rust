@@ -264,10 +264,36 @@ Projection(v) rows=8 actual=8
 
 「値を1つ抽出するたびに平均バケツ行数を再計算する」という設計上、[`MCV_MAX_ENTRIES`](10)件に達する前に、残りのどの値も新しい閾値を超えなくなる(=固定点に達する)のが通常です。
 それでも、極端に段階的な分布(出現回数が少しずつ減っていく多数の値)では、10件に達してもまだ固定点に届かない場合があります。
-この場合は抽出をそこで打ち切り、残った値は複数の単一値バケツへ分割されたままになります。
-等値述語(`estimate_equality_selectivity`、後述)は同じ値を持つバケツを合算するため選択率自体は狂いませんが、範囲述語やHistogramのバケツ粒度には粗さが残ります。
+この場合は抽出をそこで打ち切り、MCVの閾値をわずかに下回る値が残余に残ります。
 
-バケツの組み立ては、ソート済みの(MCVを除いた残余の)非NULL値を`HISTOGRAM_BUCKET_COUNT`個の区間へ、できるだけ均等に割ります。
+### Histogramは同値の連続runをバケツ境界で分割しない
+
+残余に残ったこの手の値は、まだ1つのバケツの目標行数は上回っています。
+バケツの組み立てを「ソート済みの残余値を`行数 ÷ バケツ数`ぶんずつ機械的に切り分ける」だけの単純な実装にしていると、この値がちょうど切れ目をまたいでしまい、**単一値バケツ**(その値だけで埋まったバケツ)と**混合バケツ**(その値の残りと、別の値が混在するバケツ)に分割されてしまいます。
+
+出現回数`[15, 14, 12, 11, 10, 9, 8, 7, 7, 6, 6]`(値`0`〜`10`)に、一意な値42件(`1000`〜`1041`)を加えた147行のテーブルで確かめます。
+
+```console
+minidb> -- vが0〜10(出現回数[15,14,12,11,10,9,8,7,7,6,6])と、
+minidb> -- 1000〜1041(一意な値、各1行)からなる147行のテーブルをANALYZE
+minidb> ANALYZE t;
+ANALYZE 1
+minidb> EXPLAIN ANALYZE SELECT v FROM t WHERE v = 10;
+QUERY PLAN
+----------
+Projection(v) rows=6 actual=6
+  └─ Filter(v = 10) rows=6 actual=6
+    └─ SeqScan(t) rows=147 actual=147
+(3 rows)
+```
+
+`0`〜`9`(10個)は、MCVの固定点抽出([`MCV_MAX_ENTRIES`]、10件)にちょうど達するまでに移り、`10`(出現回数6)はこの上限によって残余に残ります。
+`10`を一意な値(`1000`〜`1041`)よりすべて小さくしてあるため、ソート順で`10`の6行はまとまって先頭に並びます。
+残余は48行(`10`が6行、一意な値が42行)、equi-depthの目標バケツ行数は48÷10=4.8行(切り捨てて4行、端数8個は先頭のバケツへ1行ずつ多め)です。
+行数だけを見て機械的に切り分けると、1個目のバケツ(目標5行)は`10`の5行、2個目のバケツ(目標5行)は`10`の残り1行と一意な値4件、という具合に、`10`の6行がバケツをまたいでしまいます。
+`col = 10`の等値述語は、値`10`を含む**先頭の1バケツだけ**を見て見積もる仕組みなので、6行のうち一部しか数えられていないバケツの行数比率から見積もることになり、実際の6行よりはるかに小さい値を返してしまいます。
+
+この問題を避けるため、`build_equi_depth_histogram`は、目標の切れ目が同じ値の連続run(同じ値が連なった範囲)の途中に来る場合、runの終わりまで境界を伸ばします。
 
 ```rust
 fn build_equi_depth_histogram(sorted_values: &[Value]) -> Vec<Bucket> {
@@ -280,25 +306,44 @@ fn build_equi_depth_histogram(sorted_values: &[Value]) -> Vec<Bucket> {
     let base_size = total / bucket_count;
     let remainder = total % bucket_count;
 
-    let mut buckets = Vec::with_capacity(bucket_count);
+    let mut buckets = Vec::new();
     let mut start = 0;
-    for i in 0..bucket_count {
-        // 割り切れない分は、先頭のバケツから1行ずつ多めに配る。
-        let size = base_size + usize::from(i < remainder);
-        let end = start + size;
+    let mut bucket_index = 0;
+    while start < total {
+        // 割り切れない分は、先頭のバケツから1行ずつ多めに配る、という目標
+        // サイズ自体は従来どおり。
+        let target_size = base_size + usize::from(bucket_index < remainder);
+        let mut end = (start + target_size.max(1)).min(total);
+        // 目標の切れ目が同じ値の連続run(同じ値が連なった範囲)の途中に
+        // 来る場合、runの終わりまで境界を伸ばす。これにより、1つの値が
+        // 2つのバケツにまたがることはなくなる(モジュール冒頭の説明を参照)。
+        // 結果としてバケツの行数は均等ではなくなる(runが長い値のぶん、
+        // そのバケツだけ目標サイズを超える)。
+        while end < total && sorted_values[end] == sorted_values[end - 1] {
+            end += 1;
+        }
         let chunk = &sorted_values[start..end];
         buckets.push(Bucket {
-            lower: chunk.first().expect("sizeは1以上").clone(),
-            upper: chunk.last().expect("sizeは1以上").clone(),
+            lower: chunk.first().expect("startを含むため1行以上").clone(),
+            upper: chunk.last().expect("startを含むため1行以上").clone(),
             row_count: chunk.len() as u64,
         });
         start = end;
+        bucket_index += 1;
     }
     buckets
 }
 ```
 
-割り切れない余りは先頭のバケツから1行ずつ多めに配るだけの単純な実装ですが、値の総数が`HISTOGRAM_BUCKET_COUNT`未満なら、バケツもその数だけしかできません。
+先ほどの147行の例では、1個目のバケツの目標の切れ目(5行目)がちょうど`10`の連続runの途中(6行のうち5行目)に来ます。
+境界をrunの終わりまで伸ばすことで、`10`の6行はすべて1個目のバケツに収まります(`lower == upper == 10`、`row_count = 6`)。
+`col = 10`はこのバケツ1個だけを見れば正確な行数(6行)が分かるため、`rows=6`が`actual=6`と一致します。
+
+この設計の代わりに、バケツの行数は均等ではなくなります。
+目標の切れ目をまたぐ長いrunがあるバケツは、目標行数を超えて膨らみます(runの長さがそのままそのバケツの行数になります)。
+これは等頻度(equi-depth)という名前が示す「バケツの行数を均等にする」という理想からの意図的な後退ですが、行数の均等さそのものより「値がバケツをまたがない」ことのほうが、この章の推定式にとって重要です。
+値がバケツをまたがなくなったことで、等値述語の推定(`equality_selectivity_within_non_null`、次節)は「値を含むバケツ」をちょうど1個だけ見ればよくなり、複数のバケツにまたがった分を合算するような処理は不要になります。
+永続化した統計を検証する`validate_stats_metadata`(後述)も、バケツの行数がおおむね均等であることは前提にしていません(バケツ数の上限、各バケツの`row_count > 0`、境界の昇順、行数合計の一致だけを検査します)。
 
 ## `ANALYZE`文: 統計を集める
 
@@ -485,24 +530,19 @@ fn equality_selectivity_within_non_null(stats: &ColumnStats, row_count: u64, val
         for bucket in &stats.histogram {
             if compare_values(value, &bucket.lower) != Ordering::Less && compare_values(value, &bucket.upper) != Ordering::Greater
             {
-                // `lower == upper == value`は、このバケツの中身が`value`
-                // 1個だけであることを意味する。MCVの採用条件(平均バケツ行数を
-                // 上回ること)ぎりぎりで採用されなかった値は、複数の単一値
-                // バケツにまたがりうる(`crate::statistics`モジュールの
-                // 説明を参照)。この場合はバケツ単位ではなく値単位で数えるため、
-                // 同じ値を持つバケツをすべて合算する。
+                // `build_equi_depth_histogram`(`crate::statistics`)は、同じ値の
+                // 連続runをバケツ境界で分割しない。したがって`value`を含む
+                // バケツは必ずちょうど1個であり、複数のバケツにまたがって
+                // 合算する必要は無い。
                 if compare_values(&bucket.lower, &bucket.upper) == Ordering::Equal {
-                    let total_for_value: u64 = stats
-                        .histogram
-                        .iter()
-                        .filter(|b| compare_values(&b.lower, &b.upper) == Ordering::Equal && &b.lower == value)
-                        .map(|b| b.row_count)
-                        .sum();
-                    return (total_for_value as f64 / non_null_rows).clamp(0.0, 1.0);
+                    // このバケツの中身は`value`だけ(単一値バケツ)なので、
+                    // 実際の行数をそのまま使える。
+                    return (bucket.row_count as f64 / non_null_rows).clamp(0.0, 1.0);
                 }
-                // バケツ内の行が均等にDistinct値へ散らばっているとみなし、
-                // 1つの値あたりの行数を求める。分母は非NULL行全体(残余だけ
-                // ではない)なので、ここで直接「非NULL行の中での割合」になる。
+                // 混合バケツ(複数のDistinct値が入っている)。バケツ内の行が
+                // 均等にDistinct値へ散らばっているとみなし、1つの値あたりの
+                // 行数を求める。分母は非NULL行全体(残余だけではない)なので、
+                // ここで直接「非NULL行の中での割合」になる。
                 return (bucket.row_count as f64 / ndv_per_bucket / non_null_rows).clamp(0.0, 1.0);
             }
         }
@@ -536,9 +576,8 @@ fn equality_selectivity_within_non_null(stats: &ColumnStats, row_count: u64, val
 
 冒頭の例(`status`列、20行中2行が`1`)がまさにこの経路を通ります。
 平均バケツ行数(20行÷10バケツ=2行)を、値`1`の出現回数(2回)は上回らないため、MCVには採用されません。
-残余のequi-depth Histogramは、この2行を(1行ずつの)2個の単一値バケツへ分割します。
-`lower == upper == value`という条件でこの状況を検出し、バケツ単位ではなく値単位で数える(同じ値を持つバケツをすべて合算する)ことで、`col = 1`の選択率は2/20(=`rows=2`)を正しく返します。
-この合算を行わずバケツ単位のまま`ndv_per_bucket`で割ると、2行のうち1バケツぶんの1行しか数えられず、見積もりは半分の`rows=1`まで縮んでしまいます。
+残余のequi-depth Histogramは、同値の連続runをバケツ境界で分割しないため、この2行を1個の単一値バケツにまとめます。
+`lower == upper == value`という条件でこのバケツを検出し、その実際の行数(2行)をそのまま使うことで、`col = 1`の選択率は2/20(=`rows=2`)を正しく返します。
 
 `0`(90行)や`0`(50行)のように、1つの値だけでMCVの閾値を超え、その値以外の非NULL値が1つも残らない列(`a`が常に`0`固定の列など)では、残余のHistogramは空になります。
 MCVは「Histogramが空になった」時点で、この列の非NULLの値をすべて網羅しています。

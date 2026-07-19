@@ -196,24 +196,21 @@ fn equality_selectivity_within_non_null(stats: &ColumnStats, row_count: u64, val
         for bucket in &stats.histogram {
             if compare_values(value, &bucket.lower) != Ordering::Less && compare_values(value, &bucket.upper) != Ordering::Greater
             {
-                // `lower == upper == value`は、このバケツの中身が`value`
-                // 1個だけであることを意味する。MCVの採用条件(平均バケツ行数を
-                // 上回ること)ぎりぎりで採用されなかった値は、複数の単一値
-                // バケツにまたがりうる(`crate::statistics`モジュールの
-                // 説明を参照)。この場合はバケツ単位ではなく値単位で数えるため、
-                // 同じ値を持つバケツをすべて合算する。
+                // `build_equi_depth_histogram`(`crate::statistics`)は、同じ値の
+                // 連続runをバケツ境界で分割しない。したがって`value`を含む
+                // バケツは必ずちょうど1個であり、複数のバケツにまたがって
+                // 合算する必要は無い(第4部3巡目レビュー対応。以前の実装は
+                // 単一値バケツどうしの合算しか行っておらず、単一値バケツと
+                // 混合バケツにまたがる場合を数え落としていた)。
                 if compare_values(&bucket.lower, &bucket.upper) == Ordering::Equal {
-                    let total_for_value: u64 = stats
-                        .histogram
-                        .iter()
-                        .filter(|b| compare_values(&b.lower, &b.upper) == Ordering::Equal && &b.lower == value)
-                        .map(|b| b.row_count)
-                        .sum();
-                    return (total_for_value as f64 / non_null_rows).clamp(0.0, 1.0);
+                    // このバケツの中身は`value`だけ(単一値バケツ)なので、
+                    // 実際の行数をそのまま使える。
+                    return (bucket.row_count as f64 / non_null_rows).clamp(0.0, 1.0);
                 }
-                // バケツ内の行が均等にDistinct値へ散らばっているとみなし、
-                // 1つの値あたりの行数を求める。分母は非NULL行全体(残余だけ
-                // ではない)なので、ここで直接「非NULL行の中での割合」になる。
+                // 混合バケツ(複数のDistinct値が入っている)。バケツ内の行が
+                // 均等にDistinct値へ散らばっているとみなし、1つの値あたりの
+                // 行数を求める。分母は非NULL行全体(残余だけではない)なので、
+                // ここで直接「非NULL行の中での割合」になる。
                 return (bucket.row_count as f64 / ndv_per_bucket / non_null_rows).clamp(0.0, 1.0);
             }
         }
@@ -626,20 +623,22 @@ mod tests {
     }
 
     #[test]
-    fn equality_sums_buckets_that_a_single_value_spans_after_narrowly_missing_mcv() {
+    fn equality_uses_the_single_bucket_a_narrowly_missed_mcv_value_lands_in() {
         // 20行中2行だけが値`1`(残り18行は値`0`でMCVへ移る)。平均バケツ行数は
-        // 20/10=2で、値`1`の出現回数(2)はこれを上回らないためMCVには載らず、
-        // 残余のequi-depth Histogramで2つの単一値バケツ(それぞれ1行)に
-        // 分割される(ch27冒頭の例と同じ状況)。equality推定は、バケツ単位では
-        // なく値単位で数えるため、2つのバケツを合算して2/20を返すはず。
+        // 20/10=2で、値`1`の出現回数(2)はこれを上回らないためMCVには載らない。
+        // `build_equi_depth_histogram`(`crate::statistics`)は同じ値の連続run
+        // をバケツ境界で分割しないため、値`1`の2行はちょうど1個の単一値
+        // バケツに収まる(第4部3巡目レビュー対応。以前は行数だけで機械的に
+        // 分割していたため、この2行が2個の単一値バケツに分かれることが
+        // あった)。
         let mcv = vec![(Value::BigInt(0), 18)];
-        let residual_buckets =
-            vec![Bucket { lower: Value::BigInt(1), upper: Value::BigInt(1), row_count: 1 }, Bucket { lower: Value::BigInt(1), upper: Value::BigInt(1), row_count: 1 }];
+        let residual_buckets = vec![Bucket { lower: Value::BigInt(1), upper: Value::BigInt(1), row_count: 2 }];
         let stats =
             ColumnStats { null_count: 0, distinct_count: 2, min: Some(Value::BigInt(0)), max: Some(Value::BigInt(1)), histogram: residual_buckets, mcv };
         let selectivity = estimate_equality_selectivity(Some(&stats), 20, &Value::BigInt(1));
         assert!((selectivity - 2.0 / 20.0).abs() < 1e-9, "selectivity={selectivity}");
     }
+
 
     #[test]
     fn equality_accounts_for_null_fraction() {

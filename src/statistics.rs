@@ -66,13 +66,37 @@
 //!
 //! [`MCV_MAX_ENTRIES`]件に達した時点でまだ固定点に達していない(=残余に
 //! なお平均バケツ行数を超える値が残っている)場合は、抽出をそこで打ち切る。
-//! この場合、残った値は従来どおり複数の単一値バケツへ分割されうるが、
-//! `crate::estimator::estimate_equality_selectivity`が同じ値を持つバケツを
-//! 合算する(`crate::estimator`モジュールの説明を参照)ため、単一値バケツに
-//! 限っては選択率の見積もり自体は狂わない。狂いうるのは、その値が範囲述語
-//! (`crate::estimator::estimate_range_selectivity`)の対象になった場合や、
-//! Histogramのバケツ数そのもの([`HISTOGRAM_BUCKET_COUNT`]、境界の粒度)が
-//! 想定より粗くなる場合である。
+//! この場合でも、残った値がバケツをまたぐことは無い。理由は
+//! `build_equi_depth_histogram`側の設計にある(第4部3巡目レビュー対応)。
+//!
+//! # Histogramは同値の連続runをバケツ境界で分割しない
+//!
+//! 当初の`build_equi_depth_histogram`は、ソート済みの残余値を単純に
+//! `行数 ÷ バケツ数`ぶんずつ機械的に切り分けていた。この方式では、MCVの
+//! 閾値をわずかに下回る(=MCVには採用されないが、1バケツの目標行数は
+//! 超える)値が、たまたま目標の切れ目をまたいで存在すると、その値は
+//! **単一値バケツ**(その値だけで埋まったバケツ)と**混合バケツ**(その値の
+//! 残りと、別の値が混在するバケツ)に分割されてしまう。等値述語の推定
+//! (`crate::estimator::equality_selectivity_within_non_null`)が単一値バケツ
+//! どうしの合算だけで済ませていたころは、この混合バケツ側に紛れ込んだ分を
+//! 数え漏らしていた(頻度`[15, 14, 12, 11, 10, 9, 8, 7, 7, 6, 6]`+一意値42件
+//! という分布で、`v = 10`が`rows=5 actual=6`になった再現がこれに当たる)。
+//!
+//! `build_equi_depth_histogram`は、目標の切れ目が同じ値の連続runの途中に
+//! 来る場合、runの終わりまで境界を伸ばす。バケツは常に「1個以上の
+//! 完全なrun」の集まりになるため、ある値が2つのバケツにまたがることは
+//! 構造的に起こらない(値を含むバケツは必ずちょうど1個であり、その
+//! バケツが単一値だけで埋まっているか、複数の値が混在しているかのどちらか
+//! である)。この結果、等値述語の推定はバケツをまたいだ合算を一切必要と
+//! せず、見つかった1個のバケツだけを見ればよくなる。
+//!
+//! 代わりに、バケツの行数は均等ではなくなる。目標の切れ目をまたぐ長いrun
+//! があるバケツは、目標行数を超えて膨らむ(runの長さがそのままそのバケツの
+//! 行数になる)。これは等頻度(equi-depth)という名前が示す「バケツの行数を
+//! 均等にする」という理想からの意図的な後退だが、行数の均等さそのものより
+//! 「値がバケツをまたがない」ことのほうが、この章の推定式にとって重要である
+//! (`crate::estimator::equality_selectivity_within_non_null`のドキュメントを
+//! 参照)。
 
 use std::collections::HashSet;
 
@@ -268,19 +292,30 @@ fn build_equi_depth_histogram(sorted_values: &[Value]) -> Vec<Bucket> {
     let base_size = total / bucket_count;
     let remainder = total % bucket_count;
 
-    let mut buckets = Vec::with_capacity(bucket_count);
+    let mut buckets = Vec::new();
     let mut start = 0;
-    for i in 0..bucket_count {
-        // 割り切れない分は、先頭のバケツから1行ずつ多めに配る。
-        let size = base_size + usize::from(i < remainder);
-        let end = start + size;
+    let mut bucket_index = 0;
+    while start < total {
+        // 割り切れない分は、先頭のバケツから1行ずつ多めに配る、という目標
+        // サイズ自体は従来どおり。
+        let target_size = base_size + usize::from(bucket_index < remainder);
+        let mut end = (start + target_size.max(1)).min(total);
+        // 目標の切れ目が同じ値の連続run(同じ値が連なった範囲)の途中に
+        // 来る場合、runの終わりまで境界を伸ばす。これにより、1つの値が
+        // 2つのバケツにまたがることはなくなる(モジュール冒頭の説明を参照)。
+        // 結果としてバケツの行数は均等ではなくなる(runが長い値のぶん、
+        // そのバケツだけ目標サイズを超える)。
+        while end < total && sorted_values[end] == sorted_values[end - 1] {
+            end += 1;
+        }
         let chunk = &sorted_values[start..end];
         buckets.push(Bucket {
-            lower: chunk.first().expect("sizeは1以上").clone(),
-            upper: chunk.last().expect("sizeは1以上").clone(),
+            lower: chunk.first().expect("startを含むため1行以上").clone(),
+            upper: chunk.last().expect("startを含むため1行以上").clone(),
             row_count: chunk.len() as u64,
         });
         start = end;
+        bucket_index += 1;
     }
     buckets
 }
@@ -405,6 +440,47 @@ mod tests {
         assert_eq!(stats.columns[0].mcv, vec![(Value::BigInt(0), 50), (Value::BigInt(1), 8)]);
         let residual_total: u64 = stats.columns[0].histogram.iter().map(|b| b.row_count).sum();
         assert_eq!(residual_total, 42);
+    }
+
+    #[test]
+    fn histogram_does_not_split_a_value_across_a_singleton_and_a_mixed_bucket() {
+        // codexレビュー3巡目の再現ケース: 出現回数[15,14,12,11,10,9,8,7,7,6,6]
+        // (値0〜10)+一意値42件(合計147行)という分布。MCVは固定点方式で
+        // 抽出するが、MCV_MAX_ENTRIES(10)件に達した時点で0〜9(10個)を
+        // 抽出し終えており、11個目の値(`10`、出現回数6)はMCVに入らないまま
+        // 残余へ回る。
+        //
+        // `10`を、残余に含まれる一意値(1000〜1041)よりすべて小さい値にして
+        // あるため、ソート順で`10`の6行はまとまって先頭に並ぶ。旧実装
+        // (行数だけを見て機械的に等頻度分割する)なら、この6行は1個目の
+        // バケツ(5行、単一値)と2個目のバケツ(1行+一意値4件の混合)に
+        // 分かれ、`v = 10`の推定は単一値バケツの5行しか数えられなかった
+        // (`rows=5 actual=6`)。`build_equi_depth_histogram`が同値の連続run
+        // をバケツ境界で分割しない今の実装では、6行すべてが1個の単一値
+        // バケツに収まるはずである。
+        let mut values = Vec::new();
+        for (v, count) in [15, 14, 12, 11, 10, 9, 8, 7, 7, 6, 6].into_iter().enumerate() {
+            values.extend(std::iter::repeat_n(Value::BigInt(v as i64), count));
+        }
+        values.extend((1000..1042).map(Value::BigInt));
+        assert_eq!(values.len(), 147);
+
+        let stats = collect(&values);
+        let column = &stats.columns[0];
+
+        // 0〜9(10個)がMCVへ移り、10(出現回数6)はMCV_MAX_ENTRIESの上限に
+        // よって残余に残る。
+        assert_eq!(column.mcv.len(), MCV_MAX_ENTRIES);
+        assert!(!column.mcv.iter().any(|(v, _)| *v == Value::BigInt(10)), "mcv={:?}", column.mcv);
+
+        let bucket_for_ten = column
+            .histogram
+            .iter()
+            .find(|b| compare_values(&Value::BigInt(10), &b.lower) != std::cmp::Ordering::Less && compare_values(&Value::BigInt(10), &b.upper) != std::cmp::Ordering::Greater)
+            .unwrap_or_else(|| panic!("値10を含むバケツが見つかりません: {:?}", column.histogram));
+        assert_eq!(bucket_for_ten.lower, Value::BigInt(10));
+        assert_eq!(bucket_for_ten.upper, Value::BigInt(10));
+        assert_eq!(bucket_for_ten.row_count, 6, "histogram={:?}", column.histogram);
     }
 
     #[test]
