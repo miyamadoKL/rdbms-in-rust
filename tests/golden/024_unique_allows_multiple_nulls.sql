@@ -1,0 +1,3 @@
+CREATE TABLE users (id BIGINT NOT NULL, email TEXT UNIQUE);
+INSERT INTO users VALUES (1, NULL), (2, NULL);
+SELECT id FROM users;

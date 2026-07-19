@@ -1,0 +1,21 @@
+CREATE TABLE
+
+INSERT 5
+
+dept | COUNT(*) | SUM(amount) | MIN(amount) | MAX(amount)
+---------------------------------------------------------
+eng | 2 | 300 | 100 | 200
+hr | 1 | NULL | NULL | NULL
+sales | 2 | 50 | 50 | 50
+(3 rows)
+
+dept | COUNT(*)
+---------------
+eng | 2
+sales | 2
+(2 rows)
+
+COUNT(*)
+--------
+0
+(1 row)

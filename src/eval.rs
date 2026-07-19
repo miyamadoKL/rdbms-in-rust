@@ -1,14 +1,21 @@
-//! `Expr`を`Value`へ変換する式評価器。
+//! `Expr`・`BoundExpr`を`Value`へ変換する式評価器。
 //!
 //! 対応するのは、算術演算・比較演算・SQLの三値論理・`IS [NOT] NULL`・`CAST`・
-//! Scalar Function呼び出し・列参照(`Expr::ColumnRef`)である。列参照は、
-//! `row`引数で渡された行環境(`Row`、第10章で導入)から値を引く。`INSERT`の
-//! `VALUES`のように行を伴わない文脈では`row`に`None`を渡し、列参照が現れれば
-//! `DbError::Eval`にする。
+//! Scalar Function呼び出し・列参照である。列参照は、`row`引数で渡された行環境
+//! (`Row`、第10章で導入)から値を引く。`INSERT`の`VALUES`のように行を伴わない
+//! 文脈では`row`に`None`を渡す。
+//!
+//! `eval_expr`は構文解析直後の`Expr`(名前解決前)を、`eval_bound_expr`は
+//! `Binder`(第17章)が名前解決・型検査を終えた`BoundExpr`をそれぞれ評価する。
+//! `VALUES`リストのように、`Binder`が列参照を持たないと分かっている式
+//! (`Expr`のまま`Database`が保持する)には引き続き`eval_expr`を使う。列参照を
+//! 含みうる式(`WHERE`句、`SELECT`の対象式、`SET`の右辺)は、必ず`Binder`を
+//! 経由した`BoundExpr`になってから`eval_bound_expr`で評価する。
 
 use std::collections::HashMap;
 
 use crate::ast::{BinaryOperator, Expr, UnaryOperator};
+use crate::binder::BoundExpr;
 use crate::error::{DbError, DbResult};
 use crate::types::{DataType, Row, Value};
 
@@ -52,6 +59,71 @@ pub fn eval_expr(expr: &Expr, functions: &FunctionRegistry, row: Option<&Row>) -
                 .map(|arg| eval_expr(arg, functions, row))
                 .collect::<DbResult<Vec<_>>>()?;
             functions.call(name, &values)
+        }
+        Expr::Aggregate { .. } => Err(DbError::Eval(
+            "集約関数(COUNT/SUM/MIN/MAX)は複数行にまたがる文脈(SELECTの対象式・HAVING・ORDER BY)でのみ使えます"
+                .to_string(),
+        )),
+    }
+}
+
+/// `BoundExpr`を評価して`Value`を返す。`eval_expr`の束縛済み版。
+///
+/// 列参照(`BoundExpr::ColumnRef`)は、`Binder`(第17章)が決めた列インデックス
+/// (`column_index`)で`row`から直接値を引く。名前を毎回`Schema`と突き合わせる
+/// `eval_expr`の`Expr::ColumnRef`とは異なり、この索引は束縛の時点で検査済み
+/// なので、ここでの`get_index`は`Schema`に対する再検証を行わない。
+///
+/// `table_ordinal`は、複数のテーブルを結合した`JOIN`(第22章)であっても
+/// `eval_bound_expr`自身は参照しない。`Binder`が`column_index`をすでに
+/// **結合後スキーマ**(`tables`を左から右へ連結した列の並び)上のフラットな
+/// 添字へ変換済みだからである(`binder`モジュールの`BoundSelect`ドキュメント
+/// 参照)。`row`は、`Join`演算子が左右のタプルを連結して作った1個の`Tuple`を
+/// 指す`Row`であり、単一テーブルの`SELECT`と同じ`get_index`だけで列参照を
+/// 解決できる。`table_ordinal`は主にエラーメッセージや`EXPLAIN`表示のための
+/// 付随情報として残してある。
+pub fn eval_bound_expr(expr: &BoundExpr, functions: &FunctionRegistry, row: Option<&Row>) -> DbResult<Value> {
+    match expr {
+        BoundExpr::IntLiteral { value, .. } => Ok(Value::BigInt(*value)),
+        BoundExpr::StringLiteral { value, .. } => Ok(Value::Text(value.clone())),
+        BoundExpr::BoolLiteral { value, .. } => Ok(Value::Boolean(*value)),
+        BoundExpr::NullLiteral { .. } => Ok(Value::Null),
+        BoundExpr::ColumnRef { column_index, name, .. } => {
+            match row {
+                Some(row) => row
+                    .get_index(*column_index)
+                    .cloned()
+                    .ok_or_else(|| DbError::Eval(format!("列'{name}'が見つかりません"))),
+                None => Err(DbError::Eval(format!("列参照'{name}'は行を伴わない文脈では使えません"))),
+            }
+        }
+        BoundExpr::Paren { expr, .. } => eval_bound_expr(expr, functions, row),
+        BoundExpr::UnaryOp { op, expr, .. } => eval_unary(*op, eval_bound_expr(expr, functions, row)?),
+        BoundExpr::BinaryOp { op, lhs, rhs, .. } => eval_binary_bound(*op, lhs, rhs, functions, row),
+        BoundExpr::IsNull { expr, negated, .. } => {
+            let is_null = eval_bound_expr(expr, functions, row)?.is_null();
+            Ok(Value::Boolean(if *negated { !is_null } else { is_null }))
+        }
+        BoundExpr::Cast { expr, data_type, .. } => {
+            let value = eval_bound_expr(expr, functions, row)?;
+            eval_cast(value, *data_type)
+        }
+        BoundExpr::FunctionCall { name, args, .. } => {
+            let values = args
+                .iter()
+                .map(|arg| eval_bound_expr(arg, functions, row))
+                .collect::<DbResult<Vec<_>>>()?;
+            functions.call(name, &values)
+        }
+        BoundExpr::Aggregate { .. } => {
+            // `Binder::bind_select`は、集約が絡む`SELECT`では`BoundExpr::Aggregate`を
+            // 常に`AggregateExec`の出力列への`ColumnRef`へ書き換える(第21章)。
+            // このアームに到達するのは、その不変条件が破れた場合の最終防衛線であり、
+            // `executor::predicate_matches`が型不一致に対して持つ最終防衛線
+            // (`crate::binder`モジュール冒頭のドキュメント参照)と同じ位置づけである。
+            Err(DbError::Eval(
+                "集約関数はAggregate演算子でのみ計算されます(Binderが値へ書き換え忘れています)".to_string(),
+            ))
         }
     }
 }
@@ -116,6 +188,46 @@ fn eval_binary(
             op,
             eval_expr(lhs, functions, row)?,
             eval_expr(rhs, functions, row)?,
+        ),
+    }
+}
+
+/// `eval_binary`の`BoundExpr`版。
+fn eval_binary_bound(
+    op: BinaryOperator,
+    lhs: &BoundExpr,
+    rhs: &BoundExpr,
+    functions: &FunctionRegistry,
+    row: Option<&Row>,
+) -> DbResult<Value> {
+    match op {
+        BinaryOperator::And => {
+            let l = value_to_tri(&eval_bound_expr(lhs, functions, row)?)?;
+            let r = value_to_tri(&eval_bound_expr(rhs, functions, row)?)?;
+            Ok(tri_to_value(tri_and(l, r)))
+        }
+        BinaryOperator::Or => {
+            let l = value_to_tri(&eval_bound_expr(lhs, functions, row)?)?;
+            let r = value_to_tri(&eval_bound_expr(rhs, functions, row)?)?;
+            Ok(tri_to_value(tri_or(l, r)))
+        }
+        BinaryOperator::Add
+        | BinaryOperator::Subtract
+        | BinaryOperator::Multiply
+        | BinaryOperator::Divide => eval_arith(
+            op,
+            eval_bound_expr(lhs, functions, row)?,
+            eval_bound_expr(rhs, functions, row)?,
+        ),
+        BinaryOperator::Eq
+        | BinaryOperator::NotEq
+        | BinaryOperator::Lt
+        | BinaryOperator::LtEq
+        | BinaryOperator::Gt
+        | BinaryOperator::GtEq => eval_compare(
+            op,
+            eval_bound_expr(lhs, functions, row)?,
+            eval_bound_expr(rhs, functions, row)?,
         ),
     }
 }
@@ -765,6 +877,7 @@ mod tests {
     #[test]
     fn column_ref_without_a_row_is_an_error() {
         let expr = Expr::ColumnRef {
+            qualifier: None,
             name: "id".to_string(),
             span: dummy_span(),
         };
@@ -781,6 +894,7 @@ mod tests {
         let row = Row::new(&schema, &tuple);
 
         let expr = Expr::ColumnRef {
+            qualifier: None,
             name: "id".to_string(),
             span: dummy_span(),
         };
@@ -797,6 +911,7 @@ mod tests {
         let row = Row::new(&schema, &tuple);
 
         let expr = Expr::ColumnRef {
+            qualifier: None,
             name: "does_not_exist".to_string(),
             span: dummy_span(),
         };

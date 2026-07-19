@@ -8,9 +8,12 @@
 //! - `SELECT <式|*> [, <式|*> ...] [FROM <table>] [WHERE <式>]`
 //! - `CREATE TABLE <table> (<col> <type> [NOT NULL], ...)`
 //! - `DROP TABLE <table>`
+//! - `CREATE [UNIQUE] INDEX <index> ON <table> (<col>)`(第24章)
+//! - `DROP INDEX <index>`(第24章)
 //! - `INSERT INTO <table> [(<col>, ...)] VALUES (<式>, ...), ...`
 //! - `UPDATE <table> SET <col> = <式> [, ...] [WHERE <式>]`
 //! - `DELETE FROM <table> [WHERE <式>]`
+//! - `EXPLAIN <SELECT|INSERT INTO|UPDATE|DELETE FROM>`(第19章)
 //! - 式: リテラル(整数・文字列・真偽値・`NULL`)、列参照、二項演算(`+ - * /`、
 //!   比較、`AND` `OR`)、単項演算(`-` `NOT`)、`IS [NOT] NULL`、関数呼び出し、
 //!   `CAST(expr AS type)`、括弧
@@ -18,9 +21,10 @@
 //! 優先順位は低い順に`OR` < `AND` < `NOT` < 比較 < `+` `-` < `*` `/` < 単項`-`。
 
 use crate::ast::{
-    Assignment, BinaryOperator, ColumnDef, CreateTableStatement, DeleteStatement,
-    DropTableStatement, Expr, Ident, InsertStatement, SelectItem, SelectStatement, Statement,
-    UnaryOperator, UpdateStatement,
+    AggregateFunc, Assignment, BinaryOperator, ColumnDef, CreateIndexStatement, CreateTableStatement,
+    DeleteStatement, DropIndexStatement, DropTableStatement, ExplainStatement, Expr, FromClause, Ident,
+    InsertStatement, JoinClause, JoinKind, OrderByItem, SelectItem, SelectStatement, Statement, UnaryOperator,
+    UpdateStatement,
 };
 use crate::error::{DbError, DbResult};
 use crate::lexer::{self, Keyword, Span, Token, TokenKind};
@@ -57,6 +61,16 @@ impl<'a> Parser<'a> {
 
     fn peek_kind(&self) -> &TokenKind {
         &self.peek().kind
+    }
+
+    /// `n`個先(`n == 0`は`peek_kind`と同じ)のトークンの種類を覗き見る。配列の
+    /// 末尾を超える場合は最後のトークン(常に`Eof`)を返す。`CREATE TABLE`と
+    /// `CREATE INDEX`・`CREATE UNIQUE INDEX`(第24章)、`DROP TABLE`と
+    /// `DROP INDEX`(第24章)は、どちらも1個目のキーワード(`CREATE`・`DROP`)が
+    /// 共通のため、2個目のトークンを覗いてから分岐する。
+    fn peek_nth_kind(&self, n: usize) -> &TokenKind {
+        let idx = (self.pos + n).min(self.tokens.len() - 1);
+        &self.tokens[idx].kind
     }
 
     fn advance(&mut self) -> Token {
@@ -130,14 +144,10 @@ impl<'a> Parser<'a> {
     fn parse_statement(&mut self) -> DbResult<Statement> {
         match self.peek_kind() {
             TokenKind::Keyword(Keyword::Select) => {
-                self.parse_select_statement().map(Statement::Select)
+                self.parse_select_statement().map(|s| Statement::Select(Box::new(s)))
             }
-            TokenKind::Keyword(Keyword::Create) => self
-                .parse_create_table_statement()
-                .map(Statement::CreateTable),
-            TokenKind::Keyword(Keyword::Drop) => {
-                self.parse_drop_table_statement().map(Statement::DropTable)
-            }
+            TokenKind::Keyword(Keyword::Create) => self.parse_create_statement(),
+            TokenKind::Keyword(Keyword::Drop) => self.parse_drop_statement(),
             TokenKind::Keyword(Keyword::Insert) => {
                 self.parse_insert_statement().map(Statement::Insert)
             }
@@ -147,16 +157,72 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Delete) => {
                 self.parse_delete_statement().map(Statement::Delete)
             }
+            TokenKind::Keyword(Keyword::Explain) => {
+                self.parse_explain_statement().map(Statement::Explain)
+            }
             _ => Err(self.unexpected(
-                "SELECT・CREATE TABLE・DROP TABLE・INSERT INTO・UPDATE・DELETE FROMのいずれか",
+                "SELECT・CREATE TABLE・DROP TABLE・CREATE INDEX・DROP INDEX・INSERT INTO・UPDATE・\
+                 DELETE FROM・EXPLAINのいずれか",
             )),
         }
+    }
+
+    /// `CREATE`の直後を覗き見て、`CREATE TABLE`と`CREATE [UNIQUE] INDEX`(第24章)を
+    /// 振り分ける。
+    fn parse_create_statement(&mut self) -> DbResult<Statement> {
+        match self.peek_nth_kind(1) {
+            TokenKind::Keyword(Keyword::Table) => self.parse_create_table_statement().map(Statement::CreateTable),
+            TokenKind::Keyword(Keyword::Index) => self.parse_create_index_statement(false).map(Statement::CreateIndex),
+            TokenKind::Keyword(Keyword::Unique) => self.parse_create_index_statement(true).map(Statement::CreateIndex),
+            _ => Err(self.unexpected("TABLE・INDEX・UNIQUE INDEXのいずれか")),
+        }
+    }
+
+    /// `DROP`の直後を覗き見て、`DROP TABLE`と`DROP INDEX`(第24章)を振り分ける。
+    fn parse_drop_statement(&mut self) -> DbResult<Statement> {
+        match self.peek_nth_kind(1) {
+            TokenKind::Keyword(Keyword::Table) => self.parse_drop_table_statement().map(Statement::DropTable),
+            TokenKind::Keyword(Keyword::Index) => self.parse_drop_index_statement().map(Statement::DropIndex),
+            _ => Err(self.unexpected("TABLE・INDEXのいずれか")),
+        }
+    }
+
+    // ---- EXPLAIN ----
+
+    /// `EXPLAIN <SELECT|INSERT INTO|UPDATE|DELETE FROM>`を解析する。
+    ///
+    /// 対象を`SELECT`・`INSERT INTO`・`UPDATE`・`DELETE FROM`の4種類に限るのは、
+    /// `EXPLAIN`が見せるのはLogical Plan/Physical Planに変換できる文だけだから
+    /// である(第19章)。`CREATE TABLE`・`DROP TABLE`はどちらの計画も経由しない
+    /// (`Database::execute_create_table`等を直接呼ぶ)ため対象に含めない。
+    /// `EXPLAIN EXPLAIN ...`のような入れ子も、この関数が生の`parse_statement`
+    /// ではなく`SELECT`等4種の解析関数だけを呼ぶことで、構文の時点で拒否される。
+    fn parse_explain_statement(&mut self) -> DbResult<ExplainStatement> {
+        let start = self.expect_keyword(Keyword::Explain, "EXPLAIN")?.start;
+
+        let statement = match self.peek_kind() {
+            TokenKind::Keyword(Keyword::Select) => self.parse_select_statement().map(|s| Statement::Select(Box::new(s)))?,
+            TokenKind::Keyword(Keyword::Insert) => self.parse_insert_statement().map(Statement::Insert)?,
+            TokenKind::Keyword(Keyword::Update) => self.parse_update_statement().map(Statement::Update)?,
+            TokenKind::Keyword(Keyword::Delete) => self.parse_delete_statement().map(Statement::Delete)?,
+            _ => return Err(self.unexpected("SELECT・INSERT INTO・UPDATE・DELETE FROMのいずれか")),
+        };
+
+        let end = statement.span().end;
+        Ok(ExplainStatement { statement: Box::new(statement), span: Span { start, end } })
     }
 
     // ---- SELECT ----
 
     fn parse_select_statement(&mut self) -> DbResult<SelectStatement> {
         let start = self.expect_keyword(Keyword::Select, "SELECT")?.start;
+
+        let distinct = if let TokenKind::Keyword(Keyword::Distinct) = self.peek_kind() {
+            self.advance();
+            true
+        } else {
+            false
+        };
 
         let mut items = vec![self.parse_select_item()?];
         while *self.peek_kind() == TokenKind::Comma {
@@ -168,8 +234,29 @@ impl<'a> Parser<'a> {
         let from = if let TokenKind::Keyword(Keyword::From) = self.peek_kind() {
             self.advance();
             let table = self.expect_ident()?;
-            end = table.span.end;
-            Some(table)
+            let mut from_end = table.span.end;
+            let alias = if let TokenKind::Keyword(Keyword::As) = self.peek_kind() {
+                self.advance();
+                let alias = self.expect_ident()?;
+                from_end = alias.span.end;
+                Some(alias)
+            } else {
+                None
+            };
+
+            let mut joins = Vec::new();
+            while let Some(join) = self.parse_join_clause()? {
+                from_end = join.span.end;
+                joins.push(join);
+            }
+
+            end = from_end;
+            Some(FromClause {
+                span: Span::new(table.span.start, from_end),
+                table,
+                alias,
+                joins,
+            })
         } else {
             None
         };
@@ -183,12 +270,135 @@ impl<'a> Parser<'a> {
             None
         };
 
+        let group_by = if let TokenKind::Keyword(Keyword::Group) = self.peek_kind() {
+            self.advance();
+            self.expect_keyword(Keyword::By, "BY")?;
+            let mut exprs = vec![self.parse_expr(0)?];
+            while *self.peek_kind() == TokenKind::Comma {
+                self.advance();
+                exprs.push(self.parse_expr(0)?);
+            }
+            end = exprs.last().expect("直前にpushしたばかり").span().end;
+            exprs
+        } else {
+            Vec::new()
+        };
+
+        let having = if let TokenKind::Keyword(Keyword::Having) = self.peek_kind() {
+            self.advance();
+            let expr = self.parse_expr(0)?;
+            end = expr.span().end;
+            Some(expr)
+        } else {
+            None
+        };
+
+        let order_by = if let TokenKind::Keyword(Keyword::Order) = self.peek_kind() {
+            self.advance();
+            self.expect_keyword(Keyword::By, "BY")?;
+            let mut items = vec![self.parse_order_by_item()?];
+            while *self.peek_kind() == TokenKind::Comma {
+                self.advance();
+                items.push(self.parse_order_by_item()?);
+            }
+            end = items.last().expect("直前にpushしたばかり").span.end;
+            items
+        } else {
+            Vec::new()
+        };
+
+        let limit = if let TokenKind::Keyword(Keyword::Limit) = self.peek_kind() {
+            self.advance();
+            let expr = self.parse_expr(0)?;
+            end = expr.span().end;
+            Some(expr)
+        } else {
+            None
+        };
+
+        let offset = if let TokenKind::Keyword(Keyword::Offset) = self.peek_kind() {
+            self.advance();
+            let expr = self.parse_expr(0)?;
+            end = expr.span().end;
+            Some(expr)
+        } else {
+            None
+        };
+
         Ok(SelectStatement {
+            distinct,
             items,
             from,
             where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
             span: Span::new(start, end),
         })
+    }
+
+    /// `ORDER BY`の要素1個(`<式> [ASC|DESC]`)を読む。
+    fn parse_order_by_item(&mut self) -> DbResult<OrderByItem> {
+        let expr = self.parse_expr(0)?;
+        let mut end = expr.span().end;
+        let desc = match self.peek_kind() {
+            TokenKind::Keyword(Keyword::Asc) => {
+                end = self.advance().span.end;
+                false
+            }
+            TokenKind::Keyword(Keyword::Desc) => {
+                end = self.advance().span.end;
+                true
+            }
+            _ => false,
+        };
+        let span = Span::new(expr.span().start, end);
+        Ok(OrderByItem { expr, desc, span })
+    }
+
+    /// `FROM`の直後、または直前の`JOIN`の直後に続く`[INNER] JOIN <table>
+    /// [AS <alias>] ON <expr>`を1個読む(第22章)。次のトークンが`JOIN`・
+    /// `INNER`のどちらでもなければ、`JOIN`の連鎖はここで終わりなので`None`を
+    /// 返す(呼び出し側の`while let`が抜ける)。
+    ///
+    /// `JOIN`単独は`INNER JOIN`の別名として受理する。標準SQLも`JOIN`だけを
+    /// 書いた場合は`INNER JOIN`とみなす規則なので、`Parser`の時点で
+    /// `JoinKind::Inner`へ統一してしまい、`Binder`以降はこの2つの書き方の
+    /// 違いを一切意識しない。
+    fn parse_join_clause(&mut self) -> DbResult<Option<JoinClause>> {
+        let start = match self.peek_kind() {
+            TokenKind::Keyword(Keyword::Join) => self.peek().span.start,
+            TokenKind::Keyword(Keyword::Inner) => self.peek().span.start,
+            _ => return Ok(None),
+        };
+
+        if let TokenKind::Keyword(Keyword::Inner) = self.peek_kind() {
+            self.advance();
+            self.expect_keyword(Keyword::Join, "JOIN")?;
+        } else {
+            self.advance();
+        }
+
+        let table = self.expect_ident()?;
+        let alias = if let TokenKind::Keyword(Keyword::As) = self.peek_kind() {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        self.expect_keyword(Keyword::On, "ON")?;
+        let on = self.parse_expr(0)?;
+        let end = on.span().end;
+
+        Ok(Some(JoinClause {
+            kind: JoinKind::Inner,
+            table,
+            alias,
+            on,
+            span: Span::new(start, end),
+        }))
     }
 
     /// `*`は`parse_expr`(乗算の`*`と同じToken)に渡すと式として解釈できないため、
@@ -226,24 +436,46 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// 列定義の型名に続く列制約(`NOT NULL`・`PRIMARY KEY`・`UNIQUE`)を、
+    /// 現れる限り任意の順序・任意の個数だけ読む(第20章)。同じ制約が複数回
+    /// 現れても構文としては受理し、`Database::execute_create_table`が実際に
+    /// 意味のある組み合わせかどうかを検査する(複合`PRIMARY KEY`の拒否など)。
     fn parse_column_def(&mut self) -> DbResult<ColumnDef> {
         let name = self.expect_ident()?;
         let type_name = self.expect_ident()?;
         let mut end = type_name.span.end;
 
-        let not_null = if let TokenKind::Keyword(Keyword::Not) = self.peek_kind() {
-            self.advance();
-            end = self.expect_keyword(Keyword::Null, "NULL")?.end;
-            true
-        } else {
-            false
-        };
+        let mut not_null = false;
+        let mut primary_key = false;
+        let mut unique = false;
+
+        loop {
+            match self.peek_kind() {
+                TokenKind::Keyword(Keyword::Not) => {
+                    self.advance();
+                    end = self.expect_keyword(Keyword::Null, "NULL")?.end;
+                    not_null = true;
+                }
+                TokenKind::Keyword(Keyword::Primary) => {
+                    self.advance();
+                    end = self.expect_keyword(Keyword::Key, "KEY")?.end;
+                    primary_key = true;
+                }
+                TokenKind::Keyword(Keyword::Unique) => {
+                    end = self.advance().span.end;
+                    unique = true;
+                }
+                _ => break,
+            }
+        }
 
         Ok(ColumnDef {
             span: Span::new(name.span.start, end),
             name,
             type_name,
             not_null,
+            primary_key,
+            unique,
         })
     }
 
@@ -257,6 +489,45 @@ impl<'a> Parser<'a> {
 
         Ok(DropTableStatement {
             table,
+            span: Span::new(start, end),
+        })
+    }
+
+    // ---- CREATE INDEX / DROP INDEX(第24章) ----
+
+    /// `CREATE [UNIQUE] INDEX <index> ON <table> (<column>)`を解析する。
+    /// `unique`は`parse_create_statement`が`CREATE`の2個先を覗いて渡す
+    /// (`UNIQUE`キーワードを読んでいるかどうか)。
+    fn parse_create_index_statement(&mut self, unique: bool) -> DbResult<CreateIndexStatement> {
+        let start = self.expect_keyword(Keyword::Create, "CREATE")?.start;
+        if unique {
+            self.expect_keyword(Keyword::Unique, "UNIQUE")?;
+        }
+        self.expect_keyword(Keyword::Index, "INDEX")?;
+        let index = self.expect_ident()?;
+        self.expect_keyword(Keyword::On, "ON")?;
+        let table = self.expect_ident()?;
+        self.expect_punct(TokenKind::LParen, "(")?;
+        let column = self.expect_ident()?;
+        let end = self.expect_punct(TokenKind::RParen, ")")?.end;
+
+        Ok(CreateIndexStatement {
+            unique,
+            index,
+            table,
+            column,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_drop_index_statement(&mut self) -> DbResult<DropIndexStatement> {
+        let start = self.expect_keyword(Keyword::Drop, "DROP")?.start;
+        self.expect_keyword(Keyword::Index, "INDEX")?;
+        let index = self.expect_ident()?;
+        let end = index.span.end;
+
+        Ok(DropIndexStatement {
+            index,
             span: Span::new(start, end),
         })
     }
@@ -517,10 +788,26 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Ident(name) => {
                 let start_span = self.advance().span;
-                if *self.peek_kind() == TokenKind::LParen {
+                if *self.peek_kind() == TokenKind::Dot {
+                    // `u.id`。関数呼び出しは`schema.func()`のような修飾名を
+                    // このSQLサブセットでは扱わないため、`.`を見た時点で
+                    // 列参照だと確定できる。
+                    self.advance();
+                    let column = self.expect_ident()?;
+                    let span = Span::new(start_span.start, column.span.end);
+                    Ok(Expr::ColumnRef {
+                        qualifier: Some(Ident {
+                            name,
+                            span: start_span,
+                        }),
+                        name: column.name,
+                        span,
+                    })
+                } else if *self.peek_kind() == TokenKind::LParen {
                     self.parse_function_call(name, start_span)
                 } else {
                     Ok(Expr::ColumnRef {
+                        qualifier: None,
                         name,
                         span: start_span,
                     })
@@ -556,7 +843,20 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `name(...)`を読む。`name`が集約関数(`COUNT`・`SUM`・`MIN`・`MAX`、
+    /// 大文字小文字を無視)の名前と一致する場合は[`parse_aggregate_call`]に
+    /// 委ね、それ以外はScalar Functionの呼び出しとして読む。
+    ///
+    /// 集約関数を予約語にせず識別子のまま特別扱いしているのは、`abs`・
+    /// `length`(第8章)と同じくScalar Functionの名前が予約語ではない設計を
+    /// 崩さないためである。`count`という名前を列名やテーブル名として使いたい
+    /// 場合は、この関数を経由しない(`(`が続かない)限り、これまでどおり
+    /// 識別子として解決される。
     fn parse_function_call(&mut self, name: String, name_span: Span) -> DbResult<Expr> {
+        if let Some(func) = AggregateFunc::from_name(&name) {
+            return self.parse_aggregate_call(func, name_span);
+        }
+
         self.expect_punct(TokenKind::LParen, "(")?;
 
         let mut args = Vec::new();
@@ -572,6 +872,29 @@ impl<'a> Parser<'a> {
         Ok(Expr::FunctionCall {
             name,
             args,
+            span: Span::new(name_span.start, end),
+        })
+    }
+
+    /// 集約関数呼び出し`COUNT(*)` / `COUNT(<式>)` / `SUM(<式>)` / `MIN(<式>)` /
+    /// `MAX(<式>)`を読む。`*`が引数として書けるのは`COUNT`だけである
+    /// (`SUM(*)`のような構文はここで拒否する)。
+    fn parse_aggregate_call(&mut self, func: AggregateFunc, name_span: Span) -> DbResult<Expr> {
+        self.expect_punct(TokenKind::LParen, "(")?;
+
+        let arg = if func == AggregateFunc::Count && *self.peek_kind() == TokenKind::Star {
+            self.advance();
+            None
+        } else if *self.peek_kind() == TokenKind::Star {
+            return Err(self.unexpected(&format!("{}の引数には式が必要です(*は使えません)", func.name())));
+        } else {
+            Some(Box::new(self.parse_expr(0)?))
+        };
+
+        let end = self.expect_punct(TokenKind::RParen, ")")?.end;
+        Ok(Expr::Aggregate {
+            func,
+            arg,
             span: Span::new(name_span.start, end),
         })
     }
@@ -649,7 +972,11 @@ mod tests {
             Expr::StringLiteral { value, .. } => Expr::StringLiteral { value, span: dummy },
             Expr::BoolLiteral { value, .. } => Expr::BoolLiteral { value, span: dummy },
             Expr::NullLiteral { .. } => Expr::NullLiteral { span: dummy },
-            Expr::ColumnRef { name, .. } => Expr::ColumnRef { name, span: dummy },
+            Expr::ColumnRef { qualifier, name, .. } => Expr::ColumnRef {
+                qualifier: qualifier.map(|q| Ident { name: q.name, span: dummy }),
+                name,
+                span: dummy,
+            },
             Expr::UnaryOp { op, expr, .. } => Expr::UnaryOp {
                 op,
                 expr: Box::new(strip_spans(*expr)),
@@ -669,6 +996,11 @@ mod tests {
             Expr::FunctionCall { name, args, .. } => Expr::FunctionCall {
                 name,
                 args: args.into_iter().map(strip_spans).collect(),
+                span: dummy,
+            },
+            Expr::Aggregate { func, arg, .. } => Expr::Aggregate {
+                func,
+                arg: arg.map(|expr| Box::new(strip_spans(*expr))),
                 span: dummy,
             },
             Expr::Paren { expr, .. } => Expr::Paren {
@@ -923,10 +1255,107 @@ mod tests {
         assert_expr_eq(
             "id",
             Expr::ColumnRef {
+                qualifier: None,
                 name: "id".to_string(),
                 span: Span::new(0, 0),
             },
         );
+    }
+
+    #[test]
+    fn parses_qualified_column_ref() {
+        assert_expr_eq(
+            "u.id",
+            Expr::ColumnRef {
+                qualifier: Some(Ident {
+                    name: "u".to_string(),
+                    span: Span::new(0, 0),
+                }),
+                name: "id".to_string(),
+                span: Span::new(0, 0),
+            },
+        );
+    }
+
+    #[test]
+    fn parses_from_with_alias() {
+        let statement = parse_statement("SELECT u.id FROM users AS u").unwrap();
+        match statement {
+            Statement::Select(select) => {
+                let from = select.from.expect("FROMがあるはず");
+                assert_eq!(from.table.name, "users");
+                assert_eq!(from.alias.map(|a| a.name), Some("u".to_string()));
+            }
+            other => panic!("Statement::Selectを期待したが{other:?}が返った"),
+        }
+    }
+
+    // ---- JOIN(第22章) ----
+
+    #[test]
+    fn parses_inner_join_with_on_clause() {
+        let statement = parse_statement("SELECT a.x FROM a INNER JOIN b ON a.id = b.id").unwrap();
+        match statement {
+            Statement::Select(select) => {
+                let from = select.from.expect("FROMがあるはず");
+                assert_eq!(from.joins.len(), 1);
+                assert_eq!(from.joins[0].kind, JoinKind::Inner);
+                assert_eq!(from.joins[0].table.name, "b");
+            }
+            other => panic!("Statement::Selectを期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn join_alone_is_treated_as_inner_join() {
+        let statement = parse_statement("SELECT a.x FROM a JOIN b ON a.id = b.id").unwrap();
+        match statement {
+            Statement::Select(select) => {
+                assert_eq!(select.from.unwrap().joins[0].kind, JoinKind::Inner);
+            }
+            other => panic!("Statement::Selectを期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_join_with_alias() {
+        let statement = parse_statement("SELECT x.id FROM a AS x JOIN b AS y ON x.id = y.id").unwrap();
+        match statement {
+            Statement::Select(select) => {
+                let from = select.from.unwrap();
+                assert_eq!(from.alias.map(|a| a.name), Some("x".to_string()));
+                assert_eq!(from.joins[0].alias.as_ref().map(|a| a.name.as_str()), Some("y"));
+            }
+            other => panic!("Statement::Selectを期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_multiple_chained_joins() {
+        let statement =
+            parse_statement("SELECT a.x FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id").unwrap();
+        match statement {
+            Statement::Select(select) => {
+                let from = select.from.unwrap();
+                assert_eq!(from.joins.len(), 2);
+                assert_eq!(from.joins[0].table.name, "b");
+                assert_eq!(from.joins[1].table.name, "c");
+            }
+            other => panic!("Statement::Selectを期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn join_without_on_is_a_syntax_error() {
+        let err = parse_statement("SELECT a.x FROM a JOIN b").unwrap_err();
+        assert!(matches!(err, DbError::Parse { .. }));
+    }
+
+    #[test]
+    fn comma_separated_from_is_still_rejected() {
+        // カンマ結合(`FROM a, b`)はこの章では対応しない(本文の解説を参照)。
+        let err = parse_statement("SELECT a.x FROM a, b").unwrap_err();
+        assert!(matches!(err, DbError::Parse { .. }));
     }
 
     #[test]
@@ -943,7 +1372,7 @@ mod tests {
         let statement = parse_statement("SELECT id FROM users WHERE id = 1").unwrap();
         match statement {
             Statement::Select(select) => {
-                assert_eq!(select.from.map(|t| t.name), Some("users".to_string()));
+                assert_eq!(select.from.map(|t| t.table.name), Some("users".to_string()));
                 assert!(select.where_clause.is_some());
             }
             other => panic!("SELECT文を期待したが{other:?}が返った"),
@@ -969,11 +1398,78 @@ mod tests {
     }
 
     #[test]
+    fn parses_primary_key_and_unique_column_constraints() {
+        let statement = parse_statement(
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT UNIQUE, name TEXT)",
+        )
+        .unwrap();
+        match statement {
+            Statement::CreateTable(create) => {
+                assert!(create.columns[0].primary_key);
+                assert!(!create.columns[0].unique);
+                assert!(create.columns[1].unique);
+                assert!(!create.columns[1].primary_key);
+                assert!(!create.columns[2].primary_key);
+                assert!(!create.columns[2].unique);
+            }
+            other => panic!("CREATE TABLE文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_column_constraints_in_any_order() {
+        // `NOT NULL`・`PRIMARY KEY`・`UNIQUE`はどの順序で書いても構文として
+        // 受理する。
+        let statement =
+            parse_statement("CREATE TABLE t (id BIGINT UNIQUE NOT NULL PRIMARY KEY)").unwrap();
+        match statement {
+            Statement::CreateTable(create) => {
+                assert!(create.columns[0].not_null);
+                assert!(create.columns[0].primary_key);
+                assert!(create.columns[0].unique);
+            }
+            other => panic!("CREATE TABLE文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
     fn parses_drop_table() {
         let statement = parse_statement("DROP TABLE users").unwrap();
         match statement {
             Statement::DropTable(drop) => assert_eq!(drop.table.name, "users"),
             other => panic!("DROP TABLE文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_create_index() {
+        let statement = parse_statement("CREATE INDEX idx_users_id ON users (id)").unwrap();
+        match statement {
+            Statement::CreateIndex(create) => {
+                assert!(!create.unique);
+                assert_eq!(create.index.name, "idx_users_id");
+                assert_eq!(create.table.name, "users");
+                assert_eq!(create.column.name, "id");
+            }
+            other => panic!("CREATE INDEX文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_create_unique_index() {
+        let statement = parse_statement("CREATE UNIQUE INDEX idx_users_email ON users (email)").unwrap();
+        match statement {
+            Statement::CreateIndex(create) => assert!(create.unique),
+            other => panic!("CREATE UNIQUE INDEX文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_drop_index() {
+        let statement = parse_statement("DROP INDEX idx_users_id").unwrap();
+        match statement {
+            Statement::DropIndex(drop) => assert_eq!(drop.index.name, "idx_users_id"),
+            other => panic!("DROP INDEX文を期待したが{other:?}が返った"),
         }
     }
 
@@ -1063,6 +1559,66 @@ mod tests {
             Statement::Delete(delete) => assert!(delete.where_clause.is_none()),
             other => panic!("DELETE文を期待したが{other:?}が返った"),
         }
+    }
+
+    // ---- EXPLAIN ----
+
+    #[test]
+    fn parses_explain_select() {
+        let statement = parse_statement("EXPLAIN SELECT id FROM users").unwrap();
+        match statement {
+            Statement::Explain(explain) => assert!(matches!(*explain.statement, Statement::Select(_))),
+            other => panic!("EXPLAIN文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_explain_insert() {
+        let statement = parse_statement("EXPLAIN INSERT INTO users VALUES (1)").unwrap();
+        match statement {
+            Statement::Explain(explain) => assert!(matches!(*explain.statement, Statement::Insert(_))),
+            other => panic!("EXPLAIN文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_explain_update() {
+        let statement = parse_statement("EXPLAIN UPDATE users SET id = 1").unwrap();
+        match statement {
+            Statement::Explain(explain) => assert!(matches!(*explain.statement, Statement::Update(_))),
+            other => panic!("EXPLAIN文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn parses_explain_delete() {
+        let statement = parse_statement("EXPLAIN DELETE FROM users").unwrap();
+        match statement {
+            Statement::Explain(explain) => assert!(matches!(*explain.statement, Statement::Delete(_))),
+            other => panic!("EXPLAIN文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn explain_span_covers_the_keyword_through_the_inner_statement() {
+        let statement = parse_statement("EXPLAIN SELECT id FROM users").unwrap();
+        let Statement::Explain(explain) = statement else {
+            panic!("EXPLAIN文を期待した");
+        };
+        assert_eq!(explain.span.start, 0);
+        assert_eq!(explain.span.end, "EXPLAIN SELECT id FROM users".len());
+    }
+
+    #[test]
+    fn explain_rejects_create_table() {
+        let err = parse_statement("EXPLAIN CREATE TABLE t (id BIGINT)").unwrap_err();
+        assert!(matches!(err, DbError::Parse { .. }));
+    }
+
+    #[test]
+    fn explain_rejects_nested_explain() {
+        let err = parse_statement("EXPLAIN EXPLAIN SELECT id FROM users").unwrap_err();
+        assert!(matches!(err, DbError::Parse { .. }));
     }
 
     #[test]

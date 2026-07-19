@@ -61,6 +61,21 @@ pub enum DbError {
         column: usize,
     },
 
+    /// `Binder`(第17章)がASTをBound ASTへ変換できなかったエラー。発生位置の
+    /// 行・列を持つ。未知のテーブル・列参照、複数テーブルにまたがる曖昧な
+    /// 列参照、式の型検査の失敗がここに当たる。`Lex`・`Parse`と表示形式を
+    /// 揃えている(`行N列M: 種別: メッセージ`)ので、利用者はエラーがどの段階
+    /// (字句解析・構文解析・名前解決)で起きたかを見分けられる。
+    #[error("行{line}列{column}: 名前解決エラー: {message}")]
+    Bind {
+        /// エラーの内容。
+        message: String,
+        /// 発生位置の行番号(1始まり)。
+        line: usize,
+        /// 発生位置の列番号(1始まり)。
+        column: usize,
+    },
+
     /// File HeaderまたはPageのバイト列が壊れているエラー(Magic Number不一致、
     /// Format Version不一致、checksum不一致、バイト数不一致、未知のPage Typeなど)。
     #[error("破損したページです: {0}")]
@@ -108,6 +123,85 @@ pub enum DbError {
     /// `next_table_id`がすでに`u64::MAX`で、これ以上安全に加算できないエラー。
     #[error("これ以上テーブルを作成できません: TableIdの上限(u64::MAX)に達しました")]
     TableIdSpaceExhausted,
+
+    /// `CREATE TABLE`の列定義に、`PRIMARY KEY`が2列以上に指定されたエラー(第20章)。
+    /// このSQLサブセットは単一列の`PRIMARY KEY`だけに対応する。複合`PRIMARY KEY`
+    /// (複数列の組で一意性を課す構文)は演習課題として読者に残す。
+    #[error("PRIMARY KEYは1列にのみ指定できます(複合PRIMARY KEYはこの章の範囲外です)")]
+    MultiplePrimaryKeys,
+
+    /// `INSERT`または`UPDATE`が、`PRIMARY KEY`列に既存の行(または同じ文の
+    /// 別の行)と同じ値を書き込もうとしたエラー(第20章)。
+    #[error("PRIMARY KEY制約違反です: 列'{column}'の値{value}が重複しています")]
+    PrimaryKeyViolation {
+        /// 違反した列の名前。
+        column: String,
+        /// 重複していた値の表示(`Value`の利用者向け表示形式)。
+        value: String,
+    },
+
+    /// `INSERT`または`UPDATE`が、`UNIQUE`列に既存の行(または同じ文の
+    /// 別の行)と同じ値を書き込もうとしたエラー(第20章)。`NULL`同士は
+    /// 重複とみなさない(`crate::constraints`のドキュメント参照)。
+    #[error("UNIQUE制約違反です: 列'{column}'の値{value}が重複しています")]
+    UniqueViolation {
+        /// 違反した列の名前。
+        column: String,
+        /// 重複していた値の表示(`Value`の利用者向け表示形式)。
+        value: String,
+    },
+
+    /// `crate::btree`(第23章)の`insert`・`lookup`に`Value::Null`をキーとして
+    /// 渡したエラー。B+Treeは`NULL`をキーとして保持しない(モジュールの
+    /// ドキュメント参照)。`NULL`を持つ行をインデックスへ入れない判断は、
+    /// 呼び出し側(第24章の`CREATE INDEX`・Index Maintenance)の責務であり、
+    /// このエラーはその呼び出し側が誤って`NULL`を渡した場合の防御である。
+    #[error("NULLはB+Treeのキーにできません")]
+    NullKeyNotAllowed,
+
+    /// `crate::btree`(第23章)の`BTree::create`で決めたキー型と異なる型の
+    /// `Value`を`insert`・`lookup`に渡したエラー。
+    #[error("B+Treeのキー型が一致しません: {expected}型のツリーに{actual}型の値を渡しました")]
+    BTreeKeyTypeMismatch {
+        /// `BTree::create`で決めたキー型。
+        expected: String,
+        /// 実際に渡された値の型。
+        actual: String,
+    },
+
+    /// `crate::btree`(第23章)の`insert`に渡したキー(またはLeaf Split・
+    /// Internal Splitが親へ押し上げようとした区切りキー)1件だけでも、
+    /// 空のLeaf PageまたはInternal Pageに収まらないほど大きいエラー。
+    /// `HeapFile::insert`(第13章)の`DbError::TupleTooLarge`と同じ理由で、
+    /// これ以上分割してもページに収まらない場合の割り切りとして返す。
+    #[error("B+Treeのキーがページに収まりません: {0}バイト")]
+    BTreeKeyTooLarge(usize),
+
+    /// `crate::btree`(第24章)が`unique`フラグを立てて作られた索引に対して、
+    /// すでに存在するキーを`insert`しようとしたエラー。この索引自身は
+    /// どの列がPRIMARY KEY・UNIQUEかを知らないため、列名を含まない。
+    /// 呼び出し側(`crate::index::check_uniqueness_with_index`、または
+    /// `crate::storage::Storage`のIndex Maintenance)が、この章の
+    /// `DbError::PrimaryKeyViolation`・`DbError::UniqueViolation`(列名つき)へ
+    /// 翻訳してから利用者へ返す。
+    #[error("B+Tree索引のunique制約に違反しています")]
+    BTreeUniqueViolation,
+
+    /// `CREATE INDEX`が、すでにカタログへ登録済みの索引名を指定したエラー(第24章)。
+    #[error("索引はすでに存在します: {0}")]
+    DuplicateIndex(String),
+
+    /// `DROP INDEX`が、カタログに登録されていない索引名を指定したエラー(第24章)。
+    #[error("索引が存在しません: {0}")]
+    IndexNotFound(String),
+
+    /// `DROP INDEX`が、`PRIMARY KEY`・`UNIQUE`列に対応して自動生成された
+    /// 制約索引を指定したエラー(第3部2巡目レビュー対応)。この索引を
+    /// `DROP INDEX`で消せてしまうと、対応する列の一意性制約を検査する手段が
+    /// 失われる。`DROP TABLE`はテーブルごとこの索引も取り除くため、
+    /// このエラーの対象にはならない。
+    #[error("索引'{0}'はPRIMARY KEY・UNIQUE制約が自動生成した索引のため、DROP INDEXでは削除できません")]
+    CannotDropConstraintIndex(String),
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

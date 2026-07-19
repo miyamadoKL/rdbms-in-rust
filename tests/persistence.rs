@@ -195,3 +195,61 @@ fn memory_and_disk_backends_agree_on_the_same_sql() {
 
     std::fs::remove_file(&path).unwrap();
 }
+
+#[test]
+fn primary_key_and_unique_constraints_survive_reopen() {
+    // `PRIMARY KEY`・`UNIQUE`はCatalogページの列ごとのレコードに追加した
+    // フラグ(第20章)として永続化される。再オープン後も、その制約が
+    // 引き続き効いていることを確認する。
+    let path = temp_db_path("constraints-survive-reopen");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT UNIQUE, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'a@example.com', 'Alice')")
+            .unwrap();
+        db.flush().unwrap();
+    }
+
+    let mut db = Database::open(&path).unwrap();
+    let duplicate_id = db.execute("INSERT INTO users VALUES (1, 'b@example.com', 'Bob')");
+    assert!(matches!(
+        duplicate_id,
+        Err(minidb::DbError::PrimaryKeyViolation { .. })
+    ));
+
+    let duplicate_email = db.execute("INSERT INTO users VALUES (2, 'a@example.com', 'Carol')");
+    assert!(matches!(
+        duplicate_email,
+        Err(minidb::DbError::UniqueViolation { .. })
+    ));
+
+    // 違反した2件は書き込まれておらず、再オープン直後の1行のままである。
+    assert_eq!(db.execute("SELECT id FROM users").unwrap().rows().len(), 1);
+
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn a_failed_insert_with_a_unique_violation_does_not_grow_the_file() {
+    // 制約違反はStatement Rollbackの対象であり、`Storage::insert`自体を
+    // 一度も呼ばない。ファイルサイズが変わらないことで、書き込みが実際に
+    // 1バイトも行われていないことを確認する。
+    let path = temp_db_path("unique-violation-no-growth");
+    let mut db = Database::open(&path).unwrap();
+    db.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+    db.flush().unwrap();
+    let file_size_before = std::fs::metadata(&path).unwrap().len();
+
+    for _ in 0..3 {
+        let result = db.execute("INSERT INTO users VALUES (1, 'Bob')");
+        assert!(result.is_err());
+    }
+    db.flush().unwrap();
+
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), file_size_before);
+
+    std::fs::remove_file(&path).unwrap();
+}

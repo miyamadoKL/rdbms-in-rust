@@ -16,18 +16,29 @@ use crate::lexer::Span;
 /// SQL文1本を表す。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    /// `SELECT`文。
-    Select(SelectStatement),
+    /// `SELECT`文。第21章で`ORDER BY`・`GROUP BY`・`HAVING`・`LIMIT`・`OFFSET`が
+    /// 加わり`SelectStatement`自体が大きくなったため、他の(小さい)variantとの
+    /// サイズ差を抑えるために`Box`で間接化する。
+    Select(Box<SelectStatement>),
     /// `CREATE TABLE`文。
     CreateTable(CreateTableStatement),
     /// `DROP TABLE`文。
     DropTable(DropTableStatement),
+    /// `CREATE INDEX` / `CREATE UNIQUE INDEX`文(第24章)。
+    CreateIndex(CreateIndexStatement),
+    /// `DROP INDEX`文(第24章)。
+    DropIndex(DropIndexStatement),
     /// `INSERT INTO`文。
     Insert(InsertStatement),
     /// `UPDATE`文。
     Update(UpdateStatement),
     /// `DELETE FROM`文。
     Delete(DeleteStatement),
+    /// `EXPLAIN`文。`SELECT`・`INSERT INTO`・`UPDATE`・`DELETE FROM`のいずれか
+    /// 1本を対象に取れる(第19章)。`CREATE TABLE`・`DROP TABLE`はLogical
+    /// Plan/Physical Planを経由しない文であり、`EXPLAIN`する対象を持たないため
+    /// 対象に含めない。
+    Explain(ExplainStatement),
 }
 
 impl Statement {
@@ -37,9 +48,12 @@ impl Statement {
             Statement::Select(s) => s.span,
             Statement::CreateTable(s) => s.span,
             Statement::DropTable(s) => s.span,
+            Statement::CreateIndex(s) => s.span,
+            Statement::DropIndex(s) => s.span,
             Statement::Insert(s) => s.span,
             Statement::Update(s) => s.span,
             Statement::Delete(s) => s.span,
+            Statement::Explain(s) => s.span,
         }
     }
 }
@@ -57,17 +71,117 @@ pub struct Ident {
 /// `SELECT`文。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStatement {
+    /// `DISTINCT`が指定されていたかどうか(第21章)。
+    pub distinct: bool,
     /// `SELECT`の直後に並ぶ、カンマ区切りの式リスト。
     pub items: Vec<SelectItem>,
-    /// `FROM <table>`。省略した`SELECT`は、列を持たない空のSchemaに対する
-    /// 1件のタプルを暗黙の入力とみなして実行する(`where_clause`のドキュメント
+    /// `FROM <table> [AS <alias>]`。省略した`SELECT`は、列を持たない空のSchemaに
+    /// 対する1件のタプルを暗黙の入力とみなして実行する(`where_clause`のドキュメント
     /// コメント参照)。
-    pub from: Option<Ident>,
+    pub from: Option<FromClause>,
     /// `WHERE <expr>`。`from`を伴わない`SELECT`でも構文として受理するだけでなく、
     /// 意味も持つ。`from`が無い`SELECT`は、この1件の暗黙のタプルに対して
     /// `where_clause`を適用し、`TRUE`なら1行、`FALSE`または`NULL`(UNKNOWN)なら
     /// 0行を返す(`database`モジュールの`execute_select_without_from`参照)。
     pub where_clause: Option<Expr>,
+    /// `GROUP BY <式, ...>`(第21章)。空なら`GROUP BY`を持たない。
+    pub group_by: Vec<Expr>,
+    /// `HAVING <expr>`(第21章)。
+    pub having: Option<Expr>,
+    /// `ORDER BY <式> [ASC|DESC], ...`(第21章)。
+    pub order_by: Vec<OrderByItem>,
+    /// `LIMIT <expr>`(第21章)。
+    pub limit: Option<Expr>,
+    /// `OFFSET <expr>`(第21章)。`LIMIT`を伴わない`OFFSET`単体も構文としては許す。
+    pub offset: Option<Expr>,
+    pub span: Span,
+}
+
+/// `ORDER BY`に並ぶ要素1個(第21章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderByItem {
+    pub expr: Expr,
+    /// `DESC`が指定されていたかどうか。`ASC`または未指定なら`false`。
+    pub desc: bool,
+    pub span: Span,
+}
+
+/// 集約関数の種類(第21章)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunc {
+    Count,
+    Sum,
+    Min,
+    Max,
+}
+
+impl AggregateFunc {
+    /// 識別子(大文字小文字を無視)を集約関数として解決する。集約関数でなければ`None`。
+    pub fn from_name(name: &str) -> Option<AggregateFunc> {
+        match name.to_ascii_uppercase().as_str() {
+            "COUNT" => Some(AggregateFunc::Count),
+            "SUM" => Some(AggregateFunc::Sum),
+            "MIN" => Some(AggregateFunc::Min),
+            "MAX" => Some(AggregateFunc::Max),
+            _ => None,
+        }
+    }
+
+    /// SQLの関数名としての表示(常に大文字)。
+    pub fn name(self) -> &'static str {
+        match self {
+            AggregateFunc::Count => "COUNT",
+            AggregateFunc::Sum => "SUM",
+            AggregateFunc::Min => "MIN",
+            AggregateFunc::Max => "MAX",
+        }
+    }
+}
+
+/// `SELECT`の`FROM <table> [AS <alias>] [<JOIN> ...]`。
+///
+/// `alias`があれば、`table`自身の名前は`Binder`(第17章)による列参照の解決では
+/// 使えなくなる(`AS`はテーブルを新しい名前で覆い隠す、標準SQLの規則)。
+/// `alias`が無い場合は`table`の名前がそのまま修飾子として使える。
+///
+/// `joins`は、`table`の右側へ順に連結する`INNER JOIN`の並び(第22章)。
+/// 空なら単一テーブルの`FROM`であり、この場合は第17章までと同じ意味を持つ。
+/// カンマ区切りの複数テーブル(`FROM a, b`)はこの章では構文として受理しない
+/// (`parser`モジュールのドキュメント、および本文の解説を参照)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FromClause {
+    pub table: Ident,
+    pub alias: Option<Ident>,
+    pub joins: Vec<JoinClause>,
+    pub span: Span,
+}
+
+/// `JOIN`の種類(第22章)。この章では`INNER`(`JOIN`単独も同義)のみを扱う。
+/// `LEFT OUTER JOIN`等は章末の演習課題で追加する対象として、あえて
+/// バリアントを1つだけに絞ってある。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+}
+
+impl JoinKind {
+    /// `EXPLAIN`・エラーメッセージでの表示名。
+    pub fn name(self) -> &'static str {
+        match self {
+            JoinKind::Inner => "INNER JOIN",
+        }
+    }
+}
+
+/// `FROM`に続く1個の`[INNER] JOIN <table> [AS <alias>] ON <expr>`(第22章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinClause {
+    pub kind: JoinKind,
+    pub table: Ident,
+    pub alias: Option<Ident>,
+    /// `ON`に続く結合条件。`WHERE`と同じくBOOLEANを返す式でなければならない
+    /// (`Binder::bind_from`が検査する)。
+    pub on: Expr,
     pub span: Span,
 }
 
@@ -108,6 +222,12 @@ pub struct ColumnDef {
     pub type_name: Ident,
     /// `NOT NULL`が指定されていたかどうか。
     pub not_null: bool,
+    /// `PRIMARY KEY`が指定されていたかどうか(第20章)。単一列のみに対応し、
+    /// 同じ`CREATE TABLE`の複数の列に指定された場合の扱いは`Database`側
+    /// (`execute_create_table`)が検査する。
+    pub primary_key: bool,
+    /// `UNIQUE`が指定されていたかどうか(第20章)。
+    pub unique: bool,
     pub span: Span,
 }
 
@@ -115,6 +235,28 @@ pub struct ColumnDef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropTableStatement {
     pub table: Ident,
+    pub span: Span,
+}
+
+/// `CREATE INDEX <index> ON <table> (<column>)`文(第24章)。
+///
+/// このSQLサブセットの索引キーは単一列に限る(`crate::btree`と同じ制約)ため、
+/// `(<column>)`の中は列名を1個だけ持つ。`UNIQUE`が指定されていれば`unique`が
+/// `true`になり、`PRIMARY KEY`・`UNIQUE`列に自動で作られる索引(`Database::execute_create_table`)と
+/// 同じ、キーの重複を`crate::btree::BTree`自身が拒否する索引になる。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndexStatement {
+    pub unique: bool,
+    pub index: Ident,
+    pub table: Ident,
+    pub column: Ident,
+    pub span: Span,
+}
+
+/// `DROP INDEX`文(第24章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropIndexStatement {
+    pub index: Ident,
     pub span: Span,
 }
 
@@ -159,6 +301,14 @@ pub struct DeleteStatement {
     pub table: Ident,
     /// `WHERE <expr>`。省略した場合はテーブルの全行が対象になる。
     pub where_clause: Option<Expr>,
+    pub span: Span,
+}
+
+/// `EXPLAIN`文。`statement`は`EXPLAIN`の直後に続く1本のSQL文。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplainStatement {
+    pub statement: Box<Statement>,
+    /// `EXPLAIN`キーワードから対象の文の末尾までを覆う範囲。
     pub span: Span,
 }
 
@@ -210,8 +360,12 @@ pub enum Expr {
     NullLiteral {
         span: Span,
     },
-    /// 列参照。`users.id`のような修飾名は、Lexerが`.`を扱わないため対象外。
+    /// 列参照。`users.id`のような修飾名も、`qualifier`に`users`を持つことで
+    /// 表現できる(第17章で`Dot`トークンに対応した)。`qualifier`がテーブル名
+    /// そのものを指すかテーブルAliasを指すかはASTの時点では区別せず、
+    /// どちらの解決(`Binder`)も同じ`Ident`から行う。
     ColumnRef {
+        qualifier: Option<Ident>,
         name: String,
         span: Span,
     },
@@ -236,6 +390,16 @@ pub enum Expr {
     FunctionCall {
         name: String,
         args: Vec<Expr>,
+        span: Span,
+    },
+    /// 集約関数呼び出し(第21章)。`COUNT`・`SUM`・`MIN`・`MAX`は、Scalar
+    /// Functionとは異なり複数行にまたがる状態(集計中の合計・件数など)を
+    /// 持つため、`FunctionCall`とは別のノードとして表す。`arg`が`None`なのは
+    /// `COUNT(*)`だけであり、他の3関数は構文の時点で必ず引数を1個持つ
+    /// (`Parser::parse_aggregate_call`が検査する)。
+    Aggregate {
+        func: AggregateFunc,
+        arg: Option<Box<Expr>>,
         span: Span,
     },
     /// `(expr)`。優先順位を明示するための括弧そのものをASTに残す。
@@ -266,6 +430,7 @@ impl Expr {
             | Expr::BinaryOp { span, .. }
             | Expr::IsNull { span, .. }
             | Expr::FunctionCall { span, .. }
+            | Expr::Aggregate { span, .. }
             | Expr::Paren { span, .. }
             | Expr::Cast { span, .. } => *span,
         }

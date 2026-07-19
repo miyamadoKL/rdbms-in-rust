@@ -1,0 +1,34 @@
+CREATE TABLE
+
+CREATE TABLE
+
+INSERT 3
+
+INSERT 5
+
+customers.name | orders.item
+----------------------------
+Alice | apple
+Alice | banana
+Bob | cherry
+(3 rows)
+
+QUERY PLAN
+----------
+Projection(customers.name, orders.item)
+  └─ HashJoin(INNER JOIN, id = customer_id)
+    └─ SeqScan(customers)
+    └─ SeqScan(orders)
+(4 rows)
+
+QUERY PLAN
+----------
+Projection(customers.name)
+  └─ NestedLoopJoin(INNER JOIN, id <> customer_id)
+    └─ SeqScan(customers)
+    └─ SeqScan(orders)
+(4 rows)
+
+ERROR: 行1列8: 名前解決エラー: 列'id'は複数のテーブルに存在するため曖昧です: customers, orders
+
+ERROR: 行1列53: 名前解決エラー: ON句はBOOLEANを返す式である必要があります: 式の型はBIGINTです

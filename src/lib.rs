@@ -20,11 +20,32 @@
 //! ストレージエンジン`storage`が加わる。第16章では、`database`のSQL実行経路が
 //! `storage`(永続モード、`Database::open`)と`storage_mem`(インメモリモード、
 //! `Database::memory`)のどちらでも動くようになり、`CREATE TABLE`・`INSERT`・
-//! `SELECT`・`UPDATE`・`DELETE`が再起動をまたいで残る。
+//! `SELECT`・`UPDATE`・`DELETE`が再起動をまたいで残る。第17章では、ASTを
+//! カタログと突き合わせて名前解決・型検査を行う`Binder`が加わり、`database`の
+//! 実行経路は構文解析(`parser`)→名前解決(`binder`)→実行(`executor`)という
+//! 3段階になる。第18章では、`BoundStatement`を関係代数の演算子木
+//! (`LogicalPlan`)へ変換する`logical_plan`が加わり、`database`の実行経路は
+//! 構文解析→名前解決→計画(`logical_plan`)→実行という4段階になる。第19章では、
+//! `LogicalPlan`から実行アルゴリズムを確定した`PhysicalPlan`を作り、
+//! `Executor::next()`で1行ずつ引っ張り出すVolcano型のPull実行を行う
+//! `physical_plan`が加わる。`database`の実行経路は構文解析→名前解決→
+//! 論理計画→物理計画→実行という5段階になり、`EXPLAIN`で`PhysicalPlan`の
+//! 木を確認できるようになる。第20章では、`CREATE TABLE`の列制約に`PRIMARY
+//! KEY`・`UNIQUE`が加わり、その一意性を走査ベースで検査する`constraints`が
+//! 加わる。`INSERT`・`UPDATE`は、対象行すべての検査を終えるまで書き込みを
+//! 一切始めないStatement Rollbackの対象に、この一意性検査も含めるようになる。
+//! 第23章では、キーから`RecordId`を`O(log n)`で引くディスク上のB+Tree
+//! (`btree`、ページ内レイアウトを扱う`btree_page`)が加わる。この章の
+//! `BTree`はまだ`Storage`とは結線されておらず、`Storage`と同じ`BufferPool`の
+//! 上で動く独立したデータ構造として、Point Lookup・Insert・各種Splitを提供する。
 
 pub mod ast;
+pub mod binder;
+pub mod btree;
+pub mod btree_page;
 pub mod buffer_pool;
 pub mod catalog;
+pub mod constraints;
 pub mod database;
 pub mod disk_manager;
 pub mod error;
@@ -33,9 +54,12 @@ pub mod executor;
 pub mod free_space_map;
 pub mod heap_file;
 pub mod ids;
+pub mod index;
 pub mod lexer;
+pub mod logical_plan;
 pub mod page;
 pub mod parser;
+pub mod physical_plan;
 pub mod slotted_page;
 pub mod storage;
 pub mod storage_mem;
@@ -43,6 +67,8 @@ pub mod tuple_codec;
 pub mod types;
 
 pub use ast::{Expr, Statement};
+pub use binder::{Binder, BoundExpr, BoundStatement, CatalogLookup};
+pub use btree::BTree;
 pub use buffer_pool::{BufferPool, BufferPoolStats, PageReadGuard, PageWriteGuard};
 pub use catalog::{Catalog, TableInfo};
 pub use database::{Database, QueryResult};
@@ -52,12 +78,15 @@ pub use eval::{FunctionRegistry, eval_expr};
 pub use free_space_map::FreeSpaceMap;
 pub use heap_file::{HeapFile, Scan};
 pub use ids::{PageId, RecordId, SlotId, TableId, TransactionId};
+pub use index::IndexInfo;
 pub use lexer::{Keyword, Span, Token, TokenKind, tokenize};
+pub use logical_plan::LogicalPlan;
 pub use page::{
     FILE_HEADER_SIZE, FORMAT_VERSION, MAGIC, PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, PAGE_SIZE,
     FileHeader, Page, PageType,
 };
 pub use parser::parse_statement;
+pub use physical_plan::{Executor, PhysicalPlan};
 pub use slotted_page::{SLOT_ENTRY_SIZE, SLOTTED_HEADER_SIZE, SlotStatus, SlottedPage, SlottedPageRef};
 pub use storage::Storage;
 pub use storage_mem::{MemStorage, MemTable};
