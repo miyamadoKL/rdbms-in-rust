@@ -83,9 +83,19 @@ fn violation_for(column: &Column, value: &crate::types::Value) -> DbError {
 /// 誤検出してしまう(`crate::executor::update`のコメントを参照)。
 ///
 /// `table_id`の`PRIMARY KEY`・`UNIQUE`列に対応する`UNIQUE`索引が見つからない
-/// 場合は`panic`する。第24章から、`Database::execute_create_table`が
-/// `PRIMARY KEY`・`UNIQUE`列に対して必ず`UNIQUE`索引を自動生成するため、
-/// この状況はディスクバックエンドでは起こらない不変条件である。
+/// 場合は`DbError::CorruptCatalog`を返す。第24章から、
+/// `Database::execute_create_table`が`PRIMARY KEY`・`UNIQUE`列に対して必ず
+/// `UNIQUE`索引を自動生成するため、この状況は通常起こらない不変条件である。
+///
+/// 第3部レビュー対応: 以前はこの不変条件が崩れた場合に`unreachable!`で
+/// プロセスごと終了させていた。しかし`Database::execute_create_table`が
+/// テーブルを永続化した**後**に制約索引の作成へ失敗しうる経路が存在した
+/// ため(既存の手動索引名が自動生成名と衝突した場合など、詳しくは
+/// `Database::execute_create_table`を参照)、この不変条件は「テーブルは
+/// 存在するのに対応する索引が無い」という形でカタログの破損として実際に
+/// 観測されうる。1件のクエリの異常な入力・状態が原因でサーバープロセス
+/// 全体を巻き添えにする`panic`ではなく、その1件の`INSERT`・`UPDATE`だけを
+/// 失敗させる`DbError`として返す。
 pub fn check_uniqueness_with_index(
     storage: &Storage,
     table_id: TableId,
@@ -94,13 +104,13 @@ pub fn check_uniqueness_with_index(
     exclude: &HashSet<RecordId>,
 ) -> crate::error::DbResult<()> {
     for (column_index, column) in schema.unique_constrained_columns() {
-        let index = storage.unique_index_for_column(table_id, column_index).unwrap_or_else(|| {
-            unreachable!(
-                "PRIMARY KEY・UNIQUE列'{}'には第24章からCREATE TABLEが自動でUNIQUE索引を \
-                 作るため、対応する索引が必ず見つかるはず",
+        let index = storage.unique_index_for_column(table_id, column_index).ok_or_else(|| {
+            DbError::CorruptCatalog(format!(
+                "PRIMARY KEY・UNIQUE列'{}'に対応するUNIQUE索引が見つかりません(CREATE TABLEが\
+                 自動生成するはずの索引が欠落しています)",
                 column.name
-            )
-        });
+            ))
+        })?;
         for candidate in candidates {
             let value = candidate.get(column_index).expect("candidateはschemaと同じ列数を持つ");
             if value.is_null() {
@@ -113,4 +123,56 @@ pub fn check_uniqueness_with_index(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::Storage;
+    use crate::types::Column;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "minidb-index-test-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        path.push(unique);
+        path
+    }
+
+    /// 第3部レビュー対応の回帰テスト: `PRIMARY KEY`列に対応するはずの
+    /// `UNIQUE`索引が(通常のSQL経路では起こらないはずだが)カタログから
+    /// 欠落している状態で`check_uniqueness_with_index`を呼ぶと、
+    /// プロセスを巻き添えにする`panic`(旧`unreachable!`)ではなく
+    /// `DbError::CorruptCatalog`を返す。
+    ///
+    /// この状態は、`Database::execute_create_table`が
+    /// 索引名の衝突を事前検査するようになった第3部レビュー対応後は、通常の
+    /// `CREATE TABLE`経由では作れなくなった。ここでは`Storage`を直接操作し、
+    /// 一度自動生成された制約索引を`drop_index`で取り除くことで、その
+    /// 「起こらないはずの」状態を意図的に再現する。
+    #[test]
+    fn check_uniqueness_with_index_reports_a_corrupt_catalog_instead_of_panicking_when_the_constraint_index_is_missing() {
+        let path = temp_path("missing-constraint-index");
+        let mut storage = Storage::create(&path).unwrap();
+        let schema = Schema::new(vec![Column::new("id", DataType::BigInt, false).with_primary_key(), Column::new("name", DataType::Text, true)]);
+        let table_id = storage.create_table("users", schema.clone()).unwrap();
+        storage.create_constraint_index("users_id_idx", "users", "id", true).unwrap();
+
+        // 通常はCREATE TABLEの一部として自動生成され、CREATE TABLE自身が
+        // 完了した後にユーザーが直接DROP INDEXできる名前でもない
+        // (自動生成索引だと利用者に知る手段が無い)が、ここではテストのために
+        // 直接`Storage::drop_index`で取り除き、「テーブルはPRIMARY KEYを
+        // 持つと申告しているのに、対応する索引が無い」という不変条件違反を
+        // 作る。
+        storage.drop_index("users_id_idx").unwrap();
+
+        let candidate = Tuple::new(&schema, vec![crate::types::Value::BigInt(1), crate::types::Value::Text("alice".to_string())]).unwrap();
+        let err = check_uniqueness_with_index(&storage, table_id, &schema, &[candidate], &HashSet::new()).unwrap_err();
+        assert!(matches!(err, DbError::CorruptCatalog(message) if message.contains("id")));
+
+        std::fs::remove_file(&path).unwrap();
+    }
 }

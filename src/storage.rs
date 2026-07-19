@@ -651,6 +651,36 @@ impl Storage {
         Ok(())
     }
 
+    /// `table_id`の全索引について、`tuple`を挿入(または`UPDATE`で書き直す)
+    /// 際にどの索引にもキーが収まることを、Heapへの書き込みより前に確認する
+    /// (第3部レビュー対応)。
+    ///
+    /// `crate::executor::storage_insert`・`storage_update`は、`storage.insert`・
+    /// `storage.update`でHeapを書き換える前に、この検査を全対象行に対して
+    /// 済ませておく。これを怠ると、Heapへの書き込みが終わった**後**に
+    /// `index_insert_row`が`DbError::BTreeKeyTooLarge`で失敗し、Heapには
+    /// 存在するが索引には無い行(Seq Scanでは見えるがIndex Scanでは見えない
+    /// 行)が残ってしまう。
+    ///
+    /// この検査は`crate::btree::BTree::check_key_fits`(「キー1件が空のページに
+    /// 収まるか」だけを見る)を全索引に対して行うだけで、`index_insert_row`
+    /// 実行の代わりにはならない。実際の`insert`が引き起こすLeaf・Internal
+    /// Splitは、既存ページの空き具合次第でこの検査を通過した後でも失敗する
+    /// 余地を残す(そちらの後始末は`index_insert_row`自身の巻き戻しに任せる)。
+    pub fn check_indexes_accept_row(&self, table_id: TableId, tuple: &Tuple) -> DbResult<()> {
+        for entry in self.indexes.values().filter(|e| e.info.table_id == table_id) {
+            let Some(value) = tuple.get(entry.info.column_index) else { continue };
+            if value.is_null() {
+                continue;
+            }
+            entry
+                .btree
+                .check_key_fits(value)
+                .map_err(|err| translate_btree_error(err, entry.info.primary_key, &entry.info.column_name, value))?;
+        }
+        Ok(())
+    }
+
     /// 新しく挿入(または`UPDATE`で書き直され)た行`tuple`(`RecordId`は`rid`)に
     /// ついて、`table_id`の全索引(`UNIQUE`・非`UNIQUE`の両方)を更新する
     /// (Index Maintenance、第24章)。
@@ -659,18 +689,47 @@ impl Storage {
     /// (`crate::btree::BTree`のモジュールドキュメント「`NULL`はキーにしない」を
     /// 参照)。`UNIQUE`索引で重複が見つかった場合は`DbError::PrimaryKeyViolation`・
     /// `DbError::UniqueViolation`を返す。呼び出し側(`crate::executor`)は、
-    /// この関数を呼ぶ前に`crate::index::check_uniqueness_with_index`で
-    /// 検査を終えている前提のため、通常はここで初めて違反が見つかることはない。
+    /// この関数を呼ぶ前に`crate::index::check_uniqueness_with_index`・
+    /// [`Self::check_indexes_accept_row`]で検査を終えている前提のため、通常は
+    /// ここで初めて違反が見つかることはない。
+    ///
+    /// # 第3部レビュー対応: 途中の索引が失敗したら、それより前の索引を戻す
+    ///
+    /// `table_id`が複数の索引を持つ場合、この関数はそれらを1つずつ順に
+    /// `insert`していく。[`Self::check_indexes_accept_row`]を通過していても、
+    /// Leaf・Internal Split(既存ページの空き具合に依存する)は原理的に
+    /// まだ失敗しうる。途中の索引で失敗したとき、それより前にすでに
+    /// `insert`済みだった索引をそのままにしてエラーを返すと、Heap(この
+    /// 行自体はまだ存在する)・一部の索引(この行を指す)・残りの索引
+    /// (この行を指さない)が食い違ったままになる。この関数はそれを避け、
+    /// 失敗した索引より前に成功していた`insert`を逆順に`delete`で
+    /// 巻き戻してからエラーを返す。それでもHeap自体(この`rid`の行)は
+    /// この関数の責務の外にあるため戻さない。呼び出し側
+    /// (`crate::executor::storage_insert`・`storage_update`)が、この関数が
+    /// 返したエラーを見てHeap側の巻き戻しを行う。
     pub fn index_insert_row(&mut self, table_id: TableId, tuple: &Tuple, rid: RecordId) -> DbResult<()> {
-        for entry in self.indexes.values_mut().filter(|e| e.info.table_id == table_id) {
-            let Some(value) = tuple.get(entry.info.column_index) else { continue };
+        let index_names: Vec<String> =
+            self.indexes.values().filter(|e| e.info.table_id == table_id).map(|e| e.info.name.clone()).collect();
+
+        let mut applied: Vec<(String, crate::types::Value)> = Vec::new();
+        for index_name in index_names {
+            let entry = self.indexes.get_mut(&index_name).expect("直前にこのテーブルの索引として集めた名前なので必ず存在する");
+            let Some(value) = tuple.get(entry.info.column_index).cloned() else { continue };
             if value.is_null() {
                 continue;
             }
-            entry
-                .btree
-                .insert(value, rid)
-                .map_err(|err| translate_btree_error(err, entry.info.primary_key, &entry.info.column_name, value))?;
+            match entry.btree.insert(&value, rid) {
+                Ok(()) => applied.push((index_name, value)),
+                Err(err) => {
+                    let (primary_key, column_name) = (entry.info.primary_key, entry.info.column_name.clone());
+                    for (applied_name, applied_value) in applied.into_iter().rev() {
+                        if let Some(applied_entry) = self.indexes.get_mut(&applied_name) {
+                            let _ = applied_entry.btree.delete(&applied_value, rid);
+                        }
+                    }
+                    return Err(translate_btree_error(err, primary_key, &column_name, &value));
+                }
+            }
         }
         Ok(())
     }
@@ -2236,6 +2295,87 @@ mod tests {
             storage.unique_index_for_column(table_id, 1).unwrap().lookup(&Value::Text("alice".to_string())).unwrap(),
             vec![dup_rid]
         );
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&idx_path);
+    }
+
+    /// 第3部レビュー対応の回帰テスト: `table_id`が複数の索引を持つ状態で、
+    /// そのうち1つの索引だけが`DbError::BTreeKeyTooLarge`で拒否する行を
+    /// `index_insert_row`へ渡すと、それより前に成功していた(他の)索引への
+    /// 反映が巻き戻され、この`rid`がどの索引にも残らないことを確認する。
+    /// `self.indexes`は`HashMap`で走査順が非決定的なため、"name"索引が先に
+    /// 成功してから"id"索引で失敗する場合と、その逆の場合のどちらが起きても
+    /// この不変条件は保たれるべきである。
+    #[test]
+    fn index_insert_row_rolls_back_earlier_indexes_when_a_later_index_rejects_the_key() {
+        let path = temp_path("index-insert-row-rollback");
+        let flag_idx_path = index_file_path(&path, "flag_idx");
+        let name_idx_path = index_file_path(&path, "name_idx");
+
+        // `id: BIGINT`の代わりに1バイトで符号化される`flag: BOOLEAN`を使い、
+        // 「Heapの1行としては収まるが、`name`列を索引化したB+Treeの空の
+        // Leaf Page1枚には収まらない」という値の幅を作る(`users_schema`の
+        // `id: BIGINT`(8バイト)ではこの幅が存在しない。Heap側のタプル
+        // エンコーディングの固定オーバーヘッドがB+Tree側の固定オーバーヘッド
+        // より小さいため、Heapに収まる値は常にB+Treeにも収まってしまう)。
+        let schema = Schema::new(vec![Column::new("flag", DataType::Boolean, false), Column::new("name", DataType::Text, true)]);
+
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("users", schema.clone()).unwrap();
+        storage.create_index("flag_idx", "users", "flag", false).unwrap();
+        storage.create_index("name_idx", "users", "name", false).unwrap();
+
+        // Heapのタプル1件が収まる上限は`PAGE_PAYLOAD_SIZE - 12`バイト、
+        // このタプルの`name`以外の部分(bitmap 1 + flag 1 + 長さ接頭辞 4)は
+        // 6バイトなので、`name`は最大`PAGE_PAYLOAD_SIZE - 18`バイトまで
+        // Heapに収まる。一方name_idx(B+Tree)の空のLeaf Page1枚に収まる
+        // キーの上限は`PAGE_PAYLOAD_SIZE - 24`バイト。この2つの間の長さの
+        // `name`を選べば、Heapには収まるがname_idxには収まらない。
+        let huge_name = "x".repeat(crate::page::PAGE_PAYLOAD_SIZE - 20);
+        let tuple = Tuple::new(&schema, vec![Value::Boolean(true), Value::Text(huge_name)]).unwrap();
+        let bytes = crate::tuple_codec::encode_tuple(&schema, &tuple);
+        let rid = storage.insert(table_id, &bytes).unwrap();
+
+        let err = expect_err(storage.index_insert_row(table_id, &tuple, rid));
+        assert!(matches!(err, DbError::BTreeKeyTooLarge(_)));
+
+        // flag_idxが先に成功していたとしても、巻き戻されてこの`rid`を指す
+        // エントリは残っていないはず。
+        let flag_entries: Vec<_> = storage
+            .index_btree("flag_idx")
+            .unwrap()
+            .range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+            .unwrap()
+            .collect::<DbResult<Vec<_>>>()
+            .unwrap();
+        assert!(flag_entries.iter().all(|(_, r)| *r != rid), "flag_idxにこのrid宛のエントリが残っている: {flag_entries:?}");
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&flag_idx_path);
+        let _ = std::fs::remove_file(&name_idx_path);
+    }
+
+    /// `check_indexes_accept_row`が、対象となる索引のうち1つでもキーが
+    /// 収まらなければ、Heapへの書き込みより前に(何にも触れずに)エラーを
+    /// 返すことを確認する(第3部レビュー対応の主防御)。
+    #[test]
+    fn check_indexes_accept_row_rejects_before_touching_anything() {
+        let (path, idx_path) = index_test_paths("check-indexes-accept-row");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("users", users_schema()).unwrap();
+        storage.create_index("idx", "users", "name", false).unwrap();
+
+        let schema = users_schema();
+        let huge_name = "x".repeat(crate::page::PAGE_PAYLOAD_SIZE);
+        let tuple = Tuple::new(&schema, vec![Value::BigInt(1), Value::Text(huge_name)]).unwrap();
+
+        let err = expect_err(storage.check_indexes_accept_row(table_id, &tuple));
+        assert!(matches!(err, DbError::BTreeKeyTooLarge(_)));
+
+        // 小さい値なら通る。
+        let ok_tuple = Tuple::new(&schema, vec![Value::BigInt(1), Value::Text("alice".to_string())]).unwrap();
+        storage.check_indexes_accept_row(table_id, &ok_tuple).unwrap();
 
         std::fs::remove_file(&path).unwrap();
         let _ = std::fs::remove_file(&idx_path);

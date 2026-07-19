@@ -132,6 +132,23 @@ fn checked_range(payload_len: usize, start: usize, len: usize, what: &str) -> Db
 /// `header_size`・`trailer_size`(キーの後ろに続く固定長データのバイト数、
 /// Leafなら`RECORD_ID_SIZE`、Internalなら`CHILD_ID_SIZE`)を引数化することで、
 /// Leaf PageとInternal Pageの両方から共通のロジックとして呼べるようにしてある。
+///
+/// [`LeafPage::write_entries`]・[`InternalPage::write_entries`]が書き出す
+/// レイアウトは「Directory直後(`dir_end`)から、エントリがキー順に隙間なく
+/// 詰まっている」という正規形1通りしか無い(モジュールドキュメント「常に
+/// 全エントリを書き直す」を参照)。以前の実装は各エントリの範囲が
+/// `payload`の内側に収まっていることしか検査しておらず、それぞれのエントリが
+/// **どこを指してよいか**を検査していなかった。そのため、キー領域が
+/// Header・Directoryを指す配置(Directoryの`key_offset`をわざと`0`にする、
+/// など)や、複数のエントリが同じ領域を指す配置(2件のDirectoryエントリに
+/// 同じ`key_offset`を書く、など)も「範囲内に収まっている」という理由だけで
+/// 通ってしまっていた。
+///
+/// この検査では、`i`番目のエントリの`key_offset`が「直前のエントリの
+/// 終端(`0`番目なら`dir_end`)」と正確に一致することを要求する。これにより、
+/// 先頭エントリの`key_offset`はDirectory直後以外を指せなくなり(Header・
+/// Directoryへの越境を拒否する)、後続のどのエントリも直前のエントリの
+/// 終端以外を指せなくなる(重複領域・隙間を拒否する)。
 fn validate(payload: &[u8], header_size: usize, trailer_size: usize, what: &str) -> DbResult<usize> {
     if payload.len() < header_size {
         return Err(DbError::CorruptPage(format!(
@@ -141,13 +158,20 @@ fn validate(payload: &[u8], header_size: usize, trailer_size: usize, what: &str)
     }
     let entry_count = read_u16(payload, 0) as usize;
     let dir_end = checked_range(payload.len(), header_size, entry_count * DIR_ENTRY_SIZE, &format!("{what}のDirectory"))?;
-    let _ = dir_end;
 
+    let mut cursor = dir_end;
     let mut previous_key: Option<Vec<u8>> = None;
     for i in 0..entry_count {
         let (key_offset, key_len) = dir_entry(payload, header_size, i);
+        if key_offset != cursor {
+            return Err(DbError::CorruptPage(format!(
+                "{what}のエントリ{i}のオフセット({key_offset})が、正規のレイアウトで期待される位置\
+                 ({cursor}、直前のエントリの直後)と一致しません(Header・Directoryを指す配置や、\
+                 複数エントリが領域を共有する配置は許されません)"
+            )));
+        }
         let key_end = checked_range(payload.len(), key_offset, key_len, &format!("{what}のエントリ{i}のキー"))?;
-        checked_range(payload.len(), key_end, trailer_size, &format!("{what}のエントリ{i}の付随データ"))?;
+        let trailer_end = checked_range(payload.len(), key_end, trailer_size, &format!("{what}のエントリ{i}の付随データ"))?;
 
         let key = &payload[key_offset..key_end];
         if let Some(prev) = &previous_key {
@@ -161,6 +185,7 @@ fn validate(payload: &[u8], header_size: usize, trailer_size: usize, what: &str)
             }
         }
         previous_key = Some(key.to_vec());
+        cursor = trailer_end;
     }
     Ok(entry_count)
 }
@@ -175,6 +200,21 @@ fn required_len(header_size: usize, entries_key_lens: impl Iterator<Item = usize
     }
     let _ = count;
     total
+}
+
+/// `entries`が`payload_len`バイトのLeaf Pageに収まるかどうかを、実際の
+/// ページには一切触れずに判定する。[`LeafPage::write_entries`]が内部で
+/// 使う計算(`required_len`)をそのまま公開したもので、`crate::btree`の
+/// Leaf Splitが「左右どちらの新しいページも収まることを確認してから、
+/// 初めて実ページを書き換える」ために使う(先に書いてから収まらないことに
+/// 気づくと、書き換え済みの元ページを元に戻す手段が無い)。
+pub fn leaf_entries_fit(payload_len: usize, entries: &[(Vec<u8>, RecordId)]) -> bool {
+    required_len(LEAF_HEADER_SIZE, entries.iter().map(|(k, _)| k.len()), RECORD_ID_SIZE) <= payload_len
+}
+
+/// [`leaf_entries_fit`]のInternal Page版。
+pub fn internal_entries_fit(payload_len: usize, entries: &[(Vec<u8>, PageId)]) -> bool {
+    required_len(INTERNAL_HEADER_SIZE, entries.iter().map(|(k, _)| k.len()), CHILD_ID_SIZE) <= payload_len
 }
 
 /// `payload`をLeaf Pageとして読み取り専用で開くビュー。
@@ -550,6 +590,51 @@ mod tests {
         assert!(matches!(LeafPageRef::open(&payload), Err(DbError::CorruptPage(_))));
     }
 
+    /// 正規のレイアウトでは、0番目のエントリの`key_offset`は`dir_end`
+    /// (`LEAF_HEADER_SIZE + entry_count * DIR_ENTRY_SIZE`)しかありえない。
+    /// `key_offset`をHeader領域(`next_leaf`フィールドの内部)へ向けた場合、
+    /// 「payloadの範囲内」ではあるが正規のレイアウトではないため拒否される。
+    #[test]
+    fn leaf_open_rejects_an_entry_pointing_into_the_header() {
+        let mut payload = fresh_payload();
+        payload[0..2].copy_from_slice(&1u16.to_le_bytes());
+        // key_offset=2(next_leafフィールドの内部、Header領域)。
+        payload[LEAF_HEADER_SIZE..LEAF_HEADER_SIZE + 2].copy_from_slice(&2u16.to_le_bytes());
+        payload[LEAF_HEADER_SIZE + 2..LEAF_HEADER_SIZE + 4].copy_from_slice(&1u16.to_le_bytes());
+        assert!(matches!(LeafPageRef::open(&payload), Err(DbError::CorruptPage(_))));
+    }
+
+    /// `key_offset`をDirectory自身の内部(`dir_end`より手前)へ向けた場合も、
+    /// 同じ理由で拒否される。
+    #[test]
+    fn leaf_open_rejects_an_entry_pointing_into_the_directory() {
+        let mut payload = fresh_payload();
+        payload[0..2].copy_from_slice(&1u16.to_le_bytes());
+        // key_offset=LEAF_HEADER_SIZE(Directory自身の先頭。dir_endはこれより
+        // DIR_ENTRY_SIZE分だけ後ろ)。
+        payload[LEAF_HEADER_SIZE..LEAF_HEADER_SIZE + 2].copy_from_slice(&(LEAF_HEADER_SIZE as u16).to_le_bytes());
+        payload[LEAF_HEADER_SIZE + 2..LEAF_HEADER_SIZE + 4].copy_from_slice(&1u16.to_le_bytes());
+        assert!(matches!(LeafPageRef::open(&payload), Err(DbError::CorruptPage(_))));
+    }
+
+    /// 2件のエントリが同じ領域を指す(1件目の領域を2件目が上書きする形で
+    /// 重複する)配置を拒否する。`write_entries`が生成する正規のレイアウトは
+    /// エントリ同士が連続して隙間なく並ぶため、2件目の`key_offset`は必ず
+    /// 1件目の終端と一致する。ここでは1件目と同じ`key_offset`を2件目にも
+    /// 書き込み、領域を重複させる。
+    #[test]
+    fn leaf_open_rejects_two_entries_that_share_the_same_region() {
+        let mut payload = fresh_payload();
+        {
+            let mut page = LeafPage::init(&mut payload);
+            assert!(page.write_entries(&[(b"a".to_vec(), rid(1, 0)), (b"b".to_vec(), rid(1, 1))]));
+        }
+        let (offset0, _) = dir_entry(&payload, LEAF_HEADER_SIZE, 0);
+        let dir_base_1 = LEAF_HEADER_SIZE + DIR_ENTRY_SIZE;
+        payload[dir_base_1..dir_base_1 + 2].copy_from_slice(&(offset0 as u16).to_le_bytes());
+        assert!(matches!(LeafPageRef::open(&payload), Err(DbError::CorruptPage(_))));
+    }
+
     #[test]
     fn leaf_next_leaf_defaults_to_none_and_survives_write_entries() {
         let mut payload = fresh_payload();
@@ -594,5 +679,43 @@ mod tests {
         let huge_key = vec![b'k'; PAGE_PAYLOAD_SIZE];
         assert!(!page.write_entries(PageId(1), &[(huge_key, PageId(3))]));
         assert_eq!(page.as_ref().entries(), original);
+    }
+
+    /// [`leaf_open_rejects_an_entry_pointing_into_the_header`]のInternal
+    /// Page版。`key_offset`をHeader領域(`leftmost_child`フィールドの内部)へ
+    /// 向けた場合を拒否する。
+    #[test]
+    fn internal_open_rejects_an_entry_pointing_into_the_header() {
+        let mut payload = fresh_payload();
+        payload[0..2].copy_from_slice(&1u16.to_le_bytes());
+        // key_offset=2(leftmost_childフィールドの内部、Header領域)。
+        payload[INTERNAL_HEADER_SIZE..INTERNAL_HEADER_SIZE + 2].copy_from_slice(&2u16.to_le_bytes());
+        payload[INTERNAL_HEADER_SIZE + 2..INTERNAL_HEADER_SIZE + 4].copy_from_slice(&1u16.to_le_bytes());
+        assert!(matches!(InternalPageRef::open(&payload), Err(DbError::CorruptPage(_))));
+    }
+
+    /// `key_offset`をDirectory自身の内部へ向けた場合を拒否する。
+    #[test]
+    fn internal_open_rejects_an_entry_pointing_into_the_directory() {
+        let mut payload = fresh_payload();
+        payload[0..2].copy_from_slice(&1u16.to_le_bytes());
+        payload[INTERNAL_HEADER_SIZE..INTERNAL_HEADER_SIZE + 2].copy_from_slice(&(INTERNAL_HEADER_SIZE as u16).to_le_bytes());
+        payload[INTERNAL_HEADER_SIZE + 2..INTERNAL_HEADER_SIZE + 4].copy_from_slice(&1u16.to_le_bytes());
+        assert!(matches!(InternalPageRef::open(&payload), Err(DbError::CorruptPage(_))));
+    }
+
+    /// [`leaf_open_rejects_two_entries_that_share_the_same_region`]のInternal
+    /// Page版。
+    #[test]
+    fn internal_open_rejects_two_entries_that_share_the_same_region() {
+        let mut payload = fresh_payload();
+        {
+            let mut page = InternalPage::init(&mut payload, PageId(1));
+            assert!(page.write_entries(PageId(1), &[(b"m".to_vec(), PageId(2)), (b"t".to_vec(), PageId(3))]));
+        }
+        let (offset0, _) = dir_entry(&payload, INTERNAL_HEADER_SIZE, 0);
+        let dir_base_1 = INTERNAL_HEADER_SIZE + DIR_ENTRY_SIZE;
+        payload[dir_base_1..dir_base_1 + 2].copy_from_slice(&(offset0 as u16).to_le_bytes());
+        assert!(matches!(InternalPageRef::open(&payload), Err(DbError::CorruptPage(_))));
     }
 }

@@ -269,14 +269,34 @@ impl Database {
                 storage.create_table(id);
             }
             Backend::Disk { storage } => {
+                // 第3部レビュー対応: 自動生成する索引名(`create_constraint_index`が
+                // 使う`"{table}_{column}_idx"`という命名)が、既存の(手動で
+                // `CREATE INDEX`された)索引名と衝突していないかを、テーブルを
+                // 登録する**前**にすべて検査しておく。これを怠ると、
+                // `storage.create_table`でテーブルを永続化した後に
+                // `create_constraint_index`が`DbError::DuplicateIndex`で
+                // 失敗した場合、テーブルだけが(対応するはずの制約索引を
+                // 持たないまま)カタログに残ってしまう。その状態で
+                // `INSERT`すると、`crate::index::check_uniqueness_with_index`が
+                // 「`PRIMARY KEY`・`UNIQUE`列には自動生成索引が必ずある」という
+                // 前提で対応する索引を探し、見つからずに整合性エラーになる
+                // (詳しくは同関数のドキュメントを参照)。
+                let constraint_index_names: Vec<String> =
+                    constraint_columns.iter().map(|(column_name, _)| format!("{}_{}_idx", create.table.name, column_name)).collect();
+                for index_name in &constraint_index_names {
+                    if storage.index(index_name).is_some() {
+                        return Err(DbError::DuplicateIndex(index_name.clone()));
+                    }
+                }
+
                 storage.create_table(&create.table.name, schema)?;
                 // Index Build: この時点でテーブルは空なので、`create_constraint_index`
                 // が行うIndex Buildは実質何もしない(将来、この後に続けて
                 // `INSERT`が並ぶSQLスクリプトを一括実行するようになっても、
-                // この設計は変わらない)。
-                for (column_name, primary_key) in &constraint_columns {
-                    let index_name = format!("{}_{}_idx", create.table.name, column_name);
-                    storage.create_constraint_index(&index_name, &create.table.name, column_name, *primary_key)?;
+                // この設計は変わらない)。上の事前検査により、ここから先の
+                // `create_constraint_index`が名前の衝突で失敗することは無い。
+                for ((column_name, primary_key), index_name) in constraint_columns.iter().zip(&constraint_index_names) {
+                    storage.create_constraint_index(index_name, &create.table.name, column_name, *primary_key)?;
                 }
             }
         }
@@ -2290,6 +2310,46 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         for suffix in ["users_id_idx", "users_email_idx"] {
+            let _ = std::fs::remove_file(format!("{}.idx.{suffix}", path.display()));
+        }
+    }
+
+    /// 第3部レビュー対応の回帰テスト: `CREATE TABLE`が自動生成しようとする
+    /// 制約索引名(`{table}_{column}_idx`)が、既存の(無関係なテーブルへの)
+    /// 手動索引とすでに衝突している場合、`CREATE TABLE`はテーブル自体も
+    /// 一切作らずに失敗する。
+    ///
+    /// 修正前は`storage.create_table`でテーブルを永続化した**後**に
+    /// 索引名の衝突が発覚し、テーブルだけが(対応する制約索引を持たないまま)
+    /// カタログに残っていた。その状態で`INSERT`すると、
+    /// `crate::index::check_uniqueness_with_index`が対応する索引を
+    /// 見つけられず`unreachable!`でプロセスごと終了していた
+    /// (`src/index.rs`の回帰テストが、その状態自体は個別に再現している)。
+    #[test]
+    fn create_table_does_not_create_the_table_when_a_constraint_index_name_collides() {
+        let path = temp_db_path("create-table-index-name-collision");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE dummy (id BIGINT NOT NULL)").unwrap();
+        // "users"テーブルはまだ存在しないが、そのPRIMARY KEY列`id`が
+        // 自動生成するはずの索引名("users_id_idx")を、無関係な"dummy"
+        // テーブルへの手動索引として先取りしておく。
+        db.execute("CREATE INDEX users_id_idx ON dummy (id)").unwrap();
+
+        let err = expect_error(db.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)"));
+        assert!(matches!(err, DbError::DuplicateIndex(name) if name == "users_id_idx"));
+
+        // テーブル自体も作られていないはず。
+        let err = expect_error(db.execute("INSERT INTO users VALUES (1, 'Alice')"));
+        assert!(matches!(err, DbError::Bind { .. }), "usersテーブルは作られていないはず");
+        let err = expect_error(db.execute("SELECT * FROM users"));
+        assert!(matches!(err, DbError::Bind { .. }), "usersテーブルは作られていないはず");
+
+        // 衝突していない名前であれば、通常どおりCREATE TABLEできる。
+        db.execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO accounts VALUES (1, 'Alice')").unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        for suffix in ["users_id_idx", "accounts_id_idx"] {
             let _ = std::fs::remove_file(format!("{}.idx.{suffix}", path.display()));
         }
     }

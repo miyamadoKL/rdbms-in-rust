@@ -136,6 +136,27 @@ pub fn insert(
 /// 検証をすべて通過したら、`storage.insert`で行を書き込んだ直後に
 /// `storage.index_insert_row`で**その行が対象になる全索引**(`UNIQUE`・
 /// 非`UNIQUE`の両方)を更新する(Index Maintenance)。
+///
+/// # 第3部レビュー対応: Heapと索引の不整合を防ぐ
+///
+/// `storage.insert`(Heapへの書き込み)と`storage.index_insert_row`(索引への
+/// 反映)は別々の呼び出しであり、間に他の操作を挟まないとはいえ、後者が
+/// 個々の索引で`DbError::BTreeKeyTooLarge`を返して失敗する余地は残る
+/// (たとえば`TEXT`列の値がHeapの1ページには収まるが、その列を索引化した
+/// B+Treeの1ページには収まらないほど長い場合)。何もしなければ、Heapには
+/// 存在するがどの索引にも登録されていない行が残り、Seq ScanとIndex Scanの
+/// 結果が食い違う。
+///
+/// これを2段構えで防ぐ。まず、`planned`の全行について
+/// `storage.check_indexes_accept_row`で「対象となる全索引にキーが収まるか」を
+/// Heapへの書き込みより前に検証する(**主防御**、通常の失敗はここで
+/// `storage`に一切触れずに検出できる)。それでも`index_insert_row`が
+/// 失敗した場合(既存ページの空き具合次第で起こりうる、まれな経路)は、
+/// その行のために書き込んだHeap行を`storage.delete`で取り除いてから
+/// エラーを返す(**保険**、`index_insert_row`自身がそれより前に成功して
+/// いた索引への反映を巻き戻す処理と対になる)。この行より前に処理した
+/// 行(同じ`INSERT`文の中の他の行)は、モジュールドキュメントに書いた
+/// 既存の割り切りのとおり巻き戻さない。
 pub fn storage_insert(
     storage: &mut Storage,
     table_id: TableId,
@@ -149,11 +170,18 @@ pub fn storage_insert(
         crate::index::check_uniqueness_with_index(storage, table_id, schema, &planned, &HashSet::new())?;
         constraints::check_uniqueness(schema, std::iter::empty(), &planned)?;
     }
+    for tuple in &planned {
+        storage.check_indexes_accept_row(table_id, tuple)?;
+    }
+
     let count = planned.len();
     for tuple in planned {
         let bytes = encode_tuple(schema, &tuple);
         let rid = storage.insert(table_id, &bytes)?;
-        storage.index_insert_row(table_id, &tuple, rid)?;
+        if let Err(err) = storage.index_insert_row(table_id, &tuple, rid) {
+            let _ = storage.delete(table_id, rid);
+            return Err(err);
+        }
     }
     Ok(count)
 }
@@ -306,6 +334,23 @@ pub fn update(
 /// `storage.index_insert_row`で挿入し直す。値が変わらない列でも、行が
 /// 別のページへ移動していれば`RecordId`は変わるため、この削除→挿入を
 /// 省略すると索引が古い`RecordId`を指したまま残ってしまう。
+///
+/// # 第3部レビュー対応: Heapと索引の不整合を防ぐ
+///
+/// `storage_insert`と同じ理由([`storage_insert`]のドキュメントを参照)で、
+/// `storage.update`(Heapの書き換え)・`storage.index_delete_row`(旧索引の
+/// 削除)・`storage.index_insert_row`(新索引への挿入)という3段階のどこかで
+/// エラーが起きると、Heapと索引が食い違ったまま残る余地がある。
+///
+/// まず`planned`の全行について、更新後の値(`new_tuple`)が対象となる
+/// 全索引に収まるかを`storage.check_indexes_accept_row`でHeapの書き換えより
+/// 前に検証する(主防御)。`index_delete_row`は、`NULL`でも型不一致でもない
+/// 既存のキーを取り除くだけなので通常は失敗しない(`BTree::delete`が
+/// 返しうるエラーはどちらもすでに除外済みの入力にしか起こらない)。
+/// `index_insert_row`は、事前検査を通過していてもLeaf・Internal Split
+/// (既存ページの空き具合に依存する)で、なお失敗する余地が残る(まれな
+/// 経路の保険)。いずれの段階が失敗しても、Heap・索引を更新前の内容
+/// (`old_tuple`、ただし物理的な位置は`new_rid`)へ戻してからエラーを返す。
 pub fn storage_update(
     storage: &mut Storage,
     table_id: TableId,
@@ -341,13 +386,34 @@ pub fn storage_update(
         crate::index::check_uniqueness_with_index(storage, table_id, schema, &candidates, &exclude)?;
         constraints::check_uniqueness(schema, std::iter::empty(), &candidates)?;
     }
+    for (_, _, new_tuple) in &planned {
+        storage.check_indexes_accept_row(table_id, new_tuple)?;
+    }
 
     let count = planned.len();
     for (old_rid, old_tuple, new_tuple) in planned {
-        let bytes = encode_tuple(schema, &new_tuple);
-        let new_rid = storage.update(table_id, old_rid, &bytes)?.unwrap_or(old_rid);
-        storage.index_delete_row(table_id, &old_tuple, old_rid)?;
-        storage.index_insert_row(table_id, &new_tuple, new_rid)?;
+        let old_bytes = encode_tuple(schema, &old_tuple);
+        let new_bytes = encode_tuple(schema, &new_tuple);
+        let new_rid = storage.update(table_id, old_rid, &new_bytes)?.unwrap_or(old_rid);
+
+        if let Err(err) = storage.index_delete_row(table_id, &old_tuple, old_rid) {
+            // 通常は起こらない(このコメントの上、`storage_update`ドキュメントの
+            // 「第3部レビュー対応」を参照)。万一に備え、Heapだけでも
+            // 更新前の内容へ戻す。
+            let _ = storage.update(table_id, new_rid, &old_bytes);
+            return Err(err);
+        }
+
+        if let Err(err) = storage.index_insert_row(table_id, &new_tuple, new_rid) {
+            // 事前検査(check_indexes_accept_row)をすり抜けた、まれな失敗
+            // (Leaf・Internal Splitが既存ページの空き具合次第で失敗する経路)。
+            // 旧索引・旧Heapへ戻す。`index_insert_row`はここまでに成功していた
+            // (無かった)索引への反映をすでに自身で巻き戻し済みなので、ここでは
+            // 直前に削除した旧索引エントリを`new_rid`向けに挿入し直すだけでよい。
+            let _ = storage.index_insert_row(table_id, &old_tuple, new_rid);
+            let _ = storage.update(table_id, new_rid, &old_bytes);
+            return Err(err);
+        }
     }
     Ok(count)
 }
@@ -756,5 +822,204 @@ mod tests {
         assert_eq!(scanned[0].values()[0], Value::BigInt(2));
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    // ---- 第3部レビュー対応: storage_insert/storage_updateとIndex Maintenanceの不整合 ----
+
+    /// `id: BIGINT`(8バイト)を使う`users_schema`では、「Heapの1行としては
+    /// 収まるが、対応するB+Treeの空のLeaf Page1枚には収まらない」という
+    /// 値の幅が存在しない(`crate::storage`のテスト
+    /// `index_insert_row_rolls_back_earlier_indexes_when_a_later_index_rejects_the_key`
+    /// のコメントを参照)。1バイトで符号化される`flag: BOOLEAN`を使い、
+    /// この幅を作れるスキーマにする。
+    fn flag_schema() -> Schema {
+        Schema::new(vec![Column::new("flag", DataType::Boolean, false), Column::new("payload", DataType::Text, true)])
+    }
+
+    fn flag_tuple(flag: bool, payload: Option<&str>) -> Tuple {
+        let schema = flag_schema();
+        let payload = match payload {
+            Some(s) => Value::Text(s.to_string()),
+            None => Value::Null,
+        };
+        Tuple::new(&schema, vec![Value::Boolean(flag), payload]).unwrap()
+    }
+
+    fn flag_catalog() -> Catalog {
+        let mut catalog = Catalog::new();
+        catalog.create_table("items", flag_schema()).unwrap();
+        catalog
+    }
+
+    fn flag_bound_predicate(where_sql: &str) -> BoundExpr {
+        let catalog = flag_catalog();
+        let functions = FunctionRegistry::with_builtins();
+        let sql = format!("SELECT flag FROM items WHERE {where_sql}");
+        let statement = crate::parser::parse_statement(&sql).unwrap();
+        match Binder::new(&catalog, &functions, &sql).bind(statement).unwrap() {
+            BoundStatement::Select(select) => select.predicate.expect("WHEREを指定したのでpredicateがあるはず"),
+            other => panic!("Selectを期待したが{other:?}が返った"),
+        }
+    }
+
+    fn flag_bound_assignments(update_sql: &str) -> Vec<BoundAssignment> {
+        let catalog = flag_catalog();
+        let functions = FunctionRegistry::with_builtins();
+        let sql = format!("UPDATE items SET {update_sql}");
+        let statement = crate::parser::parse_statement(&sql).unwrap();
+        match Binder::new(&catalog, &functions, &sql).bind(statement).unwrap() {
+            BoundStatement::Update(update) => update.assignments,
+            other => panic!("Updateを期待したが{other:?}が返った"),
+        }
+    }
+
+    /// `flag_schema`のテーブル`items`を1つ持つ`Storage`を作る。
+    fn items_storage(name: &str) -> (std::path::PathBuf, Storage, TableId) {
+        let path = temp_path(name);
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("items", flag_schema()).unwrap();
+        (path, storage, table_id)
+    }
+
+    /// Heapには収まるが、`payload`列を索引化したB+Treeの空のLeaf Page1枚には
+    /// 収まらないほど長い`TEXT`値(`crate::storage`のテストと同じ幅の計算)。
+    fn oversized_payload() -> String {
+        "x".repeat(crate::page::PAGE_PAYLOAD_SIZE - 20)
+    }
+
+    /// `table_id`が持つ全索引について、索引が指す`RecordId`の集合が、
+    /// Seq Scan(Heap)側でその索引化列がNULLでない行の`RecordId`の集合と
+    /// 一致することを確認する(第3部レビューが要求する「エラー後もSeq Scan
+    /// とIndex Scanが一致する」の検証そのもの)。
+    fn assert_every_index_matches_seq_scan(storage: &Storage, table_id: TableId, schema: &Schema) {
+        for info in storage.indexes_for_table(table_id).cloned().collect::<Vec<_>>() {
+            let btree = storage.index_btree(&info.name).unwrap();
+            let mut index_rids: Vec<RecordId> = btree
+                .range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+                .unwrap()
+                .map(|entry| entry.unwrap().1)
+                .collect();
+            index_rids.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+
+            let mut expected_rids: Vec<RecordId> = storage
+                .scan(table_id)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|(_, bytes)| !decode_tuple(schema, bytes).unwrap().get(info.column_index).unwrap().is_null())
+                .map(|(rid, _)| rid)
+                .collect();
+            expected_rids.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+
+            assert_eq!(index_rids, expected_rids, "索引{}がSeq Scanの結果と一致しない", info.name);
+        }
+    }
+
+    /// レビュー指摘5番の再現条件: `INSERT`文の2行目の`payload`が、Heapには
+    /// 収まるが対応する索引には収まらない。事前検査
+    /// (`Storage::check_indexes_accept_row`)がHeapへの書き込みより前に
+    /// 全行を検査するため、1行目もまったく書き込まれず、既存の行・索引も
+    /// 変化しない。
+    #[test]
+    fn storage_insert_leaves_heap_and_every_index_consistent_when_a_row_does_not_fit_an_index() {
+        let (path, mut storage, table_id) = items_storage("insert-index-mismatch");
+        let schema = flag_schema();
+        let functions = FunctionRegistry::with_builtins();
+        storage.create_index("flag_idx", "items", "flag", false).unwrap();
+        storage.create_index("payload_idx", "items", "payload", false).unwrap();
+
+        // 事前に妥当な行を1件入れておく(既存の行・索引が変化しないことを
+        // 確認する対象)。
+        storage_insert(&mut storage, table_id, &schema, &functions, None, &[vec![expr("true"), expr("'seed'")]]).unwrap();
+
+        let huge_payload = oversized_payload();
+        let rows = vec![
+            vec![expr("false"), expr("'ok'")],
+            vec![expr("true"), expr(&format!("'{huge_payload}'"))],
+        ];
+        let err = storage_insert(&mut storage, table_id, &schema, &functions, None, &rows).unwrap_err();
+        assert!(matches!(err, DbError::BTreeKeyTooLarge(_)));
+
+        let scanned = scan_all(&storage, table_id, &schema).unwrap();
+        assert_eq!(scanned.len(), 1, "全行を検査してから書き込むため、1行目も含めて一切挿入されていないはず");
+        assert_eq!(scanned[0].values(), flag_tuple(true, Some("seed")).values());
+        assert_every_index_matches_seq_scan(&storage, table_id, &schema);
+
+        std::fs::remove_file(&path).unwrap();
+        storage.drop_index("flag_idx").unwrap();
+        storage.drop_index("payload_idx").unwrap();
+    }
+
+    /// レビュー指摘6番の再現条件(ページ内更新、`RecordId`は変わらない版):
+    /// 対象の行が単独でページを占有しており、更新後の値がそのページの
+    /// 残り容量に収まる(索引の制約さえ無ければ、`RecordId`を変えずに
+    /// ページ内で書き換えられる)状況を作る。この場合でも、更新後の値が
+    /// 索引に収まらなければ`storage_update`はエラーを返し、Heap・索引とも
+    /// 更新前の内容のまま変化しない。
+    #[test]
+    fn storage_update_leaves_heap_and_every_index_consistent_when_the_new_value_does_not_fit_an_index_in_place() {
+        let (path, mut storage, table_id) = items_storage("update-index-mismatch-in-place");
+        let schema = flag_schema();
+        let functions = FunctionRegistry::with_builtins();
+        storage.create_index("flag_idx", "items", "flag", false).unwrap();
+        storage.create_index("payload_idx", "items", "payload", false).unwrap();
+
+        // このテーブルの唯一の行にする。ページには他の行が無いため、
+        // `payload`をそのページの残り容量いっぱいまで書き換えても
+        // (索引の制約さえ無ければ)`RecordId`を変えずに収まる。
+        storage_insert(&mut storage, table_id, &schema, &functions, None, &[vec![expr("true"), expr("'alice'")]]).unwrap();
+        let before = scan_all(&storage, table_id, &schema).unwrap();
+
+        let huge_payload = oversized_payload();
+        let assignments = flag_bound_assignments(&format!("payload = '{huge_payload}'"));
+        let predicate = flag_bound_predicate("flag = TRUE");
+        let err = storage_update(&mut storage, table_id, &schema, &functions, &assignments, Some(&predicate)).unwrap_err();
+        assert!(matches!(err, DbError::BTreeKeyTooLarge(_)));
+
+        let after = scan_all(&storage, table_id, &schema).unwrap();
+        assert_eq!(after, before, "更新前の行がそのまま残っているはず");
+        assert_every_index_matches_seq_scan(&storage, table_id, &schema);
+
+        std::fs::remove_file(&path).unwrap();
+        storage.drop_index("flag_idx").unwrap();
+        storage.drop_index("payload_idx").unwrap();
+    }
+
+    /// レビュー指摘6番の再現条件(`RecordId`移動版): 更新対象の行と同じページに
+    /// 別の行(`filler`)を先に詰めておき、更新後の値がそのページに収まらず
+    /// 別ページへ移動する状況を作る。移動が起きるかどうかに関わらず、更新後の
+    /// 値が索引に収まらなければ`storage_update`は失敗し、Heap・索引とも
+    /// 更新前の内容のまま変化しない。
+    #[test]
+    fn storage_update_leaves_heap_and_every_index_consistent_when_the_new_value_does_not_fit_an_index_and_the_row_would_move() {
+        let (path, mut storage, table_id) = items_storage("update-index-mismatch-move");
+        let schema = flag_schema();
+        let functions = FunctionRegistry::with_builtins();
+        storage.create_index("flag_idx", "items", "flag", false).unwrap();
+        storage.create_index("payload_idx", "items", "payload", false).unwrap();
+
+        // fillerでページの大半を埋めてから、更新対象の行を同じページへ入れる。
+        // 更新後の値(oversized_payload)は、たとえ索引の制約が無かったとしても
+        // このページには収まらず、別ページへ移動せざるをえない大きさである。
+        let filler_payload = "y".repeat(3_000);
+        let rows = vec![
+            vec![expr("true"), expr(&format!("'{filler_payload}'"))],
+            vec![expr("false"), expr("'small'")],
+        ];
+        storage_insert(&mut storage, table_id, &schema, &functions, None, &rows).unwrap();
+        let before = scan_all(&storage, table_id, &schema).unwrap();
+
+        let huge_payload = oversized_payload();
+        let assignments = flag_bound_assignments(&format!("payload = '{huge_payload}'"));
+        let predicate = flag_bound_predicate("flag = FALSE");
+        let err = storage_update(&mut storage, table_id, &schema, &functions, &assignments, Some(&predicate)).unwrap_err();
+        assert!(matches!(err, DbError::BTreeKeyTooLarge(_)));
+
+        let after = scan_all(&storage, table_id, &schema).unwrap();
+        assert_eq!(after, before, "更新前の全行がそのまま残っているはず(行の移動も起きていないはず)");
+        assert_every_index_matches_seq_scan(&storage, table_id, &schema);
+
+        std::fs::remove_file(&path).unwrap();
+        storage.drop_index("flag_idx").unwrap();
+        storage.drop_index("payload_idx").unwrap();
     }
 }

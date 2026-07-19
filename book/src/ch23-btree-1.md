@@ -61,8 +61,9 @@ B+Treeはキーを挿入するたびに、次の3つの性質を保ち続けま�
 - **整列**: どのページの中でも、エントリは常にキーの昇順に並んでいる。
 - **占有率**: どのページも、`PAGE_SIZE`(この章では`PAGE_PAYLOAD_SIZE`)を超えるエントリを保持しない。収まりきらなくなったら、ページを2つに割る(Split)。
 - **親子の区切りキー**: 内部ページのキー`key_i`は「`key_i`以上のキーは`key_i`の右側の子以降にある」という境界を表し、常に子の内容と矛盾しない。
+- **エラーを返す場合は木を変更しない**: `Split`がキーを持て余して`DbError::BTreeKeyTooLarge`を返す場合、`insert`を呼ぶ前の木を一切変更しない。
 
-この3つを保ったまま木を成長させる操作が、この章の主題である**Split**です。
+この4つを保ったまま木を成長させる操作が、この章の主題である**Split**です。
 
 ## キーをバイト列へエンコードする
 
@@ -420,28 +421,44 @@ fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbR
     let (left, right) = entries.split_at(mid);
     let separator = right[0].0.clone();
 
-    let new_id = self.pool.allocate_page(PageType::BTreeLeaf)?;
+    if !leaf_entries_fit(PAGE_PAYLOAD_SIZE, left) || !leaf_entries_fit(PAGE_PAYLOAD_SIZE, right) {
+        return Err(DbError::BTreeKeyTooLarge(separator.len()));
+    }
+
+    // ここから先は、両側とも収まることが確定しているため、以下の書き込みは
+    // (プール自体のI/Oエラーを除けば)失敗しない。
     let old_next = {
+        let guard = self.pool.read_page(current_id)?;
+        LeafPageRef::open(guard.data())?.next_leaf()
+    };
+    let new_id = self.pool.allocate_page(PageType::BTreeLeaf)?;
+    {
         let mut guard = self.pool.write_page(current_id)?;
         let mut page = LeafPage::open(guard.data_mut())?;
-        let old_next = page.as_ref().next_leaf();
-        if !page.write_entries(left) {
-            return Err(DbError::BTreeKeyTooLarge(separator.len()));
-        }
+        let fits = page.write_entries(left);
+        debug_assert!(fits, "事前検査(leaf_entries_fit)を通過した書き込みが失敗するのは実装が壊れている場合に限る");
         page.set_next_leaf(new_id);
-        old_next
-    };
+    }
     {
         let mut guard = self.pool.write_page(new_id)?;
         let mut page = LeafPage::init(guard.data_mut());
-        if !page.write_entries(right) {
-            return Err(DbError::BTreeKeyTooLarge(separator.len()));
-        }
+        let fits = page.write_entries(right);
+        debug_assert!(fits, "事前検査(leaf_entries_fit)を通過した書き込みが失敗するのは実装が壊れている場合に限る");
         page.set_next_leaf(old_next);
     }
     Ok((separator, new_id))
 }
 ```
+
+`leaf_entries_fit`は、`write_entries`が内部で使っている「必要バイト数を計算して`payload`の大きさと比べる」計算だけを公開したヘルパーで、実際のページには一切触れません。
+`left`と`right`のどちらか一方でも収まらなければ、`current_id`の書き換えも新しいページの確保も行わずに`DbError::BTreeKeyTooLarge`を返します。
+
+この事前検査が無いとどうなるか考えてみます。
+仮に前半(`left`)を先に`current_id`へ書いてしまってから後半(`right`)の書き込みを試みたとします。
+`right`が収まらないと分かるのはその時点であり、`current_id`はすでに前半だけの内容に書き換わっています。
+呼び出し元(`insert`)へエラーを返しても、この書き換えを元に戻す手段はもうありません。
+「Split以前に存在していたエントリの半分が消える」という、分割の不変条件のどれとも両立しない状態が残ります。
+事前検査によって、両側の`write_entries`はどちらも失敗しないと分かってから初めて実行するので、この状態は起こりえません。
 
 `old_next`(元の`current_id`が指していた右隣)を新しいページ(`new_id`)へ引き継ぎ、`current_id`自身は`new_id`を指すよう`next_leaf`を書き換えている点が、`next_leaf`を持たなかった場合との違いです。
 分割によって2枚に増えたページの間にも、分割前と同じ「キー順に並んだ横のリンク」を保ちます。
@@ -481,11 +498,21 @@ fn insert_into_internal(&self, parent_id: PageId, separator: &[u8], new_page_id:
 
 ```rust
 fn split_internal(&self, entries: &[(Vec<u8>, PageId)], leftmost_child: PageId, current_id: PageId) -> DbResult<(Vec<u8>, PageId)> {
+    if entries.len() < 2 {
+        let max_len = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+        return Err(DbError::BTreeKeyTooLarge(max_len));
+    }
     let mid = entries.len() / 2;
     let separator = entries[mid].0.clone();
     let left_entries = &entries[0..mid];
     let right_leftmost = entries[mid].1;
     let right_entries = &entries[mid + 1..];
+
+    if !internal_entries_fit(PAGE_PAYLOAD_SIZE, left_entries) || !internal_entries_fit(PAGE_PAYLOAD_SIZE, right_entries) {
+        return Err(DbError::BTreeKeyTooLarge(separator.len()));
+    }
+    // ここから先は、両側とも収まることが確定しているため、以下の書き込みは
+    // (プール自体のI/Oエラーを除けば)失敗しない。
     // ...(current_idへleft_entries、新しいInternal Pageへright_entriesを書く)
     Ok((separator, new_id))
 }
@@ -494,6 +521,9 @@ fn split_internal(&self, entries: &[(Vec<u8>, PageId)], leftmost_child: PageId, 
 Leaf Splitは後半の先頭キーをコピーして区切りキーにしましたが、Internal Splitは真ん中のキー(`entries[mid].0`)をどちらの子にも残さず、そのまま親へ押し上げます。
 Internal Pageのキーは「どちらの子を見るべきか」という境界を表すだけの情報で、Leaf Pageのキーのように行の実データと対応する値そのものではないため、複製して残す理由がありません。
 この非対称性が、モジュール冒頭で決めた「分割の不変条件」の3つ目(親子の区切りキー)をLeafとInternalの両方で保ち続ける仕組みです。
+
+`internal_entries_fit`による事前検査と、検査を通過するまで実ページに触れない構造は、`split_leaf`とまったく同じ理由です。
+先に`left_entries`を`current_id`へ書いてから`right_entries`が収まらないと判明した場合、`current_id`はもう元のエントリを失っており、エラーを返しても元へ戻せません。
 
 ### Root Split
 
@@ -550,7 +580,9 @@ fn set_root(&mut self, new_root: PageId) -> DbResult<()> {
 `btree`モジュールと`btree_page`モジュールのテストは、大きく3種類に分かれます。
 
 1つ目は、ページ内レイアウトの単体テスト(`btree_page`)です。
-書き込みと読み込みの往復、収まりきらない挿入が`payload`を変更せず`false`を返すこと、壊れたバイト列(範囲外のオフセット、降順のキー)を`open`が`CorruptPage`として検出することを確認しています。
+書き込みと読み込みの往復、収まりきらない挿入が`payload`を変更せず`false`を返すこと、壊れたバイト列を`open`が`CorruptPage`として検出することを確認しています。
+検証する壊れ方は、単純な範囲外オフセットや降順のキーだけではありません。
+`validate`は、`write_entries`が生成する正規のレイアウト(先頭エントリの`key_offset`は必ずDirectory直後、以降の各エントリは直前のエントリの終端から始まる)そのものを検査しているため、キー領域がHeaderやDirectoryを指す配置や、複数エントリの領域が重なる配置(それぞれ`payload`の範囲には収まっているので、範囲チェックだけでは見逃してしまいます)も`CorruptPage`として拒否できることを、LeafとInternalの両方で確認しています。
 
 2つ目は、`BTree`自体の機能テストです。
 `NULL`キーやキー型の不一致が拒否されること、重複キーを挿入すると全件が`lookup`で返ること、`BOOLEAN`や`TEXT`のキーでも正しく動くことを確認したうえで、昇順、降順、ランダムな順序で挿入した場合のいずれでも、挿入した全キーが`lookup`で一致することを確認します。
@@ -622,6 +654,10 @@ pub fn height(&self) -> DbResult<usize> {
 
 どの経路をたどっても同じ値になるのは、B+Treeが「全ての葉が同じ深さに揃う」性質を持つからで、これはRoot Splitについて確認した性質そのものです。
 このメソッドを使い、空の木の高さが1であること、十分な件数を挿入するとその高さが実際に増えることも別途確認しています。
+
+`split_leaf`と`split_internal`が「エラーを返す場合は木を変更しない」という不変条件を守っていることも、専用のテストで直接確認します。
+`leaf_split_leaves_the_original_page_untouched_when_the_new_side_would_not_fit`は、既存のLeaf Pageがほぼ満杯の状態へ、新しいページ側に収まりようのない巨大キーを挿入し、`DbError::BTreeKeyTooLarge`を受け取った後もRoot、元の葉の`PageId`、Leaf間リンク、既存の全エントリが変化していないことを検証します。
+`internal_split_leaves_the_original_page_untouched_when_the_new_side_would_not_fit`はInternal Page版で、Root Splitで生まれたRoot(Internal Page)の区切りキーへ収まりようのないキーを混ぜて`split_internal`(同じモジュール内のテストなので直接呼べます)を呼び、同じ不変条件を確認します。
 
 3つ目は、`Storage`(第15章)がすでに使っている「シード固定のXorshiftで決定的な乱数列を作る」という手法を借りたモデルベーステストです。
 5,000件の`BIGINT`キーをシャッフルして挿入しながら、同じキーと`RecordId`を`std::collections::BTreeMap`にも積んでおき、全キーについて`lookup`の結果が`BTreeMap`の記録と一致することを確認します。

@@ -111,23 +111,29 @@ fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbR
     let (left, right) = entries.split_at(mid);
     let separator = right[0].0.clone();
 
-    let new_id = self.pool.allocate_page(PageType::BTreeLeaf)?;
+    if !leaf_entries_fit(PAGE_PAYLOAD_SIZE, left) || !leaf_entries_fit(PAGE_PAYLOAD_SIZE, right) {
+        return Err(DbError::BTreeKeyTooLarge(separator.len()));
+    }
+
+    // ここから先は、両側とも収まることが確定しているため、以下の書き込みは
+    // (プール自体のI/Oエラーを除けば)失敗しない。
     let old_next = {
+        let guard = self.pool.read_page(current_id)?;
+        LeafPageRef::open(guard.data())?.next_leaf()
+    };
+    let new_id = self.pool.allocate_page(PageType::BTreeLeaf)?;
+    {
         let mut guard = self.pool.write_page(current_id)?;
         let mut page = LeafPage::open(guard.data_mut())?;
-        let old_next = page.as_ref().next_leaf();
-        if !page.write_entries(left) {
-            return Err(DbError::BTreeKeyTooLarge(separator.len()));
-        }
+        let fits = page.write_entries(left);
+        debug_assert!(fits, "事前検査(leaf_entries_fit)を通過した書き込みが失敗するのは実装が壊れている場合に限る");
         page.set_next_leaf(new_id);
-        old_next
-    };
+    }
     {
         let mut guard = self.pool.write_page(new_id)?;
         let mut page = LeafPage::init(guard.data_mut());
-        if !page.write_entries(right) {
-            return Err(DbError::BTreeKeyTooLarge(separator.len()));
-        }
+        let fits = page.write_entries(right);
+        debug_assert!(fits, "事前検査(leaf_entries_fit)を通過した書き込みが失敗するのは実装が壊れている場合に限る");
         page.set_next_leaf(old_next);
     }
     Ok((separator, new_id))
@@ -137,7 +143,10 @@ fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbR
 分割前、`current_id`は`old_next`という右隣を持っていました。
 分割後は、`current_id`(前半のエントリ)の右隣が新しくできた`new_id`(後半のエントリ)になり、`new_id`の右隣がかつての`old_next`になります。
 「`current_id` → `old_next`」という1本のリンクが「`current_id` → `new_id` → `old_next`」という2本へ伸びるだけで、鎖のどこにも切れ目ができません。
-`old_next`を`current_id`の`write_entries`より前に読み出しているのは、`write_entries`自身が(直前で見たとおり)そのままの`next_leaf`を保存してしまうため、上書きする前の値を確保しておく必要があるからです。
+`old_next`を、`current_id`を書き換えるどの`write_page`よりも前の`read_page`で読み出しているのは、`write_entries`自身が(直前で見たとおり)そのままの`next_leaf`を保存してしまうため、上書きする前の値を確保しておく必要があるからです。
+
+`leaf_entries_fit`による事前検査と、それを通過するまで`current_id`と`new_id`のどちらのページにも触れない構造は、第23章で導入したものです。
+`left`と`right`のどちらかが収まらない場合、`current_id`の書き換えも新しいページの確保も行わずに`DbError::BTreeKeyTooLarge`を返し、`old_next`の読み出しさえ実行しません(第23章「分割の不変条件」を参照)。
 
 ## Range Scan: 葉をたどって範囲を返す
 
@@ -333,32 +342,63 @@ B+Treeの標準的な削除は、エントリを取り除いた結果ページ�
 無駄なページI/Oが多少増える代わりに、実装は挿入よりずっと単純になり、次の節で必要になる「索引からエントリを1件消す」という操作を最小限のコードで用意できます。
 隣接ページの再編成は、この章の演習問題に残します。
 
+最初に書いたバージョンは、Point Lookupと同じ`find_leaf`(一致の**最後**の葉に着地する探索、前章)で削除対象の葉を決めていました。
+`key`だけでなく`rid`も一致する条件で削除するので、「探索経路を決めるのは`key`だけで、`rid`は削除する1件を絞り込むためだけに使う」という設計です。
+
+```rust
+// 最初に書いたバージョン(誤り)
+let leaf_id = self.find_leaf(&key_bytes)?;
+let mut entries = {
+    let guard = self.pool.read_page(leaf_id)?;
+    LeafPageRef::open(guard.data())?.entries()
+};
+let Some(pos) = entries.iter().position(|(k, r)| k.as_slice() == key_bytes.as_slice() && *r == rid) else {
+    return Ok(false);
+};
+// ...(以下、entries.remove(pos)してwrite_entriesし直すだけ)
+```
+
+これは、削除対象の`(key, rid)`が複数の葉にまたがる同じキーのうち、`find_leaf`が着地した葉より**左**の葉にある場合に壊れます。
+500件の同じキーで高さ2の木を作り、最初に挿入した`RecordId`(挿入順を保つ設計により、先頭の葉に残るはず)を`delete`すると、`find_leaf`は一致の最後の葉(先頭ではなく末尾)に着地し、そこには目的の`rid`が無いため`false`(削除できなかった)を返してしまいます。
+`rid`は探索経路(どちらの子へ降りるか)に一切使われないので、「`rid`まで正確に把握している」ことは、`key`だけで決まる探索の着地点を補正してはくれません。
+
+正しい`delete`は、`find_leaf_for_lower_bound`(前節、`range`の下限探索用に用意したもの)で一致の**最初**の葉から出発し、`next_leaf`を右へたどりながら`(key, rid)`を探します。
+
 ```rust
 pub fn delete(&mut self, key: &Value, rid: RecordId) -> DbResult<bool> {
     self.check_key_type(key)?;
     let key_bytes = encode_key(key)?;
 
-    let leaf_id = self.find_leaf(&key_bytes)?;
-    let mut entries = {
-        let guard = self.pool.read_page(leaf_id)?;
-        LeafPageRef::open(guard.data())?.entries()
-    };
-    let Some(pos) = entries.iter().position(|(k, r)| k.as_slice() == key_bytes.as_slice() && *r == rid) else {
-        return Ok(false);
-    };
-    entries.remove(pos);
+    let mut leaf_id = self.find_leaf_for_lower_bound(&key_bytes)?;
+    loop {
+        let (mut entries, next_leaf) = {
+            let guard = self.pool.read_page(leaf_id)?;
+            let view = LeafPageRef::open(guard.data())?;
+            (view.entries(), view.next_leaf())
+        };
 
-    let mut guard = self.pool.write_page(leaf_id)?;
-    let mut page = LeafPage::open(guard.data_mut())?;
-    let fits = page.write_entries(&entries);
-    debug_assert!(fits, "エントリを取り除くだけの書き込みが収まらないのは、write_entriesの実装が壊れている場合に限る");
-    Ok(true)
+        if let Some(pos) = entries.iter().position(|(k, r)| k.as_slice() == key_bytes.as_slice() && *r == rid) {
+            entries.remove(pos);
+            let mut guard = self.pool.write_page(leaf_id)?;
+            let mut page = LeafPage::open(guard.data_mut())?;
+            let fits = page.write_entries(&entries);
+            debug_assert!(fits, "エントリを取り除くだけの書き込みが収まらないのは、write_entriesの実装が壊れている場合に限る");
+            return Ok(true);
+        }
+
+        let might_continue = entries.is_empty() || entries.last().unwrap().0.as_slice() <= key_bytes.as_slice();
+        if !might_continue || next_leaf == NO_NEXT_LEAF {
+            return Ok(false);
+        }
+        leaf_id = next_leaf;
+    }
 }
 ```
 
-`key`だけでなく`rid`も一致する条件で削除しているのは、同じキーに複数の`RecordId`が対応している場合(重複キー、第23章)に、そのうちの1件だけを消したいからです。
-`find_leaf`が返す1ページの中に目的の`(key, rid)`が無ければ、そのキー自体が別ページにある可能性もありますが、削除対象は呼び出し側(次の節のIndex Maintenance)がすでに`(key, rid)`の組として正確に把握しているため、`find_leaf`の一致バイアス(前節)が問題になりません。
-削除したいエントリを探すのではなく、削除したいエントリが**存在するはずの**葉を一直線に降りているだけだからです。
+このページで`(key, rid)`が見つからなければ、まだ`key`の残りが右隣の葉に続いている可能性が消えるまで(`might_continue`)、`next_leaf`を右へ進みます。
+「まだ続いている可能性がある」の条件は、このページが空(先行する`delete`がLazy Deleteで空にした葉、後述)か、末尾のキーがまだ`key`以下であることです。
+末尾のキーが`key`を追い越しているページまで来たら、これより右に`key`のエントリが残っている余地はありません(エントリは葉をまたいでもキー順に並んでいるという、B+Treeの基本性質そのものです)。
+`find_leaf_for_lower_bound`はLeaf Splitの境界次第で、`key`と等しい区切りキーを持つ葉より1つ左の葉を返すことがある(区切りキーは分割後の右側の葉にしか物理的にコピーされないため、そちらの葉には`key`のエントリが1件も無いことがある、第23章)ため、最初の1ページで見つからないことは珍しくありません。
 
 `write_entries`は、常にエントリが**減る**方向の書き込みなので、収まりきらずに`false`を返すことはありません。
 `debug_assert!`はその前提を明文化しているだけで、実行時のコストにはなりません(releaseビルドでは消えます)。
@@ -682,13 +722,13 @@ pub fn check_uniqueness_with_index(
     exclude: &HashSet<RecordId>,
 ) -> crate::error::DbResult<()> {
     for (column_index, column) in schema.unique_constrained_columns() {
-        let index = storage.unique_index_for_column(table_id, column_index).unwrap_or_else(|| {
-            unreachable!(
-                "PRIMARY KEY・UNIQUE列'{}'には第24章からCREATE TABLEが自動でUNIQUE索引を \
-                 作るため、対応する索引が必ず見つかるはず",
+        let index = storage.unique_index_for_column(table_id, column_index).ok_or_else(|| {
+            DbError::CorruptCatalog(format!(
+                "PRIMARY KEY・UNIQUE列'{}'に対応するUNIQUE索引が見つかりません(CREATE TABLEが\
+                 自動生成するはずの索引が欠落しています)",
                 column.name
-            )
-        });
+            ))
+        })?;
         for candidate in candidates {
             let value = candidate.get(column_index).expect("candidateはschemaと同じ列数を持つ");
             if value.is_null() {
@@ -703,6 +743,11 @@ pub fn check_uniqueness_with_index(
     Ok(())
 }
 ```
+
+`unique_index_for_column`が`None`を返すのは、`PRIMARY KEY`や`UNIQUE`の列に対応するはずのUNIQUE索引が見つからない場合です。
+`Database::execute_create_table`はテーブルの永続化と制約索引の作成を別々の呼び出しで行うため(次の節を参照)、既存の手動索引名と自動生成名が衝突するなどして後者だけが失敗すると、対応する索引を持たないテーブルがカタログに残ります。
+この状況を`unreachable!`(この不変条件が崩れることは無いという前提でプロセスごと止める処理)で扱うと、1件の`CREATE TABLE`が引き金になった不整合でサーバープロセス全体を巻き添えにしてしまいます。
+そこでこの分岐は`DbError::CorruptCatalog`を返し、被害をその1件の`INSERT`や`UPDATE`だけに閉じ込めます。
 
 `exclude`は、`UPDATE`が「これから書き換える行自身の更新前のエントリ」を誤って重複と判定しないための除外リストです。
 `INSERT`では空集合を渡し、`UPDATE`では書き換え対象の全行の**更新前**`RecordId`を渡します。
@@ -725,14 +770,28 @@ if schema.unique_constrained_columns().next().is_some() {
 ### `PRIMARY KEY`と`UNIQUE`列には自動でUNIQUE索引を作る
 
 利用者が明示的に`CREATE INDEX`しなくても、`PRIMARY KEY`と`UNIQUE`の列には自動で索引が付くようにします。
-`Database::execute_create_table`が、テーブルを作った直後に対応する列だけ`create_constraint_index`を呼びます。
+自動生成する索引名は`"{テーブル名}_{列名}_idx"`という単純な組み立てなので、利用者がまったく同じ名前で先に`CREATE INDEX`していた場合、名前が衝突します。
+`Database::execute_create_table`は、この衝突が起きていないかをテーブルを永続化する**前**にまとめて検査してから、対応する列だけ`create_constraint_index`を呼びます。
 
 ```rust
-for (column_name, primary_key) in &constraint_columns {
-    let index_name = format!("{}_{}_idx", create.table.name, column_name);
-    storage.create_constraint_index(&index_name, &create.table.name, column_name, *primary_key)?;
+let constraint_index_names: Vec<String> =
+    constraint_columns.iter().map(|(column_name, _)| format!("{}_{}_idx", create.table.name, column_name)).collect();
+for index_name in &constraint_index_names {
+    if storage.index(index_name).is_some() {
+        return Err(DbError::DuplicateIndex(index_name.clone()));
+    }
+}
+
+storage.create_table(&create.table.name, schema)?;
+for ((column_name, primary_key), index_name) in constraint_columns.iter().zip(&constraint_index_names) {
+    storage.create_constraint_index(index_name, &create.table.name, column_name, *primary_key)?;
 }
 ```
+
+先に`storage.create_table`でテーブルを永続化してから`create_constraint_index`を呼ぶ順序だと、名前の衝突は`create_constraint_index`が`DbError::DuplicateIndex`を返した時点で初めて発覚します。
+そのときにはテーブルはすでにカタログへ登録済みで、対応する`UNIQUE`索引を持たないまま残ります。
+その状態で`INSERT`すると、`check_uniqueness_with_index`(前節)が「`PRIMARY KEY`や`UNIQUE`の列には自動生成索引が必ずある」という前提で対応する索引を探し、見つからずに`DbError::CorruptCatalog`を返すところまで症状が伝播します。
+索引名の予約(この事前検査)は、症状が起きる場所ではなく、不整合が生まれる場所そのものを塞ぐ修正です。
 
 `create_constraint_index`は、公開APIの`create_index`(`CREATE INDEX`構文が呼ぶ、常に`unique`だけを指定できる)とは別に用意した内部専用の入口で、`primary_key`まで指定できます。
 `CREATE INDEX`(SQL構文)からは`PRIMARY KEY`を宣言できないので、この経路を公開APIへ混ぜ込む理由がないからです。
@@ -766,6 +825,8 @@ n= 16000 elapsed=34.90µs
 この章のテストは、`crate::btree`、`crate::storage`、`crate::database`の3つの層に分かれます。
 
 `crate::btree`のテストは、Range Scanの境界(`Included`、`Excluded`、`Unbounded`の組み合わせ、空の範囲)、複数ページにまたがる重複キーが取りこぼされないことの回帰、`unique`フラグの動作、Lazy Delete後の`lookup`と`range`の一貫性を確認します。
+`delete_finds_the_target_rid_regardless_of_which_leaf_it_ended_up_in_after_duplicate_key_splits`は、この節で直した`delete`の境界値テストです。
+同じキーで500件のエントリを挿入してLeaf Splitを複数回起こしたうえで、先頭、中間、末尾それぞれの葉に残った`RecordId`を指定して削除できることを確認します。
 5,000件規模のシードつき乱数列を`std::collections::BTreeMap`と突き合わせるモデルベーステスト(第23章から続く手法)は、`range`と`delete`の両方に対しても書きました。
 
 ```rust
@@ -836,5 +897,5 @@ test result: ok. 534 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
 ### 発展課題
 
 1. `Storage::create_index`は、索引ごとに専用のファイルを作るという設計を採りました(モジュール冒頭の説明を参照)。この設計を、テーブル本体と同じファイルに複数の索引を同居させる設計へ書き換えるとすると、`crate::btree::BTree`のMetaページ配置(ページ1固定)をどう変更する必要があるかを設計してください。`Storage`のCatalogページに各索引のMetaページの`PageId`を記録する案と、`BTree::create`に呼び出し側が確保したMetaページの`PageId`を渡させる案の両方を検討し、それぞれが`crate::btree`のテスト(単独のファイルとして`BTree`を使う、第23章からのテスト)にどう影響するかを比較してください。
-2. `crate::index::check_uniqueness_with_index`は、`PRIMARY KEY`と`UNIQUE`の列ごとに対応する`UNIQUE`索引が必ず存在するという前提のもとで`unreachable!`を使っています。テーブルを`ALTER TABLE`で後から`PRIMARY KEY`に変更できるようになったと仮定すると、この前提はどこで崩れる可能性があるか、崩れないようにするにはどこで何を検査すればよいかを検討してください(`ALTER TABLE`自体はこの教材のSQLサブセットにまだ無い機能です)。
+2. `Database::execute_create_table`は、自動生成する制約索引名がすでに使われていないかをテーブルの永続化より前にまとめて検査するようになりました(前節)。この検査は「索引名の衝突」という1種類の失敗だけを防ぎます。`PRIMARY KEY`と`UNIQUE`の両方を持つテーブルのように、自動生成する制約索引が2本以上ある場合、1本目の`create_constraint_index`が成功した直後に2本目が(索引名の衝突ではなく)`DbError::CatalogTooLarge`のような別の理由で失敗すると、テーブルは索引を1本だけ持った不完全な状態のままカタログに残ります。この経路を再現するテストを書き、テーブルの永続化そのものを制約索引がすべて揃うまで遅らせる設計と、失敗時にテーブルと作成済みの制約索引を取り除くロールバックを実装する設計の両方を検討してください。
 3. `RangeScan`は、`next_leaf`をたどりながら1ページずつ`BufferPool::read_page`を呼びます。`Storage::create_index`のIndex Buildと同様に大量の行を読む場面で、`BufferPool::stats()`(第14章)を使ってヒット率を実測し、Point Lookup(`lookup`)を同じ件数繰り返す場合と比べてページI/Oの回数がどう違うかを比較してください。

@@ -141,10 +141,12 @@ use std::ops::Bound;
 use crate::buffer_pool::BufferPool;
 use crate::error::{DbError, DbResult};
 use crate::ids::{PageId, RecordId};
-use crate::page::PageType;
+use crate::page::{PageType, PAGE_PAYLOAD_SIZE};
 use crate::types::{DataType, Value};
 
-use crate::btree_page::{InternalPage, InternalPageRef, LeafPage, LeafPageRef, NO_NEXT_LEAF};
+use crate::btree_page::{
+    internal_entries_fit, leaf_entries_fit, InternalPage, InternalPageRef, LeafPage, LeafPageRef, NO_NEXT_LEAF,
+};
 
 /// Metaページ(Rootの`PageId`とキー型)の定位置。ページ0はDiskManagerのFile
 /// Headerが占有しているため、空いている最初の番号を使う(`crate::storage`の
@@ -354,11 +356,23 @@ impl BTree {
 
     /// `key`と`rid`の対応を1件削除する(Lazy Delete)。
     ///
-    /// `find_leaf`でたどり着いた1枚のLeaf Pageから、`key`と`rid`の両方が
-    /// 一致するエントリを取り除いて書き戻す。一致する`(key, rid)`が
-    /// 見つかって削除できたら`true`、そもそも存在しなければ`false`を返す。
-    /// 同じキーに複数の`RecordId`が対応している場合、削除するのは`rid`が
-    /// 一致する1件だけである。
+    /// [`Self::find_leaf_for_lower_bound`]で`key`と一致する**最初**の葉から
+    /// 探索を始め、`key`と`rid`の両方が一致するエントリが見つかるまで
+    /// `next_leaf`を右へたどる。一致する`(key, rid)`が見つかって削除できたら
+    /// `true`、そもそも存在しなければ`false`を返す。同じキーに複数の
+    /// `RecordId`が対応している場合、削除するのは`rid`が一致する1件だけである。
+    ///
+    /// 同じキーを持つエントリがLeaf Splitによって複数のLeaf Pageへ
+    /// またがっている場合、`rid`は探索経路(どちらの子へ降りるか)に一切
+    /// 使われないため、`rid`だけを見て「このキーはどの葉にあるか」を
+    /// 決めることはできない。`find_leaf`(一致の最後の葉を返す)から探索を
+    /// 始めると、対象の`RecordId`がそれより左の葉にある場合に見つけられない
+    /// (`lookup`が第24章でLeaf間リンクを使うよう書き換えられた理由と同じ)。
+    /// そのため`delete`も`find_leaf_for_lower_bound`で一致の最初の葉から
+    /// 出発し、右隣の葉のキーが`key`と一致しなくなる(または`next_leaf`が
+    /// 尽きる)まで走査する。走査の対象になる葉が(先行する`delete`で)空に
+    /// なっていても、それだけでは「このキーの残りが右の葉にもう無い」とは
+    /// 判断できないため、空の葉はそのまま素通りして次の葉へ進む。
     ///
     /// **Redistribution・Merge・Root縮小は行わない**。エントリを取り除いた
     /// 結果、Leaf Pageの占有率がどれだけ下がっても、隣接するページと
@@ -372,21 +386,71 @@ impl BTree {
         self.check_key_type(key)?;
         let key_bytes = encode_key(key)?;
 
-        let leaf_id = self.find_leaf(&key_bytes)?;
-        let mut entries = {
-            let guard = self.pool.read_page(leaf_id)?;
-            LeafPageRef::open(guard.data())?.entries()
-        };
-        let Some(pos) = entries.iter().position(|(k, r)| k.as_slice() == key_bytes.as_slice() && *r == rid) else {
-            return Ok(false);
-        };
-        entries.remove(pos);
+        let mut leaf_id = self.find_leaf_for_lower_bound(&key_bytes)?;
+        loop {
+            let (mut entries, next_leaf) = {
+                let guard = self.pool.read_page(leaf_id)?;
+                let view = LeafPageRef::open(guard.data())?;
+                (view.entries(), view.next_leaf())
+            };
 
-        let mut guard = self.pool.write_page(leaf_id)?;
-        let mut page = LeafPage::open(guard.data_mut())?;
-        let fits = page.write_entries(&entries);
-        debug_assert!(fits, "エントリを取り除くだけの書き込みが収まらないのは、write_entriesの実装が壊れている場合に限る");
-        Ok(true)
+            if let Some(pos) = entries.iter().position(|(k, r)| k.as_slice() == key_bytes.as_slice() && *r == rid) {
+                entries.remove(pos);
+                let mut guard = self.pool.write_page(leaf_id)?;
+                let mut page = LeafPage::open(guard.data_mut())?;
+                let fits = page.write_entries(&entries);
+                debug_assert!(fits, "エントリを取り除くだけの書き込みが収まらないのは、write_entriesの実装が壊れている場合に限る");
+                return Ok(true);
+            }
+
+            // このページで見つからなかった。空の葉(先行するdeleteが空にした)、
+            // あるいは末尾のキーがまだ`key`以下のページであれば、`key`の
+            // エントリが右隣の葉に続いている可能性が消えないため、
+            // `next_leaf`へ進む。`find_leaf_for_lower_bound`はLeaf Splitの
+            // 境界次第で、`key`と等しい区切りキーを持つ葉より1つ左の葉を
+            // 返すことがある(区切りキーは分割後の右側の葉にしか複製されない
+            // ため、そちらの葉には`key`のエントリが1件も無い)。この場合も
+            // 末尾のキーは`key`未満なので、下の条件で正しく右隣へ進む。
+            // 末尾のキーが`key`を追い越しているページまで来たら、これより
+            // 右に`key`のエントリが残っている余地は無い。
+            let might_continue = entries.is_empty() || entries.last().unwrap().0.as_slice() <= key_bytes.as_slice();
+            if !might_continue || next_leaf == NO_NEXT_LEAF {
+                return Ok(false);
+            }
+            leaf_id = next_leaf;
+        }
+    }
+
+    /// `key`を1件挿入しようとしたときに、空のLeaf Page1枚にすら収まらない
+    /// ほど大きくないかどうかを、実際には何も書き換えずに判定する。
+    ///
+    /// [`crate::storage::Storage::check_indexes_accept_row`]が、複数の索引を
+    /// 横断して1行を挿入・更新する前に「どの索引でもこのキーが収まる」ことを
+    /// 確認するために使う。索引の更新は`Storage::index_insert_row`が対象と
+    /// なる索引を1つずつ順に`insert`していく形であり、事前にこの検査を
+    /// 挟まないと、複数ある索引のうち途中の1つで`DbError::BTreeKeyTooLarge`が
+    /// 起きたとき、それより前に更新済みの索引だけが新しい行を指し、Heapの
+    /// 行そのものはすでに書き込まれている(あるいは書き換わっている)という
+    /// 不整合が生まれる(第3部レビューで指摘された)。
+    ///
+    /// この検査が見るのは「キー1件が空のページに収まるか」だけである。
+    /// 実際の`insert`が引き起こすLeaf・Internal Splitは、既存ページの
+    /// 空き具合次第でこの検査を通過した後でも`DbError::BTreeKeyTooLarge`に
+    /// なる余地を残す(その場合の後始末は`Storage::index_insert_row`が
+    /// 行う巻き戻しに任せる。この関数は「よくある失敗」をHeapへの書き込み
+    /// より前に防ぐ主防御であり、後者は「まれな失敗」の保険にすぎない)。
+    ///
+    /// `key`が`Value::Null`なら`DbError::NullKeyNotAllowed`、このツリーの
+    /// `key_type()`と異なる型なら`DbError::BTreeKeyTypeMismatch`を返す。
+    pub fn check_key_fits(&self, key: &Value) -> DbResult<()> {
+        self.check_key_type(key)?;
+        let key_bytes = encode_key(key)?;
+        let dummy_rid = RecordId::new(PageId(0), crate::ids::SlotId(0));
+        if leaf_entries_fit(PAGE_PAYLOAD_SIZE, &[(key_bytes.clone(), dummy_rid)]) {
+            Ok(())
+        } else {
+            Err(DbError::BTreeKeyTooLarge(key_bytes.len()))
+        }
     }
 
     /// `key`と`rid`の対応を1件挿入する。
@@ -520,6 +584,15 @@ impl BTree {
     /// 忘れると、分割の前後で「`current_id`の次は`old_next`」というリンクが
     /// 新しいページを飛び越したまま残り、`new_id`に移ったエントリへRange Scan
     /// (`range`)がたどり着けなくなる。
+    ///
+    /// **エラーを返す場合は既存の木を一切変更しない**。`left`・`right`の
+    /// どちらかがページに収まらない場合、[`leaf_entries_fit`]による事前検査
+    /// だけで判定し、`current_id`の書き換えも新しいページの確保も行わずに
+    /// `DbError::BTreeKeyTooLarge`を返す。この検査を怠って`left`を先に
+    /// `current_id`へ書いてしまうと、そのあとで`right`が収まらないと
+    /// 判明した時点では元の`current_id`のエントリはもう失われており、
+    /// 呼び出し元([`Self::insert`])へエラーを返しても木を元の状態へ
+    /// 戻す手段が無い(この非対称な失敗が第3部レビューで指摘された)。
     fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbResult<(Vec<u8>, PageId)> {
         if entries.len() < 2 {
             let max_len = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -529,23 +602,29 @@ impl BTree {
         let (left, right) = entries.split_at(mid);
         let separator = right[0].0.clone();
 
-        let new_id = self.pool.allocate_page(PageType::BTreeLeaf)?;
+        if !leaf_entries_fit(PAGE_PAYLOAD_SIZE, left) || !leaf_entries_fit(PAGE_PAYLOAD_SIZE, right) {
+            return Err(DbError::BTreeKeyTooLarge(separator.len()));
+        }
+
+        // ここから先は、両側とも収まることが確定しているため、以下の書き込みは
+        // (プール自体のI/Oエラーを除けば)失敗しない。
         let old_next = {
+            let guard = self.pool.read_page(current_id)?;
+            LeafPageRef::open(guard.data())?.next_leaf()
+        };
+        let new_id = self.pool.allocate_page(PageType::BTreeLeaf)?;
+        {
             let mut guard = self.pool.write_page(current_id)?;
             let mut page = LeafPage::open(guard.data_mut())?;
-            let old_next = page.as_ref().next_leaf();
-            if !page.write_entries(left) {
-                return Err(DbError::BTreeKeyTooLarge(separator.len()));
-            }
+            let fits = page.write_entries(left);
+            debug_assert!(fits, "事前検査(leaf_entries_fit)を通過した書き込みが失敗するのは実装が壊れている場合に限る");
             page.set_next_leaf(new_id);
-            old_next
-        };
+        }
         {
             let mut guard = self.pool.write_page(new_id)?;
             let mut page = LeafPage::init(guard.data_mut());
-            if !page.write_entries(right) {
-                return Err(DbError::BTreeKeyTooLarge(separator.len()));
-            }
+            let fits = page.write_entries(right);
+            debug_assert!(fits, "事前検査(leaf_entries_fit)を通過した書き込みが失敗するのは実装が壊れている場合に限る");
             page.set_next_leaf(old_next);
         }
         Ok((separator, new_id))
@@ -558,6 +637,11 @@ impl BTree {
     /// 残らない。Internal Pageのキーは「どちらの子を見るべきか」という
     /// 境界を表すだけの情報であり、Leaf Pageのキーのように行の実データと
     /// 対応する値そのものではないため、複製して残す理由が無い。
+    ///
+    /// [`Self::split_leaf`]と同じ理由で、**エラーを返す場合は既存の木を
+    /// 一切変更しない**。`left_entries`・`right_entries`のどちらかが収まらない
+    /// 場合は、[`internal_entries_fit`]による事前検査だけで判定し、
+    /// `current_id`の書き換えも新しいページの確保も行わない。
     fn split_internal(&self, entries: &[(Vec<u8>, PageId)], leftmost_child: PageId, current_id: PageId) -> DbResult<(Vec<u8>, PageId)> {
         if entries.len() < 2 {
             let max_len = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -569,20 +653,24 @@ impl BTree {
         let right_leftmost = entries[mid].1;
         let right_entries = &entries[mid + 1..];
 
+        if !internal_entries_fit(PAGE_PAYLOAD_SIZE, left_entries) || !internal_entries_fit(PAGE_PAYLOAD_SIZE, right_entries) {
+            return Err(DbError::BTreeKeyTooLarge(separator.len()));
+        }
+
+        // ここから先は、両側とも収まることが確定しているため、以下の書き込みは
+        // (プール自体のI/Oエラーを除けば)失敗しない。
         {
             let mut guard = self.pool.write_page(current_id)?;
             let mut page = InternalPage::open(guard.data_mut())?;
-            if !page.write_entries(leftmost_child, left_entries) {
-                return Err(DbError::BTreeKeyTooLarge(separator.len()));
-            }
+            let fits = page.write_entries(leftmost_child, left_entries);
+            debug_assert!(fits, "事前検査(internal_entries_fit)を通過した書き込みが失敗するのは実装が壊れている場合に限る");
         }
         let new_id = self.pool.allocate_page(PageType::BTreeInternal)?;
         {
             let mut guard = self.pool.write_page(new_id)?;
             let mut page = InternalPage::init(guard.data_mut(), right_leftmost);
-            if !page.write_entries(right_leftmost, right_entries) {
-                return Err(DbError::BTreeKeyTooLarge(separator.len()));
-            }
+            let fits = page.write_entries(right_leftmost, right_entries);
+            debug_assert!(fits, "事前検査(internal_entries_fit)を通過した書き込みが失敗するのは実装が壊れている場合に限る");
         }
         Ok((separator, new_id))
     }
@@ -1148,6 +1236,95 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// レビュー指摘の再現条件: 既存のLeaf Pageがほぼ満杯の状態で、新しい
+    /// ページ側に収まりようのない巨大キーを挿入すると`BTreeKeyTooLarge`を
+    /// 返す。旧実装は元ページ(前半)を先に書き換えてから新ページ側の空き
+    /// 容量を検査していたため、この場合に元ページのエントリが50%失われた
+    /// まま(既存キーが半分しか参照できない状態で)エラーを返していた。
+    /// 事前検査に変更した後は、エラーを返す代わりに木が一切変化しないことを
+    /// 確認する。
+    #[test]
+    fn leaf_split_leaves_the_original_page_untouched_when_the_new_side_would_not_fit() {
+        let path = temp_path("leaf-split-atomic");
+        let mut btree = open_btree(&path, DataType::Text);
+
+        let n = 200usize;
+        let mut expected = Vec::new();
+        for i in 0..n {
+            let key = format!("{i:04}");
+            let record = rid(1, i as u16);
+            btree.insert(&Value::Text(key.clone()), record).unwrap();
+            expected.push((key, record));
+        }
+        assert_eq!(btree.height().unwrap(), 1, "この件数・キー幅ではまだLeaf Splitが起きていないはず(前提が崩れている)");
+        let leaf_id = btree.root_page_id();
+
+        let huge_key = "x".repeat(crate::page::PAGE_PAYLOAD_SIZE);
+        let err = btree.insert(&Value::Text(huge_key.clone()), rid(9, 9)).unwrap_err();
+        assert!(matches!(err, DbError::BTreeKeyTooLarge(_)));
+
+        // エラーを返した以上、木は一切変わっていないはず: Root、葉の
+        // PageId、Leaf間リンク、既存の全エントリがすべて元のまま。
+        assert_eq!(btree.root_page_id(), leaf_id);
+        assert_eq!(btree.height().unwrap(), 1);
+        for (key, record) in &expected {
+            assert_eq!(btree.lookup(&Value::Text(key.clone())).unwrap(), vec![*record], "key={key}");
+        }
+        assert_eq!(btree.lookup(&Value::Text(huge_key)).unwrap(), Vec::new(), "収まらなかったキーは挿入されていないはず");
+
+        let guard = btree.pool.read_page(leaf_id).unwrap();
+        let view = LeafPageRef::open(guard.data()).unwrap();
+        assert_eq!(view.entry_count(), n, "元ページのエントリ数が変化している");
+        assert_eq!(view.next_leaf(), NO_NEXT_LEAF, "分割していないので次の葉へのリンクは無いままのはず");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// [`leaf_split_leaves_the_original_page_untouched_when_the_new_side_would_not_fit`]の
+    /// Internal Page版。Root SplitでRootがInternal Pageになった直後の状態を
+    /// 使い、`split_internal`(private、同一モジュール内のテストなので
+    /// 直接呼べる)へ収まりようのない区切りキーを混ぜたエントリ列を渡す。
+    #[test]
+    fn internal_split_leaves_the_original_page_untouched_when_the_new_side_would_not_fit() {
+        let path = temp_path("internal-split-atomic");
+        let mut btree = open_btree(&path, DataType::Text);
+
+        let mut i = 0usize;
+        while btree.height().unwrap() == 1 {
+            btree.insert(&Value::Text(wide_key(i)), rid(1, 0)).unwrap();
+            i += 1;
+            assert!(i < 10_000, "Root Splitが起きないまま挿入回数の上限に達した(テストの前提が崩れている)");
+        }
+        assert_eq!(btree.height().unwrap(), 2);
+        let internal_id = btree.root_page_id();
+
+        let (leftmost, original_entries) = {
+            let guard = btree.pool.read_page(internal_id).unwrap();
+            let view = InternalPageRef::open(guard.data()).unwrap();
+            (view.leftmost_child(), view.entries())
+        };
+        assert!(!original_entries.is_empty(), "Root Split直後のRootは区切りキーを1本以上持つはず");
+
+        // 収まりようがないほど巨大な区切りキーを先頭に混ぜる。
+        // `mid = entries.len() / 2 >= 1`であるため、必ず左側(current_id側)に
+        // 含まれ、事前検査で失敗する。
+        let huge_key = "x".repeat(crate::page::PAGE_PAYLOAD_SIZE);
+        let mut entries = original_entries.clone();
+        entries.insert(0, (huge_key.into_bytes(), PageId(999_999)));
+
+        let err = btree.split_internal(&entries, leftmost, internal_id).unwrap_err();
+        assert!(matches!(err, DbError::BTreeKeyTooLarge(_)));
+
+        // エラーを返した以上、internal_idのページは一切変わっていないはず。
+        let guard = btree.pool.read_page(internal_id).unwrap();
+        let view = InternalPageRef::open(guard.data()).unwrap();
+        assert_eq!(view.leftmost_child(), leftmost);
+        assert_eq!(view.entries(), original_entries);
+        assert_eq!(btree.root_page_id(), internal_id, "Root自体も変わっていないはず");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
     /// 「測って確認する」: B+Treeの`lookup`が`O(log n)`で伸びることを、
     /// 第20章の走査ベース一意性検査(`O(n)`)と同じ`n`(1,000〜16,000)で確認する。
     /// 実行環境に依存する実行時間そのものは回帰テストにしないため`#[ignore]`を
@@ -1417,6 +1594,45 @@ mod tests {
         // 削除しなかった最後の1件は、削除で空になった葉が木の中に残っていても
         // 正しく引ける。
         assert_eq!(btree.lookup(&Value::Text(wide_key(n - 1))).unwrap(), vec![rid(1, ((n - 1) % 1000) as u16)]);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// レビュー指摘の再現条件: 同じキーを持つ500件のエントリをLeaf Splitで
+    /// 複数の葉へまたがらせ、先頭・中間・末尾の葉に残った`RecordId`を
+    /// それぞれ削除できることを確認する。旧実装は`find_leaf`(一致の最後の
+    /// 葉)から探索を始めていたため、先頭の葉にある`RecordId`を指定すると
+    /// `deleted=false`のまま索引エントリが残っていた。
+    #[test]
+    fn delete_finds_the_target_rid_regardless_of_which_leaf_it_ended_up_in_after_duplicate_key_splits() {
+        let path = temp_path("delete-spanning-leaves");
+        let mut btree = open_btree(&path, DataType::Text);
+        let wide_value = "x".repeat(120);
+        let n = 500usize;
+        let rids: Vec<RecordId> = (0..n).map(|i| rid(1, i as u16)).collect();
+        for &r in &rids {
+            btree.insert(&Value::Text(wide_value.clone()), r).unwrap();
+        }
+        assert!(btree.height().unwrap() >= 2, "500件の重複キーを挿入すればLeaf Splitが起きているはず");
+
+        // 挿入順を保つ設計(`leaf_insert_position`が重複キーの最後尾へ挿入する)
+        // により、先頭で挿入した`RecordId`は最も左のLeaf Pageに、末尾で
+        // 挿入した`RecordId`は最も右のLeaf Pageに残る。
+        let first = rids[0];
+        let middle = rids[n / 2];
+        let last = rids[n - 1];
+
+        assert!(btree.delete(&Value::Text(wide_value.clone()), first).unwrap(), "先頭の葉にあるRecordIdを削除できるはず");
+        assert!(btree.delete(&Value::Text(wide_value.clone()), middle).unwrap(), "中間の葉にあるRecordIdを削除できるはず");
+        assert!(btree.delete(&Value::Text(wide_value.clone()), last).unwrap(), "末尾の葉にあるRecordIdを削除できるはず");
+        // 一度削除したRecordIdをもう一度指定しても、もう存在しないので偽を返す。
+        assert!(!btree.delete(&Value::Text(wide_value.clone()), first).unwrap());
+
+        let mut remaining = btree.lookup(&Value::Text(wide_value.clone())).unwrap();
+        remaining.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        let mut expected: Vec<RecordId> = rids.into_iter().filter(|r| *r != first && *r != middle && *r != last).collect();
+        expected.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        assert_eq!(remaining, expected);
 
         std::fs::remove_file(&path).unwrap();
     }
