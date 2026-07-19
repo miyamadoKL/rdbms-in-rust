@@ -409,7 +409,7 @@ fn insert_into_leaf(&self, leaf_id: PageId, key_bytes: &[u8], rid: RecordId) -> 
 `PRIMARY KEY`や`UNIQUE`の一意性検査(第20章の`crate::constraints`と同じ役割のもの)をこの索引自身に持たせる変更は、第24章でIndex Maintenanceを実装するときに扱います。
 
 `write_entries`が`false`を返したら(収まらなかったら)、`split_leaf`を呼びます。
-挿入後の全エントリをちょうど半分に割り、前半は元のページへ、後半は新しく確保したLeaf Pageへ書き直します。
+挿入後の全エントリをバイト容量が釣り合う位置で2つに割り(次節「キー長の上限がSplitの伝播全体を安全にする」で理由を説明します)、前半は元のページへ、後半は新しく確保したLeaf Pageへ書き直します。
 
 ```rust
 fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbResult<(Vec<u8>, PageId)> {
@@ -803,7 +803,7 @@ n= 16000 height=2 elapsed=43.7µs
 
 1. `BTree::insert`に、すでに`lookup`で確認できる件数のキーを挿入した後、さらに`BTree::create`時とは異なる`DataType`の`Value`を`insert`したときに`DbError::BTreeKeyTypeMismatch`が返ることを、`expected`と`actual`フィールドの中身まで検証するテストを追加してください。
 2. `LeafPageRef::find`と`InternalPageRef::child_for`は、どちらも`lo`と`hi`だけを持つ手書きの二分探索です。この二分探索を、添字配列を`Vec`へ`collect`してから`slice::binary_search_by`(または`partition_point`)に渡す実装に書き換え、`many_keys_force_multi_level_split_and_all_remain_findable`のような多段Splitを伴うテストの実行時間が、変更前後でどれだけ変わるかを`std::time::Instant`で比較してください。
-3. `split_leaf`と`split_internal`は、エントリをちょうど半分(`entries.len() / 2`)で分割します。この分割位置を「前半3分の1、後半3分の2」のように変えると、`many_keys_force_multi_level_split_and_all_remain_findable`が確認している木の高さや、`insert`を連続して呼んだときのSplit発生回数がどう変わるかを実測してください。
+3. `split_leaf`と`split_internal`は、`leaf_split_point`と`internal_split_point`(「キー長の上限がSplitの伝播全体を安全にする」を参照)を使い、左から貪欲にエントリを詰めて`capacity`を超える直前で区切ります。キーの長さが揃っている場合はこれがほぼ中央での分割になりますが、キー長がばらつく場合は必ずしも中央にはなりません。`many_keys_force_multi_level_split_and_all_remain_findable`のキー(固定長の`wide_key`)を、長さが数倍〜十数倍ばらつく可変長のキーに差し替え、分割のたびに左右へ入るエントリの**件数**の偏りを実測してください。件数が偏っても、両側とも`capacity`には収まり続けること(モジュールドキュメントの証明どおり)を確認したうえで、件数の偏りが木の高さや`insert`1件あたりのSplit発生回数にどう影響するかを考察してください。
 
 ### 発展課題
 

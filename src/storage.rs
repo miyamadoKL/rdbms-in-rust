@@ -57,8 +57,23 @@
 //! 列ごとのレコードの末尾(`nullable`の直後)に`primary_key`・`unique`という
 //! 2バイトを追加した。この章より前に`Storage::create`で作られたファイルは
 //! この2バイトを持たないため、この章のコードで`Storage::open`しようとすると
-//! `nullable`の直後で次の列(または`page_count`)を読もうとして境界がずれ、
-//! `DbError::CorruptCatalog`になる。
+//! `nullable`の直後で次の列(または`page_count`)を読もうとして境界がずれる。
+//!
+//! この時点では、境界がずれた読み出しが`DbError::CorruptCatalog`になることを
+//! 「レイアウトが変わったファイルは開けない」という設計上の帰結として
+//! 説明していた。ずれた読み出しの先で、いずれ文字列の長さプレフィックス
+//! (`name_len`・`col_name_len`)を大きく誤読し、残りバイト数を超える範囲を
+//! 要求して`take`の境界検査に引っかかる、という筋道である。だが
+//! Catalogページの`payload`は`PAGE_PAYLOAD_SIZE`バイト固定で、実データの
+//! 直後から末尾まで`0`で埋められている(`persist_catalog`を参照)ため、
+//! ずれた読み出しの結果が**たまたま小さい値**(索引が1本だけの場合の
+//! `is_constraint`の後続バイトなど)になると、境界検査に一度も引っかからず
+//! 静かに「妥当に見える」値を組み立ててしまう経路が実際に存在する
+//! (第3部レビューで、索引メタデータへの`is_constraint`追加時に実例が
+//! 見つかった)。つまり、この「いずれ`CorruptCatalog`になるはず」という
+//! 説明は、レイアウト変更の内容によっては成り立たない場合がある。
+//! この教材が確実な保証として採用している方式は、後述の
+//! [`CATALOG_MAGIC`]・[`CATALOG_LAYOUT_VERSION`]による判定である。
 //!
 //! ページ構造そのもの(File Header・Pageの`checksum`・`FORMAT_VERSION`、
 //! [`crate::page`])はこの章でも変えていない。`Page::decode`が検証する
@@ -133,12 +148,51 @@
 //! ```
 //!
 //! この章より前(第23章以前)に`Storage::create`で作られたファイルはこの
-//! セクションを持たないため、この章のコードで開こうとすると`index_count`を
-//! 読む前にバイト列が尽き、`DbError::CorruptCatalog`になる(モジュール冒頭の
-//! 「第20章での変更」節と同じ、章をまたいだファイル互換性を約束しない方針)。
-//! `is_constraint`(第3部2巡目レビュー対応で追加)も同じ方針で、この
-//! フィールドを持たない古いファイルは`decode_catalog`がバイト列の途中で
-//! 尽きて`DbError::CorruptCatalog`になる。
+//! セクションを持たない。この教材は章をまたいだファイル互換性を約束しない
+//! 方針だが(モジュール冒頭の「第20章での変更」節を参照)、「約束しない」ことと
+//! 「古い形式を開こうとすると確実にエラーになる」ことは別の話である。
+//! 索引が1本もないファイルでは、この章のコードは`index_count`を読む位置に
+//! 残っている`0`埋めの`payload`をそのまま`index_count = 0`として受理して
+//! しまい、`DbError::CorruptCatalog`にすらならない(索引が無いという結論
+//! 自体はたまたま正しいので、実害は無いまま素通りする)。
+//!
+//! # 第3部レビュー対応: レイアウトの版を先頭に埋め込み、確実に拒否する
+//!
+//! `is_constraint`(索引が自動生成された制約索引かどうか、`crate::index::IndexInfo`を
+//! 参照)を追加したとき、この「約束しないが、たいていはエラーになるはず」
+//! という説明の弱さが実際の不具合として表面化した。索引を1本だけ持つ
+//! 旧いカタログを新しいコードで開くと、`is_constraint`を読む位置に残っている
+//! `0`埋めの`payload`が`is_constraint = false`としてそのまま受理されてしまい、
+//! `DROP INDEX`が制約索引まで削除できてしまう(`crate::storage`のテスト
+//! `open_rejects_a_pre_is_constraint_catalog_with_a_single_constraint_index`が
+//! この状態を再現する)。索引が複数本ある場合は、1本目のレコードが1バイト
+//! 短く読まれることで2本目以降のフィールド境界そのものがずれ、無関係な
+//! 整合性エラーとして観測される。
+//!
+//! この種の不具合を個別のフィールドごとに塞ぐのではなく、レイアウトが
+//! 変わったこと自体を`payload`の**先頭**で検出できるようにする。
+//!
+//! ```text
+//! magic:          u8 × 8  (CATALOG_MAGIC、固定のASCII文字列)
+//! layout_version: u32     (CATALOG_LAYOUT_VERSION)
+//! (以降、next_table_idから続くこのモジュールのレイアウト)
+//! ```
+//!
+//! `encode_catalog`は`payload`の先頭に、固定のマジックバイト列
+//! ([`CATALOG_MAGIC`])と、現在のレイアウト版([`CATALOG_LAYOUT_VERSION`])を
+//! 書く。`decode_catalog`はこの2つを最初に検査し、マジックバイト列が
+//! 一致しないか、レイアウト版が現在のコードが理解する値と異なる場合は、
+//! それ以降のバイト列を一切解釈せずに`DbError::CorruptCatalog`を返す。
+//!
+//! マジックバイト列を単なる版番号ではなく固定のASCII文字列にしてあるのは、
+//! 版番号だけでは「古いファイルの`next_table_id`(この位置に来る値)が
+//! たまたま現在の版番号と同じ小さな整数である」という偶然の一致を排除
+//! できないからである。8バイトの固定文字列と偶然一致する確率は無視できる。
+//!
+//! **索引メタデータ・テーブル定義・Free Page Listのいずれかのレイアウトを
+//! 今後変更する場合は、`CATALOG_LAYOUT_VERSION`を必ず1つ増やす。**
+//! 増やし忘れると、この節が解決したのと同じ「たまたま妥当に見える値を
+//! 静かに受理してしまう」不具合が再発しうる。
 //!
 //! 索引の実データ(`crate::btree::BTree`が持つB+Tree本体)は、この
 //! Catalogページと同じファイルには置かない。**索引ごとに専用のファイル**
@@ -1270,6 +1324,33 @@ fn claim_page(
     Ok(())
 }
 
+/// Catalogページのpayloadの先頭に置く、固定の識別バイト列(第3部レビュー
+/// 対応)。
+///
+/// この章より前のカタログレイアウト(`is_constraint`を持たない版など)は、
+/// payloadの先頭がこの8バイトと一致することはまず無い(先頭は
+/// `next_table_id`という`u64`の値であり、任意のテーブル数を表しうるが、
+/// この8バイトのASCII文字列と偶然一致する確率は無視できる)。
+/// `decode_catalog`はまずこの8バイトを検査し、一致しなければ
+/// `DbError::CorruptCatalog`で即座に拒否する。これにより、レイアウトが
+/// 変わった後に古いカタログを新しいコードで開いても、フィールドを
+/// 読み違えたまま「たまたま妥当に見える値」を受理してしまうことがない。
+const CATALOG_MAGIC: [u8; 8] = *b"MDBCTLG1";
+
+/// Catalogページのレイアウト版(第3部レビュー対応)。
+///
+/// [`CATALOG_MAGIC`]の直後に置く`u32`で、`decode_catalog`は
+/// [`CATALOG_LAYOUT_VERSION`]と完全に一致する場合だけ、それ以降のバイト列を
+/// このモジュールの現在の`encode_catalog`と同じレイアウトとして解釈する。
+///
+/// **索引メタデータ・テーブル定義・Free Page Listのいずれかのレイアウトを
+/// 変更する(フィールドの追加・削除・並び替え、型の変更など)たびに、
+/// この定数を1つ増やすこと。** 増やし忘れると、新しいコードが古いレイアウトの
+/// バイト列を新しいレイアウトとして読み違え、フィールドの境界がずれた
+/// まま「たまたま妥当に見える値」を受理してしまう危険がある
+/// (`is_constraint`フィールドを追加した際に実際に起きた不具合)。
+const CATALOG_LAYOUT_VERSION: u32 = 1;
+
 /// `decode_catalog`が返す、Catalogページから復元した状態。
 struct DecodedCatalog {
     next_table_id: u64,
@@ -1295,6 +1376,8 @@ fn encode_catalog(
     indexes: &[&IndexInfo],
 ) -> Vec<u8> {
     let mut out = Vec::new();
+    out.extend_from_slice(&CATALOG_MAGIC);
+    out.extend_from_slice(&CATALOG_LAYOUT_VERSION.to_le_bytes());
     out.extend_from_slice(&next_table_id.to_le_bytes());
     out.extend_from_slice(&(tables.len() as u32).to_le_bytes());
     out.extend_from_slice(&(free_pages.len() as u32).to_le_bytes());
@@ -1359,6 +1442,21 @@ fn encode_catalog(
 /// 壊れたバイト列の長さそのもの(高々`PAGE_PAYLOAD_SIZE`)で頭打ちになる。
 fn decode_catalog(bytes: &[u8]) -> DbResult<DecodedCatalog> {
     let mut cursor = bytes;
+
+    let magic = take(&mut cursor, CATALOG_MAGIC.len(), "catalog_magic")?;
+    if magic != CATALOG_MAGIC {
+        return Err(DbError::CorruptCatalog(
+            "Catalogページの先頭が識別バイト列と一致しません(このレイアウトを導入する前の、\
+             章をまたいで互換性の無い古いカタログである可能性があります)"
+                .to_string(),
+        ));
+    }
+    let layout_version = take_u32(&mut cursor, "catalog_layout_version")?;
+    if layout_version != CATALOG_LAYOUT_VERSION {
+        return Err(DbError::CorruptCatalog(format!(
+            "Catalogページのレイアウト版が不明です: {layout_version}(現在のコードは{CATALOG_LAYOUT_VERSION}のみ理解します)"
+        )));
+    }
 
     let next_table_id = take_u64(&mut cursor, "next_table_id")?;
     let table_count = take_u32(&mut cursor, "table_count")? as usize;
@@ -1652,12 +1750,14 @@ mod tests {
         Storage::create(&path).unwrap();
 
         let mut payload = vec![0u8; PAGE_PAYLOAD_SIZE];
-        payload[0..8].copy_from_slice(&0u64.to_le_bytes()); // next_table_id
-        payload[8..12].copy_from_slice(&1u32.to_le_bytes()); // table_count = 1
-        payload[12..16].copy_from_slice(&0u32.to_le_bytes()); // free_page_count
-        payload[16..24].copy_from_slice(&0u64.to_le_bytes()); // table_id
+        payload[0..8].copy_from_slice(&CATALOG_MAGIC);
+        payload[8..12].copy_from_slice(&CATALOG_LAYOUT_VERSION.to_le_bytes());
+        payload[12..20].copy_from_slice(&0u64.to_le_bytes()); // next_table_id
+        payload[20..24].copy_from_slice(&1u32.to_le_bytes()); // table_count = 1
+        payload[24..28].copy_from_slice(&0u32.to_le_bytes()); // free_page_count
+        payload[28..36].copy_from_slice(&0u64.to_le_bytes()); // table_id
         // name_lenを、ページに残っている実バイト数よりずっと大きい値へ偽る。
-        payload[24..26].copy_from_slice(&u16::MAX.to_le_bytes());
+        payload[36..38].copy_from_slice(&u16::MAX.to_le_bytes());
 
         let mut page = Page::new(CATALOG_PAGE_ID, PageType::Catalog);
         page.payload_mut().copy_from_slice(&payload);
@@ -1669,6 +1769,137 @@ mod tests {
 
         let err = expect_err(Storage::open(&path));
         assert!(matches!(err, DbError::CorruptCatalog(_)));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// [`CATALOG_MAGIC`]・[`CATALOG_LAYOUT_VERSION`]・`is_constraint`のいずれも
+    /// 持たない、この章より前のカタログレイアウトを手書きで再現する
+    /// (第3部レビュー対応の回帰テスト)。
+    ///
+    /// 索引メタデータのレイアウトだけが、`unique: u8`・`primary_key: u8`・
+    /// `key_type: u8`で終わる(`is_constraint`が無い)点で現行の`encode_catalog`と
+    /// 異なる。それ以外(`next_table_id`・テーブル定義・Free Page List)は
+    /// このモジュール冒頭のドキュメントに記録されている、この時点までの
+    /// レイアウトのままである。
+    fn encode_pre_magic_catalog_without_is_constraint(
+        next_table_id: u64,
+        tables: &HashMap<TableId, TableEntry>,
+        indexes: &[(&str, TableId, usize, &str, bool, bool, DataType)],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&next_table_id.to_le_bytes());
+        out.extend_from_slice(&(tables.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // free_page_count
+
+        let mut sorted: Vec<(&TableId, &TableEntry)> = tables.iter().collect();
+        sorted.sort_by_key(|(id, _)| id.0);
+        for (id, entry) in sorted {
+            out.extend_from_slice(&id.0.to_le_bytes());
+            let name_bytes = entry.info.name.as_bytes();
+            out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+
+            let columns = entry.info.schema.columns();
+            out.extend_from_slice(&(columns.len() as u16).to_le_bytes());
+            for column in columns {
+                let col_name_bytes = column.name.as_bytes();
+                out.extend_from_slice(&(col_name_bytes.len() as u16).to_le_bytes());
+                out.extend_from_slice(col_name_bytes);
+                out.push(data_type_to_u8(column.data_type));
+                out.push(u8::from(column.nullable));
+                out.push(u8::from(column.primary_key));
+                out.push(u8::from(column.unique));
+            }
+            out.extend_from_slice(&(entry.page_ids.len() as u32).to_le_bytes());
+            for &page_id in &entry.page_ids {
+                out.extend_from_slice(&page_id.0.to_le_bytes());
+            }
+        }
+
+        out.extend_from_slice(&(indexes.len() as u32).to_le_bytes());
+        for &(name, table_id, column_index, column_name, unique, primary_key, key_type) in indexes {
+            let name_bytes = name.as_bytes();
+            out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(&table_id.0.to_le_bytes());
+            out.extend_from_slice(&(column_index as u16).to_le_bytes());
+            let column_name_bytes = column_name.as_bytes();
+            out.extend_from_slice(&(column_name_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(column_name_bytes);
+            out.push(u8::from(unique));
+            out.push(u8::from(primary_key));
+            out.push(data_type_to_u8(key_type));
+            // is_constraintバイトは無い(このレイアウトにはまだ存在しない)。
+        }
+        out
+    }
+
+    /// レビュー指摘の再現条件その1: 制約索引を1本だけ持つ、`is_constraint`
+    /// フィールド導入前のカタログ。
+    ///
+    /// `CATALOG_MAGIC`・`CATALOG_LAYOUT_VERSION`を持たないこの旧レイアウトを
+    /// 現在のコードでそのまま`open`すると、Catalogページのpayloadは
+    /// (`persist_catalog`が末尾を0で埋めるため)実データの直後から0が
+    /// 続いている。`is_constraint`を検査する前の実装は、この0を
+    /// `is_constraint = false`として黙って受理してしまい、`DROP INDEX`で
+    /// 制約索引を削除できてしまう不整合につながっていた
+    /// (`crate::index`の回帰テストが、その不整合自体は別に再現している)。
+    /// マジックバイト列による版検査を追加した現在は、`open`の時点で
+    /// 決定的に`DbError::CorruptCatalog`を返し、レイアウトを読み違えたまま
+    /// 受理することがない。
+    #[test]
+    fn open_rejects_a_pre_is_constraint_catalog_with_a_single_constraint_index() {
+        let path = temp_path("legacy-catalog-single-constraint-index");
+        Storage::create(&path).unwrap();
+
+        let schema = Schema::new(vec![Column::new("id", DataType::BigInt, false).with_primary_key(), Column::new("name", DataType::Text, true)]);
+        let table_id = TableId(0);
+        let mut tables = single_table_entry(table_id, "users", Vec::new());
+        tables.get_mut(&table_id).unwrap().info.schema = schema;
+
+        let indexes = [("users_id_idx", table_id, 0usize, "id", true, true, DataType::BigInt)];
+        let bytes = encode_pre_magic_catalog_without_is_constraint(1, &tables, &indexes);
+        write_catalog_payload(&path, &bytes);
+
+        let err = expect_err(Storage::open(&path));
+        assert!(matches!(err, DbError::CorruptCatalog(_)), "旧レイアウトは決定的に拒否されるはず: {err:?}");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// レビュー指摘の再現条件その2: 制約索引を複数本(`PRIMARY KEY`・`UNIQUE`)
+    /// 持つ、`is_constraint`フィールド導入前のカタログ。
+    ///
+    /// 索引が複数本ある場合、`is_constraint`検査が無いだけでは済まない。
+    /// 1本目の索引レコードが`is_constraint`ぶんの1バイトだけ短いため、
+    /// 2本目以降の索引レコードは読み出し位置が1バイトずつ左へずれ、
+    /// 2本目の`name_len`の上位バイトを前の索引の`key_type`として読むなど、
+    /// フィールドの境界そのものが崩れる。マジックバイト列による版検査は、
+    /// この種のずれを個別に検査するのではなく、レイアウト全体を
+    /// 決定的に拒否することで防ぐ。
+    #[test]
+    fn open_rejects_a_pre_is_constraint_catalog_with_multiple_constraint_indexes() {
+        let path = temp_path("legacy-catalog-multiple-constraint-indexes");
+        Storage::create(&path).unwrap();
+
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::BigInt, false).with_primary_key(),
+            Column::new("email", DataType::Text, true).with_unique(),
+        ]);
+        let table_id = TableId(0);
+        let mut tables = single_table_entry(table_id, "users", Vec::new());
+        tables.get_mut(&table_id).unwrap().info.schema = schema;
+
+        let indexes = [
+            ("users_id_idx", table_id, 0usize, "id", true, true, DataType::BigInt),
+            ("users_email_idx", table_id, 1usize, "email", true, false, DataType::Text),
+        ];
+        let bytes = encode_pre_magic_catalog_without_is_constraint(1, &tables, &indexes);
+        write_catalog_payload(&path, &bytes);
+
+        let err = expect_err(Storage::open(&path));
+        assert!(matches!(err, DbError::CorruptCatalog(_)), "旧レイアウトは決定的に拒否されるはず: {err:?}");
 
         std::fs::remove_file(&path).unwrap();
     }

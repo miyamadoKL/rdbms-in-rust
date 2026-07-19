@@ -107,7 +107,9 @@ fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbR
         let max_len = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
         return Err(DbError::BTreeKeyTooLarge(max_len));
     }
-    let mid = entries.len() / 2;
+    // 件数の中央(`entries.len() / 2`)ではなく、バイト容量を基準に分割点を
+    // 選ぶ(モジュールドキュメント「Split中の伝播が安全である理由」を参照)。
+    let mid = leaf_split_point(PAGE_PAYLOAD_SIZE, entries);
     let (left, right) = entries.split_at(mid);
     let separator = right[0].0.clone();
 
@@ -916,8 +918,46 @@ pub fn drop_index(&mut self, index_name: &str) -> DbResult<()> {
 この組み合わせは、`unique`列(`true`)だけを見て`CREATE UNIQUE INDEX`(SQL構文、`is_constraint = false`)由来の索引と区別することはできないため、`is_constraint`という独立したフィールドが要ります。
 
 `IndexInfo`はCatalogページへ永続化するメタデータ(モジュール冒頭の表)の1つなので、`is_constraint`を持たせるにはそのレイアウトに1バイト足す必要があります。
-この章より前に作られたファイルはこの1バイトを持たないため、開こうとすると読む前にバイト列が尽きて`DbError::CorruptCatalog`になります。
-この章が一貫して採っている「章をまたいだファイル互換性は約束しない」方針(モジュール冒頭を参照)のとおりです。
+この章が一貫して採っている「章をまたいだファイル互換性は約束しない」方針(モジュール冒頭を参照)のもとでも、古いレイアウトのファイルを開こうとしたら**確実に**エラーにする必要があります。
+
+最初は「持たないフィールドを読もうとすれば、いずれバイト列が尽きて`DbError::CorruptCatalog`になるはず」という説明で済ませていました。
+ところが、Catalogページの`payload`は固定長で、実データの直後から末尾まで`0`で埋められています(`persist_catalog`を参照)。
+索引が1本だけのファイルでは、`is_constraint`を読む位置に残っている`0`がそのまま`is_constraint = false`として受理されてしまい、`DbError::CorruptCatalog`には**なりません**。
+実際に、`is_constraint`を導入する前に保存したファイルを新しいコードで開くと成功し、その後の`DROP INDEX`が制約索引まで削除できてしまう不具合として観測されました。
+索引が複数本ある場合は、1本目のレコードが1バイト短く読まれることで2本目以降のフィールド境界そのものがずれ、無関係な整合性エラーとして観測されます。
+
+この種の不具合をフィールドごとに塞ぐのではなく、レイアウトが変わったこと自体を`payload`の先頭で検出できるようにします。
+
+```rust
+const CATALOG_MAGIC: [u8; 8] = *b"MDBCTLG1";
+const CATALOG_LAYOUT_VERSION: u32 = 1;
+```
+
+`encode_catalog`は`payload`の先頭にこのマジックバイト列とレイアウト版を書き、`decode_catalog`はそれ以降を解釈する前にこの2つを検査します。
+
+```rust
+let magic = take(&mut cursor, CATALOG_MAGIC.len(), "catalog_magic")?;
+if magic != CATALOG_MAGIC {
+    return Err(DbError::CorruptCatalog(
+        "Catalogページの先頭が識別バイト列と一致しません(このレイアウトを導入する前の、\
+         章をまたいで互換性の無い古いカタログである可能性があります)"
+            .to_string(),
+    ));
+}
+let layout_version = take_u32(&mut cursor, "catalog_layout_version")?;
+if layout_version != CATALOG_LAYOUT_VERSION {
+    return Err(DbError::CorruptCatalog(format!(
+        "Catalogページのレイアウト版が不明です: {layout_version}(現在のコードは{CATALOG_LAYOUT_VERSION}のみ理解します)"
+    )));
+}
+```
+
+マジックバイト列を単なる版番号ではなく固定のASCII文字列にしてあるのは、版番号だけでは「古いファイルの`next_table_id`(この位置に来る値)がたまたま現在の版番号と同じ小さな整数である」という偶然の一致を排除できないからです。
+8バイトの固定文字列と偶然一致する確率は無視できます。
+索引メタデータ、テーブル定義、Free Page Listのいずれかのレイアウトを今後変更するときは、`CATALOG_LAYOUT_VERSION`を必ず1つ増やします。
+増やし忘れると、ここで解決したのと同じ「たまたま妥当に見える値を静かに受理してしまう」不具合が再発します。
+
+「旧形式で制約索引1本」「旧形式で制約索引複数本」のCatalogページを、`is_constraint`もマジックバイト列も持たない旧レイアウトのまま手書きで組み立て、現在のコードの`Storage::open`がどちらも`DbError::CorruptCatalog`で拒否することを確認する回帰テストを追加しました。
 
 ### 走査ベース検査の退役範囲
 
