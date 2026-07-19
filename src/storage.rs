@@ -759,7 +759,7 @@ impl Storage {
         let index_path = index_file_path(&self.path, index_name);
         let _ = std::fs::remove_file(&index_path);
         let disk = DiskManager::open(&index_path)?;
-        let mut btree = BTree::create(BufferPool::new(disk, DEFAULT_BUFFER_POOL_CAPACITY), info.key_type, info.unique)?;
+        let btree = BTree::create(BufferPool::new(disk, DEFAULT_BUFFER_POOL_CAPACITY), info.key_type, info.unique)?;
 
         let table_info = self.tables.get(&info.table_id).expect("索引の対象テーブルはDROP TABLEされていない前提").info.clone();
         let mut pairs: Vec<(Value, RecordId)> = Vec::new();
@@ -1067,7 +1067,7 @@ impl Storage {
 
         let index_path = index_file_path(&self.path, index_name);
         let disk = DiskManager::open(&index_path)?;
-        let mut btree = BTree::create(BufferPool::new(disk, DEFAULT_BUFFER_POOL_CAPACITY), key_type, unique)?;
+        let btree = BTree::create(BufferPool::new(disk, DEFAULT_BUFFER_POOL_CAPACITY), key_type, unique)?;
 
         // Index Build: 既存の全行を読み、対象列がNULLでない行だけを挿入する。
         let mut pairs: Vec<(crate::types::Value, RecordId)> = Vec::new();

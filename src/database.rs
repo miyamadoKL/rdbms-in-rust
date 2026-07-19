@@ -951,12 +951,28 @@ impl Database {
     /// 対応表へ戻す、など)を書いているため、ここでスロットの形を変えると
     /// その前提が壊れる。この関数は中身(`state`・`undo_log`)だけを書き換える。
     fn abort_transaction(&mut self, victim: TransactionId) -> DbResult<()> {
+        // `undo_log`だけでなく`wal_last_lsn`も、ここで使ったら
+        // (`std::mem::take`で)消費してしまう。理由は本文
+        // 「二重巻き戻しを防ぐ」を参照: この関数はVictim Selectionの結果として
+        // 呼ばれるが、呼び出し元のトランザクションは、その後で改めて
+        // `rollback_tx`・`execute_rollback`(`ROLLBACK`はAborted状態でも
+        // 唯一受け付けられる文である)を呼ぶことを想定している。もし
+        // `wal_last_lsn`をここで消費せず残したままにすると、その後の
+        // `rollback_tx`がこの`Some(lsn)`をそのまま使って**同じWALレコードを
+        // 二重に**Undoしてしまう。1回目のUndoで書き戻した値を、その後
+        // 別のトランザクションが書き換えていたとしても、2回目のUndoは
+        // それを気にせず古いBefore Imageで踏みつぶす。`undo_log`
+        // (Memoryバックエンド)はすでに`mem::take`で空にしていたため
+        // この事故を免れていたが、`wal_last_lsn`(Diskバックエンド)は
+        // `Option<Lsn>`をコピーして使うだけだったため、この章の統合テストで
+        // 実スレッドが`DeadlockDetected`を受けたあと`rollback_tx`を呼ぶという
+        // (ごく自然な)後始末をするまで、この二重巻き戻しは表面化しなかった。
         let (undo_log, wal_last_lsn) = if let Some(tx) = &mut self.tx
             && tx.id == victim
         {
-            (std::mem::take(&mut tx.undo_log), tx.wal_last_lsn)
+            (std::mem::take(&mut tx.undo_log), tx.wal_last_lsn.take())
         } else if let Some(ctx) = self.harness_contexts.get_mut(&victim) {
-            (std::mem::take(&mut ctx.undo_log), ctx.wal_last_lsn)
+            (std::mem::take(&mut ctx.undo_log), ctx.wal_last_lsn.take())
         } else {
             return Ok(());
         };
@@ -1571,6 +1587,120 @@ impl Database {
             Backend::Memory { catalog, .. } => Box::new(catalog.tables().cloned()),
             Backend::Disk { storage } => Box::new(storage.tables().cloned()),
         }
+    }
+}
+
+/// 複数の実スレッドから同じ`Database`を安全に共有するための最小限のラッパー
+/// (第35章)。
+///
+/// `Database`自身のフィールド(`Catalog`・`Backend`・`LockManager`等)は
+/// スレッドセーフになっていない。このラッパーは`Mutex<Database>`1本で
+/// `Database`全体を丸ごと直列化し、「複数スレッドから同じ`Database`に
+/// 安全に触れる」という最小限の目標だけを満たす。SQL実行エンジンの内部
+/// (Catalog・Lock Manager・実行計画の組み立て)そのものを細粒度にロック
+/// フリー化し、セッションごとに独立させるのは第37章の仕事であり、この章の
+/// 範囲ではない。
+///
+/// 一方、`Mutex`の外にある**Buffer PoolとB+Treeは、この章で本物のLatchを
+/// 持つようになった**([`crate::buffer_pool`]・[`crate::btree`]を参照)ため、
+/// `Arc<BTree>`のように`Database`を経由せず直接複数スレッドから共有すれば、
+/// ページ単位の細かい並行性をそのまま使える。この2つの粒度(`Database`は
+/// トランザクション単位で粗く、Buffer Pool・B+Treeはページ単位で細かい)が
+/// 併存している状態が、この章の到達点である。
+///
+/// # `Blocked`を実スレッドの「待機」に変える
+///
+/// [`LockManager::acquire`]自体は第31章から変わっていない。`Blocked`だと
+/// 判断したら`DbError::WouldBlock`という**値**を返すだけで、呼び出し元の
+/// スレッドを止めはしない。決定的インターリーブテストハーネス(第30章)は、
+/// この値を受け取って「今は再試行しない」と判断する側に回ることで、
+/// 単一スレッドのままインターリーブを制御していた。
+///
+/// このラッパーは、その`WouldBlock`を受け取ったら`Condvar::wait`で
+/// スレッドを実際に眠らせ、他のどこかで`release_all`が呼ばれるたびに
+/// 起こして同じ文を再試行する。`LockManager`本体を書き換えず、その外側に
+/// 「値を受け取って待機に変える」薄い層を1枚重ねただけであり、決定的
+/// ハーネスを使う既存のテスト(第30〜34章)は一切変更していない。この
+/// 二層構成(下: 値を返すだけの`LockManager`、上: それを待機に変える
+/// このラッパー)を保つことで、同じ`LockManager`を単一スレッドの決定的
+/// テストと複数スレッドの実行時の両方で使い回せる。
+pub struct SharedDatabase {
+    db: std::sync::Mutex<Database>,
+    cvar: std::sync::Condvar,
+}
+
+impl SharedDatabase {
+    /// `db`を包んで、複数スレッドから共有できるようにする。
+    pub fn new(db: Database) -> Self {
+        SharedDatabase { db: std::sync::Mutex::new(db), cvar: std::sync::Condvar::new() }
+    }
+
+    /// 新しいトランザクションを開始する([`Database::begin_tx`]を参照)。
+    pub fn begin_tx(&self) -> TxHandle {
+        self.lock().begin_tx()
+    }
+
+    /// 分離レベルを指定して新しいトランザクションを開始する
+    /// ([`Database::begin_tx_with_isolation`]を参照)。
+    pub fn begin_tx_with_isolation(&self, isolation_level: IsolationLevel) -> TxHandle {
+        self.lock().begin_tx_with_isolation(isolation_level)
+    }
+
+    /// [`Database::execute_in_tx`]のブロッキング版。
+    ///
+    /// `DbError::WouldBlock`を受け取ったら、このスレッドを`Condvar`で
+    /// 眠らせ、起こされるたびに同じ`sql`をもう一度試す。他の結果
+    /// (`Ok`、`WouldBlock`以外の`Err`)はそのまま呼び出し元へ返す。
+    /// `DbError::DeadlockDetected`はここでは特別扱いしない。Victimに
+    /// 選ばれたトランザクションは`WouldBlock`を返さずこのエラーを返す
+    /// ([`Database::acquire_lock_or_detect_deadlock`]を参照)ため、この
+    /// メソッドはループを継続せずそのまま呼び出し元へ伝える。
+    ///
+    /// 試行のたびに(結果によらず)`Condvar::notify_all`を呼ぶ。この試行が
+    /// デッドロック解決のために別のトランザクションを強制Abortしていたら
+    /// (`Database::abort_transaction`、`lock_manager.release_all`)、その
+    /// Victim自身のスレッドが別に眠っているかもしれない。通知を怠ると、
+    /// そのスレッドは自分がAbort済みになったことに気付けないまま永久に
+    /// 眠り続ける。過剰な通知(何も変わっていない試行のあとの通知)は
+    /// 起こされたスレッドが条件を再確認して再び眠るだけで安全だが、通知の
+    /// 欠落は起こすべきスレッドを永久に眠らせたままにする。安全側に倒し、
+    /// 毎回無条件に通知する。
+    pub fn execute_in_tx(&self, handle: &TxHandle, sql: &str) -> DbResult<QueryResult> {
+        let mut guard = self.lock();
+        loop {
+            let outcome = guard.execute_in_tx(handle, sql);
+            self.cvar.notify_all();
+            match outcome {
+                Err(DbError::WouldBlock) => {
+                    guard = self.cvar.wait(guard).unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// `handle`が指すトランザクションを確定する([`Database::commit_tx`]を
+    /// 参照)。ロックを解放するため、成功・失敗によらず`notify_all`する。
+    pub fn commit_tx(&self, handle: TxHandle) -> DbResult<()> {
+        let mut guard = self.lock();
+        let result = guard.commit_tx(handle);
+        drop(guard);
+        self.cvar.notify_all();
+        result
+    }
+
+    /// `handle`が指すトランザクションを取り消す([`Database::rollback_tx`]を
+    /// 参照)。`commit_tx`と同じ理由で`notify_all`する。
+    pub fn rollback_tx(&self, handle: TxHandle) -> DbResult<()> {
+        let mut guard = self.lock();
+        let result = guard.rollback_tx(handle);
+        drop(guard);
+        self.cvar.notify_all();
+        result
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Database> {
+        self.db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 

@@ -80,19 +80,34 @@
 //! 横移動するため、一致したキーが何ページにまたがっていても取りこぼさない
 //! (詳しくは本文(book)を参照)。
 //!
-//! # ページへのアクセスと並行性
+//! # ページへのアクセスと並行性(第35章: Lock Coupling)
 //!
 //! ページの読み書きはすべて`BufferPool`(第14章)の`PageReadGuard`・
-//! `PageWriteGuard`経由で行う。`insert`は、あるページを書き込み用にpinしている
-//! 間は同じページを二重に`pin`しない(`BufferPool`の`Mutex`は再入可能ではない
-//! ため、二重にpinしようとするとデッドロックする)。分割の伝播([`BTree::insert`]の
-//! 後半)は、親から子へ1ページずつ順番にpinと解放を繰り返す設計にしており、
-//! 複数階層のページを同時にpinし続けることはない。
+//! `PageWriteGuard`経由で行う。この2つの型が、第35章から`RwLock<Frame>`を
+//! 直接くるむようになった([`crate::buffer_pool`]を参照)。つまりこの`BTree`に
+//! とって「ページを`read_page`・`write_page`する」ことと「そのページの
+//! **Latch**を取る」ことは同じ1つの操作であり、B+Tree専用のロックを別途
+//! 持つ必要はない。
 //!
-//! `minidb`はこの章の時点でまだシングルスレッドで動作しており、複数のスレッドが
-//! 同時にこの`BTree`へ`insert`する状況は扱わない。ページ単位のLatch(読み書き
-//! ロック)によって複数スレッドから安全にB+Treeを操作できるようにするのは
-//! 第35章の仕事である。
+//! `insert`(悲観的**Lock Coupling**、いわゆるCrabbing)は、Rootから葉まで
+//! 降りながらWrite Latchを`Vec`にスタックとして積んでいく。あるノードが
+//! **安全**(このキーを収めてもそのノード自身がSplitを親へ伝播しない)だと
+//! 判明した時点で、それより上の祖先のLatchを全て解放する
+//! ([`Self::insert`]の実装を参照)。`lookup`・`range`が使う探索
+//! (`find_leaf`・`find_leaf_for_lower_bound`・`leftmost_leaf`)はRead Latchで
+//! 同じ形の受け渡しを行う。親のLatchを持ったまま子のLatchを取り、子を
+//! 取ってから親を放す(**先に取ってから離す**、逆の順序では一瞬でも
+//! どちらのLatchも持たない隙間ができ、その間に他のスレッドが親のページを
+//! 書き換えてしまう余地が生まれる)。
+//!
+//! Latchの取得順序は常に**上から下、左から右**に固定している。上下の順序は
+//! 今説明したRoot→葉の一本道そのものであり、複数スレッドがどの順で
+//! ページに触れても、常に浅い層から深い層へ向かうという向きは変わらない。
+//! 左右の順序は、[`RangeScan`]が`next_leaf`(第24章)を辿って隣の葉へ進む
+//! ときに、常に右隣のLatchだけを新たに取得する(左へ戻る経路を持たない)
+//! ことに現れる。どちらの軸でも「すでに持っているLatchより上位・右側の
+//! Latchだけを新たに要求する」規律が保たれているため、2つのスレッドが
+//! 互いに相手の持つLatchを待ち合う循環は起こりえない。
 //!
 //! # Metaページ
 //!
@@ -192,8 +207,7 @@
 //! 崩れた場合の保険として残すが、`insert`経由では通常到達しない。
 
 use std::ops::Bound;
-
-use crate::buffer_pool::BufferPool;
+use crate::buffer_pool::{BufferPool, PageReadGuard, PageWriteGuard};
 use crate::error::{DbError, DbResult};
 use crate::ids::{PageId, RecordId};
 use crate::page::{PageType, PAGE_PAYLOAD_SIZE};
@@ -213,6 +227,14 @@ const META_PAGE_ID: PageId = PageId(1);
 /// キーから`RecordId`の集まりを引く、ディスク上のB+Tree。
 pub struct BTree {
     pool: BufferPool,
+    /// Rootページ。**`create`で決まったきり、この`BTree`が生きている間
+    /// 二度と変わらない**(第35章、[`Self::grow_new_root`]のドキュメントを
+    /// 参照)。だからこそ、`insert`・`delete`・`lookup`・`range`は`&mut self`
+    /// を要求せず`&self`だけで呼べる。`key_type`・`unique`も同じく`create`の
+    /// 時点で決まったきり変わらない、素の`Copy`型のフィールドである。この
+    /// `BTree`が持つ可変な状態は`pool`(`BufferPool`は内部にLatchを持つ)の
+    /// 中にしかなく、`BTree`自体を`Arc<BTree>`として複数スレッドから直接
+    /// 共有できる(`Arc<Mutex<BTree>>`のような外側のロックを別途必要としない)。
     root: PageId,
     key_type: DataType,
     /// 第24章で追加。`true`なら`insert`が既存のキーとの重複を
@@ -275,7 +297,8 @@ impl BTree {
         self.key_type
     }
 
-    /// 現在のRootページの`PageId`(テスト・デバッグ用)。
+    /// Rootページの`PageId`(テスト・デバッグ用)。`create`から一度も変わらない
+    /// (`Self::grow_new_root`のドキュメントを参照)。
     pub fn root_page_id(&self) -> PageId {
         self.root
     }
@@ -287,20 +310,19 @@ impl BTree {
     /// 葉までの経路をたどっても同じ層数になる)ため、どの経路をたどっても
     /// この値は変わらない。
     pub fn height(&self) -> DbResult<usize> {
-        let mut current = self.root;
+        let mut guard = self.pool.read_page(self.root)?;
         let mut height = 1;
         loop {
-            let guard = self.pool.read_page(current)?;
             match guard.page_type() {
                 PageType::BTreeLeaf => return Ok(height),
                 PageType::BTreeInternal => {
-                    let view = InternalPageRef::open(guard.data())?;
-                    let next = view.leftmost_child();
-                    drop(guard);
-                    current = next;
+                    let next = InternalPageRef::open(guard.data())?.leftmost_child();
+                    // 子のRead Latchを取ってから親を放す(Lock Coupling、
+                    // モジュール冒頭を参照)。
+                    guard = self.pool.read_page(next)?;
                     height += 1;
                 }
-                other => return Err(unexpected_page_type(current, other)),
+                other => return Err(unexpected_page_type(guard.page_id(), other)),
             }
         }
     }
@@ -335,44 +357,17 @@ impl BTree {
     pub fn range<'a>(&'a self, lower: Bound<&Value>, upper: Bound<&Value>) -> DbResult<RangeScan<'a>> {
         let lower_bytes = self.encode_bound(lower)?;
         let upper_bytes = self.encode_bound(upper)?;
-
-        // `Included`は一致の最初の葉から出発する必要がある(同じキーが複数の
-        // 葉にまたがる場合、それより左を取りこぼさないため)。`Excluded`は
-        // `key`そのものより後ろへ進みたいだけなので、一致の最後の葉
-        // (`find_leaf`、点検索と同じ探索)から出発し、そのページ内で`key`を
-        // 追い越す位置まで前進すれば足りる(下の`start_index`を参照)。
         let start_leaf = match &lower_bytes {
-            Bound::Unbounded => self.leftmost_leaf()?,
-            Bound::Included(k) => self.find_leaf_for_lower_bound(k)?,
-            Bound::Excluded(k) => self.find_leaf(k)?,
-        };
-        let start_index = {
-            let guard = self.pool.read_page(start_leaf)?;
-            let view = LeafPageRef::open(guard.data())?;
-            match &lower_bytes {
-                Bound::Unbounded => 0,
-                Bound::Included(k) => match view.find(k) {
-                    Ok(mut i) => {
-                        while i > 0 && view.key(i - 1) == k.as_slice() {
-                            i -= 1;
-                        }
-                        i
-                    }
-                    Err(i) => i,
-                },
-                Bound::Excluded(k) => match view.find(k) {
-                    Ok(mut hi) => {
-                        while hi + 1 < view.entry_count() && view.key(hi + 1) == k.as_slice() {
-                            hi += 1;
-                        }
-                        hi + 1
-                    }
-                    Err(i) => i,
-                },
-            }
+            Bound::Unbounded => self.leftmost_leaf()?.page_id(),
+            Bound::Included(k) => self.find_leaf_for_lower_bound(k)?.page_id(),
+            Bound::Excluded(k) => self.find_leaf(k)?.page_id(),
         };
 
-        Ok(RangeScan { pool: &self.pool, key_type: self.key_type, upper: upper_bytes, current: Some((start_leaf, start_index)) })
+        Ok(RangeScan {
+            btree: self,
+            upper: upper_bytes,
+            current: Some((start_leaf, ScanPosition::Start(lower_bytes))),
+        })
     }
 
     /// `bound`(境界の値)をキーのバイト列へエンコードする。`Bound::Unbounded`は
@@ -391,22 +386,25 @@ impl BTree {
         }
     }
 
-    /// Rootから常に`leftmost_child`をたどり、木の中で最も左のLeaf Pageに
-    /// たどり着く。[`Self::height`]と同じ経路だが、葉のPageIdそのものが
-    /// 欲しい`range`(下限が`Unbounded`の場合)から使う。
-    fn leftmost_leaf(&self) -> DbResult<PageId> {
-        let mut current = self.root;
+    /// Rootから常に`leftmost_child`をたどり、木の中で最も左のLeaf Pageの
+    /// Read Latchを握ったまま返す。[`Self::height`]と同じ経路だが、葉の
+    /// 中身をこのあと読みたい`range`(下限が`Unbounded`の場合)から使う。
+    ///
+    /// `PageId`だけを返してLatchを手放すと、この葉がまだ木の高さ1の
+    /// Root(=葉)そのものである場合に限り、手放した直後に他のスレッドが
+    /// Root Splitでこのページの中身をInternal Pageへ書き換えてしまう隙間が
+    /// できる。呼び出し元がこのGuardを握ったまま中身を読み切ることで、
+    /// その隙間を作らない([`Self::range`]のコメントを参照)。
+    fn leftmost_leaf(&self) -> DbResult<PageReadGuard<'_>> {
+        let mut guard = self.pool.read_page(self.root)?;
         loop {
-            let guard = self.pool.read_page(current)?;
             match guard.page_type() {
-                PageType::BTreeLeaf => return Ok(current),
+                PageType::BTreeLeaf => return Ok(guard),
                 PageType::BTreeInternal => {
-                    let view = InternalPageRef::open(guard.data())?;
-                    let next = view.leftmost_child();
-                    drop(guard);
-                    current = next;
+                    let next = InternalPageRef::open(guard.data())?.leftmost_child();
+                    guard = self.pool.read_page(next)?;
                 }
-                other => return Err(unexpected_page_type(current, other)),
+                other => return Err(unexpected_page_type(guard.page_id(), other)),
             }
         }
     }
@@ -439,18 +437,27 @@ impl BTree {
     ///
     /// `key`が`Value::Null`なら`DbError::NullKeyNotAllowed`、このツリーの
     /// `key_type()`と異なる型なら`DbError::BTreeKeyTypeMismatch`を返す。
-    pub fn delete(&mut self, key: &Value, rid: RecordId) -> DbResult<bool> {
+    pub fn delete(&self, key: &Value, rid: RecordId) -> DbResult<bool> {
         self.check_key_type(key)?;
         let key_bytes = encode_key(key)?;
 
-        let mut leaf_id = self.find_leaf_for_lower_bound(&key_bytes)?;
-        loop {
-            let (mut entries, next_leaf) = {
-                let guard = self.pool.read_page(leaf_id)?;
-                let view = LeafPageRef::open(guard.data())?;
-                (view.entries(), view.next_leaf())
-            };
+        // 最初の葉だけは、`find_leaf_for_lower_bound`が返すGuardをそのまま
+        // 使う。いったんPageIdだけを受け取ってGuardを手放し、あらためて
+        // `read_page(leaf_id)`し直す設計だと、この葉がまだ木の高さ1の
+        // Root(=葉)そのものである場合に限り、その間に他のスレッドが
+        // Root Splitでこのページをinternal Pageへ書き換えてしまう隙間が
+        // できる([`Self::range`]のコメントと同じ理由)。2件目以降の
+        // `next_leaf`は常にRootとは別の、型が生涯変わらないページなので、
+        // この配慮は最初の1回だけでよい。
+        let first_guard = self.find_leaf_for_lower_bound(&key_bytes)?;
+        let mut leaf_id = first_guard.page_id();
+        let (mut entries, mut next_leaf) = {
+            let view = LeafPageRef::open(first_guard.data())?;
+            (view.entries(), view.next_leaf())
+        };
+        drop(first_guard);
 
+        loop {
             if let Some(pos) = entries.iter().position(|(k, r)| k.as_slice() == key_bytes.as_slice() && *r == rid) {
                 entries.remove(pos);
                 let mut guard = self.pool.write_page(leaf_id)?;
@@ -475,6 +482,10 @@ impl BTree {
                 return Ok(false);
             }
             leaf_id = next_leaf;
+            let guard = self.pool.read_page(leaf_id)?;
+            let view = LeafPageRef::open(guard.data())?;
+            entries = view.entries();
+            next_leaf = view.next_leaf();
         }
     }
 
@@ -541,110 +552,212 @@ impl BTree {
     /// 伝播が安全である理由」を参照)。伝播の途中(葉のSplitが済んだ後)で
     /// この検査を行っても、すでに葉レベルの変更をディスクへ反映してしまった
     /// 後では手遅れである。
-    pub fn insert(&mut self, key: &Value, rid: RecordId) -> DbResult<()> {
+    ///
+    /// # Lock Coupling(第35章)
+    ///
+    /// Rootから葉まで、通過したページのWrite Latch(`PageWriteGuard`)を
+    /// `ancestors`にスタックとして積みながら降りる。各ノードに着いた時点で、
+    /// このキーを収めても**そのノード自身がSplitして親へ伝播しないか**を
+    /// 判定し(`leaf_is_safe_for_insert`・`internal_is_safe_for_insert`)、
+    /// 安全だと分かればそれより上の祖先のLatchを全て解放する
+    /// (`ancestors.clear()`)。この判定を怠って祖先のLatchを最後まで
+    /// 律儀に持ち続けても正しさは保てるが、木の浅い層のページが
+    /// 挿入のたびに毎回Write Latchで塞がれ、並行度がRootの手前で頭打ちになる。
+    ///
+    /// 葉に着いた時点で残っている`ancestors`は、末尾(最も深い)が葉自身、
+    /// それより前が実際にSplitしうる祖先だけである。伝播
+    /// (`insert_into_leaf`・`insert_into_internal`)は、この`ancestors`から
+    /// 都度`pop`したGuardをそのまま使う。ページを指す`PageId`だけを覚えておいて
+    /// 後から`pool.write_page`を呼び直す設計にしなかったのは、すでに
+    /// Write Latchを握っているページを同じスレッドがもう一度`write_page`
+    /// しようとすると、`RwLock`は再入可能ではないためそのまま永久に止まる
+    /// からである(モジュール冒頭の`crate::buffer_pool`の説明を参照)。
+    pub fn insert(&self, key: &Value, rid: RecordId) -> DbResult<()> {
         self.check_key_type(key)?;
         if self.unique && !self.lookup(key)?.is_empty() {
             return Err(DbError::BTreeUniqueViolation);
         }
         let key_bytes = encode_key(key)?;
-        if key_bytes.len() > self.max_key_len() {
+        let max_key_len = self.max_key_len();
+        if key_bytes.len() > max_key_len {
             return Err(DbError::BTreeKeyTooLarge(key_bytes.len()));
         }
 
-        // Rootから葉まで下りながら、通過したInternal Pageの`PageId`を
-        // `path`に記録する。分割が起きた場合、この`path`を根の方向へ
-        // たどりながら親へ挿入していく(下から上への伝播)。
-        let mut path: Vec<PageId> = Vec::new();
+        let mut ancestors: Vec<PageWriteGuard<'_>> = Vec::new();
         let mut current = self.root;
         loop {
-            let guard = self.pool.read_page(current)?;
+            let guard = self.pool.write_page(current)?;
             match guard.page_type() {
-                PageType::BTreeLeaf => break,
+                PageType::BTreeLeaf => {
+                    let safe = leaf_is_safe_for_insert(&LeafPageRef::open(guard.data())?, &key_bytes, rid);
+                    if safe {
+                        ancestors.clear();
+                    }
+                    ancestors.push(guard);
+                    break;
+                }
                 PageType::BTreeInternal => {
-                    let view = InternalPageRef::open(guard.data())?;
-                    let next = view.child_for(&key_bytes);
-                    drop(guard);
-                    path.push(current);
+                    let (next, safe) = {
+                        let view = InternalPageRef::open(guard.data())?;
+                        (view.child_for(&key_bytes), internal_is_safe_for_insert(&view, max_key_len))
+                    };
+                    if safe {
+                        ancestors.clear();
+                    }
+                    ancestors.push(guard);
                     current = next;
                 }
                 other => return Err(unexpected_page_type(current, other)),
             }
         }
-        let leaf_id = current;
 
-        let mut pending = self.insert_into_leaf(leaf_id, &key_bytes, rid)?;
+        let mut current_guard = ancestors.pop().expect("直前のループが必ず1つ以上のGuardをpushしてから抜ける");
+        let mut pending = self.insert_into_leaf(&mut current_guard, &key_bytes, rid)?;
 
+        // `current_guard`は、これから処理しようとしているページのWrite
+        // Latchを常に保持し続ける。`ancestors.pop()`が`None`を返す
+        // (伝播がRootまで達した)瞬間まで手放さない。これは、[`Self::insert`]
+        // ドキュメントに書いたLock Couplingの規律そのものであると同時に、
+        // `grow_new_root`がRoot自身のページを(page idを変えずに)書き換える
+        // 操作に、すでに持っているWrite Latchをそのまま使い回すためでもある
+        // (`grow_new_root`のドキュメントを参照)。
         while let Some((separator, new_page_id)) = pending {
-            pending = match path.pop() {
-                Some(parent_id) => self.insert_into_internal(parent_id, &separator, new_page_id)?,
-                None => {
-                    self.grow_new_root(&separator, new_page_id)?;
-                    None
-                }
+            let Some(mut parent_guard) = ancestors.pop() else {
+                return self.grow_new_root(current_guard, &separator, new_page_id);
             };
+            drop(current_guard);
+            pending = self.insert_into_internal(&mut parent_guard, &separator, new_page_id)?;
+            current_guard = parent_guard;
         }
         Ok(())
     }
 
-    /// `leaf_id`が指すLeaf Pageへ`(key_bytes, rid)`を挿入する。収まれば
-    /// `None`、Leaf Splitが起きれば`Some((区切りキー, 新しいLeaf PageのId))`
-    /// を返す。
-    fn insert_into_leaf(&self, leaf_id: PageId, key_bytes: &[u8], rid: RecordId) -> DbResult<Option<(Vec<u8>, PageId)>> {
-        let mut entries = {
-            let guard = self.pool.read_page(leaf_id)?;
-            LeafPageRef::open(guard.data())?.entries()
-        };
+    /// すでに`insert`が保持している`leaf_guard`(Write Latch)へ
+    /// `(key_bytes, rid)`を挿入する。収まれば`None`、Leaf Splitが起きれば
+    /// `Some((区切りキー, 新しいLeaf PageのId))`を返す。
+    fn insert_into_leaf(
+        &self,
+        leaf_guard: &mut PageWriteGuard<'_>,
+        key_bytes: &[u8],
+        rid: RecordId,
+    ) -> DbResult<Option<(Vec<u8>, PageId)>> {
+        let mut entries = LeafPageRef::open(leaf_guard.data())?.entries();
         let pos = leaf_insert_position(&entries, key_bytes);
         entries.insert(pos, (key_bytes.to_vec(), rid));
 
         let fits = {
-            let mut guard = self.pool.write_page(leaf_id)?;
-            let mut page = LeafPage::open(guard.data_mut())?;
+            let mut page = LeafPage::open(leaf_guard.data_mut())?;
             page.write_entries(&entries)
         };
         if fits {
             return Ok(None);
         }
-        self.split_leaf(&entries, leaf_id).map(Some)
+        self.split_leaf(&entries, leaf_guard).map(Some)
     }
 
-    /// `parent_id`が指すInternal Pageへ、Leaf SplitまたはInternal Splitが
-    /// 生んだ`(区切りキー, 新しいページのId)`を挿入する。収まれば`None`、
-    /// さらにInternal Splitが起きれば`Some((区切りキー, 新しいInternal PageのId))`
-    /// を返す。
-    fn insert_into_internal(&self, parent_id: PageId, separator: &[u8], new_page_id: PageId) -> DbResult<Option<(Vec<u8>, PageId)>> {
+    /// すでに`insert`が保持している`parent_guard`(Write Latch)へ、Leaf
+    /// SplitまたはInternal Splitが生んだ`(区切りキー, 新しいページのId)`を
+    /// 挿入する。収まれば`None`、さらにInternal Splitが起きれば
+    /// `Some((区切りキー, 新しいInternal PageのId))`を返す。
+    fn insert_into_internal(
+        &self,
+        parent_guard: &mut PageWriteGuard<'_>,
+        separator: &[u8],
+        new_page_id: PageId,
+    ) -> DbResult<Option<(Vec<u8>, PageId)>> {
         let (leftmost, mut entries) = {
-            let guard = self.pool.read_page(parent_id)?;
-            let view = InternalPageRef::open(guard.data())?;
+            let view = InternalPageRef::open(parent_guard.data())?;
             (view.leftmost_child(), view.entries())
         };
         let pos = internal_insert_position(&entries, separator);
         entries.insert(pos, (separator.to_vec(), new_page_id));
 
         let fits = {
-            let mut guard = self.pool.write_page(parent_id)?;
-            let mut page = InternalPage::open(guard.data_mut())?;
+            let mut page = InternalPage::open(parent_guard.data_mut())?;
             page.write_entries(leftmost, &entries)
         };
         if fits {
             return Ok(None);
         }
-        self.split_internal(&entries, leftmost, parent_id).map(Some)
+        self.split_internal(&entries, leftmost, parent_guard).map(Some)
     }
 
-    /// Rootが分割された(`path`が空になった)ときに、新しいInternal Pageを
-    /// 1枚確保してRootに据える(Root Split)。木の高さが1つ増える、この章の
-    /// `BTree`が木を成長させる唯一の経路である。
-    fn grow_new_root(&mut self, separator: &[u8], new_page_id: PageId) -> DbResult<()> {
-        let new_root_id = self.pool.allocate_page(PageType::BTreeInternal)?;
+    /// Rootが分割された(`ancestors`が空になった)ときに、木の高さを1つ
+    /// 増やす(Root Split)。この章の`BTree`が木を成長させる唯一の経路である。
+    ///
+    /// `old_root_guard`は、Rootページ(`self.root`、呼び出し元`insert`がまだ
+    /// 保持しているWrite Latch)そのものを指す。
+    ///
+    /// # Rootの`PageId`は生涯変わらない(第35章)
+    ///
+    /// 第34章までのこの関数は、新しくInternal Pageを1枚確保してそちらを
+    /// 新しいRootに据え、`BTree.root`(当時は普通の`PageId`フィールド)を
+    /// 新しいRootの`PageId`へ書き換えていた。単一スレッドではこれで問題ない。
+    /// しかし複数スレッドが同時に`insert`していると、あるスレッドが
+    /// `self.root`を読んで(Rootのつもりで)そのページへ向けてWrite Latchを
+    /// 取りに行った直後に、別のスレッドがRootを分割して`self.root`を
+    /// 差し替えてしまう余地がある。前者のスレッドが実際にそのページへ
+    /// たどり着いた時点では、そこはもう「今のRoot」ではなく、Root Splitで
+    /// 左半分だけを残された**古い**Rootであり、右半分に移ったエントリが
+    /// 見えないまま誤ったページへ挿入してしまう(この章の統合テストで
+    /// 実際に観測された、木の破損の原因)。
+    ///
+    /// この章では、**Rootの`PageId`を`create`のときのまま生涯変えない**
+    /// ことでこの種の余地を構造的に消した。Root Splitは、新しいページを
+    /// 確保して**そちらへ古いRootの中身をコピーし**(`left_child_id`)、
+    /// 古いRoot自身のページ(page idはそのまま)を、
+    /// `[left_child_id, (separator, new_page_id)]`という1エントリだけの
+    /// 新しいInternal Pageへ**上書き**する。`self.root`を読むどのスレッドも、
+    /// 常に同じ`PageId`をLatchすればよく、その先の中身が「まだ葉のまま」か
+    /// 「すでにInternal Pageへ育っている」かだけが変わる。
+    fn grow_new_root(&self, mut old_root_guard: PageWriteGuard<'_>, separator: &[u8], new_page_id: PageId) -> DbResult<()> {
+        let left_child_type = old_root_guard.page_type();
+        let left_child_id = self.pool.allocate_page(left_child_type)?;
+
+        // 古いRootの中身を、新しく確保したページへそのままコピーする。
+        // 元のRootが収まっていたのと同じ`PAGE_PAYLOAD_SIZE`の別ページへの
+        // 単純な複製であり、収まらない事態は起こらない。
         {
-            let mut guard = self.pool.write_page(new_root_id)?;
-            let mut page = InternalPage::init(guard.data_mut(), self.root);
-            if !page.write_entries(self.root, &[(separator.to_vec(), new_page_id)]) {
-                return Err(DbError::BTreeKeyTooLarge(separator.len()));
+            let mut left_guard = self.pool.write_page(left_child_id)?;
+            match left_child_type {
+                PageType::BTreeLeaf => {
+                    let (entries, next_leaf) = {
+                        let view = LeafPageRef::open(old_root_guard.data())?;
+                        (view.entries(), view.next_leaf())
+                    };
+                    let mut page = LeafPage::init(left_guard.data_mut());
+                    let fits = page.write_entries(&entries);
+                    debug_assert!(fits, "元のRootと同じ大きさのページへの複製が収まらないのは実装が壊れている場合に限る");
+                    page.set_next_leaf(next_leaf);
+                }
+                PageType::BTreeInternal => {
+                    let (leftmost, entries) = {
+                        let view = InternalPageRef::open(old_root_guard.data())?;
+                        (view.leftmost_child(), view.entries())
+                    };
+                    let mut page = InternalPage::init(left_guard.data_mut(), leftmost);
+                    let fits = page.write_entries(leftmost, &entries);
+                    debug_assert!(fits, "元のRootと同じ大きさのページへの複製が収まらないのは実装が壊れている場合に限る");
+                }
+                other => return Err(unexpected_page_type(old_root_guard.page_id(), other)),
             }
         }
-        self.set_root(new_root_id)
+
+        // 古いRoot自身を、新しいInternal Page(1エントリだけ)へ上書きする。
+        // page id(`self.root`)はここでも変わらない。
+        let new_root_entries = [(separator.to_vec(), new_page_id)];
+        if !internal_entries_fit(PAGE_PAYLOAD_SIZE, &new_root_entries) {
+            return Err(DbError::BTreeKeyTooLarge(separator.len()));
+        }
+        // Leaf PageからInternal Pageへ、この1回だけ`PageType`そのものを
+        // 書き換える(`old_root_guard.data_mut()`が書くのはページの中身
+        // だけで、ページヘッダの`page_type`は別に持っている、
+        // `crate::page::Page`を参照)。
+        old_root_guard.set_page_type(PageType::BTreeInternal);
+        let mut page = InternalPage::init(old_root_guard.data_mut(), left_child_id);
+        let fits = page.write_entries(left_child_id, &new_root_entries);
+        debug_assert!(fits, "事前検査(internal_entries_fit)を通過した書き込みが失敗するのは実装が壊れている場合に限る");
+        Ok(())
     }
 
     /// `entries`(挿入対象を含めた、`current_id`に収まりきらなかった全エントリ)
@@ -671,7 +784,15 @@ impl BTree {
     /// 判明した時点では元の`current_id`のエントリはもう失われており、
     /// 呼び出し元([`Self::insert`])へエラーを返しても木を元の状態へ
     /// 戻す手段が無い(この非対称な失敗が第3部レビューで指摘された)。
-    fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbResult<(Vec<u8>, PageId)> {
+    ///
+    /// `current_id`のページはすでに呼び出し元(`insert_into_leaf`)がWrite
+    /// Latchを保持している(`current_guard`)ため、ここでは新しく確保する
+    /// 右側のページだけを`pool.write_page`で新たにpinする。
+    fn split_leaf(
+        &self,
+        entries: &[(Vec<u8>, RecordId)],
+        current_guard: &mut PageWriteGuard<'_>,
+    ) -> DbResult<(Vec<u8>, PageId)> {
         if entries.len() < 2 {
             let max_len = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
             return Err(DbError::BTreeKeyTooLarge(max_len));
@@ -688,14 +809,10 @@ impl BTree {
 
         // ここから先は、両側とも収まることが確定しているため、以下の書き込みは
         // (プール自体のI/Oエラーを除けば)失敗しない。
-        let old_next = {
-            let guard = self.pool.read_page(current_id)?;
-            LeafPageRef::open(guard.data())?.next_leaf()
-        };
+        let old_next = LeafPageRef::open(current_guard.data())?.next_leaf();
         let new_id = self.pool.allocate_page(PageType::BTreeLeaf)?;
         {
-            let mut guard = self.pool.write_page(current_id)?;
-            let mut page = LeafPage::open(guard.data_mut())?;
+            let mut page = LeafPage::open(current_guard.data_mut())?;
             let fits = page.write_entries(left);
             debug_assert!(fits, "事前検査(leaf_entries_fit)を通過した書き込みが失敗するのは実装が壊れている場合に限る");
             page.set_next_leaf(new_id);
@@ -722,7 +839,12 @@ impl BTree {
     /// 一切変更しない**。`left_entries`・`right_entries`のどちらかが収まらない
     /// 場合は、[`internal_entries_fit`]による事前検査だけで判定し、
     /// `current_id`の書き換えも新しいページの確保も行わない。
-    fn split_internal(&self, entries: &[(Vec<u8>, PageId)], leftmost_child: PageId, current_id: PageId) -> DbResult<(Vec<u8>, PageId)> {
+    fn split_internal(
+        &self,
+        entries: &[(Vec<u8>, PageId)],
+        leftmost_child: PageId,
+        current_guard: &mut PageWriteGuard<'_>,
+    ) -> DbResult<(Vec<u8>, PageId)> {
         if entries.len() < 2 {
             let max_len = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
             return Err(DbError::BTreeKeyTooLarge(max_len));
@@ -742,10 +864,10 @@ impl BTree {
         }
 
         // ここから先は、両側とも収まることが確定しているため、以下の書き込みは
-        // (プール自体のI/Oエラーを除けば)失敗しない。
+        // (プール自体のI/Oエラーを除けば)失敗しない。`current_id`のページは
+        // すでに呼び出し元がWrite Latchを保持している(`split_leaf`と同じ理由)。
         {
-            let mut guard = self.pool.write_page(current_id)?;
-            let mut page = InternalPage::open(guard.data_mut())?;
+            let mut page = InternalPage::open(current_guard.data_mut())?;
             let fits = page.write_entries(leftmost_child, left_entries);
             debug_assert!(fits, "事前検査(internal_entries_fit)を通過した書き込みが失敗するのは実装が壊れている場合に限る");
         }
@@ -760,19 +882,20 @@ impl BTree {
     }
 
     /// `key_bytes`を含みうる唯一のLeaf Pageを、Rootから下って探す。
-    fn find_leaf(&self, key_bytes: &[u8]) -> DbResult<PageId> {
-        let mut current = self.root;
+    ///
+    /// [`Self::leftmost_leaf`]と同じ理由で、見つけた葉のRead Latchを握った
+    /// まま返す(呼び出し元がGuardを手放すまで、他のスレッドがこのページの
+    /// 型を書き換える隙間ができない)。
+    fn find_leaf(&self, key_bytes: &[u8]) -> DbResult<PageReadGuard<'_>> {
+        let mut guard = self.pool.read_page(self.root)?;
         loop {
-            let guard = self.pool.read_page(current)?;
             match guard.page_type() {
-                PageType::BTreeLeaf => return Ok(current),
+                PageType::BTreeLeaf => return Ok(guard),
                 PageType::BTreeInternal => {
-                    let view = InternalPageRef::open(guard.data())?;
-                    let next = view.child_for(key_bytes);
-                    drop(guard);
-                    current = next;
+                    let next = InternalPageRef::open(guard.data())?.child_for(key_bytes);
+                    guard = self.pool.read_page(next)?;
                 }
-                other => return Err(unexpected_page_type(current, other)),
+                other => return Err(unexpected_page_type(guard.page_id(), other)),
             }
         }
     }
@@ -787,30 +910,27 @@ impl BTree {
     /// 最後の葉を返すため、そこから[`crate::btree_page::LeafPageRef::next_leaf`]
     /// で右方向にしか進めないRange Scanの出発点には使えない
     /// (それより左の葉に残っている同じキーのエントリを取りこぼす)。
-    fn find_leaf_for_lower_bound(&self, key_bytes: &[u8]) -> DbResult<PageId> {
-        let mut current = self.root;
+    ///
+    /// [`Self::leftmost_leaf`]と同じ理由で、見つけた葉のRead Latchを握った
+    /// まま返す。
+    fn find_leaf_for_lower_bound(&self, key_bytes: &[u8]) -> DbResult<PageReadGuard<'_>> {
+        let mut guard = self.pool.read_page(self.root)?;
         loop {
-            let guard = self.pool.read_page(current)?;
             match guard.page_type() {
-                PageType::BTreeLeaf => return Ok(current),
+                PageType::BTreeLeaf => return Ok(guard),
                 PageType::BTreeInternal => {
-                    let view = InternalPageRef::open(guard.data())?;
-                    let next = view.child_for_lower_bound(key_bytes);
-                    drop(guard);
-                    current = next;
+                    let next = InternalPageRef::open(guard.data())?.child_for_lower_bound(key_bytes);
+                    guard = self.pool.read_page(next)?;
                 }
-                other => return Err(unexpected_page_type(current, other)),
+                other => return Err(unexpected_page_type(guard.page_id(), other)),
             }
         }
     }
 
     /// Rootを`new_root`へ切り替え、Metaページへ永続化する。
-    fn set_root(&mut self, new_root: PageId) -> DbResult<()> {
-        self.root = new_root;
-        self.write_meta()
-    }
-
-    /// 現在のRootの`PageId`とキー型をMetaページへ書き込む。
+    /// Rootの`PageId`とキー型をMetaページへ書き込む。`create`のときに一度
+    /// 呼ぶだけでよい(Rootの`PageId`は生涯変わらない、
+    /// [`Self::grow_new_root`]を参照)。
     fn write_meta(&self) -> DbResult<()> {
         let mut guard = self.pool.write_page(META_PAGE_ID)?;
         let data = guard.data_mut();
@@ -846,20 +966,46 @@ impl BTree {
     }
 }
 
+/// [`RangeScan`]が今どこまで読んだかを表す、**値に基づく**位置。
+///
+/// 第34章までは、この位置を「葉の中の添字(`usize`)」という数値そのもので
+/// 覚えていた。単一スレッドでは正しいが、第35章で複数スレッドから同じ葉へ
+/// 並行して`insert`できるようになると、この数値表現は意味を失う。ある
+/// 時点で「この添字より先は無い(=この葉にはまだ目的のキーが無い)」ことを
+/// 意味していた添字が、その後もう1件挿入されて葉が育つと、次に読んだときは
+/// 「まだ誰も返していない実在のエントリ」を指してしまう。同じ添字が指す
+/// 意味が、葉の中身が変わるたびに変わってしまうということである(この章の
+/// 統合テストで実際に踏んだ不具合、本文を参照)。
+///
+/// この章では、位置を添字ではなく**直前に返した`(key, rid)`そのもの**、
+/// または「まだこの葉から1件も返していない」ことを表す元の`Bound`で覚える。
+/// 次の`next()`は、葉を毎回新しく読み直したうえで、その`(key, rid)`(または
+/// `Bound`)を`LeafPageRef::find`で**その時点の中身に対して**もう一度探し直す。
+/// 葉が途中で育っていても、探しているのは実在する値そのものなので、
+/// 「今の中身のどこにあるか」を正しく再特定できる。
+enum ScanPosition {
+    /// この葉ではまだ1件も返していない。`range`が受け取った元の下限
+    /// (最初の葉のとき)、または`Bound::Unbounded`(`next_leaf`をたどって
+    /// 移ってきた、2番目以降の葉のとき)を持つ。
+    Start(Bound<Vec<u8>>),
+    /// 直前に返した`(key, rid)`。次はこれより後ろから探す。
+    After(Vec<u8>, RecordId),
+}
+
 /// [`BTree::range`]が返すイテレータ。
 ///
-/// 現在読んでいるLeaf Pageの`PageId`とページ内の添字(`current`)だけを保持し、
-/// ページ内のエントリを読み尽くしたら`next_leaf`(第24章)が指す右隣の葉を
-/// 読み込む。[`crate::heap_file::Scan`](第13章)が「現在のページと走査位置」
-/// だけを持ってテーブル全体を読み進めるのと同じ設計であり、`BTree`全体を
-/// 一度にメモリへ読み込むことはしない。
+/// 現在読んでいるLeaf Pageの`PageId`と、その葉の中での位置([`ScanPosition`]、
+/// 添字ではなく値で表す。理由は[`ScanPosition`]のドキュメントを参照)だけを
+/// 保持し、ページ内のエントリを読み尽くしたら`next_leaf`(第24章)が指す
+/// 右隣の葉を読み込む。[`crate::heap_file::Scan`](第13章)が「現在のページと
+/// 走査位置」だけを持ってテーブル全体を読み進めるのと同じ設計であり、
+/// `BTree`全体を一度にメモリへ読み込むことはしない。
 pub struct RangeScan<'a> {
-    pool: &'a BufferPool,
-    key_type: DataType,
+    btree: &'a BTree,
     /// 上限。`Bound::Unbounded`ならどのキーも上限を超えない。
     upper: Bound<Vec<u8>>,
-    /// 次に読むべき`(Leaf PageのId, そのページ内での添字)`。読み終えたら`None`。
-    current: Option<(PageId, usize)>,
+    /// 次に読むべき`(Leaf PageのId, その葉の中での位置)`。読み終えたら`None`。
+    current: Option<(PageId, ScanPosition)>,
 }
 
 impl RangeScan<'_> {
@@ -873,47 +1019,127 @@ impl RangeScan<'_> {
     }
 }
 
+/// `view`(ある時点の葉の中身)の中で、`position`が指す位置を今の中身に
+/// 対して探し直し、次に返すべきエントリの添字を返す(無ければ
+/// `view.entry_count()`、この葉にはもう無いという意味)。
+///
+/// [`ScanPosition`]のドキュメントに書いたとおり、この関数は`view`を読む
+/// たびに毎回呼ばれる。前回の結果を数値のまま持ち越さないことが、
+/// 並行`insert`でこの葉が育っても壊れない理由そのものである。
+fn locate_within_leaf(view: &LeafPageRef<'_>, position: &ScanPosition) -> usize {
+    match position {
+        ScanPosition::Start(Bound::Unbounded) => 0,
+        ScanPosition::Start(Bound::Included(k)) => match view.find(k) {
+            Ok(mut i) => {
+                while i > 0 && view.key(i - 1) == k.as_slice() {
+                    i -= 1;
+                }
+                i
+            }
+            Err(i) => i,
+        },
+        ScanPosition::Start(Bound::Excluded(k)) => match view.find(k) {
+            Ok(mut hi) => {
+                while hi + 1 < view.entry_count() && view.key(hi + 1) == k.as_slice() {
+                    hi += 1;
+                }
+                hi + 1
+            }
+            Err(i) => i,
+        },
+        ScanPosition::After(key, rid) => match view.find(key) {
+            Ok(mut i) => {
+                while i > 0 && view.key(i - 1) == key.as_slice() {
+                    i -= 1;
+                }
+                // 同じキーが連続する範囲(重複キー、モジュールドキュメントを
+                // 参照)を、直前に返した`rid`が見つかるまで読み進める。
+                // 見つかった次の位置から再開する。見つからなければ
+                // (このRIDだけ何らかの理由で読めなくなった場合の保険として)
+                // その範囲を通り過ぎた位置から再開する。
+                while i < view.entry_count() && view.key(i) == key.as_slice() {
+                    if view.record_id(i) == *rid {
+                        return i + 1;
+                    }
+                    i += 1;
+                }
+                i
+            }
+            Err(i) => i,
+        },
+    }
+}
+
 impl Iterator for RangeScan<'_> {
     type Item = DbResult<(Value, RecordId)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let (leaf_id, index) = self.current?;
-            let guard = match self.pool.read_page(leaf_id) {
+            let (leaf_id, position) = self.current.take()?;
+            let guard = match self.btree.pool.read_page(leaf_id) {
                 Ok(guard) => guard,
-                Err(err) => {
-                    self.current = None;
-                    return Some(Err(err));
-                }
-            };
-            let view = match LeafPageRef::open(guard.data()) {
-                Ok(view) => view,
-                Err(err) => {
-                    self.current = None;
-                    return Some(Err(err));
-                }
+                Err(err) => return Some(Err(err)),
             };
 
+            // `leaf_id`はこのスキャンが以前Leaf Pageだと確認したページである。
+            // ただし、木の高さがまだ1で葉=Rootだった場合に限り、その確認から
+            // このRead Latch取得までの間に他のスレッドがRoot Splitでこの
+            // ページをInternal Pageへ書き換えている可能性が残る(第35章、
+            // `BTree::grow_new_root`のドキュメントを参照)。2件目以降の
+            // `next_leaf`はRootとは別の、型が生涯変わらないページなので、
+            // 実際にこの分岐に来るのは最初の1回だけである。この場合は
+            // Rootから探索をやり直す(`position`はどのみち`Start`のはず)。
+            if guard.page_type() != PageType::BTreeLeaf {
+                drop(guard);
+                // 探し直す先を決める道しるべ用のキー。`position`自体は
+                // (`After`の場合の`rid`も含めて)変えずに使い回す。`After`の
+                // 場合、そのキーはもう「今のRoot」には無い(左の子へ移された)
+                // はずだが、値としては木のどこかに必ず存在するので、
+                // `find_leaf_for_lower_bound`で辿り直せば正しい葉に着地する。
+                let seek_key: Bound<&[u8]> = match &position {
+                    ScanPosition::Start(Bound::Unbounded) => Bound::Unbounded,
+                    ScanPosition::Start(Bound::Included(k)) => Bound::Included(k.as_slice()),
+                    ScanPosition::Start(Bound::Excluded(k)) => Bound::Excluded(k.as_slice()),
+                    ScanPosition::After(key, _) => Bound::Included(key.as_slice()),
+                };
+                let restarted = match seek_key {
+                    Bound::Unbounded => self.btree.leftmost_leaf(),
+                    Bound::Included(k) => self.btree.find_leaf_for_lower_bound(k),
+                    Bound::Excluded(k) => self.btree.find_leaf(k),
+                };
+                match restarted {
+                    Ok(fresh_guard) => {
+                        self.current = Some((fresh_guard.page_id(), position));
+                        continue;
+                    }
+                    Err(err) => return Some(Err(err)),
+                }
+            }
+
+            let view = match LeafPageRef::open(guard.data()) {
+                Ok(view) => view,
+                Err(err) => return Some(Err(err)),
+            };
+
+            let index = locate_within_leaf(&view, &position);
             if index < view.entry_count() {
                 let key_bytes = view.key(index);
                 if self.exceeds_upper(key_bytes) {
-                    self.current = None;
                     return None;
                 }
                 let rid = view.record_id(index);
                 let key_owned = key_bytes.to_vec();
-                self.current = Some((leaf_id, index + 1));
+                self.current = Some((leaf_id, ScanPosition::After(key_owned.clone(), rid)));
                 drop(guard);
-                return Some(decode_key(self.key_type, &key_owned).map(|value| (value, rid)));
+                return Some(decode_key(self.btree.key_type, &key_owned).map(|value| (value, rid)));
             }
 
             let next_leaf = view.next_leaf();
             drop(guard);
             if next_leaf == NO_NEXT_LEAF {
-                self.current = None;
                 return None;
             }
-            self.current = Some((next_leaf, 0));
+            self.current = Some((next_leaf, ScanPosition::Start(Bound::Unbounded)));
         }
     }
 }
@@ -955,6 +1181,33 @@ fn internal_insert_position(entries: &[(Vec<u8>, PageId)], key: &[u8]) -> usize 
         }
     }
     lo
+}
+
+/// [`BTree::insert`]のLock Coupling(悲観的Crabbing)が使う、Leaf Pageの
+/// 安全性判定(第35章)。
+///
+/// **安全**とは、`(key_bytes, rid)`をこのまま挿入してもこのページ自身が
+/// Splitせず、したがって変更が親へ伝播しないということ。実際に書き込む前に
+/// 判定できるよう、挿入後のエントリ一覧を仮に組み立ててから
+/// [`leaf_entries_fit`]で収まるかどうかを確認する(実際の書き込みは行わない)。
+fn leaf_is_safe_for_insert(view: &LeafPageRef<'_>, key_bytes: &[u8], rid: RecordId) -> bool {
+    let mut entries = view.entries();
+    let pos = leaf_insert_position(&entries, key_bytes);
+    entries.insert(pos, (key_bytes.to_vec(), rid));
+    leaf_entries_fit(PAGE_PAYLOAD_SIZE, &entries)
+}
+
+/// [`leaf_is_safe_for_insert`]のInternal Page版。
+///
+/// この時点では、下の階層でSplitが起きるかどうかも、起きた場合に押し上げ
+/// られてくる区切りキーの実際の長さもまだ分からない。`max_key_len`
+/// (`BTree::max_key_len`、`insert`が受け付ける最大のキー長)を持つダミーの
+/// エントリを1件仮に足して判定することで、実際に来る区切りキーがどんな
+/// 長さであっても安全側に倒す。
+fn internal_is_safe_for_insert(view: &InternalPageRef<'_>, max_key_len: usize) -> bool {
+    let mut entries = view.entries();
+    entries.push((vec![0u8; max_key_len], PageId(0)));
+    internal_entries_fit(PAGE_PAYLOAD_SIZE, &entries)
 }
 
 /// `value`を、Leaf Page・Internal Pageの二分探索がバイト列としての大小比較
@@ -1098,7 +1351,7 @@ mod tests {
     #[test]
     fn null_key_is_rejected_by_insert_and_lookup() {
         let path = temp_path("null-key");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         assert!(matches!(btree.insert(&Value::Null, rid(1, 0)), Err(DbError::NullKeyNotAllowed)));
         assert!(matches!(btree.lookup(&Value::Null), Err(DbError::NullKeyNotAllowed)));
         std::fs::remove_file(&path).unwrap();
@@ -1107,7 +1360,7 @@ mod tests {
     #[test]
     fn wrong_key_type_is_rejected() {
         let path = temp_path("wrong-type");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         let err = btree.insert(&Value::Text("x".to_string()), rid(1, 0)).unwrap_err();
         assert!(matches!(err, DbError::BTreeKeyTypeMismatch { .. }));
         std::fs::remove_file(&path).unwrap();
@@ -1125,7 +1378,7 @@ mod tests {
     #[test]
     fn insert_then_lookup_round_trips() {
         let path = temp_path("basic");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         btree.insert(&Value::BigInt(10), rid(1, 0)).unwrap();
         btree.insert(&Value::BigInt(20), rid(1, 1)).unwrap();
         assert_eq!(btree.lookup(&Value::BigInt(10)).unwrap(), vec![rid(1, 0)]);
@@ -1137,7 +1390,7 @@ mod tests {
     #[test]
     fn duplicate_keys_are_all_returned_by_lookup() {
         let path = temp_path("duplicates");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         btree.insert(&Value::BigInt(5), rid(1, 0)).unwrap();
         btree.insert(&Value::BigInt(5), rid(1, 1)).unwrap();
         btree.insert(&Value::BigInt(5), rid(2, 0)).unwrap();
@@ -1150,7 +1403,7 @@ mod tests {
     #[test]
     fn boolean_keys_work() {
         let path = temp_path("boolean");
-        let mut btree = open_btree(&path, DataType::Boolean);
+        let btree = open_btree(&path, DataType::Boolean);
         btree.insert(&Value::Boolean(false), rid(1, 0)).unwrap();
         btree.insert(&Value::Boolean(true), rid(1, 1)).unwrap();
         assert_eq!(btree.lookup(&Value::Boolean(false)).unwrap(), vec![rid(1, 0)]);
@@ -1161,7 +1414,7 @@ mod tests {
     #[test]
     fn text_keys_preserve_lexicographic_order() {
         let path = temp_path("text");
-        let mut btree = open_btree(&path, DataType::Text);
+        let btree = open_btree(&path, DataType::Text);
         for (i, word) in ["banana", "apple", "cherry", "ab", "abc"].iter().enumerate() {
             btree.insert(&Value::Text(word.to_string()), rid(1, i as u16)).unwrap();
         }
@@ -1174,7 +1427,7 @@ mod tests {
     #[test]
     fn ascending_insert_then_lookup_all() {
         let path = temp_path("ascending");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         let n = 2_000i64;
         for i in 0..n {
             btree.insert(&Value::BigInt(i), rid(1, (i % 1000) as u16)).unwrap();
@@ -1189,7 +1442,7 @@ mod tests {
     #[test]
     fn descending_insert_then_lookup_all() {
         let path = temp_path("descending");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         let n = 2_000i64;
         for i in (0..n).rev() {
             btree.insert(&Value::BigInt(i), rid(1, (i % 1000) as u16)).unwrap();
@@ -1203,7 +1456,7 @@ mod tests {
     #[test]
     fn random_insert_then_lookup_all() {
         let path = temp_path("random");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         let n = 2_000usize;
         let order = shuffled(n, 0x0ddc_0ffe_e123_4567);
         for &i in &order {
@@ -1225,7 +1478,7 @@ mod tests {
     #[test]
     fn many_keys_force_multi_level_split_and_all_remain_findable() {
         let path = temp_path("multi-level-split");
-        let mut btree = open_btree(&path, DataType::Text);
+        let btree = open_btree(&path, DataType::Text);
         let n = 1_500usize;
         let order = shuffled(n, 0x1234_5678_9abc_def0);
         for &i in &order {
@@ -1244,7 +1497,7 @@ mod tests {
     #[test]
     fn root_split_increases_height_from_one() {
         let path = temp_path("root-split");
-        let mut btree = open_btree(&path, DataType::Text);
+        let btree = open_btree(&path, DataType::Text);
         assert_eq!(btree.height().unwrap(), 1);
 
         let mut height_increased = false;
@@ -1262,7 +1515,7 @@ mod tests {
     #[test]
     fn large_seeded_random_insert_matches_a_btreemap_model() {
         let path = temp_path("model-based");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         let n = 5_000usize;
         let order = shuffled(n, 0x9e37_79b9_7f4a_7c15);
 
@@ -1289,7 +1542,7 @@ mod tests {
         let mut inserted = Vec::new();
         {
             let disk = DiskManager::open(&path).unwrap();
-            let mut btree = BTree::create(BufferPool::new(disk, 32), DataType::BigInt, false).unwrap();
+            let btree = BTree::create(BufferPool::new(disk, 32), DataType::BigInt, false).unwrap();
             for i in 0..800i64 {
                 let record = rid(1, (i % 1000) as u16);
                 btree.insert(&Value::BigInt(i), record).unwrap();
@@ -1313,7 +1566,7 @@ mod tests {
     #[test]
     fn single_entry_too_large_for_an_empty_page_is_rejected() {
         let path = temp_path("too-large");
-        let mut btree = open_btree(&path, DataType::Text);
+        let btree = open_btree(&path, DataType::Text);
         let huge = "x".repeat(crate::page::PAGE_PAYLOAD_SIZE);
         let err = btree.insert(&Value::Text(huge), rid(1, 0)).unwrap_err();
         assert!(matches!(err, DbError::BTreeKeyTooLarge(_)));
@@ -1330,7 +1583,7 @@ mod tests {
     #[test]
     fn leaf_split_leaves_the_original_page_untouched_when_the_new_side_would_not_fit() {
         let path = temp_path("leaf-split-atomic");
-        let mut btree = open_btree(&path, DataType::Text);
+        let btree = open_btree(&path, DataType::Text);
 
         let n = 200usize;
         let mut expected = Vec::new();
@@ -1371,7 +1624,7 @@ mod tests {
     #[test]
     fn internal_split_leaves_the_original_page_untouched_when_the_new_side_would_not_fit() {
         let path = temp_path("internal-split-atomic");
-        let mut btree = open_btree(&path, DataType::Text);
+        let btree = open_btree(&path, DataType::Text);
 
         let mut i = 0usize;
         while btree.height().unwrap() == 1 {
@@ -1397,8 +1650,10 @@ mod tests {
         let mut entries = original_entries.clone();
         entries.insert(0, (huge_key.into_bytes(), PageId(999_999)));
 
-        let err = btree.split_internal(&entries, leftmost, internal_id).unwrap_err();
+        let mut guard = btree.pool.write_page(internal_id).unwrap();
+        let err = btree.split_internal(&entries, leftmost, &mut guard).unwrap_err();
         assert!(matches!(err, DbError::BTreeKeyTooLarge(_)));
+        drop(guard);
 
         // エラーを返した以上、internal_idのページは一切変わっていないはず。
         let guard = btree.pool.read_page(internal_id).unwrap();
@@ -1415,7 +1670,7 @@ mod tests {
     #[test]
     fn insert_accepts_a_key_exactly_at_the_size_limit_and_rejects_one_byte_more() {
         let path = temp_path("insert-boundary");
-        let mut btree = open_btree(&path, DataType::Text);
+        let btree = open_btree(&path, DataType::Text);
         let max_len = btree.max_key_len();
 
         let ok_key = "x".repeat(max_len);
@@ -1452,7 +1707,7 @@ mod tests {
     #[test]
     fn insert_completes_multi_level_propagation_without_error_for_keys_near_the_size_limit() {
         let path = temp_path("insert-multilevel-ok");
-        let mut btree = open_btree(&path, DataType::Text);
+        let btree = open_btree(&path, DataType::Text);
         let key_len = btree.max_key_len();
         let n = 40usize;
         let mut expected = Vec::new();
@@ -1518,7 +1773,7 @@ mod tests {
     #[test]
     fn insert_leaves_every_reachable_page_byte_identical_when_a_key_exceeds_the_limit_in_a_deep_tree() {
         let path = temp_path("insert-atomic-deep-multilevel");
-        let mut btree = open_btree(&path, DataType::Text);
+        let btree = open_btree(&path, DataType::Text);
         let key_len = btree.max_key_len();
         for i in 0..40usize {
             let key = format!("{i:06}{}", "x".repeat(key_len - 6));
@@ -1549,7 +1804,7 @@ mod tests {
         for &n in &[1_000i64, 2_000, 4_000, 8_000, 16_000] {
             let path = temp_path(&format!("lookup-bench-{n}"));
             let disk = DiskManager::open(&path).unwrap();
-            let mut btree = BTree::create(BufferPool::new(disk, 256), DataType::BigInt, false).unwrap();
+            let btree = BTree::create(BufferPool::new(disk, 256), DataType::BigInt, false).unwrap();
             for i in 0..n {
                 btree.insert(&Value::BigInt(i), rid(1, 0)).unwrap();
             }
@@ -1581,7 +1836,7 @@ mod tests {
     #[test]
     fn range_with_both_bounds_included() {
         let path = temp_path("range-included");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         for i in 0..20i64 {
             btree.insert(&Value::BigInt(i), rid(1, i as u16)).unwrap();
         }
@@ -1593,7 +1848,7 @@ mod tests {
     #[test]
     fn range_with_excluded_bounds() {
         let path = temp_path("range-excluded");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         for i in 0..20i64 {
             btree.insert(&Value::BigInt(i), rid(1, i as u16)).unwrap();
         }
@@ -1605,7 +1860,7 @@ mod tests {
     #[test]
     fn range_unbounded_on_both_sides_returns_everything_in_order() {
         let path = temp_path("range-unbounded");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         let order = shuffled(500, 0x1111_2222_3333_4444);
         for &i in &order {
             btree.insert(&Value::BigInt(i), rid(1, (i % 1000) as u16)).unwrap();
@@ -1618,7 +1873,7 @@ mod tests {
     #[test]
     fn range_one_sided_bounds() {
         let path = temp_path("range-one-sided");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         for i in 0..20i64 {
             btree.insert(&Value::BigInt(i), rid(1, i as u16)).unwrap();
         }
@@ -1633,7 +1888,7 @@ mod tests {
     #[test]
     fn range_that_matches_nothing_is_empty() {
         let path = temp_path("range-empty");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         for i in 0..20i64 {
             btree.insert(&Value::BigInt(i), rid(1, i as u16)).unwrap();
         }
@@ -1658,7 +1913,7 @@ mod tests {
     #[test]
     fn duplicate_keys_spanning_multiple_leaves_are_no_longer_dropped() {
         let path = temp_path("dup-spanning-leaves");
-        let mut btree = open_btree(&path, DataType::Text);
+        let btree = open_btree(&path, DataType::Text);
         let wide_value = "x".repeat(120);
         let n = 400usize;
         for i in 0..n {
@@ -1677,7 +1932,7 @@ mod tests {
     #[test]
     fn range_matches_a_btreemap_model() {
         let path = temp_path("range-model");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         let n = 3_000usize;
         let order = shuffled(n, 0x5a5a_1234_9876_5432);
 
@@ -1704,7 +1959,7 @@ mod tests {
     fn unique_tree_rejects_a_duplicate_key() {
         let path = temp_path("unique-reject");
         let disk = DiskManager::open(&path).unwrap();
-        let mut btree = BTree::create(BufferPool::new(disk, 64), DataType::BigInt, true).unwrap();
+        let btree = BTree::create(BufferPool::new(disk, 64), DataType::BigInt, true).unwrap();
         btree.insert(&Value::BigInt(1), rid(1, 0)).unwrap();
         let err = btree.insert(&Value::BigInt(1), rid(1, 1)).unwrap_err();
         assert!(matches!(err, DbError::BTreeUniqueViolation));
@@ -1716,7 +1971,7 @@ mod tests {
     #[test]
     fn non_unique_tree_still_accepts_duplicates() {
         let path = temp_path("non-unique-accept");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         assert!(!btree.is_unique());
         btree.insert(&Value::BigInt(1), rid(1, 0)).unwrap();
         btree.insert(&Value::BigInt(1), rid(1, 1)).unwrap();
@@ -1729,13 +1984,13 @@ mod tests {
         let path = temp_path("unique-reopen");
         {
             let disk = DiskManager::open(&path).unwrap();
-            let mut btree = BTree::create(BufferPool::new(disk, 64), DataType::BigInt, true).unwrap();
+            let btree = BTree::create(BufferPool::new(disk, 64), DataType::BigInt, true).unwrap();
             btree.insert(&Value::BigInt(1), rid(1, 0)).unwrap();
             btree.flush().unwrap();
             btree.sync().unwrap();
         }
         let disk = DiskManager::open(&path).unwrap();
-        let mut reopened = BTree::open(BufferPool::new(disk, 64)).unwrap();
+        let reopened = BTree::open(BufferPool::new(disk, 64)).unwrap();
         assert!(reopened.is_unique());
         let err = reopened.insert(&Value::BigInt(1), rid(1, 9)).unwrap_err();
         assert!(matches!(err, DbError::BTreeUniqueViolation));
@@ -1747,7 +2002,7 @@ mod tests {
     #[test]
     fn delete_removes_the_matching_entry_and_lookup_no_longer_finds_it() {
         let path = temp_path("delete-basic");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         btree.insert(&Value::BigInt(1), rid(1, 0)).unwrap();
         btree.insert(&Value::BigInt(2), rid(1, 1)).unwrap();
 
@@ -1760,7 +2015,7 @@ mod tests {
     #[test]
     fn delete_of_a_missing_entry_returns_false_and_changes_nothing() {
         let path = temp_path("delete-missing");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         btree.insert(&Value::BigInt(1), rid(1, 0)).unwrap();
 
         assert!(!btree.delete(&Value::BigInt(1), rid(9, 9)).unwrap(), "キーは一致するがridが違う");
@@ -1772,7 +2027,7 @@ mod tests {
     #[test]
     fn delete_removes_only_the_matching_rid_among_duplicate_keys() {
         let path = temp_path("delete-duplicate-key");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         btree.insert(&Value::BigInt(5), rid(1, 0)).unwrap();
         btree.insert(&Value::BigInt(5), rid(1, 1)).unwrap();
         btree.insert(&Value::BigInt(5), rid(2, 0)).unwrap();
@@ -1790,7 +2045,7 @@ mod tests {
     #[test]
     fn delete_does_not_shrink_the_tree_height() {
         let path = temp_path("delete-lazy");
-        let mut btree = open_btree(&path, DataType::Text);
+        let btree = open_btree(&path, DataType::Text);
         let wide_key = |i: usize| format!("{i:0>8}-{}", "x".repeat(120));
         let n = 1_000usize;
         for i in 0..n {
@@ -1819,7 +2074,7 @@ mod tests {
     #[test]
     fn delete_finds_the_target_rid_regardless_of_which_leaf_it_ended_up_in_after_duplicate_key_splits() {
         let path = temp_path("delete-spanning-leaves");
-        let mut btree = open_btree(&path, DataType::Text);
+        let btree = open_btree(&path, DataType::Text);
         let wide_value = "x".repeat(120);
         let n = 500usize;
         let rids: Vec<RecordId> = (0..n).map(|i| rid(1, i as u16)).collect();
@@ -1853,7 +2108,7 @@ mod tests {
     #[test]
     fn delete_then_lookup_and_range_agree_after_a_seeded_random_workload() {
         let path = temp_path("delete-model");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         let n = 2_000usize;
         let order = shuffled(n, 0x2468_1357_ace0_bdf1);
 
@@ -1888,7 +2143,7 @@ mod tests {
     #[test]
     fn delete_rejects_null_and_wrong_type() {
         let path = temp_path("delete-validation");
-        let mut btree = open_btree(&path, DataType::BigInt);
+        let btree = open_btree(&path, DataType::BigInt);
         assert!(matches!(btree.delete(&Value::Null, rid(1, 0)), Err(DbError::NullKeyNotAllowed)));
         assert!(matches!(
             btree.delete(&Value::Text("x".to_string()), rid(1, 0)),

@@ -88,7 +88,7 @@ pub use binder::{Binder, BoundExpr, BoundStatement, CatalogLookup};
 pub use btree::BTree;
 pub use buffer_pool::{BufferPool, BufferPoolStats, PageReadGuard, PageWriteGuard};
 pub use catalog::{Catalog, TableInfo};
-pub use database::{Database, QueryResult, TxHandle};
+pub use database::{Database, QueryResult, SharedDatabase, TxHandle};
 pub use disk_manager::DiskManager;
 pub use error::{DbError, DbResult};
 pub use eval::{FunctionRegistry, eval_expr};

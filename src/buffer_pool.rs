@@ -44,20 +44,55 @@
 //! 別の軽い`Mutex<Inner>`に出しておけば、走査はページ本体に一切触れずに
 //! 済み、この事故が起きない。
 //!
-//! # 単一スレッド前提の内部可変性
+//! # 第35章: フレーム本体を`RwLock`にし、Latchとして使う
 //!
-//! この章の`minidb`はまだシングルスレッドで動いている(並行アクセスは第35章の
-//! Latchまで登場しない)。それでも`&mut self`ではなく`&self`で読み書きできる
-//! ようにしているのは、第13章の`DiskManager`が`&self`を選んだ理由と同じで、
-//! `BufferPool`を`Arc`で複数の実行主体から共有できるようにしておくためである。
-//! フレームごとに別々の`Mutex`を持つ構成は、のちに複数スレッドが同時に
-//! 別々のページを読み書きできるようにするための布石でもある。ただし、
-//! `page_table`の更新とフレームへの書き込みを1つの操作として原子的に行う
-//! 保証はこの章にはまだなく、真の並行アクセスに対する安全性は第35章の
-//! Latchで扱う。
+//! 第34章まで、フレーム本体(`Frame`)は`Mutex`で守っていた。`Mutex`は
+//! Exclusiveの区別しか持たないため、同じページを読むだけの2つの
+//! [`PageReadGuard`]であっても、片方が生きている間はもう片方の`read_page`が
+//! ロック待ちで止まっていた(第14章の演習問題2、および本章の本文
+//! 「Read Latchの共存」を参照)。この章から`frames`の要素を`RwLock<Frame>`に
+//! 変え、`read_page`は`RwLock::read`、`write_page`と`evict`・`flush_frame`は
+//! `RwLock::write`を取るようにした。この`RwLock<Frame>`こそが、この章が導入
+//! する**Latch**の実体である。ページの中身を保護する主体は第14章から変わって
+//! いない。変わったのは、読み取り同士を同時に許すという一点だけである。
+//!
+//! # Latchの取得順序: Inner(メタデータ)を先に、Frame(ページ本体)をあとに
+//!
+//! `BufferPool`は2種類のロックを持つ。`page_table`・`pin_count`等をまとめた
+//! `Mutex<Inner>`(メタデータ)と、フレームごとの`RwLock<Frame>`(ページ本体、
+//! 上述のLatch)である。この2つを同時に取る箇所(`locate_or_load`・`evict`)は
+//! すべて「`Inner`を先にロックし、その`MutexGuard`を握ったままFrameのLatchを
+//! 取る」という順序で統一している。逆順(Frameを先に、Innerをあと)を許すと、
+//! スレッドAが`page_table`を調べる(Inner確保)ためにevictを試み、evict先の
+//! フレームがスレッドBの`PageReadGuard`によってLatch中で待たされている間に、
+//! スレッドBがそのGuardを`Drop`する段になって(Frameをまだ握ったまま)
+//! `unpin`のために`Inner`を取ろうとすると、AがInnerを握ったままB保有の
+//! Frameを待ち、BがFrameを握ったままAが握るInnerを待つ、という循環待ちが
+//! 起こりうる。
+//!
+//! 実際、[`PageReadGuard`]・[`PageWriteGuard`]の`Drop`は素朴に書くとこの逆順
+//! を踏む。`Drop`の中で`self.pool.unpin(...)`(Inner確保)を呼んだあと、
+//! Rustは構造体のフィールドを宣言順に自動でdropする。つまり素朴な実装では
+//! 「Inner確保 → (自動drop完了後に)Frame解放」という順序になり、`unpin`の
+//! 実行中は依然としてFrame Latchを握ったままInnerを取りに行くことになる。
+//! これは上で述べた逆順そのものであり、Buffer Poolを複数スレッドから使う
+//! 途端にデッドロックしうる。この章では`guard`フィールドを
+//! `std::mem::ManuallyDrop`で包み、`Drop::drop`の中で明示的に
+//! `ManuallyDrop::drop(&mut self.guard)`を呼んでFrame Latchを先に解放して
+//! から`unpin`(Inner確保)を呼ぶよう順序を固定した。「Frameを先に手放して
+//! からInnerに触る」は「Innerを先に、Frameをあとに」という規律に反して
+//! いるように見えるが、この2つは同時に保持されることが無くなった(Frameを
+//! 解放し終えてからInnerを取るだけ)という点で、規律が禁じる「逆順で同時に
+//! 保持する」状態そのものを作らない。
+//!
+//! この規律は、B+Tree(`crate::btree`、第35章)のLock Couplingが従う
+//! 「常に上から下、左から右」という取得順序とは別の軸の規律である。B+Treeの
+//! 規律はページとページの間の順序を、この規律はBuffer Pool内部のInnerと
+//! フレームという2種類のロックの間の順序を決める。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::mem::ManuallyDrop;
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::disk_manager::DiskManager;
 use crate::error::{DbError, DbResult};
@@ -152,7 +187,8 @@ pub struct BufferPoolStats {
 pub struct BufferPool {
     disk: DiskManager,
     /// フレームの配列。`new`で決めた容量のまま、以後は要素数を変えない。
-    frames: Vec<Mutex<Frame>>,
+    /// `RwLock`がこの章のLatchの実体である(モジュール冒頭を参照)。
+    frames: Vec<RwLock<Frame>>,
     inner: Mutex<Inner>,
 }
 
@@ -163,7 +199,7 @@ impl BufferPool {
     /// `capacity`は0より大きい必要がある(0だとどのページも読み込めない)。
     pub fn new(disk: DiskManager, capacity: usize) -> Self {
         assert!(capacity > 0, "capacityは1以上である必要があります");
-        let frames = (0..capacity).map(|_| Mutex::new(Frame { page: None })).collect();
+        let frames = (0..capacity).map(|_| RwLock::new(Frame { page: None })).collect();
         let meta = (0..capacity).map(|_| FrameMeta::empty()).collect();
         BufferPool {
             disk,
@@ -247,9 +283,13 @@ impl BufferPool {
     /// すでにキャッシュされていればヒットとしてディスクI/Oなしで返す。
     /// されていなければ`DiskManager::read_page`で読み込み、空きフレームが
     /// なければClock置換でフレームを1つ確保してから読み込む。
+    ///
+    /// 取得するのはこのフレームのRead Latch(`RwLock::read`)であり、同じ
+    /// ページを指す他のスレッドの`PageReadGuard`と共存できる。`write_page`が
+    /// 握るWrite Latchとだけ両立しない(モジュール冒頭を参照)。
     pub fn read_page(&self, id: PageId) -> DbResult<PageReadGuard<'_>> {
         let frame_id = self.locate_and_pin(id)?;
-        let guard = self.lock_frame(frame_id);
+        let guard = ManuallyDrop::new(self.lock_frame_read(frame_id));
         Ok(PageReadGuard {
             pool: self,
             frame_id,
@@ -264,7 +304,7 @@ impl BufferPool {
     /// ときにdirty flagを立てる点だけが異なる(モジュール冒頭の説明を参照)。
     pub fn write_page(&self, id: PageId) -> DbResult<PageWriteGuard<'_>> {
         let frame_id = self.locate_and_pin(id)?;
-        let guard = self.lock_frame(frame_id);
+        let guard = ManuallyDrop::new(self.lock_frame_write(frame_id));
         Ok(PageWriteGuard {
             pool: self,
             frame_id,
@@ -351,7 +391,7 @@ impl BufferPool {
             wal.lock().unwrap_or_else(|p| p.into_inner()).sync_up_to(page_lsn)?;
         }
 
-        let mut frame = self.lock_frame(frame_id);
+        let mut frame = self.lock_frame_write(frame_id);
         if let Some(page) = frame.page.as_mut() {
             // 第34章: このフレームのPage LSNをページ自身へ書き写してから
             // ディスクへ書き戻す。こうしておかないと、次にこのページを読み込む
@@ -403,7 +443,7 @@ impl BufferPool {
         // フレームの初期値として引き継ぐ(モジュール冒頭`FrameMeta::page_lsn`の
         // 「第34章での変更」を参照)。`Lsn(0)`固定で初期化していた第33章までとの違い。
         let page_lsn = page.page_lsn;
-        self.lock_frame(frame_id).page = Some(page);
+        self.lock_frame_write(frame_id).page = Some(page);
         inner.meta[frame_id] = FrameMeta {
             occupant: Some(id),
             pin_count: 0,
@@ -447,7 +487,7 @@ impl BufferPool {
                 if let Some(wal) = &wal {
                     wal.lock().unwrap_or_else(|p| p.into_inner()).sync_up_to(page_lsn)?;
                 }
-                let mut frame = self.lock_frame(i);
+                let mut frame = self.lock_frame_write(i);
                 if let Some(page) = frame.page.as_mut() {
                     // `flush_frame`と同じ理由でPage LSNをページ自身へ書き写す
                     // (第34章)。
@@ -455,7 +495,7 @@ impl BufferPool {
                     self.disk.write_page(page)?;
                 }
             }
-            self.lock_frame(i).page = None;
+            self.lock_frame_write(i).page = None;
             inner.page_table.remove(&evicted_id);
             return Ok(i);
         }
@@ -464,10 +504,20 @@ impl BufferPool {
         ))
     }
 
-    /// `frame_id`のフレーム本体を1つロックする(メタデータではなくページ本体)。
-    fn lock_frame(&self, frame_id: usize) -> MutexGuard<'_, Frame> {
+    /// `frame_id`のフレーム本体にRead Latchをかける(メタデータではなく
+    /// ページ本体)。同じフレームの他の`PageReadGuard`とは共存できるが、
+    /// `lock_frame_write`とは両立しない。
+    fn lock_frame_read(&self, frame_id: usize) -> RwLockReadGuard<'_, Frame> {
         self.frames[frame_id]
-            .lock()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `frame_id`のフレーム本体にWrite Latchをかける。他のどの`PageReadGuard`
+    /// ・`PageWriteGuard`とも同時には持てない。
+    fn lock_frame_write(&self, frame_id: usize) -> RwLockWriteGuard<'_, Frame> {
+        self.frames[frame_id]
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
@@ -497,7 +547,10 @@ pub struct PageReadGuard<'a> {
     pool: &'a BufferPool,
     frame_id: usize,
     page_id: PageId,
-    guard: MutexGuard<'a, Frame>,
+    /// `ManuallyDrop`で包み、`Drop::drop`の中で明示的にFrame Latchを解放して
+    /// から`unpin`(Inner確保)を呼べるようにしている(モジュール冒頭の
+    /// 「Latchの取得順序」を参照)。
+    guard: ManuallyDrop<RwLockReadGuard<'a, Frame>>,
 }
 
 impl PageReadGuard<'_> {
@@ -526,6 +579,15 @@ impl PageReadGuard<'_> {
 
 impl Drop for PageReadGuard<'_> {
     fn drop(&mut self) {
+        // Frame Latchを先に解放してから`unpin`(Inner確保)を呼ぶ。逆順だと
+        // Inner確保中もFrame Latchを握り続けることになり、evictと循環待ちに
+        // なりうる(モジュール冒頭の「Latchの取得順序」を参照)。
+        // SAFETY: `guard`はこの後この構造体が読まれることはなく、二重dropも
+        // 起きない(構造体自体が`Drop::drop`を抜けたあとフィールドの自動drop
+        // 対象から外れるのが`ManuallyDrop`の意味である)。
+        unsafe {
+            ManuallyDrop::drop(&mut self.guard);
+        }
         self.pool.unpin(self.frame_id, false);
     }
 }
@@ -541,7 +603,8 @@ pub struct PageWriteGuard<'a> {
     pool: &'a BufferPool,
     frame_id: usize,
     page_id: PageId,
-    guard: MutexGuard<'a, Frame>,
+    /// `PageReadGuard`と同じ理由で`ManuallyDrop`に包む。
+    guard: ManuallyDrop<RwLockWriteGuard<'a, Frame>>,
 }
 
 impl PageWriteGuard<'_> {
@@ -565,6 +628,16 @@ impl PageWriteGuard<'_> {
         self.page_mut().payload_mut()
     }
 
+    /// このページの`PageType`を書き換える(第35章)。
+    ///
+    /// `BTree::grow_new_root`が、Rootの`PageId`を変えずに(古いRootページを
+    /// そのまま)Leaf PageからInternal Pageへ育てるために使う。通常の
+    /// ページはすべて`allocate_page`が決めた`PageType`のまま生涯変わらない
+    /// ため、この操作を使うのはその1箇所だけを想定している。
+    pub fn set_page_type(&mut self, page_type: PageType) {
+        self.page_mut().page_type = page_type;
+    }
+
     fn page(&self) -> &Page {
         self.guard
             .page
@@ -582,6 +655,10 @@ impl PageWriteGuard<'_> {
 
 impl Drop for PageWriteGuard<'_> {
     fn drop(&mut self) {
+        // SAFETY: `PageReadGuard::drop`と同じ理由。
+        unsafe {
+            ManuallyDrop::drop(&mut self.guard);
+        }
         self.pool.unpin(self.frame_id, true);
     }
 }

@@ -5,7 +5,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 
 ## 目次
 
-現在執筆済みなのは[はじめに](book/src/index.md)と第1〜34章のみで、第35章以降は準備中です。
+現在執筆済みなのは[はじめに](book/src/index.md)と第1〜35章のみで、第36章以降は準備中です。
 
 ### 第0部 設計と開発環境
 
@@ -58,7 +58,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 - [第32章 Isolation LevelとDeadlock](book/src/ch32-isolation-deadlock.md)
 - [第33章 Write-Ahead Logging](book/src/ch33-wal.md)
 - [第34章 Crash RecoveryとCheckpoint](book/src/ch34-crash-recovery.md)
-- 第35章 Latchと並行B+Tree
+- [第35章 Latchと並行B+Tree](book/src/ch35-latch-concurrent-btree.md)
 
 ### 第6部 Server、運用、品質保証
 
