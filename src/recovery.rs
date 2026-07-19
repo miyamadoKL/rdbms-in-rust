@@ -85,7 +85,13 @@ pub struct RecoveryReport {
 /// Analysisが1トランザクションについて追跡する状態。
 struct TxState {
     /// このトランザクションが書いた最後のレコードのLSN。Undoの起点になる。
-    last_lsn: Lsn,
+    /// `None`は「まだ1件もInsert/Update/Deleteを書いていない」ことを表す
+    /// (`BEGIN`直後にcrashした、または`BEGIN; CHECKPOINT;`のようにCheckpoint
+    /// の時点でまだ書き込みが無かったトランザクション)。この場合Undoすべき
+    /// 対象が無いので、`apply_wal_undo_disk`には`None`をそのまま渡す
+    /// (架空の`Lsn(0)`を作って渡さない、本文「Undo起点の無いトランザクション」
+    /// を参照)。
+    last_lsn: Option<Lsn>,
     /// `Commit`または`Abort`をすでに見た(=Undo不要)なら`true`。
     resolved: bool,
 }
@@ -102,7 +108,7 @@ pub(crate) fn recover(storage: &mut Storage) -> DbResult<RecoveryReport> {
 
     let mut table: HashMap<TransactionId, TxState> = HashMap::new();
     for (txn_id, last_lsn) in seed {
-        table.insert(txn_id, TxState { last_lsn: last_lsn.unwrap_or(Lsn(0)), resolved: false });
+        table.insert(txn_id, TxState { last_lsn, resolved: false });
     }
     for record in scanned {
         match record.record_type {
@@ -110,16 +116,16 @@ pub(crate) fn recover(storage: &mut Storage) -> DbResult<RecoveryReport> {
                 table
                     .entry(record.txn_id)
                     .and_modify(|s| {
-                        s.last_lsn = record.lsn;
+                        s.last_lsn = Some(record.lsn);
                         s.resolved = true;
                     })
-                    .or_insert(TxState { last_lsn: record.lsn, resolved: true });
+                    .or_insert(TxState { last_lsn: Some(record.lsn), resolved: true });
             }
             LogRecordType::Begin | LogRecordType::Insert | LogRecordType::Update | LogRecordType::Delete => {
                 table
                     .entry(record.txn_id)
-                    .and_modify(|s| s.last_lsn = record.lsn)
-                    .or_insert(TxState { last_lsn: record.lsn, resolved: false });
+                    .and_modify(|s| s.last_lsn = Some(record.lsn))
+                    .or_insert(TxState { last_lsn: Some(record.lsn), resolved: false });
             }
             LogRecordType::Checkpoint => {}
         }
@@ -133,23 +139,27 @@ pub(crate) fn recover(storage: &mut Storage) -> DbResult<RecoveryReport> {
         crate::failpoint::hit("recovery_redo_step")?;
     }
     storage.persist_catalog_after_recovery()?;
-    storage.rebuild_all_indexes_after_recovery()?;
+    // 索引は一時ファイルへ作り直す。既存の索引ファイル(`pending_index_renames`
+    // が指す`rename`先)は、Redo・Undo・検証がすべて終わるまで一切変更しない
+    // (`Storage::rebuild_all_indexes_after_recovery`のドキュメントを参照)。
+    let pending_index_renames = storage.rebuild_all_indexes_after_recovery()?;
 
     // どの物理的な書き込み(Redo・Undoのどちらも)も、この時点まで
-    // `BufferPool`のキャッシュにしか無く、ディスクへは一切書き戻していない。
-    // `Abort`レコードも同様に、`WalWriter`のメモリ上のバッファに積むだけで
-    // `flush`・`sync`はまだ呼ばない。これが「Undo中のクラッシュへの耐性」
-    // (モジュールドキュメントを参照)の核心である。ここより前でこの関数が
-    // 失敗すると、`storage`ごと破棄され、ここまでの変更(物理的な書き込みも
-    // `Abort`レコードも)はすべてメモリ上から消える。ディスク上のバイト列は
+    // `BufferPool`のキャッシュ、または索引の一時ファイルにしか無く、
+    // 既存の永続ファイルへは一切書き戻していない。`Abort`レコードも同様に、
+    // `WalWriter`のメモリ上のバッファに積むだけで`flush`・`sync`はまだ
+    // 呼ばない。これが「Undo中のクラッシュへの耐性」(モジュールドキュメント
+    // を参照)の核心である。ここより前でこの関数が失敗すると、`storage`
+    // ごと破棄され、ここまでの変更(物理的な書き込みも`Abort`レコードも、
+    // 索引の一時ファイルも)はすべて消える。既存の永続ファイルのバイト列は
     // この`recover`を呼ぶ直前と一切変わっていない。
     let mut transactions_undone = 0usize;
     for (txn_id, state) in &table {
         if state.resolved {
             continue;
         }
-        crate::transaction::apply_wal_undo_disk(storage, Some(state.last_lsn))?;
-        storage.wal().lock().unwrap_or_else(|p| p.into_inner()).append_abort(*txn_id, Some(state.last_lsn));
+        crate::transaction::apply_wal_undo_disk(storage, state.last_lsn)?;
+        storage.wal().lock().unwrap_or_else(|p| p.into_inner()).append_abort(*txn_id, state.last_lsn);
         transactions_undone += 1;
         crate::failpoint::hit("recovery_undo_step")?;
     }
@@ -160,6 +170,13 @@ pub(crate) fn recover(storage: &mut Storage) -> DbResult<RecoveryReport> {
     // sync)。
     storage.flush()?;
     storage.sync()?;
+    // 索引の一時ファイルを、既存の索引ファイルへ`rename`でアトミックに
+    // 置き換える。同じディレクトリ内の`rename`はファイルシステムレベルで
+    // 単一の操作であり、置き換えの途中の中途半端な状態を外部から観測
+    // できない(本文「索引ファイルの入れ替えは一時ファイル経由」を参照)。
+    for (temp_path, index_path) in &pending_index_renames {
+        std::fs::rename(temp_path, index_path)?;
+    }
     storage.wal().lock().unwrap_or_else(|p| p.into_inner()).sync()?;
 
     Ok(RecoveryReport {

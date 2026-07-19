@@ -131,16 +131,16 @@ WALの記録を先頭から順に見ていき、トランザクションごと�
                 table
                     .entry(record.txn_id)
                     .and_modify(|s| {
-                        s.last_lsn = record.lsn;
+                        s.last_lsn = Some(record.lsn);
                         s.resolved = true;
                     })
-                    .or_insert(TxState { last_lsn: record.lsn, resolved: true });
+                    .or_insert(TxState { last_lsn: Some(record.lsn), resolved: true });
             }
             LogRecordType::Begin | LogRecordType::Insert | LogRecordType::Update | LogRecordType::Delete => {
                 table
                     .entry(record.txn_id)
-                    .and_modify(|s| s.last_lsn = record.lsn)
-                    .or_insert(TxState { last_lsn: record.lsn, resolved: false });
+                    .and_modify(|s| s.last_lsn = Some(record.lsn))
+                    .or_insert(TxState { last_lsn: Some(record.lsn), resolved: false });
             }
             LogRecordType::Checkpoint => {}
         }
@@ -149,6 +149,12 @@ WALの記録を先頭から順に見ていき、トランザクションごと�
 
 走査を終えた時点で、`resolved`が`false`のまま残っているトランザクションが**loser**です。
 `Commit`も`Abort`も記録されていない、つまりクラッシュの瞬間にActiveだったトランザクションだと分かります。
+
+`TxState`の`last_lsn`は`Option<Lsn>`です。
+`None`は「このトランザクションはまだ1件もWALレコードを書いていない」ことを表します。
+`Checkpoint`の瞬間にActiveだったトランザクションをTransaction Tableの初期値として引き継ぐとき(次節「Checkpoint」を参照)、そのトランザクションがまだ何も書いていなければ`last_lsn`は`None`のまま引き継がれ、この走査ループが`Insert`、`Update`、`Delete`、`Commit`、`Abort`のどれかを実際に見つけるまで`None`であり続けます。
+`Lsn`はWAL上に実在するレコードの番号であり、「まだ何も書いていない」ことを表すための架空の`Lsn`(たとえば`Lsn(0)`)を割り当てて代用してはいけません。
+架空の`Lsn`をUndoの起点として渡すと、次節のUndoが`WalWriter::record`でその`Lsn`を引こうとして見つからず、`panic`します。
 
 Dirty Page Tableに相当するものは、あえて作りません。
 本来のARIESがDirty Page Tableを持つ理由は、「Redoはどのページのどこから始めればよいか」を、ログ全体を舐めずに絞り込むためです。
@@ -235,8 +241,8 @@ Redoが終わった時点で、テーブルはクラッシュ直前の物理的�
         if state.resolved {
             continue;
         }
-        crate::transaction::apply_wal_undo_disk(storage, Some(state.last_lsn))?;
-        storage.wal().lock().unwrap_or_else(|p| p.into_inner()).append_abort(*txn_id, Some(state.last_lsn));
+        crate::transaction::apply_wal_undo_disk(storage, state.last_lsn)?;
+        storage.wal().lock().unwrap_or_else(|p| p.into_inner()).append_abort(*txn_id, state.last_lsn);
         transactions_undone += 1;
         crate::failpoint::hit("recovery_undo_step")?;
     }
@@ -245,6 +251,7 @@ Redoが終わった時点で、テーブルはクラッシュ直前の物理的�
 `ROLLBACK`が「今まさにActiveなトランザクションを、実行中のプロセスの中で」取り消すのと、`recover`が「クラッシュで凍結されたトランザクションを、開き直したプロセスの中で」取り消すのは、コードの視点からはまったく同じ操作です。
 `apply_wal_undo_disk`は`last_lsn`から`prev_lsn`を`Begin`に行き着くまでたどり、`RecordId`の付け替え(`remap`)を使いながら`Insert`、`Update`、`Delete`それぞれの逆操作を適用します。
 この`remap`が要る理由も、索引の更新順序も、第30章と第33章から変わっていません。
+`last_lsn`が`None`のloser(1件も書き込んでいないまま`Active`で終わったトランザクション)は、`apply_wal_undo_disk`が最初の1歩を踏み出す前にループを抜けて即座に`Ok(())`を返すため、そのまま何も取り消さずに`Abort`レコードだけを書きます。
 
 Undoを終えたトランザクションには`Abort`レコードを書きます。
 `ROLLBACK`と同じ体裁ですが、1つだけ違いがあります。
@@ -267,12 +274,26 @@ Redoが書き込むページも、Undoが書き込むページも、Undoが積�
 ```rust
     storage.flush()?;
     storage.sync()?;
+    for (temp_path, index_path) in &pending_index_renames {
+        std::fs::rename(temp_path, index_path)?;
+    }
     storage.wal().lock().unwrap_or_else(|p| p.into_inner()).sync()?;
 ```
 
-この3行に到達して初めて、ここまでの全変更がディスクへ実際に反映されます。
-逆に言えば、この3行より前のどこかで`recover`が失敗すれば(この章のテストでは`crate::failpoint`で意図的に発生させます)、`storage`ごと丸ごと破棄され、途中まで進んでいた変更はメモリ上から跡形もなく消えます。
+この数行に到達して初めて、ここまでの全変更がディスクへ実際に反映されます。
+逆に言えば、この手前のどこかで`recover`が失敗すれば(この章のテストでは`crate::failpoint`で意図的に発生させます)、`storage`ごと丸ごと破棄され、途中まで進んでいた変更はメモリ上から跡形もなく消えます。
 ディスク上のバイト列は、`Storage::open`を呼ぶ直前と一切変わっていません。
+
+### 索引ファイルの入れ替えは一時ファイル経由
+
+この「ディスク上のバイト列が一切変わっていない」という主張には、実は索引ファイルという見落としやすい例外があります。
+`rebuild_all_indexes_after_recovery`(Redoより前、本文「Analysis: Transaction Tableを組み立てる」の直後に呼びます)は、既存の索引ファイルを削除して同じパスへ作り直すのではなく、同じディレクトリの**一時ファイル**へ新しい索引を書きます。
+既存の索引ファイル自体には、この時点では一切触れません。
+一時ファイルを指す`BTree`をその場で`self.indexes`へ組み込むため、続くUndo(`apply_wal_undo_disk`が呼ぶ`index_insert_row`、`index_delete_row`)は、この一時ファイル上の`BTree`を正しく更新できます。
+
+既存の索引ファイルを実際に置き換えるのは、上のコード片が示す`std::fs::rename`です。
+同じディレクトリ内の`rename`はファイルシステムレベルで単一の操作であり、途中の中途半端な状態を外部から観測できません。
+これで、索引ファイルもデータページ、カタログ、WALと同じく、「Redo、Undo、検証がすべて終わるまでディスク上のバイト列が変わらない」という不変条件に加わります。
 
 次に`Storage::open`を呼び直すと、`recover`はまったく同じ入力(変化していないWAL、変化していないページ)から、Analysis、Redo、Undoを最初からやり直します。
 Redoが冪等であることはすでに確認したとおりで、Undoも`apply_wal_undo_disk`をもう一度呼ぶだけです。
@@ -341,9 +362,21 @@ fn analysis_start(records: &[LogRecord]) -> (usize, Vec<(TransactionId, Option<L
 }
 ```
 
-SQLの`CHECKPOINT`文は、現在Activeなトランザクション(`self.tx`、高々1本)をこの一覧として渡すだけの薄い入口です。
-決定的インターリーブテストハーネス(第30章)が同時に持ちうる複数のトランザクションは、この一覧に含めません。
-`CHECKPOINT`は通常のSQL経路を想定した文であり、ハーネス専用の複数トランザクションまで面倒を見る必要はこの章には無いと判断しました。
+SQLの`CHECKPOINT`文は、現在Activeなトランザクションをすべてこの一覧として渡すだけの薄い入口です。
+通常のSQL経路の`self.tx`(高々1本)だけでなく、決定的インターリーブテストハーネス(第30章)の`harness_contexts`が同時に持ちうる複数のトランザクションも、両方ともこの一覧に含めます。
+
+```rust
+    fn execute_checkpoint(&mut self, _checkpoint: CheckpointStatement) -> DbResult<QueryResult> {
+        let mut active: Vec<(TransactionId, Option<Lsn>)> =
+            self.tx.as_ref().map(|tx| vec![(tx.id, tx.wal_last_lsn)]).unwrap_or_default();
+        active.extend(self.harness_contexts.values().map(|ctx| (ctx.id, ctx.wal_last_lsn)));
+        // ...
+    }
+```
+
+`self.tx`と`harness_contexts`は、同じ`Database`が同時に持つ対等なActiveトランザクションの集合です(`TransactionId`の採番自体も共有しています)。
+`harness_contexts`側を素通りさせると、`begin_tx`で開始したトランザクションが`INSERT`したあと`CHECKPOINT`をまたいで再起動したとき、AnalysisはそのトランザクションがCheckpointの瞬間にActiveだったことを知らないまま`Checkpoint`より後ろだけを走査します。
+そのトランザクションが以後何も書かずにcrashしていれば、`Commit`も`Abort`も`Insert`もこの走査範囲に現れず、loserとして認識されないまま、未確定の行が取り消されずに残ってしまいます。
 
 `CHECKPOINT`はAnalysisの走査範囲を短くするだけで、WALファイル自体を切り詰めません。
 `Checkpoint`より前のレコードは、二度と使われないとしてもファイルに残り続けます。
@@ -395,7 +428,7 @@ pub(crate) fn hit(name: &'static str) -> DbResult<()> {
 
 ## クラッシュシナリオを試す
 
-`tests/crash_recovery.rs`に、この章が主張する4つの場面をそれぞれテストとして書きました。
+`tests/crash_recovery.rs`に、この章が主張する8つの場面をそれぞれテストとして書きました。
 
 **(a) COMMIT応答後、データページ書き戻し前のクラッシュ**は、`BEGIN`のうちに`INSERT`を2件実行して`COMMIT`し、そのあとで`flush`せずに`drop`し、開き直した`Database`が両方の行を読めることを確認します。
 `last_recovery_report()`の`records_redone`が2以上であることも合わせて確かめます。
@@ -423,13 +456,23 @@ pub(crate) fn hit(name: &'static str) -> DbResult<()> {
 **(d) CHECKPOINT直後のクラッシュ**は、30行分`INSERT`してから`CHECKPOINT`し、その後1件だけ`INSERT`してdropします。
 `last_recovery_report()`の`used_checkpoint`が`true`になり、`records_scanned`がCheckpoint後の3件程度にとどまっていることを確認します。
 
+**(e) 何も書いていないActiveなトランザクションを含むCHECKPOINT直後のクラッシュ**は、`BEGIN`の直後、まだ1件もWALレコードを書いていないうちに`CHECKPOINT`してdropします。
+このトランザクションのTransaction Table上の`last_lsn`は`None`のまま`Checkpoint`レコードへ埋め込まれるため、Undoが架空の`Lsn`を参照して`panic`しないことを確認します。
+
+**(f) CHECKPOINTのあとで書き込みを始めるトランザクション**は、(e)と同じ`BEGIN; CHECKPOINT;`のあとに`INSERT`を1件実行してdropします。
+`last_lsn`が`None`から`Some`へ切り替わる境界をまたいでも、Undoがその`INSERT`だけを正しく取り消すことを確認します。
+
+**(g) CHECKPOINT時点でハーネスがActiveなトランザクション**は、`begin_tx`で開始したトランザクションが`INSERT`したあと、通常のSQL経路から`CHECKPOINT`してdropします。
+このトランザクションが`self.tx`ではなく`harness_contexts`にあることを踏まえ、それでもTransaction Tableに含まれ、未確定の行がUndoで取り消されることを確認します。
+
+**(h) 索引ありのRedo、Undo失敗**は、索引を持つテーブルに未確定の`INSERT`、`UPDATE`を残したままdropし、`recovery_redo_step`、`recovery_undo_step`それぞれのfailpointで1回目の`Database::open`をわざと失敗させます。
+失敗の直前に読んでおいた索引ファイルのバイト列と、失敗の直後にもう一度読んだバイト列が完全に一致すること、そして2回目の`Database::open`が正しい内容で完走することの両方を確認します(本文「索引ファイルの入れ替えは一時ファイル経由」を参照)。
+
 これらに加えて、Recovery自体の冪等性(直後にもう一度開き直しても、RedoとUndoの対象が残っていないこと)と、クラッシュ後に索引が正しく作り直されることも、それぞれ別のテストで確認しています。
 
 ```console
 $ cargo test --test crash_recovery
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-$ cargo test --lib
-test result: ok. 789 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 ## この章の限界

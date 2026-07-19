@@ -173,6 +173,178 @@ fn scenario_d_checkpoint_shortens_the_analysis_scan() {
     remove_db(&path);
 }
 
+/// シナリオ(e): 1件も書き込んでいないActiveなトランザクションを含む
+/// `CHECKPOINT`のあとでクラッシュしても、次のRecoveryはpanicせずに完走する。
+///
+/// `BEGIN`だけではまだWALレコードを書かない(`WalWriter::ensure_begin`が
+/// 実際の書き込みが起きるまで`Begin`レコードの発行を遅らせる、`src/wal.rs`
+/// を参照)。したがって、この状態で`CHECKPOINT`を迎えたトランザクションの
+/// Active Transaction一覧上の`last_lsn`は`None`のままである。Analysisは
+/// このトランザクションを「Undo対象だが起点となるLSNを持たない」トランザク
+/// ションとして扱わなければならず、架空の`Lsn(0)`を作って`WalWriter::record`
+/// に渡すとその`Lsn`はWAL上に存在しないため`panic`する(この章のレビューで
+/// 実際に指摘された不具合)。
+#[test]
+fn scenario_e_checkpoint_with_an_active_transaction_that_has_not_written_anything_yet() {
+    let path = temp_db_path("crash-scenario-e");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id BIGINT PRIMARY KEY)").unwrap();
+        db.flush().unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("CHECKPOINT").unwrap();
+        // COMMIT・ROLLBACKのどちらも呼ばずにdropする。CHECKPOINTの時点で
+        // このトランザクションはまだ1件もWALレコードを書いていない。
+    }
+
+    // 修正前はここで`recovery.rs`の`apply_wal_undo_disk`がLsn(0)を参照して
+    // panicしていた。
+    let db = Database::open(&path).unwrap();
+    let report = db.last_recovery_report().unwrap();
+    assert!(report.used_checkpoint, "Checkpointレコードが見つかっているはず: {report:?}");
+    assert_eq!(report.transactions_undone, 1, "書き込みの無いActiveなトランザクションもUndo対象として解決されるはず");
+
+    let mut db = db;
+    assert!(db.execute("SELECT id FROM t").unwrap().rows().is_empty());
+    remove_db(&path);
+}
+
+/// シナリオ(f): `CHECKPOINT`の時点ではまだ何も書いていなかったトランザク
+/// ションが、`CHECKPOINT`の**あとで**書き込みを始めてからcrashしても、
+/// Undoが正しくその書き込みだけを取り消す(境界値: `last_lsn`が`None`から
+/// `Some`へ切り替わる瞬間をまたぐ)。
+#[test]
+fn scenario_f_a_transaction_starts_writing_only_after_the_checkpoint_it_was_active_at() {
+    let path = temp_db_path("crash-scenario-f");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id BIGINT PRIMARY KEY)").unwrap();
+        db.flush().unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("CHECKPOINT").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        // COMMIT・ROLLBACKを呼ばずにdropする。
+    }
+
+    let db = Database::open(&path).unwrap();
+    let report = db.last_recovery_report().unwrap();
+    assert_eq!(report.transactions_undone, 1, "Checkpoint後に始まった書き込みもUndoされるはず: {report:?}");
+
+    let mut db = db;
+    assert!(db.execute("SELECT id FROM t").unwrap().rows().is_empty(), "未確定のINSERTはUndoで取り消されているはず");
+    remove_db(&path);
+}
+
+/// シナリオ(g): 決定的インターリーブテストハーネス(`begin_tx`)で開始した
+/// トランザクションも、`CHECKPOINT`のActive Transaction Tableに含まれる。
+///
+/// `execute_checkpoint`が通常のSQL経路の`self.tx`だけを見て
+/// `harness_contexts`を無視していると、ここで`begin_tx`したトランザクション
+/// の存在をAnalysisが知らないまま`CHECKPOINT`をまたぎ、未確定の`INSERT`が
+/// Undoされずに残ってしまう(この章のレビューで実際に指摘された不具合)。
+#[test]
+fn scenario_g_a_harness_transaction_active_at_checkpoint_time_is_also_undone() {
+    let path = temp_db_path("crash-scenario-g");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id BIGINT PRIMARY KEY)").unwrap();
+        db.flush().unwrap();
+
+        let handle = db.begin_tx();
+        db.execute_in_tx(&handle, "INSERT INTO t VALUES (1)").unwrap();
+        db.execute("CHECKPOINT").unwrap();
+        // `handle`はcommit_tx・rollback_txを呼ばずにdropする。
+    }
+
+    let db = Database::open(&path).unwrap();
+    let report = db.last_recovery_report().unwrap();
+    assert!(report.used_checkpoint, "Checkpointレコードが見つかっているはず: {report:?}");
+    assert_eq!(report.transactions_undone, 1, "ハーネスのActiveなトランザクションもUndo対象に含まれるはず: {report:?}");
+
+    let mut db = db;
+    assert!(
+        db.execute("SELECT id FROM t").unwrap().rows().is_empty(),
+        "ハーネスのトランザクションが未確定のまま残した行はUndoで取り消されているはず"
+    );
+    remove_db(&path);
+}
+
+/// `db_path`の索引`index_name`が使う専用ファイルのパス(`src/storage.rs`の
+/// `index_file_path`と同じ命名規則、テストからは非公開関数を呼べないため
+/// ここで複製する)。
+fn index_file_path(db_path: &std::path::Path, index_name: &str) -> std::path::PathBuf {
+    let mut os_string = db_path.as_os_str().to_os_string();
+    os_string.push(".idx.");
+    os_string.push(index_name);
+    std::path::PathBuf::from(os_string)
+}
+
+/// シナリオ(h)・(i): 索引ありのRedo・Undo失敗それぞれのfailpointについて、
+/// 「失敗後に索引ファイルのバイト列が不変」かつ「次回Openが完走する」ことを
+/// 確認する。
+///
+/// 索引の作り直しは、Redoの前(`recovery_redo_step`より前)に一時ファイルへ
+/// 行われ、Redo・Undoの全工程が終わった`Storage::flush`・`sync`の直後に
+/// `rename`で本来の索引ファイルへ置き換わる(`Storage::
+/// rebuild_all_indexes_after_recovery`のドキュメントを参照)。したがって、
+/// Redoの途中(`recovery_redo_step`)・Undoの途中(`recovery_undo_step`)の
+/// どちらでRecoveryが失敗しても、`rename`にはまだ到達しておらず、既存の
+/// 索引ファイルのバイト列は`Database::open`を呼ぶ直前と一切変わらないはず
+/// である。
+#[test]
+fn scenario_h_and_i_index_files_are_unchanged_when_recovery_fails_at_redo_or_undo() {
+    for failpoint_name in ["recovery_redo_step", "recovery_undo_step"] {
+        let path = temp_db_path(&format!("crash-scenario-index-failpoint-{failpoint_name}"));
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)").unwrap();
+            db.execute("CREATE INDEX idx_v ON t (v)").unwrap();
+            db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+            db.flush().unwrap();
+
+            // 未確定のトランザクションを残したままdropする。Undoの対象を
+            // 必ず1本作っておくことで、`recovery_undo_step`のfailpointが
+            // 確実に発火する状況を用意する。決定的インターリーブテスト
+            // ハーネス(`begin_tx`)を使うのは、通常の`execute`経路の`BEGIN`
+            // だと、後続のすべての文が(Autocommitではなく)同じ未確定
+            // トランザクションの一部になってしまい、下のWAL sync用の1文が
+            // 狙いどおりAutocommitにならないため(`scenario_c`と同じ理由)。
+            let h = db.begin_tx();
+            db.execute_in_tx(&h, "INSERT INTO t VALUES (2, 20)").unwrap();
+            db.execute_in_tx(&h, "UPDATE t SET v = 999 WHERE id = 1").unwrap();
+
+            // `h`が積んだWALレコードは、まだ`WalWriter`のメモリ上のバッファに
+            // しか無い。別の(Autocommitの)1文を実行してWALのsyncを1回
+            // 発生させ、上の`h`のレコードも確実にディスクへ届かせる
+            // (`scenario_c`と同じ理由)。
+            db.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+        }
+
+        let index_path = index_file_path(&path, "idx_v");
+        let bytes_before = std::fs::read(&index_path).unwrap();
+
+        failpoint::arm(failpoint_name, 1);
+        assert!(Database::open(&path).is_err(), "{failpoint_name}の直後に失敗するよう仕込んだ");
+
+        let bytes_after_failure = std::fs::read(&index_path).unwrap();
+        assert_eq!(bytes_before, bytes_after_failure, "{failpoint_name}での失敗後も索引ファイルのバイト列は不変のはず");
+
+        // 2回目のOpenはfailpointが自動でdisarmされているため完走する。
+        let mut db = Database::open(&path).unwrap();
+        let result = db.execute("SELECT id FROM t WHERE v = 999").unwrap();
+        assert!(result.rows().is_empty(), "未確定のUPDATEはUndoされているはず");
+        let result = db.execute("SELECT id FROM t WHERE v = 10").unwrap();
+        assert_eq!(result.rows()[0].values(), &[Value::BigInt(1)], "id=1のvは999にUPDATEされ、Undoで元の10へ戻っているはず");
+        let result = db.execute("SELECT v FROM t WHERE id = 1").unwrap();
+        assert_eq!(result.rows()[0].values(), &[Value::BigInt(10)]);
+        assert!(db.execute("SELECT id FROM t WHERE v = 20").unwrap().rows().is_empty(), "未確定のINSERTもUndoされているはず");
+
+        remove_db(&path);
+    }
+}
+
 /// Recoveryは冪等である: 一度Recoveryが完了した直後にもう一度開き直しても、
 /// 何もRedo・Undoすることが残っていない。
 #[test]

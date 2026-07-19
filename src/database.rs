@@ -502,16 +502,23 @@ impl Database {
     /// `CHECKPOINT`を実行する(第34章)。
     ///
     /// Memoryバックエンドはそもそも永続化しない(WALを持たない)ため何もしない。
-    /// Diskバックエンドは、現在Activeなトランザクション(高々1本、`self.tx`)を
-    /// Active Transaction一覧として`Storage::checkpoint`へ渡す。決定的
-    /// インターリーブテストハーネス(`harness_contexts`)が持つトランザクション
-    /// はこの一覧に含めない。`CHECKPOINT`のSQL構文はハーネス経由の複数
-    /// トランザクションを想定しておらず、この章はその組み合わせを対象外とする
-    /// (本文「この章の限界」を参照)。トランザクションの境界文ではないため、
-    /// `self.tx`の状態は変えない。
+    /// Diskバックエンドは、現在Activeなトランザクションを全部、Active
+    /// Transaction一覧として`Storage::checkpoint`へ渡す。通常のSQL経路の
+    /// `self.tx`(高々1本)だけでなく、決定的インターリーブテストハーネス
+    /// (`harness_contexts`)が持つトランザクションも含める。`self.tx`と
+    /// `harness_contexts`は同じ`Database`が同時に持つ、対等なActive
+    /// トランザクションの集合であり(採番自体も共有している、`begin_tx`の
+    /// ドキュメントを参照)、`CHECKPOINT`の視点からハーネス経由かどうかを
+    /// 区別する理由が無い。これを省くと、`begin_tx`で開始したトランザクション
+    /// が`INSERT`したあと`CHECKPOINT`をまたいで再起動したとき、Analysisが
+    /// そのトランザクションの存在自体を知らないままRedoだけ行い、`Commit`
+    /// レコードの無い未確定の行がUndoされずに残ってしまう(この章のレビューで
+    /// 実際に指摘された不具合)。トランザクションの境界文ではないため、
+    /// `self.tx`・`harness_contexts`のどちらの状態も変えない。
     fn execute_checkpoint(&mut self, _checkpoint: CheckpointStatement) -> DbResult<QueryResult> {
-        let active: Vec<(TransactionId, Option<Lsn>)> =
+        let mut active: Vec<(TransactionId, Option<Lsn>)> =
             self.tx.as_ref().map(|tx| vec![(tx.id, tx.wal_last_lsn)]).unwrap_or_default();
+        active.extend(self.harness_contexts.values().map(|ctx| (ctx.id, ctx.wal_last_lsn)));
         match &mut self.backend {
             Backend::Memory { .. } => {}
             Backend::Disk { storage } => {
@@ -1036,9 +1043,16 @@ impl Database {
     /// - `ReadUncommitted`: 読み取りロックを一切取らない(Dirty Readを許す)。
     ///   `Ok(())`を即座に返し、`LockManager`にすら触れない。
     /// - `ReadCommitted`: 通常どおり獲得したうえで、この関数を抜ける直前に
-    ///   [`LockManager::release_keys`]で**この統計のために取った鍵だけ**を
-    ///   即座に手放す(Non-repeatable Readを許す)。`owner`が他に持っている
-    ///   (書き込みロック等の)鍵には触れない。
+    ///   [`LockManager::release_keys`]で**この文で新規に取得したShared
+    ///   ロックだけ**を即座に手放す(Non-repeatable Readを許す)。`owner`が
+    ///   この文より前から(たとえば先行する`UPDATE`によって)同じ鍵にすでに
+    ///   Exclusive・Sharedロックを持っていた場合、その鍵はここでは解放しない
+    ///   (`owner`が他に持っている書き込みロック等の鍵に触れないのはもちろん、
+    ///   **同じ鍵であっても**元から持っていたロックはCOMMIT・ABORTまで保持する。
+    ///   さもないと、`UPDATE`で確定前の変更をExclusiveロックで守っていたはず
+    ///   の行が、直後の`SELECT`が同じ行をなぞっただけで解放されてしまい、
+    ///   他のトランザクションがその未確定の行を書き換えられてしまう。この
+    ///   章のレビューで実際に指摘された不具合)。
     /// - `RepeatableRead`: 何もせず、獲得したロックをそのまま`COMMIT`まで
     ///   保持させる(第31章から変わらない挙動)。
     /// - `Serializable`(`Backend::Disk`のみ): 上の`RepeatableRead`と同じ
@@ -1059,12 +1073,21 @@ impl Database {
             keys.extend(table_ids.iter().map(|&id| LockKey::Table(id)));
         }
 
+        // READ COMMITTEDが文末に解放してよいのは、この文で新規に取得した
+        // Sharedロックだけである。`owner`がこの鍵をすでに(先行する`UPDATE`の
+        // Exclusive等で)保持しているかどうかを、実際に獲得する**前**に
+        // 記録しておく。
+        let mut newly_acquired = Vec::new();
         for &key in &keys {
+            let already_held = self.lock_manager.held_mode(owner, &key).is_some();
             self.acquire_lock_or_detect_deadlock(owner, key, mode)?;
+            if !already_held {
+                newly_acquired.push(key);
+            }
         }
 
         if level == IsolationLevel::ReadCommitted && mode == LockMode::Shared {
-            self.lock_manager.release_keys(owner, &keys);
+            self.lock_manager.release_keys(owner, &newly_acquired);
         }
         Ok(())
     }

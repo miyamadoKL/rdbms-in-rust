@@ -240,6 +240,50 @@ fn read_committed_allows_phantom_read() {
     assert_eq!(second_count, 3, "T2が挿入した行(幻)が2回目の集計に現れている(Phantom)");
 }
 
+/// READ COMMITTEDが文末に解放してよいのは、その文で**新規に**取得した
+/// Sharedロックだけである。T1が`UPDATE`で獲得したExclusiveロックは、直後の
+/// `SELECT`(同じテーブルを読むだけ)が終わってもCOMMIT・ABORTまで保持され
+/// 続けなければならない。
+///
+/// 修正前は、`acquire_scan_locks`が「この`SELECT`のために獲得しようとした
+/// 鍵」をすべて文末解放の対象にしており、T1が`UPDATE`からすでに持っていた
+/// Exclusiveロックまで一緒に解放してしまっていた。その結果、T1がまだ
+/// `COMMIT`していないのに、T2の同じ行への`UPDATE`が通ってしまう(この章の
+/// レビューで実際に指摘された不具合)。
+#[test]
+fn read_committed_select_after_update_does_not_release_the_update_s_exclusive_lock() {
+    let mut db = temp_db();
+    db.execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)").unwrap();
+    db.execute("INSERT INTO accounts VALUES (1, 100)").unwrap();
+
+    let t1 = db.begin_tx_with_isolation(IsolationLevel::ReadCommitted);
+    let t2 = db.begin_tx_with_isolation(IsolationLevel::ReadCommitted);
+
+    // T1がid=1をUPDATEし、Exclusiveロックを獲得する。
+    db.execute_in_tx(&t1, "UPDATE accounts SET balance = 70 WHERE id = 1").unwrap();
+
+    // 同じテーブルへのSELECTは、READ COMMITTEDの規律どおり文末でShared
+    // ロックを解放する。しかし、これはT1が「この文で新規に取得した」
+    // Sharedロックの話であり、先行するUPDATEのExclusiveロックには触れない。
+    let read = db.execute_in_tx(&t1, "SELECT balance FROM accounts WHERE id = 1").unwrap();
+    assert_eq!(int_value(&read, 0, 0), 70, "T1は自分の未コミットの書き込みを読める");
+
+    // T1がまだCOMMITしていないので、T2の同じ行へのUPDATEはExclusiveロック
+    // とぶつかってBlockedのままでなければならない。
+    assert!(
+        matches!(db.execute_in_tx(&t2, "UPDATE accounts SET balance = 999 WHERE id = 1"), Err(DbError::WouldBlock)),
+        "T1のUPDATEが持つExclusiveロックが、直後のSELECTで誤って解放されている"
+    );
+
+    db.commit_tx(t1).unwrap();
+
+    // T1がCOMMITして初めて、T2の書き込みが通る。
+    db.execute_in_tx(&t2, "UPDATE accounts SET balance = 999 WHERE id = 1").unwrap();
+    db.commit_tx(t2).unwrap();
+
+    assert_eq!(int_value(&db.execute("SELECT balance FROM accounts").unwrap(), 0, 0), 999);
+}
+
 // ==== REPEATABLE READ: 4つとも防がれる(Memoryバックエンド) ====
 
 #[test]
@@ -441,5 +485,37 @@ fn serializable_still_lets_updates_to_different_rows_proceed_concurrently_on_dis
     let result = db.execute("SELECT id, balance FROM accounts ORDER BY id").unwrap();
     assert_eq!(int_value(&result, 0, 1), 70);
     assert_eq!(int_value(&result, 1, 1), 55);
+    std::fs::remove_file(&path).unwrap();
+}
+
+/// `read_committed_select_after_update_does_not_release_the_update_s_exclusive_lock`
+/// のDiskバックエンド版。Diskバックエンドは行(`RecordId`)単位でロックする
+/// ため、`scan_lock_keys`が返す鍵の型(`LockKey::Tuple`)がMemoryバックエンド
+/// (`LockKey::Table`)と異なる。どちらの粒度でも、`acquire_scan_locks`が
+/// 「新規取得分だけ」を解放する規律は変わらないことを確認する。
+#[test]
+fn read_committed_select_after_update_does_not_release_the_update_s_exclusive_lock_on_disk() {
+    let (mut db, path) = accounts_disk_db("isolation-read-committed-update-then-select");
+    db.execute("INSERT INTO accounts VALUES (1, 100)").unwrap();
+
+    let t1 = db.begin_tx_with_isolation(IsolationLevel::ReadCommitted);
+    let t2 = db.begin_tx_with_isolation(IsolationLevel::ReadCommitted);
+
+    db.execute_in_tx(&t1, "UPDATE accounts SET balance = 70 WHERE id = 1").unwrap();
+
+    let read = db.execute_in_tx(&t1, "SELECT balance FROM accounts WHERE id = 1").unwrap();
+    assert_eq!(int_value(&read, 0, 0), 70, "T1は自分の未コミットの書き込みを読める");
+
+    assert!(
+        matches!(db.execute_in_tx(&t2, "UPDATE accounts SET balance = 999 WHERE id = 1"), Err(DbError::WouldBlock)),
+        "T1のUPDATEが持つTuple Lockが、直後のSELECTで誤って解放されている"
+    );
+
+    db.commit_tx(t1).unwrap();
+
+    db.execute_in_tx(&t2, "UPDATE accounts SET balance = 999 WHERE id = 1").unwrap();
+    db.commit_tx(t2).unwrap();
+
+    assert_eq!(int_value(&db.execute("SELECT balance FROM accounts").unwrap(), 0, 0), 999);
     std::fs::remove_file(&path).unwrap();
 }

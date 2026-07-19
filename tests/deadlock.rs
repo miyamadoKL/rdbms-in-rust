@@ -159,3 +159,71 @@ fn a_three_way_cycle_is_also_detected() {
     assert_eq!(int_value(&db.execute("SELECT v FROM tc").unwrap(), 0, 0), 20, "T2がtcを更新できた");
     assert!(matches!(db.commit_tx(t3), Err(DbError::DeadlockDetected)), "T3はVictimのまま");
 }
+
+/// FIFOの待ち行列の順序**だけ**が循環を閉じている3本のトランザクションの
+/// 循環待ちも検出できる。
+///
+/// `wait_for_edges`(`src/lock_manager.rs`)は、モードが衝突する保持者への
+/// 辺に加えて、待ち行列上で自分の直前に並ぶ要求への辺(FIFOで追い越せない
+/// という依存)も返すようになった。この辺が無いと、T3の`SELECT`はT1の
+/// 保持する`Shared`と両立するため衝突辺が生まれず、実際には存在する循環
+/// (T1→T3→T2→T1)を見逃す(この章のレビューで実際に指摘された不具合)。
+///
+/// - T1が`ta`に`Shared`を持つ。
+/// - T2が`ta`に`Exclusive`を要求してBlocked(T1と衝突、循環はまだ無い)。
+/// - T3が`tb`に`Exclusive`を獲得したあと、`ta`に`Shared`を要求する。T1とは
+///   両立するが、待ち行列にはすでにT2がいるためFIFOでT2の後ろに並ぶ
+///   (循環はまだ無い)。
+/// - T1が`tb`に`Exclusive`を要求する。T3が保持する`tb`と衝突し(辺T1→T3)、
+///   これに「T3はT2の後ろで待っている」というFIFOの辺(T3→T2)と、
+///   「T2はT1と衝突している」という辺(T2→T1)が合わさって、T1→T3→T2→T1の
+///   循環が閉じる。この要求を出したT1自身が循環内で最も新しいトランザク
+///   ション(3番目に`begin_tx`した)なので、VictimはT1自身になる。
+#[test]
+fn a_cycle_closed_only_by_fifo_wait_queue_order_is_also_detected() {
+    let mut db = temp_db();
+    db.execute("CREATE TABLE ta (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)").unwrap();
+    db.execute("CREATE TABLE tb (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)").unwrap();
+    db.execute("INSERT INTO ta VALUES (1, 0)").unwrap();
+    db.execute("INSERT INTO tb VALUES (1, 0)").unwrap();
+
+    // T1がta・tbへ触れる前にT2・T3をbegin_txしておき、循環を最後に閉じる
+    // T1自身が(TransactionIdが最大の)Victimになるようにする
+    // (begin_txの順序と文の実行順序は独立である、`TransactionId`は
+    // `begin_tx`した順にしか大小関係を持たない)。
+    let t2 = db.begin_tx();
+    let t3 = db.begin_tx();
+    let t1 = db.begin_tx();
+
+    // T1がtaにSharedを持つ。
+    db.execute_in_tx(&t1, "SELECT * FROM ta").unwrap();
+
+    // T2のExclusiveはT1のSharedと衝突してBlocked。循環はまだ無い。
+    assert!(matches!(db.execute_in_tx(&t2, "UPDATE ta SET v = 2 WHERE id = 1"), Err(DbError::WouldBlock)));
+
+    // T3はtbのExclusiveを獲得する(誰も持っていない)。
+    db.execute_in_tx(&t3, "UPDATE tb SET v = 3 WHERE id = 1").unwrap();
+
+    // T3のSharedはT1の保持と両立するが、待ち行列のT2を追い越せずBlocked。
+    // モードの衝突は無いので、これはFIFOの順序だけによるブロックである。
+    assert!(matches!(db.execute_in_tx(&t3, "SELECT * FROM ta"), Err(DbError::WouldBlock)));
+
+    // T1がtbを要求すると、T3の保持と衝突する(辺T1→T3)。これにFIFOの辺
+    // (T3→T2)とモード衝突の辺(T2→T1)が合わさって循環が閉じる。
+    assert!(matches!(db.execute_in_tx(&t1, "UPDATE tb SET v = 10 WHERE id = 1"), Err(DbError::DeadlockDetected)));
+
+    // T1はVictimになったので、以降ROLLBACKしか受け付けない。
+    assert!(matches!(db.execute_in_tx(&t1, "SELECT 1"), Err(DbError::DeadlockDetected)));
+    db.rollback_tx(t1).unwrap();
+
+    // T1が手放したtaのShared(すでに解放済み)により、待ち行列の先頭T2が
+    // 昇格し、続けてT3もtaのSharedを獲得できる。
+    db.execute_in_tx(&t2, "UPDATE ta SET v = 2 WHERE id = 1").unwrap();
+    db.commit_tx(t2).unwrap();
+    let read = db.execute_in_tx(&t3, "SELECT v FROM ta WHERE id = 1").unwrap();
+    assert_eq!(int_value(&read, 0, 0), 2, "T2の更新をT3が読める");
+    db.commit_tx(t3).unwrap();
+
+    assert_eq!(int_value(&db.execute("SELECT v FROM ta").unwrap(), 0, 0), 2, "T2のtaへの更新は生き残る");
+    assert_eq!(int_value(&db.execute("SELECT v FROM tb").unwrap(), 0, 0), 3, "T3のtbへの更新は生き残る(T1はUndoされた)");
+}

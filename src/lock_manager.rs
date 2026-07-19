@@ -266,6 +266,15 @@ impl<K: Eq + Hash + Clone> LockManager<K> {
         self.entries.get(key).and_then(|entry| entry.holder_mode(txn))
     }
 
+    /// `key`に対して`txn`が現在保持しているロックの強さ。`Database::acquire_scan_locks`
+    /// が、これから獲得しようとするロックが「今回の文で新規に取得したもの」か
+    /// 「以前から(たとえば同じトランザクションの先行`UPDATE`から)保持していた
+    /// もの」かを区別するために使う(第32章、READ COMMITTEDが文末に解放して
+    /// よいのは前者だけであるため)。
+    pub(crate) fn held_mode(&self, txn: TransactionId, key: &K) -> Option<LockMode> {
+        self.entries.get(key).and_then(|entry| entry.holder_mode(txn))
+    }
+
     /// `txn`が保持している`keys`のロックだけを手放す(第32章、Read Committedの
     /// 「読み取りロックを文の終わりで解放する」を実現する)。[`LockManager::release_all`]
     /// と違い、`txn`が他に持っている(または待っている)ロックには一切触れない。
@@ -304,12 +313,26 @@ impl<K: Eq + Hash + Clone> LockManager<K> {
     /// いない)。この関数は、`Database`がWait-for Graphを組み立てるために
     /// 必要な生データ(誰が誰を待っているか)を提供するだけである。
     ///
-    /// 待ち行列の**順序**(FIFOの公平性)によるブロック(先頭のExclusive要求を
-    /// 追い越せない後続のShared要求など)は辺に含めない。ここで返すのは、
-    /// 要求されたモードと実際に保持されているモードが**両立しない**という、
-    /// 本物のロック衝突だけである。Upgrade要求(`is_upgrade`)は、自分以外の
-    /// 保持者全員と衝突するとみなす(唯一の保持者であれば`acquire`の時点で
-    /// 即座に`Granted`になっており、待ち行列に残ること自体がない)。
+    /// 待ち行列の**順序**(FIFOの公平性)によるブロックも辺に含める。
+    /// [`LockManager::promote_waiters`]は待ち行列を必ず先頭から順に処理し、
+    /// 先頭が昇格できなければそこで止まる。したがって、ある待ち要求が
+    /// 昇格できるのは、その**手前に並ぶすべての要求が先に昇格し終わった**
+    /// ときに限られる。つまり待ち行列上の各要求は、実際にモードが衝突する
+    /// 保持者だけでなく、自分より前に並ぶ直前の要求にも依存している
+    /// (直前の要求がその時点でたまたま保持者と両立していても、まだ
+    /// 待ち行列に残っている限り、後続の要求はそれを追い越して先に
+    /// 昇格することはない)。この依存を辺として表現しないと、FIFOの
+    /// 順序だけで実在する循環待ちを見逃す(本文「Wait-for GraphとFIFOの
+    /// 待ち行列」を参照)。
+    ///
+    /// 返す辺は次の2種類を合わせたものである。
+    ///
+    /// 1. 要求されたモードと実際に保持されているモードが**両立しない**、
+    ///    本物のロック衝突。Upgrade要求(`is_upgrade`)は、自分以外の保持者
+    ///    全員と衝突するとみなす(唯一の保持者であれば`acquire`の時点で
+    ///    即座に`Granted`になっており、待ち行列に残ること自体がない)。
+    /// 2. 待ち行列上で自分の直前に並ぶ要求への辺(FIFOで追い越せない
+    ///    という依存)。
     pub(crate) fn wait_for_edges(&self) -> Vec<(TransactionId, TransactionId)> {
         let mut edges = Vec::new();
         for entry in self.entries.values() {
@@ -323,6 +346,10 @@ impl<K: Eq + Hash + Clone> LockManager<K> {
                         edges.push((waiter.txn, holder));
                     }
                 }
+            }
+            for pair in entry.waiters.iter().collect::<Vec<_>>().windows(2) {
+                let [predecessor, successor] = pair else { unreachable!("windows(2)は常に2要素を返す") };
+                edges.push((successor.txn, predecessor.txn));
             }
         }
         edges
@@ -518,6 +545,35 @@ mod tests {
         let mut edges = lm.wait_for_edges();
         edges.sort_by_key(|(waiter, holder)| (waiter.0, holder.0));
         assert_eq!(edges, vec![(T1, T2), (T2, T1)]);
+    }
+
+    /// `wait_for_edges`は、モードの衝突による辺だけでなく、待ち行列上で
+    /// 自分の直前に並ぶ要求への辺(FIFOで追い越せないという依存)も返す。
+    ///
+    /// T1がAにSharedを持ち、T2がAにExclusiveを要求してBlocked(モード
+    /// 衝突の辺T2→T1)。T3がBのExclusiveを獲得したあと、AにSharedを要求
+    /// する。T1のSharedとは両立するが、待ち行列にはすでにT2がいるため
+    /// FIFOでT2の後ろに並ぶ(モードの衝突は無いので、この待ちを表す辺が
+    /// 無いと循環が見えなくなる)。最後にT1がBのExclusiveを要求すると、
+    /// T3の保持と衝突する(辺T1→T3)。この3本の辺が揃って初めて、
+    /// T1→T3→T2→T1という循環が閉じる(第32章のレビューで実際に指摘
+    /// された、この辺の欠落による見逃しを固定する)。
+    #[test]
+    fn wait_for_edges_includes_fifo_queue_position_dependency() {
+        let mut lm = LockManager::new();
+        let a = table(1);
+        let b = table(2);
+
+        assert_eq!(lm.acquire(T1, a, LockMode::Shared), LockResult::Granted);
+        assert_eq!(lm.acquire(T2, a, LockMode::Exclusive), LockResult::Blocked);
+        assert_eq!(lm.acquire(T3, b, LockMode::Exclusive), LockResult::Granted);
+        // T3のSharedはT1の保持と両立するが、待ち行列のT2を追い越せずBlocked。
+        assert_eq!(lm.acquire(T3, a, LockMode::Shared), LockResult::Blocked);
+        assert_eq!(lm.acquire(T1, b, LockMode::Exclusive), LockResult::Blocked);
+
+        let mut edges = lm.wait_for_edges();
+        edges.sort_by_key(|(waiter, holder)| (waiter.0, holder.0));
+        assert_eq!(edges, vec![(T1, T3), (T2, T1), (T3, T2)], "T1→T3→T2→T1の循環を閉じる3本の辺が揃っている");
     }
 
     /// 両立するShared同士は衝突ではないため、`wait_for_edges`は辺を作らない。

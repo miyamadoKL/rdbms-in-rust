@@ -343,6 +343,16 @@ fn index_file_path(db_path: &Path, index_name: &str) -> PathBuf {
     PathBuf::from(os_string)
 }
 
+/// `rebuild_one_index_after_recovery`が索引を作り直す間だけ使う、一時ファイルの
+/// パス(第34章、`Storage::rebuild_all_indexes_after_recovery`を参照)。
+/// 索引の本体ファイルと同じディレクトリに置くことで、`std::fs::rename`が
+/// 同一ファイルシステム内のアトミックな置き換えになることを保証する。
+fn index_rebuild_temp_path(db_path: &Path, index_name: &str) -> PathBuf {
+    let mut os_string = index_file_path(db_path, index_name).into_os_string();
+    os_string.push(".rebuilding");
+    PathBuf::from(os_string)
+}
+
 /// `db_path`のWALファイル(第33章)のパスを組み立てる。索引ファイル
 /// ([`index_file_path`])と同じ命名の流儀で、本体のデータファイルとは
 /// 別のファイル`<db_path>.wal`に置く。
@@ -741,24 +751,49 @@ impl Storage {
     /// いない(モジュール冒頭を参照)。索引ページがクラッシュ後にどこまで
     /// 反映されているかを保証する手段が無いため、この章はクラッシュ後の
     /// 索引を個別に修復しようとせず、Heap(WALによって正しく復元済み)から
-    /// 全索引を丸ごと作り直す方式を選んだ。索引ファイルを削除して
-    /// `BTree::create`し直し、`Self::build_index`と同じ手順(対象列がNULLで
-    /// ない行だけを挿入)で作り直す。`unique`索引で既存行に重複キーがあった
-    /// 場合(本来クラッシュ前に検査済みのはずだが、念のため)は
-    /// `DbError`をそのまま返す。
-    pub(crate) fn rebuild_all_indexes_after_recovery(&mut self) -> DbResult<()> {
+    /// 全索引を丸ごと作り直す方式を選んだ。`Self::build_index`と同じ手順
+    /// (対象列がNULLでない行だけを挿入)で作り直す。`unique`索引で既存行に
+    /// 重複キーがあった場合(本来クラッシュ前に検査済みのはずだが、念のため)
+    /// は`DbError`をそのまま返す。
+    ///
+    /// # 索引ファイルの入れ替えは一時ファイル経由(第5部レビュー対応)
+    ///
+    /// 索引の作り直しは、既存の索引ファイルを直接削除して同じパスへ
+    /// 作り直すのではなく、同じディレクトリの**一時ファイル**へ新しい索引を
+    /// 書き、その一時ファイルを指す`BTree`を`self.indexes`へ組み込む。
+    /// 既存の索引ファイル自体(`index_file_path`が指すパス)は、この時点では
+    /// 一切変更しない。
+    ///
+    /// 戻り値の`Vec<(PathBuf, PathBuf)>`は、`(一時ファイル, 本来の索引
+    /// ファイル)`の組であり、呼び出し元(`crate::recovery::recover`)が
+    /// Redo・Undo・検証をすべて終えたあとの`Storage::flush`・`sync`と同じ
+    /// タイミングで`std::fs::rename`し、初めて既存の索引ファイルを置き換える。
+    /// これにより、Redo・Undoの途中で`recover`が失敗しても
+    /// (`crate::recovery`モジュールドキュメントの「Undo中のクラッシュへの
+    /// 耐性」)、索引ファイルのバイト列も他のファイルと同じく、`recover`を
+    /// 呼ぶ直前から一切変わらないままになる。
+    /// `self.indexes`が指す`BTree`自体はすでに一時ファイルを指しているため、
+    /// この後に続く`Undo`(`apply_wal_undo_disk`が呼ぶ`index_insert_row`・
+    /// `index_delete_row`)は、この一時ファイル上のインメモリな`BTree`を
+    /// そのまま正しく更新できる。
+    pub(crate) fn rebuild_all_indexes_after_recovery(&mut self) -> DbResult<Vec<(PathBuf, PathBuf)>> {
         let index_names: Vec<String> = self.indexes.keys().cloned().collect();
+        let mut pending_renames = Vec::with_capacity(index_names.len());
         for index_name in index_names {
-            self.rebuild_one_index_after_recovery(&index_name)?;
+            pending_renames.push(self.rebuild_one_index_after_recovery(&index_name)?);
         }
-        Ok(())
+        Ok(pending_renames)
     }
 
-    fn rebuild_one_index_after_recovery(&mut self, index_name: &str) -> DbResult<()> {
+    fn rebuild_one_index_after_recovery(&mut self, index_name: &str) -> DbResult<(PathBuf, PathBuf)> {
         let info = self.indexes.get(index_name).expect("index_namesはself.indexesのキーそのもの").info.clone();
         let index_path = index_file_path(&self.path, index_name);
-        let _ = std::fs::remove_file(&index_path);
-        let disk = DiskManager::open(&index_path)?;
+        let temp_path = index_rebuild_temp_path(&self.path, index_name);
+        // 前回の`recover`がここまで進んで失敗した場合、この一時ファイルが
+        // 残っている可能性がある。中身は不完全かもしれないので、まっさらな
+        // 状態から作り直す(本来の索引ファイルには一度も触れていない)。
+        let _ = std::fs::remove_file(&temp_path);
+        let disk = DiskManager::open(&temp_path)?;
         let btree = BTree::create(BufferPool::new(disk, DEFAULT_BUFFER_POOL_CAPACITY), info.key_type, info.unique)?;
 
         let table_info = self.tables.get(&info.table_id).expect("索引の対象テーブルはDROP TABLEされていない前提").info.clone();
@@ -775,7 +810,7 @@ impl Storage {
             btree.insert(value, *rid)?;
         }
         self.indexes.get_mut(index_name).expect("index_namesはself.indexesのキーそのもの").btree = btree;
-        Ok(())
+        Ok((temp_path, index_path))
     }
 
     /// 手動`CHECKPOINT`(第34章)。全dirtyページ(データ・カタログ・索引)を

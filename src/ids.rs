@@ -14,7 +14,7 @@
 /// let table_id = TableId(1);
 /// load_page(table_id); // 型が違うためコンパイルエラー
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PageId(pub u64);
 
 /// カタログに登録されたテーブルを指す識別子。
@@ -49,7 +49,13 @@ pub struct SlotId(pub u16);
 /// `PageId`だけでは同じページ内の複数のタプルを区別できず、`SlotId`だけでは
 /// どのページのスロットを指しているのかが分からない。この2つの組がそろって
 /// 初めて、データベース全体でタプル1件の位置を一意に表せる。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `Ord`を導出しているのは、`(page_id, slot_id)`の辞書式順序が、
+/// `crate::btree::RangeScan`が重複キーの範囲を安定した全順序で走査するための
+/// 基準になるためである(`crate::btree`モジュールの`ScanPosition::After`を
+/// 参照)。この順序自体に業務上の意味は無く、単に「常に同じ結果になる、
+/// 何らかの全順序」であればよい。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RecordId {
     /// このタプルが格納されているページ。
     pub page_id: PageId,

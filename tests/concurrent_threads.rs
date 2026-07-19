@@ -396,6 +396,112 @@ fn deadlock_between_two_real_threads_is_detected_and_resolved() {
     std::fs::remove_file(minidb_wal_path(&path)).ok();
 }
 
+/// FIFOの待ち行列の順序**だけ**が循環を閉じている3本のトランザクションの
+/// 循環待ちを、実スレッドの上でも検出・解決できる。
+///
+/// `tests/deadlock.rs`の`a_cycle_closed_only_by_fifo_wait_queue_order_is_also_detected`
+/// と同じ状況(T1がtaにSharedを持ち、T2がtaにExclusiveを要求してBlocked、
+/// T3がtbのExclusiveを獲得したあとtaにSharedを要求してT2の後ろにFIFOで
+/// 並ぶ、そこへT1がtbのExclusiveを要求してT1→T3→T2→T1の循環が閉じる)を
+/// 実スレッドで再現する。
+///
+/// 待ち行列上の位置(どちらが先に`ta`を要求したか)が循環の成立に直結する
+/// ため、ロックの状態そのものは決定的な(単一スレッドの)`Database`の上で
+/// 先に組み立てる。`Database::execute_in_tx`は`WouldBlock`を**値**として
+/// 返すだけで実スレッドを止めないので、この組み立て自体は`tests/deadlock.rs`
+/// と同じ理由で完全に決定的である。組み立て終えたあとの`Database`を
+/// `SharedDatabase`で包み、T2・T3の要求を実スレッドとして再発行させることで、
+/// 「循環の解決によって手放されたロックを、`Condvar`で本当に眠っていた
+/// スレッドが正しく引き継いで起き上がる」という、この章(第35章)が
+/// 追加した層を検証する。
+///
+/// 実スレッドが本当にデッドロックしたまま止まっていれば、このテスト自体が
+/// ハングする。ハングしたままCIを止めないよう、完了通知に上限時間を設ける。
+#[test]
+fn three_way_deadlock_closed_only_by_fifo_wait_queue_order_is_detected_on_real_threads() {
+    let mut db = minidb::Database::memory();
+    db.execute("CREATE TABLE ta (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)").unwrap();
+    db.execute("CREATE TABLE tb (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)").unwrap();
+    db.execute("INSERT INTO ta VALUES (1, 0)").unwrap();
+    db.execute("INSERT INTO tb VALUES (1, 0)").unwrap();
+
+    // begin_txの順序どおりにTransactionIdが振られる。循環を最後に閉じる
+    // T1自身が(TransactionIdが最大の)Victimになるよう、T1は最後にbegin_tx
+    // する(`tests/deadlock.rs`の同名テストと同じ理由)。
+    let t2 = db.begin_tx();
+    let t3 = db.begin_tx();
+    let t1 = db.begin_tx();
+
+    // ここから3行、決定的な単一スレッドの`Database`の上でロックの待ち行列を
+    // 組み立てる。T1がtaにSharedを持ち、T2のExclusive要求がBlockedになり、
+    // T3がtbのExclusiveを獲得したあとtaのShared要求がT2の後ろにFIFOで並ぶ。
+    db.execute_in_tx(&t1, "SELECT * FROM ta").unwrap();
+    assert!(matches!(db.execute_in_tx(&t2, "UPDATE ta SET v = 2 WHERE id = 1"), Err(DbError::WouldBlock)));
+    db.execute_in_tx(&t3, "UPDATE tb SET v = 3 WHERE id = 1").unwrap();
+    assert!(matches!(db.execute_in_tx(&t3, "SELECT * FROM ta"), Err(DbError::WouldBlock)));
+
+    // ここまでで組み立てたロックの状態を保ったまま、実スレッドから触れる
+    // `SharedDatabase`へ包み直す。
+    let shared = Arc::new(SharedDatabase::new(db));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+    // T2・T3は、さっきBlockedになったのと同じ文をもう一度発行する。待ち
+    // 行列にはすでに自分自身が並んでいるので結果は変わらず、今度こそ
+    // `SharedDatabase`が本物の`Condvar::wait`でスレッドを眠らせる。
+    let t2_thread = {
+        let shared = Arc::clone(&shared);
+        let done_tx = done_tx.clone();
+        thread::spawn(move || {
+            let result = shared.execute_in_tx(&t2, "UPDATE ta SET v = 2 WHERE id = 1");
+            if result.is_ok() {
+                shared.commit_tx(t2).unwrap();
+            }
+            let _ = done_tx.send(());
+            result
+        })
+    };
+    let t3_thread = {
+        let shared = Arc::clone(&shared);
+        let done_tx = done_tx.clone();
+        thread::spawn(move || {
+            let result = shared.execute_in_tx(&t3, "SELECT * FROM ta");
+            if result.is_ok() {
+                shared.commit_tx(t3).unwrap();
+            }
+            let _ = done_tx.send(());
+            result
+        })
+    };
+
+    // T1がtbのExclusiveを要求すると、T3が保持するtbと衝突する(辺T1→T3)。
+    // これにFIFOの辺(T3→T2)とモード衝突の辺(T2→T1)が合わさって循環が
+    // 閉じ、循環内で最も新しいT1自身がVictimに選ばれる。
+    let t1_result = shared.execute_in_tx(&t1, "UPDATE tb SET v = 10 WHERE id = 1");
+    assert!(matches!(t1_result, Err(DbError::DeadlockDetected)), "T1が循環を閉じ、自らVictimになるはず");
+    shared.rollback_tx(t1).unwrap();
+
+    // T1がtaのSharedを手放したことで、待ち行列の先頭で眠っていたT2が
+    // 起こされて昇格し、コミットして手放すと続けてT3も昇格する。
+    for _ in 0..2 {
+        done_rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "実スレッドがデッドロックの解決後も起こされていない(Condvarで待機したスレッドが\
+             永久に起こされていない可能性がある)",
+        );
+    }
+
+    assert!(t2_thread.join().unwrap().is_ok(), "T2はT1のUndo後に昇格して完走するはず");
+    assert!(t3_thread.join().unwrap().is_ok(), "T3はT2のCOMMIT後に昇格して完走するはず");
+
+    let handle = shared.begin_tx();
+    let result = shared.execute_in_tx(&handle, "SELECT v FROM ta WHERE id = 1").unwrap();
+    let tb_result = shared.execute_in_tx(&handle, "SELECT v FROM tb WHERE id = 1").unwrap();
+    shared.commit_tx(handle).unwrap();
+    let Value::BigInt(ta_v) = result.rows()[0].values()[0] else { panic!("BigInt") };
+    let Value::BigInt(tb_v) = tb_result.rows()[0].values()[0] else { panic!("BigInt") };
+    assert_eq!(ta_v, 2, "T2のtaへの更新は生き残る");
+    assert_eq!(tb_v, 3, "T3のtbへの更新は生き残る(VictimになったT1のtbへの書き込みはUndoされる)");
+}
+
 /// `Database::open`が使うWALファイルのパス(`{path}.wal`)。テスト後の後片付け
 /// にだけ使う。
 fn minidb_wal_path(db_path: &std::path::Path) -> std::path::PathBuf {

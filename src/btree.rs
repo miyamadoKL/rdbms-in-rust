@@ -1019,6 +1019,43 @@ impl RangeScan<'_> {
     }
 }
 
+/// `view`の中で、キー`key`に一致する連続範囲(重複キーの範囲、`view.find`が
+/// `Ok`を返した位置を起点に前後へ広げる)を`[lo, hi)`として返す。`key`が
+/// 存在しなければ`lo == hi`(挿入位置)になる。
+fn same_key_range(view: &LeafPageRef<'_>, key: &[u8]) -> (usize, usize) {
+    match view.find(key) {
+        Ok(found) => {
+            let mut lo = found;
+            while lo > 0 && view.key(lo - 1) == key {
+                lo -= 1;
+            }
+            let mut hi = found + 1;
+            while hi < view.entry_count() && view.key(hi) == key {
+                hi += 1;
+            }
+            (lo, hi)
+        }
+        Err(i) => (i, i),
+    }
+}
+
+/// `[lo, hi)`の範囲の中から、`RecordId`が最小のエントリの添字を返す
+/// (`after`が`Some`なら、その`RecordId`より大きいものだけを対象にする)。
+/// 該当するエントリが無ければ`None`。
+///
+/// 重複キーを持つエントリは、物理的な格納順(`leaf_insert_position`が
+/// 決める挿入順)を保っており、`RecordId`順には並んでいない。そこでこの
+/// 関数は範囲全体を線形に探し、`RecordId`の値そのものを比較して最小を選ぶ。
+/// [`ScanPosition::After`]のドキュメントに書いたとおり、この「`(key, rid)`の
+/// 辞書式順序」を重複キーの走査順序として使うことで、直前に返した`rid`が
+/// 削除によってもう存在しなくても、安定した基準(値の大小)から次に返す
+/// べきエントリを再特定できる。
+fn min_rid_index_after(view: &LeafPageRef<'_>, lo: usize, hi: usize, after: Option<RecordId>) -> Option<usize> {
+    (lo..hi)
+        .filter(|&i| after.is_none_or(|prev| view.record_id(i) > prev))
+        .min_by_key(|&i| view.record_id(i))
+}
+
 /// `view`(ある時点の葉の中身)の中で、`position`が指す位置を今の中身に
 /// 対して探し直し、次に返すべきエントリの添字を返す(無ければ
 /// `view.entry_count()`、この葉にはもう無いという意味)。
@@ -1029,15 +1066,17 @@ impl RangeScan<'_> {
 fn locate_within_leaf(view: &LeafPageRef<'_>, position: &ScanPosition) -> usize {
     match position {
         ScanPosition::Start(Bound::Unbounded) => 0,
-        ScanPosition::Start(Bound::Included(k)) => match view.find(k) {
-            Ok(mut i) => {
-                while i > 0 && view.key(i - 1) == k.as_slice() {
-                    i -= 1;
-                }
-                i
+        ScanPosition::Start(Bound::Included(k)) => {
+            let (lo, hi) = same_key_range(view, k);
+            if lo == hi {
+                // `k`自体は無い(挿入位置)。`same_key_range`が`Err`から
+                // 返した位置をそのまま使う。
+                return lo;
             }
-            Err(i) => i,
-        },
+            // 重複キーの範囲では、`RecordId`が最小のエントリから走査を
+            // 始める(`min_rid_index_after`のドキュメントを参照)。
+            min_rid_index_after(view, lo, hi, None).expect("空でない範囲には必ず最小のRecordIdが1件ある")
+        }
         ScanPosition::Start(Bound::Excluded(k)) => match view.find(k) {
             Ok(mut hi) => {
                 while hi + 1 < view.entry_count() && view.key(hi + 1) == k.as_slice() {
@@ -1047,26 +1086,18 @@ fn locate_within_leaf(view: &LeafPageRef<'_>, position: &ScanPosition) -> usize 
             }
             Err(i) => i,
         },
-        ScanPosition::After(key, rid) => match view.find(key) {
-            Ok(mut i) => {
-                while i > 0 && view.key(i - 1) == key.as_slice() {
-                    i -= 1;
-                }
-                // 同じキーが連続する範囲(重複キー、モジュールドキュメントを
-                // 参照)を、直前に返した`rid`が見つかるまで読み進める。
-                // 見つかった次の位置から再開する。見つからなければ
-                // (このRIDだけ何らかの理由で読めなくなった場合の保険として)
-                // その範囲を通り過ぎた位置から再開する。
-                while i < view.entry_count() && view.key(i) == key.as_slice() {
-                    if view.record_id(i) == *rid {
-                        return i + 1;
-                    }
-                    i += 1;
-                }
-                i
-            }
-            Err(i) => i,
-        },
+        ScanPosition::After(key, rid) => {
+            let (lo, hi) = same_key_range(view, key);
+            // 同じキーが連続する範囲(重複キー、モジュールドキュメントを
+            // 参照)の中から、直前に返した`rid`より`RecordId`が大きい
+            // エントリのうち最小のものへ進む。直前の`rid`自体がまだ範囲内に
+            // 残っていても(通常の1歩)、削除されてもう無くても(この章の
+            // レビューで指摘された不具合の再現条件)、どちらでも同じ規則で
+            // 「まだ返していない、次に小さいエントリ」を安定して選べる。
+            // 該当が無ければ、この範囲を読み尽くしたということなので、
+            // 範囲の終わり(`hi`)を返す。
+            min_rid_index_after(view, lo, hi, Some(*rid)).unwrap_or(hi)
+        }
     }
 }
 
@@ -1882,6 +1913,104 @@ mod tests {
 
         let upper_only = collect_range(&btree, Bound::Unbounded, Bound::Excluded(&Value::BigInt(3)));
         assert_eq!(upper_only.iter().map(|(n, _)| *n).collect::<Vec<_>>(), (0..3).collect::<Vec<_>>());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// レビュー指摘の再現条件: 重複キーの`RangeScan`が1件返した直後、その
+    /// `RecordId`が`delete`されると、残りの重複キーのエントリを取りこぼす
+    /// ことなく返し続けなければならない。
+    ///
+    /// 修正前の`locate_within_leaf`(`ScanPosition::After`の分岐)は、
+    /// 直前に返した`rid`が見つからないとき、同じキーの範囲を最後まで
+    /// 通り過ぎた位置から再開していた。この再現条件では、キー5にRID
+    /// 1・2・3を挿入し、`RangeScan`が最初の1件を返した直後にその`RecordId`を
+    /// `delete`する。修正前は残り2件が両方とも消えていた
+    /// (`残りは[]`になっていた)。
+    #[test]
+    fn range_scan_resumes_correctly_after_the_just_returned_rid_is_deleted() {
+        let path = temp_path("range-delete-mid-scan");
+        let btree = open_btree(&path, DataType::BigInt);
+        let rids = [rid(1, 0), rid(1, 1), rid(2, 0)];
+        for &r in &rids {
+            btree.insert(&Value::BigInt(5), r).unwrap();
+        }
+
+        let mut scan = btree.range(Bound::Included(&Value::BigInt(5)), Bound::Included(&Value::BigInt(5))).unwrap();
+        let (_, first_rid) = scan.next().unwrap().unwrap();
+        assert!(btree.delete(&Value::BigInt(5), first_rid).unwrap(), "直前にRangeScanが返したRIDを削除する");
+
+        let mut remaining: Vec<RecordId> = scan.map(|entry| entry.unwrap().1).collect();
+        remaining.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        let mut expected: Vec<RecordId> = rids.iter().copied().filter(|&r| r != first_rid).collect();
+        expected.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        assert_eq!(remaining, expected, "削除されなかった残り2件を、取りこぼさずすべて返すはず");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// 上と同じ状況を、Leaf Splitで複数の葉にまたがるほど多い重複キーの
+    /// エントリで確認する。
+    #[test]
+    fn range_scan_resumes_correctly_after_delete_when_duplicates_span_multiple_leaves() {
+        let path = temp_path("range-delete-mid-scan-split");
+        let btree = open_btree(&path, DataType::Text);
+        let wide_value = "x".repeat(120);
+        let n = 200usize;
+        let rids: Vec<RecordId> = (0..n).map(|i| rid(1, i as u16)).collect();
+        for &r in &rids {
+            btree.insert(&Value::Text(wide_value.clone()), r).unwrap();
+        }
+        assert!(btree.height().unwrap() >= 2, "重複キーの葉分割が起きているはず");
+
+        let key = Value::Text(wide_value.clone());
+        let mut scan = btree.range(Bound::Included(&key), Bound::Included(&key)).unwrap();
+        let (_, first_rid) = scan.next().unwrap().unwrap();
+        assert!(btree.delete(&Value::Text(wide_value.clone()), first_rid).unwrap());
+
+        let mut remaining: Vec<RecordId> = scan.map(|entry| entry.unwrap().1).collect();
+        remaining.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        let mut expected: Vec<RecordId> = rids.iter().copied().filter(|&r| r != first_rid).collect();
+        expected.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        assert_eq!(remaining, expected, "葉をまたぐ重複キーでも、削除されなかった全件を取りこぼさないはず");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// `next`の合間に同じキーへの`insert`が挟まっても、すでに読み終えた
+    /// エントリを二重に返したり、`panic`したりしない。新しく挿入された
+    /// エントリ自体をこのスキャンが拾うかどうかは未規定(このテストは
+    /// 主張しない)。
+    #[test]
+    fn range_scan_tolerates_an_insert_of_the_same_key_between_next_calls() {
+        let path = temp_path("range-insert-mid-scan");
+        let btree = open_btree(&path, DataType::BigInt);
+        let initial = [rid(1, 0), rid(1, 1)];
+        for &r in &initial {
+            btree.insert(&Value::BigInt(5), r).unwrap();
+        }
+
+        let mut scan = btree.range(Bound::Included(&Value::BigInt(5)), Bound::Included(&Value::BigInt(5))).unwrap();
+        let (_, first_rid) = scan.next().unwrap().unwrap();
+
+        let inserted = rid(9, 9);
+        btree.insert(&Value::BigInt(5), inserted).unwrap();
+
+        let mut remaining: Vec<RecordId> = scan.map(|entry| entry.unwrap().1).collect();
+        let mut seen = remaining.clone();
+        seen.push(first_rid);
+        seen.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        seen.dedup();
+        assert_eq!(seen.len(), remaining.len() + 1, "同じエントリを二重に返していないはず");
+
+        let original_remaining: Vec<RecordId> = initial.iter().copied().filter(|&r| r != first_rid).collect();
+        for r in original_remaining {
+            assert!(remaining.contains(&r), "挿入前から存在した残りのエントリは取りこぼさないはず");
+        }
+        // `inserted`自体をこのスキャンが拾うかどうかは未規定なので、それ以外の
+        // 余計なエントリが紛れ込んでいないことだけを確認する。
+        remaining.retain(|r| *r != inserted);
+        assert_eq!(remaining.len(), initial.len() - 1, "挿入前から存在したエントリ以外が紛れ込んでいないはず");
+
         std::fs::remove_file(&path).unwrap();
     }
 

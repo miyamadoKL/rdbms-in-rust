@@ -208,12 +208,20 @@ fn acquire_scan_locks(&mut self, owner: TransactionId, table_ids: &[TableId], mo
         keys.extend(table_ids.iter().map(|&id| LockKey::Table(id)));
     }
 
+    // READ COMMITTEDが文末に解放してよいのは、この文で新規に取得した
+    // Sharedロックだけである。`owner`がこの鍵をすでに保持しているかを、
+    // 実際に獲得する前に記録しておく。
+    let mut newly_acquired = Vec::new();
     for &key in &keys {
+        let already_held = self.lock_manager.held_mode(owner, &key).is_some();
         self.acquire_lock_or_detect_deadlock(owner, key, mode)?;
+        if !already_held {
+            newly_acquired.push(key);
+        }
     }
 
     if level == IsolationLevel::ReadCommitted && mode == LockMode::Shared {
-        self.lock_manager.release_keys(owner, &keys);
+        self.lock_manager.release_keys(owner, &newly_acquired);
     }
     Ok(())
 }
@@ -227,9 +235,16 @@ fn acquire_scan_locks(&mut self, owner: TransactionId, table_ids: &[TableId], mo
 読み取りロックが無いので、他のトランザクションが持つExclusiveロックと衝突しようがありません。
 これがDirty Readを許す理由そのものです。
 
-**Read Committed**は、いったん通常どおりロックを獲得してから、関数を抜ける直前に獲得した鍵だけを手放します。
+**Read Committed**は、いったん通常どおりロックを獲得してから、関数を抜ける直前に、この文で**新規に**獲得した鍵だけを手放します。
 「取ってすぐ返す」ため、Shared Lockを取る瞬間には他のトランザクションの未確定なExclusiveと衝突判定が働き(Dirty Readは防げます)、読み終えたあとは何にも縛られません(次の文の実行時点では、他のトランザクションが自由に書き換えられるため、Non-repeatable Readは防げません)。
-この「読み終えたら即解放」を担うのが`LockManager::release_keys`です。
+
+「新規に」を強調したのには理由があります。
+`owner`が同じトランザクションの先行する`UPDATE`によって、すでにこの鍵にExclusiveロックを持っていることがあります。
+このとき`self.lock_manager.acquire`はすでに十分なロックを持っている(`Exclusive`は`Shared`の要求も満たす)と判断してその場で`Granted`を返しますが、これは「新しく獲得した」わけではありません。
+`keys`に積まれた鍵をそのまま`release_keys`に渡してしまうと、`UPDATE`が確定前の変更を守っていたはずのExclusiveロックを、直後の`SELECT`が同じ行をなぞっただけで解放してしまいます。
+そうなれば、`COMMIT`の前にもかかわらず、他のトランザクションがその未確定の行を書き換えられてしまいます。
+このため、鍵ごとに獲得する**前**の保持状況を`held_mode`で確認し、`newly_acquired`(今回の文で本当に新しく取得した鍵だけ)を`release_keys`に渡します。
+この「読み終えたら、今回新しく取った分だけ即解放」を担うのが`LockManager::release_keys`です。
 
 ```rust
 pub(crate) fn release_keys(&mut self, txn: TransactionId, keys: &[K]) {
@@ -375,7 +390,7 @@ fn serializable_prevents_phantom_read_on_disk_backend() {
 
 ```console
 $ cargo test --test isolation_levels
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 ## デッドロックの検出とVictim Selection
@@ -417,6 +432,10 @@ pub(crate) fn wait_for_edges(&self) -> Vec<(TransactionId, TransactionId)> {
                 }
             }
         }
+        for pair in entry.waiters.iter().collect::<Vec<_>>().windows(2) {
+            let [predecessor, successor] = pair else { unreachable!("windows(2)は常に2要素を返す") };
+            edges.push((successor.txn, predecessor.txn));
+        }
     }
     edges
 }
@@ -424,9 +443,29 @@ pub(crate) fn wait_for_edges(&self) -> Vec<(TransactionId, TransactionId)> {
 
 `LockManager`自身はこの先の処理(グラフの探索、Victim Selection)を一切行いません。
 第31章から「ロックの獲得と解放」に絞ってきたこの型の責務は変えず、複数のトランザクションをまたいだグラフ探索は1段上の`Database`に置きます。
-返す辺も、待ち行列の**順序**(FIFOの公平性)によるブロックは含めません。
-先頭のExclusive要求を追い越せない後続のShared要求のような、資源の衝突ではなく順番待ちにすぎないケースを混ぜると、実際には資源を取り合っていない2つのトランザクションの間にまで辺を引いてしまいます。
-ここで返すのは、要求されたモードと実際に保持されているモードが本物の意味で衝突する辺だけです。
+
+返す辺は2種類あります。
+1つは、要求されたモードと実際に保持されているモードが本物の意味で衝突する辺です。
+もう1つが、待ち行列上で自分の直前に並ぶ要求への辺です。
+この2つめの辺が無いと、実在する循環待ちを見逃すことがあります。
+
+`promote_waiters`(第31章)は待ち行列を必ず先頭から順に処理し、先頭が昇格できなければそこで止まります。
+つまり、ある待ち要求が昇格できるのは、その手前に並ぶすべての要求が先に昇格し終わったときに限られます。
+先頭のExclusive要求を追い越せない後続のShared要求も例外ではありません。
+その後続のShared要求は、たとえ今の保持者と両立していても、手前の要求が残っている限り追い越して先に昇格することはないのです。
+
+具体的に考えてみます。
+T1がテーブルAにSharedロックを持ち、T2がテーブルAにExclusiveを要求してBlockedになったとします(T2→T1、モード衝突による辺)。
+続けてT3がテーブルBにExclusiveを獲得したあと、テーブルAにSharedを要求します。
+T1の持つSharedとは両立するのですが、待ち行列にはすでにT2が並んでいるため、T3はT2を追い越せずFIFOで後ろに並びます。
+ここでT3が両立と衝突判定だけを見ると、T3はT1と衝突していないので辺が生まれません。
+しかし実際には、T3はT2が昇格するまで進めないという意味で、T2に依存しています。
+最後にT1がテーブルBにExclusiveを要求すると、T3が保持するテーブルBと衝突し(T1→T3)、この時点でT1→T3→T2→T1という循環がすでに実在します。
+待ち行列の順序による依存(T3→T2)を辺として持たなければ、このグラフはT1→T3とT2→T1の2本しか持たず、閉路が無いように見えてしまいます。
+実際には`Blocked`のまま3本とも止まったままなのに、`Database::detect_deadlock`はデッドロックを検出できません。
+
+この依存を辺として表すために、待ち行列を先頭から見て隣り合う要求ごとに、後続から手前への辺を追加します。
+これは「モードが衝突する保持者」への辺とは別の、待ち行列の位置そのものによる依存です。
 
 `Database`側は、この辺からトランザクションIDごとの隣接表を組み立て、要求元(`owner`)を起点にDFSで自分自身へ戻ってくる経路を探します。
 
@@ -647,9 +686,9 @@ T3がVictimとしてAbortされたあとも、T1とT2は1本ずつロックを�
 
 ```console
 $ cargo test --test deadlock
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 $ cargo test --lib lock_manager
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 ## この章の限界
