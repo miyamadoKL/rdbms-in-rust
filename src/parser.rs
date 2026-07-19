@@ -22,10 +22,10 @@
 //! 優先順位は低い順に`OR` < `AND` < `NOT` < 比較 < `+` `-` < `*` `/` < 単項`-`。
 
 use crate::ast::{
-    AggregateFunc, AnalyzeStatement, Assignment, BeginStatement, BinaryOperator, ColumnDef, CommitStatement,
-    CreateIndexStatement, CreateTableStatement, DeleteStatement, DropIndexStatement, DropTableStatement,
-    ExplainStatement, Expr, FromClause, Ident, InsertStatement, IsolationLevel, JoinClause, JoinKind, OrderByItem,
-    RollbackStatement, SelectItem, SelectStatement, Statement, UnaryOperator, UpdateStatement,
+    AggregateFunc, AnalyzeStatement, Assignment, BeginStatement, BinaryOperator, CheckpointStatement, ColumnDef,
+    CommitStatement, CreateIndexStatement, CreateTableStatement, DeleteStatement, DropIndexStatement,
+    DropTableStatement, ExplainStatement, Expr, FromClause, Ident, InsertStatement, IsolationLevel, JoinClause,
+    JoinKind, OrderByItem, RollbackStatement, SelectItem, SelectStatement, Statement, UnaryOperator, UpdateStatement,
 };
 use crate::error::{DbError, DbResult};
 use crate::lexer::{self, Keyword, Span, Token, TokenKind};
@@ -167,9 +167,10 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Begin) => self.parse_begin_statement().map(Statement::Begin),
             TokenKind::Keyword(Keyword::Commit) => self.parse_commit_statement().map(Statement::Commit),
             TokenKind::Keyword(Keyword::Rollback) => self.parse_rollback_statement().map(Statement::Rollback),
+            TokenKind::Keyword(Keyword::Checkpoint) => self.parse_checkpoint_statement().map(Statement::Checkpoint),
             _ => Err(self.unexpected(
                 "SELECT・CREATE TABLE・DROP TABLE・CREATE INDEX・DROP INDEX・INSERT INTO・UPDATE・\
-                 DELETE FROM・EXPLAIN・ANALYZE・BEGIN・COMMIT・ROLLBACKのいずれか",
+                 DELETE FROM・EXPLAIN・ANALYZE・BEGIN・COMMIT・ROLLBACK・CHECKPOINTのいずれか",
             )),
         }
     }
@@ -302,6 +303,13 @@ impl<'a> Parser<'a> {
     fn parse_rollback_statement(&mut self) -> DbResult<RollbackStatement> {
         let span = self.expect_keyword(Keyword::Rollback, "ROLLBACK")?;
         Ok(RollbackStatement { span })
+    }
+
+    // ---- CHECKPOINT(第34章) ----
+
+    fn parse_checkpoint_statement(&mut self) -> DbResult<CheckpointStatement> {
+        let span = self.expect_keyword(Keyword::Checkpoint, "CHECKPOINT")?;
+        Ok(CheckpointStatement { span })
     }
 
     // ---- SELECT ----

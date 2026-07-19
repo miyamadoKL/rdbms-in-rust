@@ -99,6 +99,8 @@ pub enum Keyword {
     Repeatable,
     /// `SERIALIZABLE`(第32章)。
     Serializable,
+    /// `CHECKPOINT`文(第34章)。
+    Checkpoint,
 }
 
 impl Keyword {
@@ -154,6 +156,7 @@ impl Keyword {
             "COMMITTED" => Keyword::Committed,
             "REPEATABLE" => Keyword::Repeatable,
             "SERIALIZABLE" => Keyword::Serializable,
+            "CHECKPOINT" => Keyword::Checkpoint,
             _ => return None,
         };
         Some(keyword)

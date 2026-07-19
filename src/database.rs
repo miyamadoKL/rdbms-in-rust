@@ -83,8 +83,8 @@ use std::path::Path;
 use std::collections::HashMap;
 
 use crate::ast::{
-    AnalyzeStatement, BeginStatement, CommitStatement, CreateTableStatement, DropIndexStatement, DropTableStatement,
-    IsolationLevel, RollbackStatement, Statement,
+    AnalyzeStatement, BeginStatement, CheckpointStatement, CommitStatement, CreateTableStatement, DropIndexStatement,
+    DropTableStatement, IsolationLevel, RollbackStatement, Statement,
 };
 use crate::binder::{Binder, BoundCreateIndex, BoundExpr, BoundStatement};
 use crate::catalog::{Catalog, TableInfo};
@@ -267,6 +267,16 @@ impl Database {
         }
     }
 
+    /// `Database::open`が起動時に実行したCrash Recovery(第34章)の要約。
+    /// Memoryバックエンド、または新規作成した(既存ファイルが無かった)
+    /// Diskバックエンドでは`None`。
+    pub fn last_recovery_report(&self) -> Option<crate::recovery::RecoveryReport> {
+        match &self.backend {
+            Backend::Memory { .. } => None,
+            Backend::Disk { storage } => storage.last_recovery_report(),
+        }
+    }
+
     /// 現在のトランザクション状態(第30章)。`None`はAutocommit、つまり
     /// `BEGIN`していない状態を表す。
     pub fn transaction_state(&self) -> Option<TransactionState> {
@@ -338,6 +348,7 @@ impl Database {
             Statement::Begin(begin) => self.execute_begin(begin),
             Statement::Commit(commit) => self.execute_commit(commit),
             Statement::Rollback(rollback) => self.execute_rollback(rollback),
+            Statement::Checkpoint(checkpoint) => self.execute_checkpoint(checkpoint),
             statement => {
                 if let Some(tx) = &self.tx
                     && tx.state == TransactionState::Aborted
@@ -419,8 +430,8 @@ impl Database {
             BoundStatement::Delete(delete) => self.execute_delete(logical_plan::build_delete(delete), owner),
             BoundStatement::Explain { inner, analyze } => self.execute_explain(*inner, analyze, owner),
             BoundStatement::Analyze(analyze) => self.execute_analyze(analyze),
-            BoundStatement::Begin(_) | BoundStatement::Commit(_) | BoundStatement::Rollback(_) => {
-                unreachable!("BEGIN・COMMIT・ROLLBACKはexecuteの先頭ですでに処理済み")
+            BoundStatement::Begin(_) | BoundStatement::Commit(_) | BoundStatement::Rollback(_) | BoundStatement::Checkpoint(_) => {
+                unreachable!("BEGIN・COMMIT・ROLLBACK・CHECKPOINTはexecuteの先頭ですでに処理済み")
             }
         };
         if self.tx.is_none() {
@@ -486,6 +497,28 @@ impl Database {
         }
         self.lock_manager.release_all(tx.id);
         Ok(QueryResult::command("ROLLBACK"))
+    }
+
+    /// `CHECKPOINT`を実行する(第34章)。
+    ///
+    /// Memoryバックエンドはそもそも永続化しない(WALを持たない)ため何もしない。
+    /// Diskバックエンドは、現在Activeなトランザクション(高々1本、`self.tx`)を
+    /// Active Transaction一覧として`Storage::checkpoint`へ渡す。決定的
+    /// インターリーブテストハーネス(`harness_contexts`)が持つトランザクション
+    /// はこの一覧に含めない。`CHECKPOINT`のSQL構文はハーネス経由の複数
+    /// トランザクションを想定しておらず、この章はその組み合わせを対象外とする
+    /// (本文「この章の限界」を参照)。トランザクションの境界文ではないため、
+    /// `self.tx`の状態は変えない。
+    fn execute_checkpoint(&mut self, _checkpoint: CheckpointStatement) -> DbResult<QueryResult> {
+        let active: Vec<(TransactionId, Option<Lsn>)> =
+            self.tx.as_ref().map(|tx| vec![(tx.id, tx.wal_last_lsn)]).unwrap_or_default();
+        match &mut self.backend {
+            Backend::Memory { .. } => {}
+            Backend::Disk { storage } => {
+                storage.checkpoint(&active)?;
+            }
+        }
+        Ok(QueryResult::command("CHECKPOINT"))
     }
 
     /// `undo`を、`Active`なトランザクションがあればその`undo_log`へ積む。
@@ -1298,7 +1331,8 @@ impl Database {
             | BoundStatement::Analyze(_)
             | BoundStatement::Begin(_)
             | BoundStatement::Commit(_)
-            | BoundStatement::Rollback(_) => {
+            | BoundStatement::Rollback(_)
+            | BoundStatement::Checkpoint(_) => {
                 unreachable!(
                     "ParserがEXPLAINの対象をSELECT・INSERT INTO・UPDATE・DELETE FROMに制限している"
                 )
@@ -3533,8 +3567,10 @@ mod tests {
         // 第28章から、アクセスパスはコストで選ぶ(`choose_scan_plan`)ため、
         // 数行だけのテーブルではSeqScanのほうが安く済んでしまい索引が
         // 選ばれないことがある。この確認だけを目的に、行数を増やし
-        // `ANALYZE`して点検索を実際に選択的にしておく。
-        let rows: Vec<String> = (2..300).map(|i| format!("({i}, 'user{i}@example.com', 'User{i}')")).collect();
+        // `ANALYZE`して点検索を実際に選択的にしておく(第34章でPage LSNの分
+        // だけページの実効容量が減り、299行では境界的だったため1000行へ
+        // 引き上げてある)。
+        let rows: Vec<String> = (2..1000).map(|i| format!("({i}, 'user{i}@example.com', 'User{i}')")).collect();
         db.execute(&format!("INSERT INTO users VALUES {}", rows.join(", "))).unwrap();
         db.execute("ANALYZE users").unwrap();
 
@@ -3866,28 +3902,31 @@ mod tests {
         let mut db = orders_disk_db(&path);
         db.execute("CREATE INDEX idx_amount ON orders (amount)").unwrap();
 
-        // 5000行(バケツ10個、1バケツ=500行)を仕込む。うち500行だけ、
+        // 1400行(バケツ10個、1バケツ=140行)を仕込む。うち200行だけ、
         // ソート順で連続する1つのバケツにちょうど収まるよう`amount`を
-        // 1000(250行)と2000(250行)の2値だけに集中させ、残りの4500行は
-        // その外側([0,899]と[2001,4000])に均等に散らばせる。この結果、
+        // 1000(100行)と2000(100行)の2値だけに集中させ、残りの1200行は
+        // その外側([0,899]と[2001,3200])に均等に散らばせる。この結果、
         // 1つのバケツが`[1000, 2000]`という区間を持ちながら、実際の値は
-        // 区間の両端に偏り、中間(1400〜1600)には1行も無い。
+        // 区間の両端に偏り、中間(1400〜1600)には1行も無い。(第34章で
+        // Page LSNの分だけページの実効容量が減ったため、以前の5000行から
+        // 引き下げてある。Catalogページの`page_ids`(第15章)が収まる範囲に
+        // 収めるためで、バケツ構成の意図は変わらない。)
         let mut rows: Vec<String> = Vec::new();
-        for i in 0..2500i64 {
-            let amount = i * 900 / 2500; // [0, 899]
+        for i in 0..600i64 {
+            let amount = i * 900 / 600; // [0, 899]
             rows.push(format!("({i}, {amount}, 'name{i}')"));
         }
-        for i in 0..250i64 {
-            let id = 2500 + i;
+        for i in 0..100i64 {
+            let id = 600 + i;
             rows.push(format!("({id}, 1000, 'name{id}')"));
         }
-        for i in 0..250i64 {
-            let id = 2750 + i;
+        for i in 0..100i64 {
+            let id = 700 + i;
             rows.push(format!("({id}, 2000, 'name{id}')"));
         }
-        for i in 0..2000i64 {
-            let id = 3000 + i;
-            let amount = 2001 + i; // [2001, 4000]
+        for i in 0..600i64 {
+            let id = 800 + i;
+            let amount = 2001 + i; // [2001, 2600]
             rows.push(format!("({id}, {amount}, 'name{id}')"));
         }
         db.execute(&format!("INSERT INTO orders VALUES {}", rows.join(", "))).unwrap();
@@ -3967,7 +4006,13 @@ mod tests {
         // して選択率の推定を実際の分布に合わせる(統計が無ければ、
         // PostgreSQLの`selfuncs.c`にならった慣用のデフォルト定数
         // (`crate::estimator::DEFAULT_EQ_SEL`等)にフォールバックする、第27章)。
-        let n = 10_000i64;
+        // 第34章でPage LSNの分だけページの実効容量が減り、1万行では
+        // `ANALYZE`が集める統計情報を含めてCatalogページ(第15章、第27章)が
+        // 収まりきらなくなったため、1000行へ引き下げてある
+        // (`point_predicate_on_an_indexed_column_...`が1000行ですでに
+        // IndexScanを選ぶことを確認済みで、IndexScanが有利になる規模と
+        // いう以前の意図は変わらない)。
+        let n = 1_000i64;
         let rows: Vec<String> = (0..n).map(|i| format!("({i}, {}, 'name{i}')", i * 3)).collect();
         let insert_sql = format!("INSERT INTO orders VALUES {}", rows.join(", "));
 
@@ -4072,7 +4117,11 @@ mod tests {
         db.execute("CREATE INDEX idx_customer_id ON orders (customer_id)").unwrap();
 
         let n = 5i64;
-        let m = 5000i64;
+        // 第34章でPage LSNの分だけページの実効容量が減り、`ANALYZE`が集める
+        // 統計情報を含めてCatalogページが収まらなくなったため、5000から
+        // 1250へ引き下げてある(この規模でもIndex Nested Loop Joinが
+        // 選ばれることを確認済み。1000行以下ではHash Joinへ逆転する)。
+        let m = 1250i64;
         let modulus = n * 1000;
         let customers: Vec<String> = (0..n).map(|i| format!("({i}, 'name{i}')")).collect();
         db.execute(&format!("INSERT INTO customers VALUES {}", customers.join(", "))).unwrap();
@@ -4115,7 +4164,10 @@ mod tests {
         db.execute("CREATE INDEX idx_customer_id ON orders (customer_id)").unwrap();
 
         let n = 50i64;
-        let m = 2000i64;
+        // 第34章でPage LSNの分だけページの実効容量が減り、`ANALYZE`が集める
+        // 統計情報を含めてCatalogページが収まらなくなったため、2000から
+        // 1000へ引き下げてある(密な結合という以前の意図は変わらない)。
+        let m = 1000i64;
         let modulus = n; // 密な結合: customer_idの値域をcustomersの総数だけに絞る。
         let customers: Vec<String> = (0..n).map(|i| format!("({i}, 'name{i}')")).collect();
         db.execute(&format!("INSERT INTO customers VALUES {}", customers.join(", "))).unwrap();

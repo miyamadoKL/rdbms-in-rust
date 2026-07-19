@@ -10,8 +10,8 @@
 //! 明示的に呼ばない限り実行されず、`Database::execute("COMMIT")`はそのどちらも
 //! 呼んでいない。つまりこのクレートは、`COMMIT`が成功を返した直後にプロセスが
 //! 死んでも、その変更がディスクに残っているかどうかを何も保証していなかった
-//! (本章のテスト`committed_data_is_lost_without_a_sync_before_crash`が、この
-//! 状態を実際に再現する)。
+//! (`tests/wal_durability.rs`の`committed_data_survives_a_simulated_crash_via_recovery`が、
+//! この状態と、第34章のCrash Recoveryがそれをどう修復するかの両方を確認する)。
 //!
 //! # WALファースト不変条件
 //!
@@ -107,6 +107,11 @@ pub enum LogRecordType {
     Commit,
     /// トランザクションの取り消し。
     Abort,
+    /// `CHECKPOINT`(第34章)。`after_image`に、この時点でActiveだった
+    /// トランザクションの一覧([`encode_active_transactions`])を持つ。
+    /// `txn_id`はどの実在のトランザクションも指さない予約値
+    /// ([`CHECKPOINT_TXN_ID`])を使う。
+    Checkpoint,
 }
 
 impl LogRecordType {
@@ -118,6 +123,7 @@ impl LogRecordType {
             LogRecordType::Delete => 3,
             LogRecordType::Commit => 4,
             LogRecordType::Abort => 5,
+            LogRecordType::Checkpoint => 6,
         }
     }
 
@@ -129,9 +135,64 @@ impl LogRecordType {
             3 => Some(LogRecordType::Delete),
             4 => Some(LogRecordType::Commit),
             5 => Some(LogRecordType::Abort),
+            6 => Some(LogRecordType::Checkpoint),
             _ => None,
         }
     }
+}
+
+/// `Checkpoint`レコードの`txn_id`に使う予約値(第34章)。`TransactionId`は
+/// `0`から採番される(`crate::database::Database::next_txn_id`)ため、
+/// 実在のトランザクションと衝突しない`u64::MAX`を選ぶ。
+pub(crate) const CHECKPOINT_TXN_ID: TransactionId = TransactionId(u64::MAX);
+
+/// `CHECKPOINT`時点でActiveだったトランザクションの一覧を、`LogRecord`の
+/// `after_image`に埋め込むためのバイト列へエンコードする(第34章)。
+///
+/// ```text
+/// count: u32
+/// entries × count:
+///     txn_id:      u64
+///     has_lsn:     u8 (0 または 1)
+///     last_lsn:    u64 (has_lsnが1のときだけ)
+/// ```
+pub(crate) fn encode_active_transactions(active: &[(TransactionId, Option<Lsn>)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(active.len() as u32).to_le_bytes());
+    for (txn_id, last_lsn) in active {
+        buf.extend_from_slice(&txn_id.0.to_le_bytes());
+        match last_lsn {
+            Some(lsn) => {
+                buf.push(1);
+                buf.extend_from_slice(&lsn.0.to_le_bytes());
+            }
+            None => buf.push(0),
+        }
+    }
+    buf
+}
+
+/// [`encode_active_transactions`]の逆変換。
+pub(crate) fn decode_active_transactions(bytes: &[u8]) -> Option<Vec<(TransactionId, Option<Lsn>)>> {
+    let mut pos = 0usize;
+    let count = u32::from_le_bytes(bytes.get(pos..pos + 4)?.try_into().ok()?);
+    pos += 4;
+    let mut out = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let txn_id = TransactionId(u64::from_le_bytes(bytes.get(pos..pos + 8)?.try_into().ok()?));
+        pos += 8;
+        let has_lsn = *bytes.get(pos)?;
+        pos += 1;
+        let last_lsn = if has_lsn == 1 {
+            let lsn = Lsn(u64::from_le_bytes(bytes.get(pos..pos + 8)?.try_into().ok()?));
+            pos += 8;
+            Some(lsn)
+        } else {
+            None
+        };
+        out.push((txn_id, last_lsn));
+    }
+    Some(out)
 }
 
 /// WALの1レコード。モジュール冒頭「レコードの構成」を参照。
@@ -521,6 +582,24 @@ impl WalWriter {
         })
     }
 
+    /// `Checkpoint`レコードを追記する(第34章、`crate::storage::Storage::checkpoint`)。
+    /// `active`は、この時点でActiveな全トランザクションの
+    /// `(TransactionId, wal_last_lsn)`。
+    pub fn append_checkpoint(&mut self, active: &[(TransactionId, Option<Lsn>)]) -> Lsn {
+        let lsn = self.next_lsn();
+        self.append_record(LogRecord {
+            lsn,
+            prev_lsn: None,
+            txn_id: CHECKPOINT_TXN_ID,
+            record_type: LogRecordType::Checkpoint,
+            table_id: None,
+            rid: None,
+            old_rid: None,
+            before_image: None,
+            after_image: Some(encode_active_transactions(active)),
+        })
+    }
+
     /// `Abort`レコードを追記する。
     pub fn append_abort(&mut self, txn_id: TransactionId, prev_lsn: Option<Lsn>) -> Lsn {
         let lsn = self.next_lsn();
@@ -585,6 +664,12 @@ impl WalWriter {
     /// (`crate::transaction::apply_wal_undo_disk`が`prev_lsn`の連鎖をたどるのに使う)。
     pub fn record(&self, lsn: Lsn) -> Option<&LogRecord> {
         self.index.get(&lsn).map(|&i| &self.records[i])
+    }
+
+    /// これまでに`append`した全レコードを、書いた(LSNの昇順の)順に返す
+    /// (第34章、`crate::recovery::recover`のAnalysis・Redoが使う)。
+    pub(crate) fn records(&self) -> &[LogRecord] {
+        &self.records
     }
 
     /// これまでに`append`した全レコードを、書いた順に1行1レコードの文字列へ

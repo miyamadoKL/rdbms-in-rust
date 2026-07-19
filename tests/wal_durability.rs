@@ -21,16 +21,18 @@ fn remove_if_exists(path: &std::path::Path) {
 
 /// 「壊して確認する」: `COMMIT`が成功を返しても、テーブル本体のデータファイルが
 /// 同期されているとは限らない。`Database::flush`を一度も呼ばずに`Database`を
-/// dropする(プロセスがCOMMIT直後に死んだ状況を模す)と、そのあとで開き直した
-/// データベースに、コミットしたはずの行が見当たらない。
+/// dropする(プロセスがCOMMIT直後に死んだ状況を模す)と、テーブル本体の
+/// ページはこの時点でまだディスクに届いていない。
 ///
-/// この章はこの経路を閉じない。閉じる(コミット済みの変更をWALから読み戻す)のは
-/// 第34章のCrash Recoveryの仕事である。このテストは、その仕事がまだ残っている
-/// ことを本文の冒頭で示すための再現であり、以後のテストも含めてこの章の実装で
-/// この`assert`が変わることはない。
+/// 第33章の時点では、この直後に開き直すと行が見当たらなかった(WALを
+/// 読み戻す者がいなかったため)。第34章のCrash Recovery
+/// (`crate::recovery::recover`、`Database::open`が起動時に自動で呼ぶ)は、
+/// この行をWALのInsert/Commitレコードから読んで再現する。このテストの
+/// 名前と`assert`は、第34章のこの変化を確認するために書き換えてある
+/// (元の第33章版の主張は、このテストの直前のドキュメントコメントに残した)。
 #[test]
-fn committed_data_is_lost_without_a_flush_before_a_simulated_crash() {
-    let path = temp_db_path("wal-crash-loses-table-data");
+fn committed_data_survives_a_simulated_crash_via_recovery() {
+    let path = temp_db_path("wal-crash-recovers-table-data");
     {
         let mut db = Database::open(&path).unwrap();
         db.execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)")
@@ -46,10 +48,12 @@ fn committed_data_is_lost_without_a_flush_before_a_simulated_crash() {
 
     let mut db = Database::open(&path).unwrap();
     let result = db.execute("SELECT balance FROM accounts WHERE id = 1").unwrap();
-    assert!(
-        result.rows().is_empty(),
-        "flushしていないので、テーブル本体にはコミット済みの行がまだ届いていないはず"
+    assert_eq!(
+        result.rows().len(),
+        1,
+        "第34章のRecoveryが、WALのInsert/CommitレコードからCOMMIT済みの行を再現しているはず"
     );
+    assert_eq!(result.rows()[0].values(), &[Value::BigInt(100)]);
 
     remove_if_exists(&path);
     remove_if_exists(&wal_path(&path));

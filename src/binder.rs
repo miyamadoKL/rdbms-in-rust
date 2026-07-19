@@ -51,10 +51,10 @@
 use std::collections::HashSet;
 
 use crate::ast::{
-    AggregateFunc, AnalyzeStatement, Assignment, BeginStatement, BinaryOperator, CommitStatement, CreateIndexStatement,
-    CreateTableStatement, DeleteStatement, DropIndexStatement, DropTableStatement, Expr, FromClause, Ident,
-    InsertStatement, JoinKind, RollbackStatement, SelectItem, SelectStatement, Statement, UnaryOperator,
-    UpdateStatement,
+    AggregateFunc, AnalyzeStatement, Assignment, BeginStatement, BinaryOperator, CheckpointStatement, CommitStatement,
+    CreateIndexStatement, CreateTableStatement, DeleteStatement, DropIndexStatement, DropTableStatement, Expr,
+    FromClause, Ident, InsertStatement, JoinKind, RollbackStatement, SelectItem, SelectStatement, Statement,
+    UnaryOperator, UpdateStatement,
 };
 use crate::catalog::{Catalog, TableInfo};
 use crate::error::{DbError, DbResult};
@@ -146,6 +146,9 @@ pub enum BoundStatement {
     Commit(CommitStatement),
     /// `ROLLBACK`(第30章)。
     Rollback(RollbackStatement),
+    /// `CHECKPOINT`(第34章)。`Begin`・`Commit`・`Rollback`と同じ理由で、
+    /// ASTのバリアントをそのまま持ち回す。
+    Checkpoint(CheckpointStatement),
 }
 
 /// 束縛済みの`CREATE INDEX`(第24章)。
@@ -503,6 +506,7 @@ impl<'a> Binder<'a> {
             Statement::Begin(begin) => Ok(BoundStatement::Begin(begin)),
             Statement::Commit(commit) => Ok(BoundStatement::Commit(commit)),
             Statement::Rollback(rollback) => Ok(BoundStatement::Rollback(rollback)),
+            Statement::Checkpoint(checkpoint) => Ok(BoundStatement::Checkpoint(checkpoint)),
         }
     }
 

@@ -276,8 +276,8 @@ pub(crate) fn apply_wal_undo_disk(
                     remap.insert(old_rid, result_rid);
                 }
             }
-            LogRecordType::Begin | LogRecordType::Commit | LogRecordType::Abort => {
-                unreachable!("Begin・Commit・Abortはこのループへ集める前に取り除いている")
+            LogRecordType::Begin | LogRecordType::Commit | LogRecordType::Abort | LogRecordType::Checkpoint => {
+                unreachable!("Begin・Commit・Abort・Checkpointはこのループへ集める前に取り除いている")
             }
         }
     }

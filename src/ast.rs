@@ -49,6 +49,9 @@ pub enum Statement {
     Commit(CommitStatement),
     /// `ROLLBACK`文(第30章)。現在のトランザクションの変更を取り消す。
     Rollback(RollbackStatement),
+    /// `CHECKPOINT`文(第34章)。全dirtyページをflush・syncし、Checkpoint
+    /// レコードをWALへ書く。
+    Checkpoint(CheckpointStatement),
 }
 
 impl Statement {
@@ -68,6 +71,7 @@ impl Statement {
             Statement::Begin(s) => s.span,
             Statement::Commit(s) => s.span,
             Statement::Rollback(s) => s.span,
+            Statement::Checkpoint(s) => s.span,
         }
     }
 }
@@ -379,6 +383,12 @@ pub struct CommitStatement {
 /// `ROLLBACK`文(第30章)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RollbackStatement {
+    pub span: Span,
+}
+
+/// `CHECKPOINT`文(第34章)。修飾語を持たない単体の文。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckpointStatement {
     pub span: Span,
 }
 

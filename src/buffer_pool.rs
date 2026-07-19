@@ -89,6 +89,21 @@ struct FrameMeta {
     /// 衝突しない。dirtyなページをディスクへ書き戻す直前、この値までWALが
     /// 同期済みであることを保証する(`BufferPool::flush_frame`・`evict`の
     /// ドキュメントを参照)。
+    ///
+    /// # 第34章での変更: ページ自身へも永続化する
+    ///
+    /// 第33章までは、この値はこの`FrameMeta`(プロセスのメモリ上)にしか
+    /// 存在しなかった。この章から`crate::page::Page`自身も同じ`page_lsn`を
+    /// 持つようになり、ページをディスクへ書き戻す(`flush_frame`・`evict`)
+    /// 直前にこのメタデータの値を`Page::page_lsn`へ書き写してから
+    /// `DiskManager::write_page`を呼ぶ。ページを新しく読み込む
+    /// (`locate_or_load`)ときは、逆にディスクから読んだ`Page::page_lsn`を
+    /// この`FrameMeta::page_lsn`の初期値として引き継ぐ(`Lsn(0)`で固定的に
+    /// 初期化していた第33章までとの違い)。これにより、プロセスを再起動して
+    /// 読み直したページも、クラッシュ前にどこまでWALが反映されていたかを
+    /// 正しく覚えている状態から始まる。`crate::recovery::recover`のRedoが
+    /// 「このページのこの変更は、もうディスクに届いているか」を判定する
+    /// 材料は、まさにこの値である。
     page_lsn: Lsn,
 }
 
@@ -198,6 +213,19 @@ impl BufferPool {
                 meta.page_lsn = lsn;
             }
         }
+    }
+
+    /// `id`のページの現在のPage LSN(第34章)を返す。
+    ///
+    /// まだキャッシュされていなければ`DiskManager`から読み込む(その時点で
+    /// ディスクに永続化されている値を引き継ぐ、`locate_or_load`を参照)。
+    /// `crate::recovery::recover`のRedoが、あるログレコードをこのページへ
+    /// 再適用すべきかどうか(`このLsn < レコードのLsn`)を判定するために使う。
+    pub(crate) fn page_lsn(&self, id: PageId) -> DbResult<Lsn> {
+        let frame_id = self.locate_and_pin(id)?;
+        let lsn = self.lock_inner().meta[frame_id].page_lsn;
+        self.unpin(frame_id, false);
+        Ok(lsn)
     }
 
     /// このBufferPoolが管理する`DiskManager`の現在のページ数(Metaページを含む)。
@@ -323,8 +351,14 @@ impl BufferPool {
             wal.lock().unwrap_or_else(|p| p.into_inner()).sync_up_to(page_lsn)?;
         }
 
-        let frame = self.lock_frame(frame_id);
-        if let Some(page) = frame.page.as_ref() {
+        let mut frame = self.lock_frame(frame_id);
+        if let Some(page) = frame.page.as_mut() {
+            // 第34章: このフレームのPage LSNをページ自身へ書き写してから
+            // ディスクへ書き戻す。こうしておかないと、次にこのページを読み込む
+            // (クラッシュ後の`Storage::open`も含む)側が、どこまでの変更が
+            // すでに反映済みかを知る手段を失う(`FrameMeta::page_lsn`の
+            // 「第34章での変更」を参照)。
+            page.page_lsn = page_lsn;
             self.disk.write_page(page)?;
         }
         drop(frame);
@@ -365,13 +399,17 @@ impl BufferPool {
         };
 
         let page = self.disk.read_page(id)?;
+        // 第34章: ディスクに永続化されている`page_lsn`を、そのままこの
+        // フレームの初期値として引き継ぐ(モジュール冒頭`FrameMeta::page_lsn`の
+        // 「第34章での変更」を参照)。`Lsn(0)`固定で初期化していた第33章までとの違い。
+        let page_lsn = page.page_lsn;
         self.lock_frame(frame_id).page = Some(page);
         inner.meta[frame_id] = FrameMeta {
             occupant: Some(id),
             pin_count: 0,
             dirty: false,
             referenced: false,
-            page_lsn: Lsn(0),
+            page_lsn,
         };
         inner.page_table.insert(id, frame_id);
         Ok(frame_id)
@@ -409,8 +447,11 @@ impl BufferPool {
                 if let Some(wal) = &wal {
                     wal.lock().unwrap_or_else(|p| p.into_inner()).sync_up_to(page_lsn)?;
                 }
-                let frame = self.lock_frame(i);
-                if let Some(page) = frame.page.as_ref() {
+                let mut frame = self.lock_frame(i);
+                if let Some(page) = frame.page.as_mut() {
+                    // `flush_frame`と同じ理由でPage LSNをページ自身へ書き写す
+                    // (第34章)。
+                    page.page_lsn = page_lsn;
                     self.disk.write_page(page)?;
                 }
             }
