@@ -47,22 +47,32 @@
 //! 行数を持つ、複数のDistinct値の集まり」という前提を保ったまま、突出した
 //! 値は個別に正確な頻度で扱える。
 //!
-//! MCVへ採用する条件は、「その値の出現回数が、実際にHistogramが作る
-//! バケツ数(`min(非NULL行数, `[`HISTOGRAM_BUCKET_COUNT`]`)`、値の総数が
-//! バケツ数を下回れば、それだけしかバケツはできない)で非NULL行数を割った
-//! 平均バケツ行数を上回ること」である(「1バケツに収まるはずの行数より
-//! 多い」=「1バケツ相当に押し込めるとHistogramの精度を損なう」値、という
-//! 基準)。該当する値のうち、出現回数の多い順に最大[`MCV_MAX_ENTRIES`]件までを
-//! 採用する。すべての値の出現回数がこの閾値以下(典型的には一意に近い列)で
-//! あれば、`mcv`は空になり、Histogramはこれまでどおり全ての非NULL値から
-//! 組み立てる。
+//! MCVへ採用する条件は「その値の出現回数が、**その時点で**残っている
+//! (まだMCVへ移していない)非NULL行数から求めた平均バケツ行数を上回ること」
+//! である。出現回数の多い値から順に、1件抽出するたびに残り行数を差し引き、
+//! 平均バケツ行数(残り行数を、実際にHistogramが作るバケツ数
+//! `min(残り行数, `[`HISTOGRAM_BUCKET_COUNT`]`)`で割った値)を**その都度
+//! 再計算**する。この抽出を、残りのどの値もその時点の平均バケツ行数を
+//! 超えなくなる**固定点**まで、最大[`MCV_MAX_ENTRIES`]件まで繰り返す
+//! (`extract_mcv`)。
 //!
-//! この閾値の定義上、平均を上回る値どうしの出現回数の合計は非NULL行数を
-//! 超えられないため、[`MCV_MAX_ENTRIES`]-1件を超える値が同時にこの閾値を
-//! 上回ることは(equi-depthのバケツ数が10である限り)実際には起こらない。
-//! [`MCV_MAX_ENTRIES`]による打ち切りは、`Storage::set_table_stats`
-//! (`crate::storage`)が外部から受け取る`ColumnStats`(この`extract_mcv`を
-//! 経由しない)に対する防御的な上限として存在する。
+//! 抽出前の全体行数から一度だけ閾値を求める設計では、支配的な値をMCVへ
+//! 移したあとの残余がなお歪んでいる場合(たとえば100行が`0`×50、`1`×8、
+//! `2`〜`43`×各1という分布)を見逃す。`0`(50行)をMCVへ移すと、残り50行に
+//! 対する平均バケツ行数は5行まで下がり、`1`(8行)は最初の閾値(10行)を
+//! 超えなくても新しい閾値(5行)は超える。固定点まで抽出することで、`1`も
+//! MCVへ移り、単一値バケツへの分割(本節の問題)を避けられる
+//! (第4部2巡目レビュー対応)。
+//!
+//! [`MCV_MAX_ENTRIES`]件に達した時点でまだ固定点に達していない(=残余に
+//! なお平均バケツ行数を超える値が残っている)場合は、抽出をそこで打ち切る。
+//! この場合、残った値は従来どおり複数の単一値バケツへ分割されうるが、
+//! `crate::estimator::estimate_equality_selectivity`が同じ値を持つバケツを
+//! 合算する(`crate::estimator`モジュールの説明を参照)ため、単一値バケツに
+//! 限っては選択率の見積もり自体は狂わない。狂いうるのは、その値が範囲述語
+//! (`crate::estimator::estimate_range_selectivity`)の対象になった場合や、
+//! Histogramのバケツ数そのもの([`HISTOGRAM_BUCKET_COUNT`]、境界の粒度)が
+//! 想定より粗くなる場合である。
 
 use std::collections::HashSet;
 
@@ -191,7 +201,8 @@ impl StatsCollector {
 ///
 /// 戻り値は`(mcv, residual)`。`residual`は`mcv`に採用した値をすべて除いた
 /// 残りの値で、ソート順を保ったまま返す(`build_equi_depth_histogram`が
-/// そのまま使える)。採用条件・上限件数はモジュール冒頭の説明を参照。
+/// そのまま使える)。採用条件・上限件数・固定点まで抽出する理由はモジュール
+/// 冒頭の説明を参照。
 fn extract_mcv(sorted_values: &[Value]) -> (Vec<(Value, u64)>, Vec<Value>) {
     if sorted_values.is_empty() {
         return (Vec::new(), Vec::new());
@@ -206,30 +217,39 @@ fn extract_mcv(sorted_values: &[Value]) -> (Vec<(Value, u64)>, Vec<Value>) {
             _ => counts.push((value.clone(), 1)),
         }
     }
-
-    // `build_equi_depth_histogram`が実際に作るバケツ数は
-    // `min(値の総数, HISTOGRAM_BUCKET_COUNT)`である(値の総数がバケツ数
-    // より少なければ、その分だけしかバケツができない)。閾値もこの実際の
-    // バケツ数に対する平均行数で揃える。固定の`HISTOGRAM_BUCKET_COUNT`を
-    // 分母にすると、値の総数がバケツ数を下回る小さな列で「1回しか出現
-    // しない値」まで平均を上回ってしまい、MCVがほぼ全値を飲み込んでしまう。
-    let effective_bucket_count = sorted_values.len().min(HISTOGRAM_BUCKET_COUNT) as f64;
-    let average_bucket_size = sorted_values.len() as f64 / effective_bucket_count;
-    let mut candidates: Vec<(Value, u64)> =
-        counts.iter().filter(|(_, count)| *count as f64 > average_bucket_size).cloned().collect();
     // 出現回数の降順。同数なら値の昇順(`counts`はソート済みの値順)で決定的に揃える。
-    candidates.sort_by(|(value_a, count_a), (value_b, count_b)| {
-        count_b.cmp(count_a).then_with(|| compare_values(value_a, value_b))
-    });
-    candidates.truncate(MCV_MAX_ENTRIES);
+    counts.sort_by(|(value_a, count_a), (value_b, count_b)| count_b.cmp(count_a).then_with(|| compare_values(value_a, value_b)));
 
-    if candidates.is_empty() {
+    // 出現回数の多い値から順に、「その時点で残っている非NULL行数」に対する
+    // 平均バケツ行数(`build_equi_depth_histogram`が実際に作るバケツ数
+    // `min(残り行数, HISTOGRAM_BUCKET_COUNT)`で割った値)を都度再計算しながら
+    // 抽出する。`counts`は降順なので、ある値がその時点の閾値を超えなければ、
+    // それ以降の値(出現回数がさらに少ない)も、これ以降の閾値(残り行数の
+    // 減少に伴って単調非増加)を超えることは無い。したがって、超えない値に
+    // 出会った時点で走査を打ち切ってよい(固定点に達したことを意味する)。
+    let mut mcv: Vec<(Value, u64)> = Vec::new();
+    let mut remaining_rows = sorted_values.len() as u64;
+    for (value, count) in counts {
+        if mcv.len() >= MCV_MAX_ENTRIES {
+            break;
+        }
+        let effective_bucket_count = remaining_rows.min(HISTOGRAM_BUCKET_COUNT as u64).max(1);
+        let average_bucket_size = remaining_rows as f64 / effective_bucket_count as f64;
+        if count as f64 > average_bucket_size {
+            remaining_rows = remaining_rows.saturating_sub(count);
+            mcv.push((value, count));
+        } else {
+            break;
+        }
+    }
+
+    if mcv.is_empty() {
         return (Vec::new(), sorted_values.to_vec());
     }
 
-    let mcv_values: HashSet<&Value> = candidates.iter().map(|(value, _)| value).collect();
+    let mcv_values: HashSet<&Value> = mcv.iter().map(|(value, _)| value).collect();
     let residual: Vec<Value> = sorted_values.iter().filter(|value| !mcv_values.contains(value)).cloned().collect();
-    (candidates, residual)
+    (mcv, residual)
 }
 
 /// ソート済みの非NULL値`sorted_values`から、等頻度Histogramを組み立てる。
@@ -355,22 +375,36 @@ mod tests {
     }
 
     #[test]
-    fn mcv_never_exceeds_the_maximum_entry_count_even_with_many_skewed_values() {
-        // 9種類の値がそれぞれ平均バケツ行数を大きく超える頻度(100回)で
-        // 出現し、残りは1回だけの値がたくさんある分布。モジュール冒頭の
-        // 説明のとおり、平均バケツ行数を上回る値どうしの出現回数の合計は
-        // 非NULL行数を超えられないため、MCV_MAX_ENTRIES件に切り詰める分岐へ
-        // 実際に到達することは無い。ここでは、その上限を超えないことだけを
-        // 回帰として確認する(切り詰め自体は`crate::storage`の
-        // `validate_stats_metadata`が外部入力に対して検査する)。
+    fn mcv_extraction_can_reach_the_maximum_entry_count_under_the_fixed_point_rule() {
+        // 出現回数を段階的に下げた10個の値([20,15,12,10,9,8,7,6,5,5]、
+        // 合計97行)+ 3行の一意な値、という分布。固定点方式(モジュール冒頭の
+        // 説明を参照)では、値を1つ抽出するたびに残り行数に対する平均バケツ
+        // 行数が下がっていくため、単発の閾値計算では抽出されないはずの
+        // 値(たとえば末尾の`5`)まで抽出対象になり、MCV_MAX_ENTRIES(10)
+        // ちょうどに達する。
         let mut values = Vec::new();
-        for v in 0..9 {
-            values.extend(std::iter::repeat_n(Value::BigInt(v), 200));
+        for (v, count) in [20, 15, 12, 10, 9, 8, 7, 6, 5, 5].into_iter().enumerate() {
+            values.extend(std::iter::repeat_n(Value::BigInt(v as i64), count));
         }
-        values.extend((100..200).map(Value::BigInt));
+        values.extend((100..103).map(Value::BigInt));
         let stats = collect(&values);
-        assert!(stats.columns[0].mcv.len() < MCV_MAX_ENTRIES, "mcv={:?}", stats.columns[0].mcv);
-        assert_eq!(stats.columns[0].mcv.len(), 9);
+        assert_eq!(stats.columns[0].mcv.len(), MCV_MAX_ENTRIES, "mcv={:?}", stats.columns[0].mcv);
+    }
+
+    #[test]
+    fn mcv_extraction_lowers_the_threshold_after_removing_a_dominant_value() {
+        // codexレビュー2巡目の再現ケース: 100行が`0`×50、`1`×8、`2`〜`43`×
+        // 各1行という分布。抽出前の平均バケツ行数(100/10=10行)だけを見ると
+        // `1`(8行)はMCVに入らないが、`0`(50行)を先に抽出すると残り50行の
+        // 平均バケツ行数は5行に下がり、`1`はこの新しい閾値を上回るため
+        // 固定点方式ではMCVに移る。
+        let mut values = vec![Value::BigInt(0); 50];
+        values.extend(std::iter::repeat_n(Value::BigInt(1), 8));
+        values.extend((2..44).map(Value::BigInt));
+        let stats = collect(&values);
+        assert_eq!(stats.columns[0].mcv, vec![(Value::BigInt(0), 50), (Value::BigInt(1), 8)]);
+        let residual_total: u64 = stats.columns[0].histogram.iter().map(|b| b.row_count).sum();
+        assert_eq!(residual_total, 42);
     }
 
     #[test]

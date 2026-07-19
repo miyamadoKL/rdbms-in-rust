@@ -1463,7 +1463,9 @@ fn column_owner_stats<'a>(expr: &BoundExpr, plan: &PhysicalPlan, stats: &'a dyn 
     table_stats.columns.get(local_index).map(|c| (c, table_stats.row_count))
 }
 
-/// `predicate`(`plan`を子に持つ`Filter`の述語)の選択率を見積もる。
+/// `predicate`(`plan`を子に持つ`Filter`の述語)の選択率を見積もる。`TRUE`に
+/// なる行の割合(`WHERE`句が実際に拾う行の割合)だけを返す、[`predicate_selectivity3`]
+/// の薄いラッパー。
 ///
 /// 対応するのは、`col <op> 定数`(`=`・`<>`・`<`・`<=`・`>`・`>=`)の形の比較、
 /// `col IS [NOT] NULL`、`AND`・`OR`・`NOT`による組み合わせだけである。列参照が
@@ -1471,111 +1473,70 @@ fn column_owner_stats<'a>(expr: &BoundExpr, plan: &PhysicalPlan, stats: &'a dyn 
 /// この章の推定式が対応する範囲の外にあるため、
 /// [`estimator::DEFAULT_INEQ_SEL`]にフォールバックする。
 pub fn predicate_selectivity(predicate: &BoundExpr, plan: &PhysicalPlan, stats: &dyn StatsLookup) -> f64 {
+    predicate_selectivity3(predicate, plan, stats).is_true
+}
+
+/// [`predicate_selectivity`]の3値論理版。`predicate`の[`estimator::Selectivity3`]
+/// (`TRUE`/`FALSE`/`UNKNOWN`の3確率)を式木に沿って再帰的に組み立てる。
+///
+/// 比較・`IS [NOT] NULL`という葉で`Selectivity3`を作り、`AND`・`OR`・`NOT`は
+/// [`estimator::and3`]・[`estimator::or3`]・[`estimator::not3`]でSQLの
+/// 真理値表どおりに合成する(`estimator`モジュールの説明を参照)。対応する
+/// 範囲の外にある式(列参照が定数と比較されていない述語など)は、
+/// `UNKNOWN`にならない([`estimator::Selectivity3::certain`])既定の不等号
+/// 選択率として扱う。
+fn predicate_selectivity3(predicate: &BoundExpr, plan: &PhysicalPlan, stats: &dyn StatsLookup) -> estimator::Selectivity3 {
     match predicate {
-        BoundExpr::Paren { expr, .. } => predicate_selectivity(expr, plan, stats),
-        BoundExpr::UnaryOp { op: UnaryOperator::Not, expr, .. } => {
-            let known_fraction = operand_non_null_fraction(expr, plan, stats);
-            estimator::estimate_not_selectivity(known_fraction, predicate_selectivity(expr, plan, stats))
-        }
+        BoundExpr::Paren { expr, .. } => predicate_selectivity3(expr, plan, stats),
+        BoundExpr::UnaryOp { op: UnaryOperator::Not, expr, .. } => estimator::not3(predicate_selectivity3(expr, plan, stats)),
         BoundExpr::BinaryOp { op: BinaryOperator::And, lhs, rhs, .. } => {
-            estimator::estimate_and_selectivity(predicate_selectivity(lhs, plan, stats), predicate_selectivity(rhs, plan, stats))
+            estimator::and3(predicate_selectivity3(lhs, plan, stats), predicate_selectivity3(rhs, plan, stats))
         }
         BoundExpr::BinaryOp { op: BinaryOperator::Or, lhs, rhs, .. } => {
-            estimator::estimate_or_selectivity(predicate_selectivity(lhs, plan, stats), predicate_selectivity(rhs, plan, stats))
+            estimator::or3(predicate_selectivity3(lhs, plan, stats), predicate_selectivity3(rhs, plan, stats))
         }
-        BoundExpr::BinaryOp { op, lhs, rhs, .. } => comparison_selectivity(*op, lhs, rhs, plan, stats),
+        BoundExpr::BinaryOp { op, lhs, rhs, .. } => comparison_selectivity3(*op, lhs, rhs, plan, stats),
         BoundExpr::IsNull { expr, negated: false, .. } => {
             let (column_stats, row_count) = column_owner_stats(expr, plan, stats).unzip();
-            estimator::estimate_is_null_selectivity(column_stats, row_count.unwrap_or(estimator::DEFAULT_ROW_COUNT_ESTIMATE))
+            estimator::is_null_selectivity3(column_stats, row_count.unwrap_or(estimator::DEFAULT_ROW_COUNT_ESTIMATE))
         }
         BoundExpr::IsNull { expr, negated: true, .. } => {
             let (column_stats, row_count) = column_owner_stats(expr, plan, stats).unzip();
-            estimator::estimate_is_not_null_selectivity(column_stats, row_count.unwrap_or(estimator::DEFAULT_ROW_COUNT_ESTIMATE))
+            estimator::is_not_null_selectivity3(column_stats, row_count.unwrap_or(estimator::DEFAULT_ROW_COUNT_ESTIMATE))
         }
-        _ => estimator::DEFAULT_INEQ_SEL,
+        _ => estimator::Selectivity3::certain(estimator::DEFAULT_INEQ_SEL),
     }
 }
 
-/// `lhs <op> rhs`という1個の比較式の選択率を見積もる。`col = 定数`・
-/// `定数 = col`のどちらの並びでも同じ選択率になるよう、列参照がどちらの側に
-/// あるかを見て演算子の向きを揃える。
-fn comparison_selectivity(op: BinaryOperator, lhs: &BoundExpr, rhs: &BoundExpr, plan: &PhysicalPlan, stats: &dyn StatsLookup) -> f64 {
+/// `lhs <op> rhs`という1個の比較式の[`estimator::Selectivity3`]を見積もる。
+/// `col = 定数`・`定数 = col`のどちらの並びでも同じ選択率になるよう、
+/// 列参照がどちらの側にあるかを見て演算子の向きを揃える。
+fn comparison_selectivity3(
+    op: BinaryOperator,
+    lhs: &BoundExpr,
+    rhs: &BoundExpr,
+    plan: &PhysicalPlan,
+    stats: &dyn StatsLookup,
+) -> estimator::Selectivity3 {
     let (column_expr, op, value) = match (literal_value(rhs), literal_value(lhs)) {
         (Some(value), _) => (lhs, op, value),
         (None, Some(value)) => (rhs, flip_comparison(op), value),
-        (None, None) => return estimator::DEFAULT_INEQ_SEL,
+        (None, None) => return estimator::Selectivity3::certain(estimator::DEFAULT_INEQ_SEL),
     };
     let (column_stats, row_count) = match column_owner_stats(column_expr, plan, stats) {
         Some((c, rc)) => (Some(c), rc),
         None => (None, estimator::DEFAULT_ROW_COUNT_ESTIMATE),
     };
     match op {
-        BinaryOperator::Eq => estimator::estimate_equality_selectivity(column_stats, row_count, &value),
-        BinaryOperator::NotEq => {
-            // `<>`は`NOT(=)`と同じ「UNKNOWNを除外した補数」で見積もる
-            // (`estimator::estimate_not_selectivity`のドキュメントを参照)。
-            let eq_sel = estimator::estimate_equality_selectivity(column_stats, row_count, &value);
-            let known_fraction = known_fraction_of_comparison(column_stats, row_count, &value);
-            estimator::estimate_not_selectivity(known_fraction, eq_sel)
-        }
-        BinaryOperator::Lt => estimator::estimate_range_selectivity(column_stats, row_count, estimator::RangeOp::Lt, &value),
-        BinaryOperator::LtEq => estimator::estimate_range_selectivity(column_stats, row_count, estimator::RangeOp::Le, &value),
-        BinaryOperator::Gt => estimator::estimate_range_selectivity(column_stats, row_count, estimator::RangeOp::Gt, &value),
-        BinaryOperator::GtEq => estimator::estimate_range_selectivity(column_stats, row_count, estimator::RangeOp::Ge, &value),
-        _ => estimator::DEFAULT_INEQ_SEL,
-    }
-}
-
-/// `col <op> value`という1個の比較の「被演算子が非NULLである割合」
-/// (=この比較が`UNKNOWN`にならない行の割合)。
-///
-/// `value`自身が`NULL`なら、比較は列の値によらず常に`UNKNOWN`になるため0.0。
-/// 統計が無ければ、列のNULL率が分からないぶん「常に非NULL」(1.0)とみなす。
-/// これは、統計が無いときの`estimate_equality_selectivity`等が
-/// `DEFAULT_EQ_SEL`へ素通しでフォールバックする(NULL率による割引をしない)
-/// ことと整合する。
-fn known_fraction_of_comparison(column_stats: Option<&ColumnStats>, row_count: u64, value: &Value) -> f64 {
-    if value.is_null() {
-        return 0.0;
-    }
-    match column_stats {
-        Some(c) => 1.0 - estimator::null_fraction(c.null_count, row_count),
-        None => 1.0,
-    }
-}
-
-/// `predicate`(`NOT`または`<>`の被演算子)が`UNKNOWN`にならない行の割合。
-///
-/// 3値論理では`AND`・`OR`もオペランドが`UNKNOWN`だと結果が`UNKNOWN`に
-/// なりうる(片方が確定的に`FALSE`/`TRUE`であれば結果が決まる場合を除く)。
-/// この章の推定式はすでに`AND`・`OR`を独立性の仮定で近似しており、その
-/// 近似と同じ考え方(`estimate_and_selectivity`と同じ式)で、「両方の
-/// オペランドが非UNKNOWNである割合」を見積もる。`IS [NOT] NULL`は
-/// 常に非UNKNOWNの述語(`NULL`を渡しても`TRUE`/`FALSE`のどちらかに定まる)
-/// なので1.0を返す。
-fn operand_non_null_fraction(predicate: &BoundExpr, plan: &PhysicalPlan, stats: &dyn StatsLookup) -> f64 {
-    match predicate {
-        BoundExpr::Paren { expr, .. } => operand_non_null_fraction(expr, plan, stats),
-        BoundExpr::UnaryOp { op: UnaryOperator::Not, expr, .. } => operand_non_null_fraction(expr, plan, stats),
-        BoundExpr::BinaryOp { op: BinaryOperator::And, lhs, rhs, .. }
-        | BoundExpr::BinaryOp { op: BinaryOperator::Or, lhs, rhs, .. } => estimator::estimate_and_selectivity(
-            operand_non_null_fraction(lhs, plan, stats),
-            operand_non_null_fraction(rhs, plan, stats),
-        ),
-        BoundExpr::IsNull { .. } => 1.0,
-        BoundExpr::BinaryOp { lhs, rhs, .. } => {
-            let (column_expr, value) = match (literal_value(rhs), literal_value(lhs)) {
-                (Some(value), _) => (lhs.as_ref(), value),
-                (None, Some(value)) => (rhs.as_ref(), value),
-                (None, None) => return 1.0,
-            };
-            let column_stats = column_owner_stats(column_expr, plan, stats);
-            match column_stats {
-                Some((c, row_count)) => known_fraction_of_comparison(Some(c), row_count, &value),
-                None => known_fraction_of_comparison(None, estimator::DEFAULT_ROW_COUNT_ESTIMATE, &value),
-            }
-        }
-        _ => 1.0,
+        BinaryOperator::Eq => estimator::equality_selectivity3(column_stats, row_count, &value),
+        // `<>`は`NOT(=)`そのものなので、`equality_selectivity3`をnot3で
+        // 包むだけでよい(独立した近似式を持たない)。
+        BinaryOperator::NotEq => estimator::not3(estimator::equality_selectivity3(column_stats, row_count, &value)),
+        BinaryOperator::Lt => estimator::range_selectivity3(column_stats, row_count, estimator::RangeOp::Lt, &value),
+        BinaryOperator::LtEq => estimator::range_selectivity3(column_stats, row_count, estimator::RangeOp::Le, &value),
+        BinaryOperator::Gt => estimator::range_selectivity3(column_stats, row_count, estimator::RangeOp::Gt, &value),
+        BinaryOperator::GtEq => estimator::range_selectivity3(column_stats, row_count, estimator::RangeOp::Ge, &value),
+        _ => estimator::Selectivity3::certain(estimator::DEFAULT_INEQ_SEL),
     }
 }
 

@@ -182,6 +182,17 @@ fn skewed_distribution_moves_the_dominant_value_into_mcv() {
 この問題を避けるため、Histogramを組み立てる前に、平均バケツ行数を上回る頻度を持つ値を**MCV**(Most Common Values、最頻値)として個別に抜き出し、Histogramはそれを除いた残りの値だけから組み立てます。
 PostgreSQLの`pg_stats.most_common_vals`と同じ役割分担です。
 
+ただし、「抽出前の全体行数から一度だけ閾値を計算する」だけでは、この問題を防ぎきれません。
+100行が`0`(50行)、`1`(8行)、`2`〜`43`(各1行)という分布を考えます。
+
+抽出前の平均バケツ行数(100行÷10バケツ=10行)だけを見ると、`1`(8行)はこの10行を超えないためMCVに採用されません。
+`0`(50行)をMCVへ移したあとの残り50行は、まだ10個のバケツに分割されます(値の種類は`1`〜`43`の43種類あるため)。
+1バケツあたり5行という、新しい平均バケツ行数のもとでは、`1`(8行)はこの5行を超えているにもかかわらず、抽出前の(古い)閾値だけで判定するとMCVに移らないまま残ります。
+その結果、`1`の8行は単一値バケツ(5行)と隣接する混合バケツ(3行)に分割され、`v = 1`の見積もりは先頭のバケツの5行しか数えられません。
+
+この問題を避けるため、MCVは**固定点**まで抽出します。
+値を1つ抽出するたびに、まだMCVへ移していない残りの行数から平均バケツ行数を**再計算**し、その新しい閾値を上回る値がもう無くなるまで繰り返します。
+
 ```rust
 fn extract_mcv(sorted_values: &[Value]) -> (Vec<(Value, u64)>, Vec<Value>) {
     if sorted_values.is_empty() {
@@ -197,36 +208,64 @@ fn extract_mcv(sorted_values: &[Value]) -> (Vec<(Value, u64)>, Vec<Value>) {
             _ => counts.push((value.clone(), 1)),
         }
     }
-
-    // `build_equi_depth_histogram`が実際に作るバケツ数は
-    // `min(値の総数, HISTOGRAM_BUCKET_COUNT)`である(値の総数がバケツ数
-    // より少なければ、その分だけしかバケツができない)。閾値もこの実際の
-    // バケツ数に対する平均行数で揃える。固定の`HISTOGRAM_BUCKET_COUNT`を
-    // 分母にすると、値の総数がバケツ数を下回る小さな列で「1回しか出現
-    // しない値」まで平均を上回ってしまい、MCVがほぼ全値を飲み込んでしまう。
-    let effective_bucket_count = sorted_values.len().min(HISTOGRAM_BUCKET_COUNT) as f64;
-    let average_bucket_size = sorted_values.len() as f64 / effective_bucket_count;
-    let mut candidates: Vec<(Value, u64)> =
-        counts.iter().filter(|(_, count)| *count as f64 > average_bucket_size).cloned().collect();
     // 出現回数の降順。同数なら値の昇順(`counts`はソート済みの値順)で決定的に揃える。
-    candidates.sort_by(|(value_a, count_a), (value_b, count_b)| {
-        count_b.cmp(count_a).then_with(|| compare_values(value_a, value_b))
-    });
-    candidates.truncate(MCV_MAX_ENTRIES);
+    counts.sort_by(|(value_a, count_a), (value_b, count_b)| count_b.cmp(count_a).then_with(|| compare_values(value_a, value_b)));
 
-    if candidates.is_empty() {
+    // 出現回数の多い値から順に、「その時点で残っている非NULL行数」に対する
+    // 平均バケツ行数(`build_equi_depth_histogram`が実際に作るバケツ数
+    // `min(残り行数, HISTOGRAM_BUCKET_COUNT)`で割った値)を都度再計算しながら
+    // 抽出する。`counts`は降順なので、ある値がその時点の閾値を超えなければ、
+    // それ以降の値(出現回数がさらに少ない)も、これ以降の閾値(残り行数の
+    // 減少に伴って単調非増加)を超えることは無い。したがって、超えない値に
+    // 出会った時点で走査を打ち切ってよい(固定点に達したことを意味する)。
+    let mut mcv: Vec<(Value, u64)> = Vec::new();
+    let mut remaining_rows = sorted_values.len() as u64;
+    for (value, count) in counts {
+        if mcv.len() >= MCV_MAX_ENTRIES {
+            break;
+        }
+        let effective_bucket_count = remaining_rows.min(HISTOGRAM_BUCKET_COUNT as u64).max(1);
+        let average_bucket_size = remaining_rows as f64 / effective_bucket_count as f64;
+        if count as f64 > average_bucket_size {
+            remaining_rows = remaining_rows.saturating_sub(count);
+            mcv.push((value, count));
+        } else {
+            break;
+        }
+    }
+
+    if mcv.is_empty() {
         return (Vec::new(), sorted_values.to_vec());
     }
 
-    let mcv_values: HashSet<&Value> = candidates.iter().map(|(value, _)| value).collect();
+    let mcv_values: HashSet<&Value> = mcv.iter().map(|(value, _)| value).collect();
     let residual: Vec<Value> = sorted_values.iter().filter(|value| !mcv_values.contains(value)).cloned().collect();
-    (candidates, residual)
+    (mcv, residual)
 }
 ```
 
-先ほどのテストのとおり、`0`はMCVへ移り、Histogramには残りの1〜9(各1行)だけが残ります。
-等値述語の選択率(`estimate_equality_selectivity`、後述)は、まずMCVに値があればその実際の頻度をそのまま返し、無ければ残余のHistogramへフォールバックします。
-「平均バケツ行数を上回る値どうしの出現回数の合計は非NULL行数を超えられない」という関係上、この閾値を同時に上回る値が`MCV_MAX_ENTRIES`(10)件を超えることは実際には起こりませんが、`ANALYZE`を経由しない統計(後述の`Storage::set_table_stats`)への防御として上限は残してあります。
+`0`(50行)を抽出した時点で残り行数は50、平均バケツ行数は5に下がります。
+`1`(8行)はこの新しい閾値(5行)を上回るため、続けてMCVへ移ります。
+残った`2`〜`43`(各1行、合計42行)は、この閾値(次の残り行数42に対する平均4.2行)を上回らないため、ここで抽出が止まります。
+`v = 1`の等値述語は、この`1`がMCVに載ったことでその実際の頻度(8/100)をそのまま返します。
+
+```console
+minidb> -- vが0(50行)、1(8行)、2〜43(各1行、合計100行)というテーブルをANALYZE
+minidb> ANALYZE t;
+ANALYZE 1
+minidb> EXPLAIN ANALYZE SELECT v FROM t WHERE v = 1;
+QUERY PLAN
+----------
+Projection(v) rows=8 actual=8
+  └─ Filter(v = 1) rows=8 actual=8
+    └─ SeqScan(t) rows=100 actual=100
+(3 rows)
+```
+
+「値を1つ抽出するたびに平均バケツ行数を再計算する」という設計上、[`MCV_MAX_ENTRIES`](10)件に達する前に、残りのどの値も新しい閾値を超えなくなる(=固定点に達する)のが通常です。
+それでも、極端に段階的な分布(出現回数が少しずつ減っていく多数の値)では、10件に達してもまだ固定点に届かない場合があります。
+この場合は抽出をそこで打ち切り、残った値は複数の単一値バケツへ分割されたままになります。
+等値述語(`estimate_equality_selectivity`、後述)は同じ値を持つバケツを合算するため選択率自体は狂いませんが、範囲述語やHistogramのバケツ粒度には粗さが残ります。
 
 バケツの組み立ては、ソート済みの(MCVを除いた残余の)非NULL値を`HISTOGRAM_BUCKET_COUNT`個の区間へ、できるだけ均等に割ります。
 
@@ -471,6 +510,22 @@ fn equality_selectivity_within_non_null(stats: &ColumnStats, row_count: u64, val
         return DEFAULT_EQ_SEL;
     }
 
+    if !stats.mcv.is_empty() {
+        // Histogramは空だが、MCVは非空。`extract_mcv`はHistogramに残余の
+        // 値が1つでも残っていれば必ず1個以上のバケツを作る
+        // (`crate::statistics::build_equi_depth_histogram`)ため、Histogramが
+        // 空ということは残余が空、つまりMCVが非NULLの値をすべて網羅して
+        // いることを意味する。`value`はここまでにMCVへ見つからなかった
+        // (このifより前の`if let Some(...)`を参照)ので、`value`はこの列に
+        // 一度も出現していないと確定できる(第4部2巡目レビュー対応、
+        // codexの再現: `a`が常に`0`の列に対する`a = 1`が、統計上は稀では
+        // なく確実に0行のはずが、次の`1 / distinct_count`という単純な
+        // NDVフォールバックのせいで実際には無視できない値を返していた)。
+        return 0.0;
+    }
+
+    // MCVもHistogramも無い(Distinct値数しか分からない)場合だけ、
+    // 「NDV個の値が一様に分布している」という最も粗い仮定にフォールバックする。
     if stats.distinct_count > 0 {
         1.0 / stats.distinct_count as f64
     } else {
@@ -484,6 +539,11 @@ fn equality_selectivity_within_non_null(stats: &ColumnStats, row_count: u64, val
 残余のequi-depth Histogramは、この2行を(1行ずつの)2個の単一値バケツへ分割します。
 `lower == upper == value`という条件でこの状況を検出し、バケツ単位ではなく値単位で数える(同じ値を持つバケツをすべて合算する)ことで、`col = 1`の選択率は2/20(=`rows=2`)を正しく返します。
 この合算を行わずバケツ単位のまま`ndv_per_bucket`で割ると、2行のうち1バケツぶんの1行しか数えられず、見積もりは半分の`rows=1`まで縮んでしまいます。
+
+`0`(90行)や`0`(50行)のように、1つの値だけでMCVの閾値を超え、その値以外の非NULL値が1つも残らない列(`a`が常に`0`固定の列など)では、残余のHistogramは空になります。
+MCVは「Histogramが空になった」時点で、この列の非NULLの値をすべて網羅しています。
+したがって、問い合わせた値がそのMCVに無ければ、その値はこの列に一度も出現していないと確定できます(0.0)。
+`stats.distinct_count > 0`のときの`1 / distinct_count`というフォールバックは、MCVもHistogramも無い(NDVしか分からない)場合専用であり、MCVが非NULL値を網羅している場合に使うと、確実に0行のはずの値へ無視できない選択率を与えてしまいます(第4部2巡目レビュー対応)。
 
 ### 範囲述語: `col > / >= / < / <= 定数`
 
@@ -530,12 +590,32 @@ fn bucket_overlap_fraction(op: RangeOp, value: &Value, lower: &Value, upper: &Va
 }
 ```
 
+```rust
+fn linear_interpolation_position(value: &Value, lower: &Value, upper: &Value) -> Option<f64> {
+    match (value, lower, upper) {
+        (Value::BigInt(v), Value::BigInt(lo), Value::BigInt(hi)) if hi != lo => {
+            let v = i128::from(*v);
+            let lo = i128::from(*lo);
+            let hi = i128::from(*hi);
+            let position = (v - lo) as f64 / (hi - lo) as f64;
+            Some(position.clamp(0.0, 1.0))
+        }
+        _ => None,
+    }
+}
+```
+
 `linear_interpolation_position`は`BIGINT`どうしの`lower`、`upper`、`value`に対してだけ`Some((value - lower) / (upper - lower))`を返します。
 `TEXT`と`BOOLEAN`は`compare_values`による大小比較(全順序)は持ちますが、2値の「距離」(差)を定義する演算を持ちません。
 `"apple"`と`"banana"`の間に`"apricot"`がどれだけ近いかを測る自然な数値は存在しないため、これらの型は`None`(中点0.5という一様分布の仮定)にとどめます。
 
-Histogramがあれば、`bucket_overlap_fraction`をバケツごとに呼び、行数で重み付けして合計します。
-無ければMin/Maxを1個のバケツとみなして同じ計算をするというフォールバックで、Min/Maxも無ければ`DEFAULT_INEQ_SEL`です。
+`v - lo`と`hi - lo`を`i64`のまま引き算すると、`lower`が`i64::MIN`に近い側、`upper`が大きい側にある区間では、有効な`i64`どうしの差でも`i64`の表現範囲(最大で`u64::MAX`、2^64-1に達しうる)を超え、デバッグビルドでは`attempt to subtract with overflow`で停止してしまいます(第4部2巡目レビュー対応)。
+そのため、`v`、`lo`、`hi`を一旦`i128`へ拡張してから引き算し、その結果を`f64`へ変換します。
+
+Histogramのバケツごとに`bucket_overlap_fraction`を呼び、行数で重み付けして合計します。
+MCVは実際の値そのものを持つため、バケツのような近似は要りません。
+各MCVの値を直接`op`で判定し(`satisfies_range`)、満たす値の出現回数をそのまま合計に加えます。
+MCVもHistogramも無い(NDVやMin/Maxしか分からない)場合だけ、Min/Maxを1個のバケツとみなして`bucket_overlap_fraction`を呼ぶフォールバックを使い、Min/Maxも無ければ`DEFAULT_INEQ_SEL`です。
 
 ### `IS NULL` / `IS NOT NULL`
 
@@ -571,33 +651,74 @@ pub fn estimate_is_not_null_selectivity(stats: Option<&ColumnStats>, row_count: 
 
 ### `AND` / `OR` / `NOT`
 
-`AND`は独立性を仮定した積、`OR`は包除原理です。
-`NOT`は単純な「1引く元の値」では済みません。
+`AND`は独立性を仮定した積、`OR`は包除原理で求まりそうに見え、`NOT`は「1引く元の値」で求まりそうに見えます。
+ところが、この単純な式は3値論理の確定規則と食い違います。
+
+100行すべてで`a`が`0`固定(`a = 1`は常に`FALSE`)、`b`が`NULL`固定(`b = 1`は常に`UNKNOWN`)というテーブルで確かめます。
+
+```console
+minidb> -- aが常に0、bが常にNULLの100行をANALYZE
+minidb> ANALYZE tri;
+ANALYZE 1
+minidb> EXPLAIN ANALYZE SELECT a FROM tri WHERE NOT (a = 1 AND b = 1);
+QUERY PLAN
+----------
+Projection(a) rows=100 actual=100
+  └─ Filter(NOT (a = 1 AND b = 1)) rows=100 actual=100
+    └─ SeqScan(tri) rows=100 actual=100
+(3 rows)
+```
+
+`a = 1`は常に`FALSE`なので、`b = 1`が`UNKNOWN`であっても内側の`a = 1 AND b = 1`は常に`FALSE`に確定します(`FALSE AND UNKNOWN`は`FALSE`という、3値論理の真理値表そのものです)。
+`NOT`後は常に`TRUE`になるため、`actual=100`(全行)です。
+
+もし選択率を「`TRUE`になる確率」の1値だけで扱うと、この確定規則を再現できません。
+`sel(a = 1)`はほぼ0、`sel(b = 1)`は列`b`のNULL率(ほぼ1.0)に応じてほぼ0(比較の相手が`NULL`なら`UNKNOWN`、`WHERE`句は`UNKNOWN`を`TRUE`として拾わないため)になり、単純な積`sel(a=1) × sel(b=1)`はほぼ0のままです。
+第1巡目のレビュー対応では、`NOT(p)`を「`p`の被演算子が`UNKNOWN`にならない割合(`known_fraction`)からの補数」として見積もっていましたが、`known_fraction`を`AND`の両辺の積(「両辺とも`UNKNOWN`でない割合」)で近似していたため、`b`のほぼ全行が`UNKNOWN`である以上`known_fraction`もほぼ0になり、`NOT`後の見積もりも実際(`rows=100`)よりはるかに小さい値になっていました。
+問題は、`FALSE AND UNKNOWN`が`FALSE`(=`UNKNOWN`ではなく確定している)という規則を、「両辺とも非`UNKNOWN`か」という指標だけでは表せないことにあります。
+
+これを正しく扱うには、選択率を`TRUE`の1値ではなく、**`TRUE`/`FALSE`/`UNKNOWN`の3確率**として持ち運ぶ必要があります(第4部2巡目レビュー対応)。
 
 ```rust
-pub fn estimate_and_selectivity(a: f64, b: f64) -> f64 {
-    (a * b).clamp(0.0, 1.0)
-}
-
-pub fn estimate_or_selectivity(a: f64, b: f64) -> f64 {
-    (1.0 - (1.0 - a) * (1.0 - b)).clamp(0.0, 1.0)
+pub struct Selectivity3 {
+    pub is_true: f64,
+    pub is_false: f64,
+    pub is_unknown: f64,
 }
 ```
 
-3値論理では`NOT(UNKNOWN)`も`UNKNOWN`のままで、`WHERE`句はそれを`TRUE`として拾いません。
-したがって`NOT(p)`が`TRUE`になるのは、「`p`が`UNKNOWN`にならない行」のうち「`p`が`FALSE`の行」に限られます。
-`known_fraction`(`p`が`UNKNOWN`にならない行の割合)を引数に取り、その中での補数を返す形にします。
+比較や`IS [NOT] NULL`という葉では、この3確率をそれぞれの列のNULL率から組み立てます(`col <op> 定数`なら`is_unknown`は列のNULL率、`IS [NOT] NULL`は常に`is_unknown = 0`)。
+`AND`、`OR`、`NOT`は、独立性を仮定しつつSQLの真理値表どおりに合成します。
 
 ```rust
-pub fn estimate_not_selectivity(known_fraction: f64, selectivity: f64) -> f64 {
-    (known_fraction - selectivity).clamp(0.0, 1.0)
+pub fn and3(a: Selectivity3, b: Selectivity3) -> Selectivity3 {
+    let is_true = (a.is_true * b.is_true).clamp(0.0, 1.0);
+    let is_false = (a.is_false + b.is_false - a.is_false * b.is_false).clamp(0.0, 1.0);
+    let is_unknown = (1.0 - is_true - is_false).max(0.0);
+    Selectivity3 { is_true, is_false, is_unknown }
+}
+
+pub fn or3(a: Selectivity3, b: Selectivity3) -> Selectivity3 {
+    let is_true = (a.is_true + b.is_true - a.is_true * b.is_true).clamp(0.0, 1.0);
+    let is_false = (a.is_false * b.is_false).clamp(0.0, 1.0);
+    let is_unknown = (1.0 - is_true - is_false).max(0.0);
+    Selectivity3 { is_true, is_false, is_unknown }
+}
+
+pub fn not3(p: Selectivity3) -> Selectivity3 {
+    Selectivity3 { is_true: p.is_false, is_false: p.is_true, is_unknown: p.is_unknown }
 }
 ```
 
-`known_fraction`は、否定対象の述語の形ごとに変わります(`col <op> 定数`という比較なら列の非NULL率、`IS [NOT] NULL`なら常に1.0、`AND`/`OR`ならその両辺の`known_fraction`の積)。
-呼び出し側の`physical_plan::operand_non_null_fraction`が計算します。
-`<>`(`NotEq`)も`NOT(=)`と同じ式で見積もります。
-これが正しいのは、この教材の式体系では`UNKNOWN`が「比較の被演算子(列か定数)が`NULL`であること」だけから生じ、それ以外の経路(3値論理の`AND`/`OR`が両辺とも確定していないのに結果だけ確定する、といったケース)をこの章の推定範囲(`col <op> 定数`の比較と、その`AND`や`OR`、`NOT`による組み合わせ)が扱わないためです。
+`AND`が`FALSE`になるのは「どちらか一方が`FALSE`」のとき(他方が`UNKNOWN`でもよい)なので、独立性を仮定した包除原理`P(a=F) + P(b=F) - P(a=F)P(b=F)`で`is_false`を求めます。
+`AND`が`TRUE`になるのは「両方とも`TRUE`」のときに限られるので、`is_true`は積です。
+`is_unknown`は残り(`1 - is_true - is_false`)として求めます。
+`OR`はこの対称で、「どちらか一方が`TRUE`」で`is_true`が確定し(包除原理)、「両方とも`FALSE`」でだけ`is_false`が確定します(積)。
+`NOT`は`TRUE`と`FALSE`を入れ替えるだけで、`UNKNOWN`はそのまま`UNKNOWN`にとどまります。
+
+`predicate_selectivity`(`physical_plan`)は、式木を`Selectivity3`で再帰的にたどり、最後に`is_true`だけを取り出します。
+`<>`(`NotEq`)も、独立した近似式を持たず`not3`(`=`の`Selectivity3`)として求めます。
+第1巡目の`known_fraction`方式(旧`operand_non_null_fraction`と`estimate_not_selectivity`)は、この3確率方式に吸収する形で退役しました。
 
 `AND`の独立性の仮定(2つの述語が互いに無関係に成り立つ)は、`status`と`amount`のように実際には相関する列の組み合わせでは崩れます。
 この節ではまだ崩れないことにして、崩れる実例は後の節で`EXPLAIN ANALYZE`を使って確かめます。

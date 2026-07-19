@@ -3574,6 +3574,27 @@ mod tests {
     }
 
     #[test]
+    fn mcv_fixed_point_extraction_catches_a_mid_frequency_value_after_the_dominant_one() {
+        // codexレビュー2巡目の再現ケース: 100行が`v`=0(50行)、1(8行)、
+        // 2〜43(各1行)という分布。抽出前の平均バケツ行数(10行)だけを見ると
+        // `1`(8行)はMCVに入らず、残余のequi-depth Histogramで単一値バケツへ
+        // 分割される。`0`を抽出したあとの残り50行に対する平均バケツ行数
+        // (5行)を再計算する固定点方式であれば、`1`もMCVへ移り、
+        // `v = 1`の見積もりは実測と一致するはず。
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE t (v BIGINT)").unwrap();
+        let mut rows: Vec<String> = std::iter::repeat_n("(0)".to_string(), 50).collect();
+        rows.extend(std::iter::repeat_n("(1)".to_string(), 8));
+        rows.extend((2..44).map(|v| format!("({v})")));
+        db.execute(&format!("INSERT INTO t VALUES {}", rows.join(", "))).unwrap();
+        db.execute("ANALYZE t").unwrap();
+
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT v FROM t WHERE v = 1");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (8, 8), "line={}", lines[0]);
+    }
+
+    #[test]
     fn null_aware_equality_matches_the_actual_row_count() {
         // v=0: 非NULL率(10/100)×非NULL内での一致割合(1/10)=0.01→1行。
         let mut db = null_heavy_table();
@@ -3629,6 +3650,95 @@ mod tests {
         assert_eq!((rows, actual), (0, 0), "line={}", lines[0]);
     }
 
+    /// `a`が常に`0`(`a = 1`は常にFALSE、`a = 0`は常にTRUE)、`b`が常に`NULL`
+    /// (`b = 1`は常にUNKNOWN)という100行のテーブル。3値論理の確定規則
+    /// (`FALSE AND UNKNOWN`は`FALSE`、`TRUE OR UNKNOWN`は`TRUE`など)を
+    /// `AND`・`OR`・`NOT`のそれぞれで確かめる(第4部2巡目レビュー対応、
+    /// codexの再現: `NOT (a = 1 AND b = 1)`)。
+    fn three_valued_logic_table() -> Database {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE tri (a BIGINT, b BIGINT)").unwrap();
+        let rows: Vec<String> = std::iter::repeat_n("(0, NULL)".to_string(), 100).collect();
+        db.execute(&format!("INSERT INTO tri VALUES {}", rows.join(", "))).unwrap();
+        db.execute("ANALYZE tri").unwrap();
+        db
+    }
+
+    #[test]
+    fn and_of_false_and_unknown_is_false() {
+        // a = 1(常にFALSE) AND b = 1(常にUNKNOWN) は常にFALSE。
+        let mut db = three_valued_logic_table();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT a FROM tri WHERE a = 1 AND b = 1");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (0, 0), "line={}", lines[0]);
+    }
+
+    #[test]
+    fn and_of_true_and_unknown_is_unknown() {
+        // a = 0(常にTRUE) AND b = 1(常にUNKNOWN) は常にUNKNOWN
+        // (WHEREはUNKNOWNの行をFALSEと同じく落とす)。
+        let mut db = three_valued_logic_table();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT a FROM tri WHERE a = 0 AND b = 1");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (0, 0), "line={}", lines[0]);
+    }
+
+    #[test]
+    fn or_of_true_and_unknown_is_true() {
+        // a = 0(常にTRUE) OR b = 1(常にUNKNOWN) は常にTRUE。
+        let mut db = three_valued_logic_table();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT a FROM tri WHERE a = 0 OR b = 1");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (100, 100), "line={}", lines[0]);
+    }
+
+    #[test]
+    fn or_of_false_and_unknown_is_unknown() {
+        // a = 1(常にFALSE) OR b = 1(常にUNKNOWN) は常にUNKNOWN。
+        let mut db = three_valued_logic_table();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT a FROM tri WHERE a = 1 OR b = 1");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (0, 0), "line={}", lines[0]);
+    }
+
+    #[test]
+    fn not_of_false_and_unknown_is_true() {
+        // codexレビュー2巡目の再現そのもの: NOT(FALSE AND UNKNOWN) = NOT(FALSE) = TRUE。
+        // 第1巡目の`known_fraction`方式は、この内側のANDをUNKNOWNに近いものと
+        // 誤認し、NOT後の見積もりを実際より小さく(rows=0)していた。
+        let mut db = three_valued_logic_table();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT a FROM tri WHERE NOT (a = 1 AND b = 1)");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (100, 100), "line={}", lines[0]);
+    }
+
+    #[test]
+    fn not_of_true_and_unknown_is_unknown() {
+        // NOT(TRUE AND UNKNOWN) = NOT(UNKNOWN) = UNKNOWN。
+        let mut db = three_valued_logic_table();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT a FROM tri WHERE NOT (a = 0 AND b = 1)");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (0, 0), "line={}", lines[0]);
+    }
+
+    #[test]
+    fn not_of_true_or_unknown_is_false() {
+        // NOT(TRUE OR UNKNOWN) = NOT(TRUE) = FALSE。
+        let mut db = three_valued_logic_table();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT a FROM tri WHERE NOT (a = 0 OR b = 1)");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (0, 0), "line={}", lines[0]);
+    }
+
+    #[test]
+    fn not_of_false_or_unknown_is_unknown() {
+        // NOT(FALSE OR UNKNOWN) = NOT(UNKNOWN) = UNKNOWN。
+        let mut db = three_valued_logic_table();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT a FROM tri WHERE NOT (a = 1 OR b = 1)");
+        let (rows, actual) = parse_rows_and_actual(&lines[0]);
+        assert_eq!((rows, actual), (0, 0), "line={}", lines[0]);
+    }
+
     #[test]
     fn join_cardinality_excludes_null_keys_from_both_sides() {
         // a.v = b.vの結合キーにNULLの行を含めると、NULL同士は等号で
@@ -3649,6 +3759,27 @@ mod tests {
         let join_line = lines.iter().find(|line| line.contains("Join")).expect("Join行が見つかりません");
         let (rows, actual) = parse_rows_and_actual(join_line);
         assert_eq!((rows, actual), (10, 10), "line={join_line}");
+    }
+
+    #[test]
+    fn range_selectivity_does_not_overflow_when_the_bucket_spans_i64_min() {
+        // i64::MINを含む極値のDistinct値を挿入し、線形補間の差分計算が
+        // i64のままoverflowしないことを確認する(第4部2巡目レビュー対応、
+        // codexの再現: `attempt to subtract with overflow`)。
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE extremes (v BIGINT)").unwrap();
+        let mut values: Vec<String> = vec![format!("({})", i64::MIN)];
+        values.extend((0..10).map(|v| format!("({v})")));
+        db.execute(&format!("INSERT INTO extremes VALUES {}", values.join(", "))).unwrap();
+        db.execute("ANALYZE extremes").unwrap();
+
+        let lines = explain_lines(&mut db, "EXPLAIN SELECT v FROM extremes WHERE v < -1");
+        assert!(lines[0].starts_with("Projection(v) rows="), "line={}", lines[0]);
+
+        // 実行結果もoverflowせず、実際に一致する1行(i64::MINのみ)を返す。
+        let result = db.execute("SELECT v FROM extremes WHERE v < -1").unwrap();
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values()[0], Value::BigInt(i64::MIN));
     }
 
     #[test]

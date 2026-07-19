@@ -16,6 +16,17 @@
 //! 積として見積もる(詳細は[`estimate_equality_selectivity`]、
 //! [`estimate_range_selectivity`]を参照)。
 //!
+//! # `AND`/`OR`/`NOT`は3値論理の確率(`Selectivity3`)で合成する
+//!
+//! `col <op> 定数`のような葉の述語は`TRUE`の1値(選択率)だけで表せるが、
+//! `AND`・`OR`・`NOT`を含む複合述語はそれでは正しく合成できない
+//! (`FALSE AND UNKNOWN`は`FALSE`、`TRUE OR UNKNOWN`は`TRUE`と確定するなど、
+//! `UNKNOWN`の伝播規則が単純な積や補数では再現できないため、第4部2巡目
+//! レビュー対応)。そのためこの章は、`TRUE`/`FALSE`/`UNKNOWN`の3確率を持つ
+//! [`Selectivity3`]を葉から再帰的に組み立て、[`and3`]・[`or3`]・[`not3`]で
+//! SQLの真理値表どおりに合成する。呼び出し側(`physical_plan::predicate_selectivity`)
+//! が式木をたどって`Selectivity3`を組み立て、最後に`is_true`だけを取り出す。
+//!
 //! # 統計が無い場合のデフォルト選択率
 //!
 //! `ANALYZE`を実行していない列に対する述語は、PostgreSQLの`selfuncs.c`が
@@ -55,6 +66,49 @@ pub enum RangeOp {
     Le,
 }
 
+/// SQLの3値論理(`TRUE`/`FALSE`/`UNKNOWN`)における、1個の述語の推定確率
+/// (第4部2巡目レビュー対応)。
+///
+/// `is_true + is_false + is_unknown == 1.0`(丸め誤差を除く)を保つ。
+/// `WHERE`句が拾うのは`is_true`の行だけだが、`AND`・`OR`・`NOT`を正しく
+/// 合成するには`TRUE`の確率だけでは足りない。`FALSE AND UNKNOWN`は
+/// `FALSE`、`TRUE OR UNKNOWN`は`TRUE`と確定するため、「両辺が`UNKNOWN`で
+/// ない割合」のような単純な指標だけでは、この確定規則を再現できない
+/// (`crate::physical_plan`が第1巡目のレビュー対応で使っていた
+/// `known_fraction`方式の限界。詳細は[`and3`]・[`or3`]のドキュメントを参照)。
+/// この構造体は、比較・`IS [NOT] NULL`という葉から`TRUE`/`FALSE`/`UNKNOWN`の
+/// 3確率を計算し、`AND`・`OR`・`NOT`をSQLの真理値表どおりに合成すること
+/// (葉どうしの独立性は仮定する)で、この確定規則を再現する。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Selectivity3 {
+    pub is_true: f64,
+    pub is_false: f64,
+    pub is_unknown: f64,
+}
+
+impl Selectivity3 {
+    /// `UNKNOWN`にならない(`is_unknown == 0.0`)述語。`IS [NOT] NULL`など、
+    /// `NULL`を渡しても`TRUE`/`FALSE`のどちらかに定まる述語に使う。
+    pub fn certain(is_true: f64) -> Self {
+        let is_true = is_true.clamp(0.0, 1.0);
+        Selectivity3 { is_true, is_false: 1.0 - is_true, is_unknown: 0.0 }
+    }
+
+    /// `is_true`・`is_unknown`の2つから組み立てる。`is_false`は残りとして
+    /// 求める(3つの合計が1.0になるように)。`col <op> 定数`のような比較述語
+    /// (`UNKNOWN`になるのは被演算子が`NULL`のときだけ)に使う。
+    pub fn from_true_and_unknown(is_true: f64, is_unknown: f64) -> Self {
+        let is_true = is_true.clamp(0.0, 1.0);
+        let is_unknown = is_unknown.clamp(0.0, 1.0 - is_true);
+        Selectivity3 { is_true, is_false: (1.0 - is_true - is_unknown).max(0.0), is_unknown }
+    }
+
+    /// 常に`UNKNOWN`(`v = NULL`のような、比較の一方が`NULL`リテラルの述語)。
+    pub fn always_unknown() -> Self {
+        Selectivity3 { is_true: 0.0, is_false: 0.0, is_unknown: 1.0 }
+    }
+}
+
 /// `null_count`件が`row_count`行中のNULLである列の、NULL率(0.0〜1.0)。
 ///
 /// `row_count`が0の場合(空テーブル)は0.0を返す。`null_count`が`row_count`を
@@ -88,6 +142,33 @@ pub fn estimate_equality_selectivity(stats: Option<&ColumnStats>, row_count: u64
     let Some(stats) = stats else { return DEFAULT_EQ_SEL };
     let non_null = 1.0 - null_fraction(stats.null_count, row_count);
     non_null * equality_selectivity_within_non_null(stats, row_count, value)
+}
+
+/// [`estimate_equality_selectivity`]の3値論理版。[`Selectivity3`]のドキュメントを
+/// 参照。`value`が`NULL`なら常に`UNKNOWN`([`Selectivity3::always_unknown`])。
+/// それ以外は、`TRUE`の割合は[`estimate_equality_selectivity`]と同じ値を使い、
+/// `UNKNOWN`の割合は列のNULL率([`comparison_unknown_fraction`])を使う。
+pub fn equality_selectivity3(stats: Option<&ColumnStats>, row_count: u64, value: &Value) -> Selectivity3 {
+    if value.is_null() {
+        return Selectivity3::always_unknown();
+    }
+    let is_true = estimate_equality_selectivity(stats, row_count, value);
+    let is_unknown = comparison_unknown_fraction(stats, row_count);
+    Selectivity3::from_true_and_unknown(is_true, is_unknown)
+}
+
+/// `col <op> value`という比較述語が`UNKNOWN`になる行の割合。`UNKNOWN`になる
+/// のは、この章の式体系では被演算子の列が`NULL`のときだけである(`value`
+/// 自身が`NULL`のケースは呼び出し側が先に判定し、常に`UNKNOWN`として扱う)。
+/// 統計が無ければ、列のNULL率が分からないため0.0(常に非NULL)とみなす。
+/// これは、統計が無いときの`estimate_equality_selectivity`等が
+/// `DEFAULT_EQ_SEL`へ素通しでフォールバックする(NULL率による割引をしない)
+/// ことと整合する。
+fn comparison_unknown_fraction(stats: Option<&ColumnStats>, row_count: u64) -> f64 {
+    match stats {
+        Some(stats) => null_fraction(stats.null_count, row_count),
+        None => 0.0,
+    }
 }
 
 /// [`estimate_equality_selectivity`]の内部計算。「非NULL行の中で`value`に
@@ -140,6 +221,22 @@ fn equality_selectivity_within_non_null(stats: &ColumnStats, row_count: u64, val
         return DEFAULT_EQ_SEL;
     }
 
+    if !stats.mcv.is_empty() {
+        // Histogramは空だが、MCVは非空。`extract_mcv`はHistogramに残余の
+        // 値が1つでも残っていれば必ず1個以上のバケツを作る
+        // (`crate::statistics::build_equi_depth_histogram`)ため、Histogramが
+        // 空ということは残余が空、つまりMCVが非NULLの値をすべて網羅して
+        // いることを意味する。`value`はここまでにMCVへ見つからなかった
+        // (このifより前の`if let Some(...)`を参照)ので、`value`はこの列に
+        // 一度も出現していないと確定できる(第4部2巡目レビュー対応、
+        // codexの再現: `a`が常に`0`の列に対する`a = 1`が、統計上は稀では
+        // なく確実に0行のはずが、次の`1 / distinct_count`という単純な
+        // NDVフォールバックのせいで実際には無視できない値を返していた)。
+        return 0.0;
+    }
+
+    // MCVもHistogramも無い(Distinct値数しか分からない)場合だけ、
+    // 「NDV個の値が一様に分布している」という最も粗い仮定にフォールバックする。
     if stats.distinct_count > 0 {
         1.0 / stats.distinct_count as f64
     } else {
@@ -199,10 +296,21 @@ fn bucket_overlap_fraction(op: RangeOp, value: &Value, lower: &Value, upper: &Va
 /// 持つが、2値の「距離」(差)を定義する演算を持たない。`"apple"`と`"banana"`の
 /// 間に`"apricot"`がどれだけ近いかを測る自然な数値は存在しないため、この章では
 /// 中点(0.5)という一様分布の仮定にとどめる。
+///
+/// `v - lo`・`hi - lo`を`i64`のまま引き算すると、`lo`が`i64::MIN`に近く
+/// `v`・`hi`が大きい(または符号が逆)場合に有効な値どうしの差でも`i64`の
+/// 表現範囲を超え、デバッグビルドでは`attempt to subtract with overflow`で
+/// 停止し、リリースビルドでは巻き戻った不正な値を静かに使ってしまう
+/// (第4部2巡目レビュー対応)。`i64`の差は最大で`u64::MAX`(2^64-1)に達しうる
+/// ため、一旦`i128`へ拡張してから引き算し、その結果を`f64`へ変換することで
+/// この範囲のどんな`i64`どうしの差も正確に計算する。
 fn linear_interpolation_position(value: &Value, lower: &Value, upper: &Value) -> Option<f64> {
     match (value, lower, upper) {
         (Value::BigInt(v), Value::BigInt(lo), Value::BigInt(hi)) if hi != lo => {
-            let position = (*v - *lo) as f64 / (*hi - *lo) as f64;
+            let v = i128::from(*v);
+            let lo = i128::from(*lo);
+            let hi = i128::from(*hi);
+            let position = (v - lo) as f64 / (hi - lo) as f64;
             Some(position.clamp(0.0, 1.0))
         }
         _ => None,
@@ -227,25 +335,38 @@ pub fn estimate_range_selectivity(stats: Option<&ColumnStats>, row_count: u64, o
     non_null * range_selectivity_within_non_null(stats, op, value)
 }
 
+/// [`estimate_range_selectivity`]の3値論理版。[`equality_selectivity3`]と
+/// 同じ考え方で、`TRUE`の割合は[`estimate_range_selectivity`]と同じ値、
+/// `UNKNOWN`の割合は列のNULL率を使う。
+pub fn range_selectivity3(stats: Option<&ColumnStats>, row_count: u64, op: RangeOp, value: &Value) -> Selectivity3 {
+    if value.is_null() {
+        return Selectivity3::always_unknown();
+    }
+    let is_true = estimate_range_selectivity(stats, row_count, op, value);
+    let is_unknown = comparison_unknown_fraction(stats, row_count);
+    Selectivity3::from_true_and_unknown(is_true, is_unknown)
+}
+
 /// [`estimate_range_selectivity`]の内部計算。「非NULL行の中で述語を満たす
 /// 行の割合」(0.0〜1.0)を返す。
 fn range_selectivity_within_non_null(stats: &ColumnStats, op: RangeOp, value: &Value) -> f64 {
-    if stats.histogram.is_empty() {
+    // Histogramは残余(MCVを除いた)非NULL値だけを持つため、非NULL行全体に
+    // 対する割合を求めるには、MCVの各値についても個別に判定してから合算する
+    // 必要がある。MCVは実際の値そのものを持つため、`satisfies_range`で
+    // 過不足なく正確に判定できる(近似が要るのはHistogramのバケツだけ)。
+    let histogram_rows: u64 = stats.histogram.iter().map(|b| b.row_count).sum();
+    let mcv_rows: u64 = stats.mcv.iter().map(|(_, count)| count).sum();
+    let total_rows = histogram_rows + mcv_rows;
+
+    if total_rows == 0 {
+        // MCVもHistogramも無い(Distinct値数やMin/Maxしか分からない)場合。
+        // Min/Maxを1個のバケツとみなした近似にフォールバックする。
         return match (&stats.min, &stats.max) {
             (Some(min), Some(max)) => bucket_overlap_fraction(op, value, min, max),
             _ => DEFAULT_INEQ_SEL,
         };
     }
 
-    // Histogramは残余(MCVを除いた)非NULL値だけを持つため、非NULL行全体に
-    // 対する割合を求めるには、MCVの各値についても個別に判定してから合算する
-    // 必要がある。
-    let histogram_rows: u64 = stats.histogram.iter().map(|b| b.row_count).sum();
-    let mcv_rows: u64 = stats.mcv.iter().map(|(_, count)| count).sum();
-    let total_rows = histogram_rows + mcv_rows;
-    if total_rows == 0 {
-        return DEFAULT_INEQ_SEL;
-    }
     let histogram_matched: f64 =
         stats.histogram.iter().map(|b| b.row_count as f64 * bucket_overlap_fraction(op, value, &b.lower, &b.upper)).sum();
     let mcv_matched: f64 = stats
@@ -267,14 +388,15 @@ fn satisfies_range(op: RangeOp, x: &Value, value: &Value) -> bool {
 }
 
 /// `AND`(2つの述語の連言)の選択率。独立性を仮定した積で見積もる。
+///
+/// この関数は`TRUE`の1値だけを合成する、[`RangeOp`]の下限・上限のように
+/// 「両辺とも`UNKNOWN`になりえない」ことが分かっている場面
+/// (`physical_plan::range_selectivity_of_bounds`)専用である。一般の`WHERE`句
+/// (`AND`の両辺が任意の述語になりうる)は、`UNKNOWN`の伝播規則がこの単純な
+/// 積では正しく求まらないため、[`and3`]を使う([`Selectivity3`]のドキュメント、
+/// および[`and3`]自身のドキュメントを参照)。
 pub fn estimate_and_selectivity(a: f64, b: f64) -> f64 {
     (a * b).clamp(0.0, 1.0)
-}
-
-/// `OR`(2つの述語の選言)の選択率。包除原理(独立性を仮定した
-/// `1 - (1-a)(1-b)`)で見積もる。
-pub fn estimate_or_selectivity(a: f64, b: f64) -> f64 {
-    (1.0 - (1.0 - a) * (1.0 - b)).clamp(0.0, 1.0)
 }
 
 /// `IS NULL`述語の選択率。全行のうち`NULL`である割合、つまり
@@ -295,18 +417,65 @@ pub fn estimate_is_not_null_selectivity(stats: Option<&ColumnStats>, row_count: 
     1.0 - estimate_is_null_selectivity(stats, row_count)
 }
 
-/// `NOT`(否定)の選択率。
+/// `IS NULL`/`IS NOT NULL`述語の[`Selectivity3`]。この述語自体は`UNKNOWN`に
+/// ならない([`Selectivity3::certain`])。
+pub fn is_null_selectivity3(stats: Option<&ColumnStats>, row_count: u64) -> Selectivity3 {
+    Selectivity3::certain(estimate_is_null_selectivity(stats, row_count))
+}
+
+/// [`is_null_selectivity3`]の`IS NOT NULL`版。
+pub fn is_not_null_selectivity3(stats: Option<&ColumnStats>, row_count: u64) -> Selectivity3 {
+    Selectivity3::certain(estimate_is_not_null_selectivity(stats, row_count))
+}
+
+/// `AND`(2つの述語の連言)の[`Selectivity3`]を、SQLの3値論理の真理値表どおりに
+/// 合成する(第4部2巡目レビュー対応)。
 ///
-/// `known_fraction`は、否定対象の述語`p`が`UNKNOWN`にならない(=`TRUE`か
-/// `FALSE`のどちらかに定まる)行の割合を表す。3値論理では`NOT(UNKNOWN)`も
-/// `UNKNOWN`のままであり、`WHERE`句はそれを`TRUE`として拾わない。したがって
-/// `NOT(p)`が`TRUE`になるのは、「`p`が`UNKNOWN`にならない行」のうち
-/// 「`p`が`FALSE`の行」に限られ、その割合は`known_fraction - sel(p)`という
-/// 補数(`UNKNOWN`の行を最初から除いた集合の中での`1 - sel(p)`)で求まる。
-/// `known_fraction`を求める具体的な式は、述語の形ごとに異なるため
-/// `physical_plan::operand_non_null_fraction`(呼び出し側)が計算する。
-pub fn estimate_not_selectivity(known_fraction: f64, selectivity: f64) -> f64 {
-    (known_fraction - selectivity).clamp(0.0, 1.0)
+/// `AND`が`FALSE`になるのは「どちらか一方が`FALSE`」のときであり、他方が
+/// `UNKNOWN`でも構わない(`FALSE AND UNKNOWN`は`FALSE`)。したがって
+/// `P(AND=FALSE)`は、`a`・`b`の`FALSE`という事象の独立性を仮定した包除原理
+/// `P(a=F) + P(b=F) - P(a=F)P(b=F)`で求める。`AND`が`TRUE`になるのは
+/// 「両方とも`TRUE`」のときに限られるため、`P(AND=TRUE) = P(a=T)P(b=T)`
+/// (独立性の仮定のもとでの積)である。`P(AND=UNKNOWN)`は残りの確率
+/// (`1 - TRUE - FALSE`)として求める。
+///
+/// 第1巡目のレビュー対応で採用していた`known_fraction`方式(`physical_plan`の
+/// 旧`operand_non_null_fraction`)は、「両辺が非`UNKNOWN`である割合」の積で
+/// `NOT`の分母を近似していた。この方式は`FALSE AND UNKNOWN`のように、
+/// 片方が`UNKNOWN`でも結果が確定するケースを見逃し、確定するはずの行まで
+/// `UNKNOWN`として扱ってしまう欠陥があった(第4部2巡目レビューの再現:
+/// `NOT (a = 1 AND b = 1)`で`a`が常に`FALSE`、`b`が常に`UNKNOWN`のとき、
+/// 内側の`AND`は全行`FALSE`のはずが、旧方式は`known_fraction`を0近くまで
+/// 引き下げてしまい、`NOT`後の見積もりを実際より小さくしていた)。この
+/// 関数はその欠陥を修正し、旧`known_fraction`方式・`estimate_not_selectivity`
+/// を置き換える。
+pub fn and3(a: Selectivity3, b: Selectivity3) -> Selectivity3 {
+    let is_true = (a.is_true * b.is_true).clamp(0.0, 1.0);
+    let is_false = (a.is_false + b.is_false - a.is_false * b.is_false).clamp(0.0, 1.0);
+    let is_unknown = (1.0 - is_true - is_false).max(0.0);
+    Selectivity3 { is_true, is_false, is_unknown }
+}
+
+/// `OR`(2つの述語の選言)の[`Selectivity3`]を、SQLの3値論理の真理値表どおりに
+/// 合成する(第4部2巡目レビュー対応)。[`and3`]のドキュメントを参照。
+///
+/// `OR`が`TRUE`になるのは「どちらか一方が`TRUE`」のときであり
+/// (`TRUE OR UNKNOWN`は`TRUE`)、独立性を仮定した包除原理
+/// `P(a=T) + P(b=T) - P(a=T)P(b=T)`で求める。`OR`が`FALSE`になるのは
+/// 「両方とも`FALSE`」のときに限られるため、`P(OR=FALSE) = P(a=F)P(b=F)`
+/// (独立性の仮定のもとでの積)である。
+pub fn or3(a: Selectivity3, b: Selectivity3) -> Selectivity3 {
+    let is_true = (a.is_true + b.is_true - a.is_true * b.is_true).clamp(0.0, 1.0);
+    let is_false = (a.is_false * b.is_false).clamp(0.0, 1.0);
+    let is_unknown = (1.0 - is_true - is_false).max(0.0);
+    Selectivity3 { is_true, is_false, is_unknown }
+}
+
+/// `NOT`(否定)の[`Selectivity3`]。3値論理では、`NOT`は`TRUE`と`FALSE`を
+/// 入れ替え、`UNKNOWN`はそのまま`UNKNOWN`にとどまる(`NOT(UNKNOWN)`も
+/// `UNKNOWN`)。
+pub fn not3(p: Selectivity3) -> Selectivity3 {
+    Selectivity3 { is_true: p.is_false, is_false: p.is_true, is_unknown: p.is_unknown }
 }
 
 /// 等値結合(`left.k = right.k`)の結果行数を見積もる、標準的な式。
@@ -408,6 +577,43 @@ mod tests {
     }
 
     #[test]
+    fn equality_is_zero_when_mcv_exhausts_the_column_and_the_value_is_absent() {
+        // 列の非NULL値がすべて単一の値(0)で、その値だけでMCVの閾値を
+        // 超えるため残余のHistogramが空になる場合(第4部2巡目レビュー対応、
+        // `three_valued_logic_table`と同じ状況)。MCVはこの列の非NULL値を
+        // すべて網羅しているため、MCVに無い値(1)の選択率は「NDVの逆数」
+        // ではなく確実に0であるべき。
+        let stats = ColumnStats {
+            null_count: 0,
+            distinct_count: 1,
+            min: Some(Value::BigInt(0)),
+            max: Some(Value::BigInt(0)),
+            mcv: vec![(Value::BigInt(0), 100)],
+            histogram: Vec::new(),
+        };
+        assert_eq!(estimate_equality_selectivity(Some(&stats), 100, &Value::BigInt(1)), 0.0);
+    }
+
+    #[test]
+    fn range_uses_mcv_when_histogram_is_empty() {
+        // 上と同じ、MCVが列全体を網羅する分布。範囲述語もMCVの実際の値を
+        // 使って正確に判定できるはずで、Min/Maxを1バケツとみなす粗い近似
+        // (中点0.5)にフォールバックしてはならない。
+        let stats = ColumnStats {
+            null_count: 0,
+            distinct_count: 1,
+            min: Some(Value::BigInt(0)),
+            max: Some(Value::BigInt(0)),
+            mcv: vec![(Value::BigInt(0), 100)],
+            histogram: Vec::new(),
+        };
+        // 0 < 5は常にTRUEのはず。
+        assert_eq!(estimate_range_selectivity(Some(&stats), 100, RangeOp::Lt, &Value::BigInt(5)), 1.0);
+        // 0 > 5は常にFALSEのはず。
+        assert_eq!(estimate_range_selectivity(Some(&stats), 100, RangeOp::Gt, &Value::BigInt(5)), 0.0);
+    }
+
+    #[test]
     fn equality_uses_mcv_frequency_when_the_value_is_a_most_common_value() {
         // 0が90回、1〜9がそれぞれ1回ずつ出現する分布(codexレビューの再現ケース)。
         // 0はMCVに載り、実頻度(90/99)がそのまま返る。
@@ -473,6 +679,55 @@ mod tests {
     }
 
     #[test]
+    fn linear_interpolation_position_does_not_overflow_at_i64_extremes() {
+        // lower=i64::MIN、upper=i64::MAXという最大幅の区間。差(u64::MAXに
+        // 相当する2^64-1)はi64はおろかu64ぎりぎりでも表現できないため、
+        // i128へ拡張してから引き算する(第4部2巡目レビュー対応)。
+        let position = linear_interpolation_position(&Value::BigInt(0), &Value::BigInt(i64::MIN), &Value::BigInt(i64::MAX)).unwrap();
+        // 0は[i64::MIN, i64::MAX]のほぼ中央(厳密には0.5よりわずかに大きい、
+        // 区間の非対称性による)。
+        assert!((position - 0.5).abs() < 1e-9, "position={position}");
+
+        // valueが下限そのもの、上限そのものでも境界値としてoverflowしない。
+        let at_min = linear_interpolation_position(&Value::BigInt(i64::MIN), &Value::BigInt(i64::MIN), &Value::BigInt(i64::MAX)).unwrap();
+        assert!((at_min - 0.0).abs() < 1e-9, "at_min={at_min}");
+        let at_max = linear_interpolation_position(&Value::BigInt(i64::MAX), &Value::BigInt(i64::MIN), &Value::BigInt(i64::MAX)).unwrap();
+        assert!((at_max - 1.0).abs() < 1e-9, "at_max={at_max}");
+    }
+
+    #[test]
+    fn linear_interpolation_position_does_not_overflow_when_the_interval_crosses_zero() {
+        // lowerが負、upperが正の、0をまたぐ区間。
+        let position = linear_interpolation_position(&Value::BigInt(-25), &Value::BigInt(-100), &Value::BigInt(100)).unwrap();
+        assert!((position - 0.375).abs() < 1e-9, "position={position}");
+    }
+
+    #[test]
+    fn linear_interpolation_position_is_none_when_lower_equals_upper() {
+        // 区間の幅が0(バケツが単一値)なら、一様分布の仮定そのものが
+        // 意味を持たないためNoneを返す(`bucket_overlap_fraction`が0.5へ
+        // フォールバックする)。
+        assert_eq!(linear_interpolation_position(&Value::BigInt(5), &Value::BigInt(5), &Value::BigInt(5)), None);
+    }
+
+    #[test]
+    fn range_selectivity_does_not_overflow_at_i64_extremes() {
+        // i64::MINを含む区間に対する範囲選択率の計算がoverflowしないことを、
+        // estimate_range_selectivity経由でも確認する(codexレビューが指摘した
+        // SQL経路の再現に対応する、estimator単体側の回帰)。
+        let stats = ColumnStats {
+            null_count: 0,
+            distinct_count: 0,
+            min: Some(Value::BigInt(i64::MIN)),
+            max: Some(Value::BigInt(9)),
+            histogram: Vec::new(),
+            mcv: Vec::new(),
+        };
+        let selectivity = estimate_range_selectivity(Some(&stats), 1, RangeOp::Lt, &Value::BigInt(-1));
+        assert!((0.0..=1.0).contains(&selectivity), "selectivity={selectivity}");
+    }
+
+    #[test]
     fn range_with_min_max_uses_midpoint_for_text() {
         let stats = ColumnStats {
             null_count: 0,
@@ -519,18 +774,83 @@ mod tests {
     }
 
     #[test]
-    fn or_uses_inclusion_exclusion() {
-        // 1 - (1-0.5)(1-0.5) = 0.75
-        assert!((estimate_or_selectivity(0.5, 0.5) - 0.75).abs() < 1e-9);
+    fn not3_swaps_true_and_false_and_keeps_unknown() {
+        let p = Selectivity3 { is_true: 0.3, is_false: 0.5, is_unknown: 0.2 };
+        let negated = not3(p);
+        assert!((negated.is_true - 0.5).abs() < 1e-9);
+        assert!((negated.is_false - 0.3).abs() < 1e-9);
+        assert!((negated.is_unknown - 0.2).abs() < 1e-9);
     }
 
     #[test]
-    fn not_takes_the_complement_within_the_known_fraction() {
-        // 述語の被演算子が常に非NULL(known_fraction=1.0)なら、単純な1-selectivity。
-        assert!((estimate_not_selectivity(1.0, 0.3) - 0.7).abs() < 1e-9);
-        // known_fraction=0.1(被演算子の90%がNULLでUNKNOWN)なら、NOTのTRUEは
-        // その0.1の中でしか起こらない。
-        assert!((estimate_not_selectivity(0.1, 0.01) - 0.09).abs() < 1e-9);
+    fn and3_is_true_only_when_both_are_true() {
+        let a = Selectivity3::certain(0.5);
+        let b = Selectivity3::certain(0.4);
+        let result = and3(a, b);
+        assert!((result.is_true - 0.2).abs() < 1e-9, "is_true={}", result.is_true);
+        assert!((result.is_unknown - 0.0).abs() < 1e-9, "is_unknown={}", result.is_unknown);
+    }
+
+    #[test]
+    fn and3_false_and_unknown_is_false() {
+        // codexレビュー2巡目の再現: `a = 1`が常にFALSE、`b = 1`が常にUNKNOWN
+        // (bが常にNULL)のとき、`a = 1 AND b = 1`はSQLの3値論理で常にFALSEに
+        // 確定する(FALSEはUNKNOWNに左右されない)。
+        let a = Selectivity3 { is_true: 0.0, is_false: 1.0, is_unknown: 0.0 };
+        let b = Selectivity3 { is_true: 0.0, is_false: 0.0, is_unknown: 1.0 };
+        let result = and3(a, b);
+        assert!((result.is_false - 1.0).abs() < 1e-9, "is_false={}", result.is_false);
+        assert!((result.is_true - 0.0).abs() < 1e-9, "is_true={}", result.is_true);
+        assert!((result.is_unknown - 0.0).abs() < 1e-9, "is_unknown={}", result.is_unknown);
+    }
+
+    #[test]
+    fn and3_true_and_unknown_is_unknown() {
+        let a = Selectivity3 { is_true: 1.0, is_false: 0.0, is_unknown: 0.0 };
+        let b = Selectivity3 { is_true: 0.0, is_false: 0.0, is_unknown: 1.0 };
+        let result = and3(a, b);
+        assert!((result.is_unknown - 1.0).abs() < 1e-9, "is_unknown={}", result.is_unknown);
+        assert!((result.is_true - 0.0).abs() < 1e-9, "is_true={}", result.is_true);
+        assert!((result.is_false - 0.0).abs() < 1e-9, "is_false={}", result.is_false);
+    }
+
+    #[test]
+    fn or3_is_false_only_when_both_are_false() {
+        let a = Selectivity3::certain(0.5);
+        let b = Selectivity3::certain(0.5);
+        let result = or3(a, b);
+        // 1 - (1-0.5)(1-0.5) = 0.75
+        assert!((result.is_true - 0.75).abs() < 1e-9, "is_true={}", result.is_true);
+        assert!((result.is_unknown - 0.0).abs() < 1e-9, "is_unknown={}", result.is_unknown);
+    }
+
+    #[test]
+    fn or3_true_or_unknown_is_true() {
+        let a = Selectivity3 { is_true: 1.0, is_false: 0.0, is_unknown: 0.0 };
+        let b = Selectivity3 { is_true: 0.0, is_false: 0.0, is_unknown: 1.0 };
+        let result = or3(a, b);
+        assert!((result.is_true - 1.0).abs() < 1e-9, "is_true={}", result.is_true);
+        assert!((result.is_unknown - 0.0).abs() < 1e-9, "is_unknown={}", result.is_unknown);
+    }
+
+    #[test]
+    fn or3_false_or_unknown_is_unknown() {
+        let a = Selectivity3 { is_true: 0.0, is_false: 1.0, is_unknown: 0.0 };
+        let b = Selectivity3 { is_true: 0.0, is_false: 0.0, is_unknown: 1.0 };
+        let result = or3(a, b);
+        assert!((result.is_unknown - 1.0).abs() < 1e-9, "is_unknown={}", result.is_unknown);
+        assert!((result.is_true - 0.0).abs() < 1e-9, "is_true={}", result.is_true);
+        assert!((result.is_false - 0.0).abs() < 1e-9, "is_false={}", result.is_false);
+    }
+
+    #[test]
+    fn not_of_false_and_unknown_is_true() {
+        // `NOT (FALSE AND UNKNOWN)` = `NOT FALSE` = `TRUE`
+        // (codexレビュー2巡目の`NOT (a = 1 AND b = 1)`の再現に対応する式レベルの確認)。
+        let a = Selectivity3 { is_true: 0.0, is_false: 1.0, is_unknown: 0.0 };
+        let b = Selectivity3 { is_true: 0.0, is_false: 0.0, is_unknown: 1.0 };
+        let result = not3(and3(a, b));
+        assert!((result.is_true - 1.0).abs() < 1e-9, "is_true={}", result.is_true);
     }
 
     #[test]

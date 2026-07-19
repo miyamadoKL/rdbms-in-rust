@@ -1422,8 +1422,13 @@ fn validate_table_metadata(decoded: &DecodedCatalog) -> DbResult<()> {
 /// * 統計に紐づく`TableId`が実在するテーブルを指しているか。
 /// * 列数・列の型が、対応するテーブル定義の`Schema`と一致するか。
 /// * `null_count <= row_count`、`distinct_count <= 非NULL行数`。
+/// * 非NULL行数が0であることと`distinct_count`が0であることが同値であること
+///   (非NULL行が無いのに`distinct_count > 0`、または非NULL行があるのに
+///   `distinct_count == 0`という不整合を防ぐ、第4部2巡目レビュー対応)。
+/// * `distinct_count >= mcv.len()`(MCVは全体のDistinct値の部分集合)。
 /// * MCVの件数が上限([`MCV_MAX_ENTRIES`])以下で、値が重複せず、値の型が
-///   列の型と一致し、出現回数が`0`より大きく非NULL行数以下であること。
+///   列の型と一致し、出現回数が`0`より大きく非NULL行数以下であり、出現回数が
+///   降順(`crate::statistics::ColumnStats::mcv`の契約)に並んでいること。
 /// * Histogramのバケツ数が上限([`HISTOGRAM_BUCKET_COUNT`])以下で、各バケツの
 ///   境界の型が列の型と一致し、`lower <= upper`であり、バケツどうしが昇順に
 ///   (重ならずに)並んでいること。
@@ -1485,6 +1490,24 @@ fn validate_column_stats_metadata(
     if stats.distinct_count > non_null_rows {
         return Err(corrupt(format!("distinct_count({})が非NULL行数({non_null_rows})を超えています", stats.distinct_count)));
     }
+    // `non_null_rows == 0`(非NULLの値が1件も無い)なら、Distinct値も1つも
+    // 無いはずである。逆に`non_null_rows > 0`なら、少なくとも1個は
+    // Distinct値があるはずである。この同値性を検査しないと、非NULL行が
+    // あるのに`distinct_count = 0`という統計(後段の
+    // `crate::estimator`の`saturating_sub(...).max(1)`という底上げが、この
+    // 意味的な不整合を数値上隠してしまう)を受理してしまう(第4部2巡目
+    // レビュー対応)。
+    if (non_null_rows == 0) != (stats.distinct_count == 0) {
+        return Err(corrupt(format!(
+            "非NULL行数({non_null_rows})とdistinct_count({})の0/非0が一致しません",
+            stats.distinct_count
+        )));
+    }
+    // MCVはDistinct値の部分集合である以上、その件数が全体のDistinct値数を
+    // 超えることはありえない。
+    if stats.distinct_count < stats.mcv.len() as u64 {
+        return Err(corrupt(format!("distinct_count({})がMCVの件数({})を下回っています", stats.distinct_count, stats.mcv.len())));
+    }
 
     if stats.min.is_some() != stats.max.is_some() {
         return Err(corrupt("MinとMaxの有無が一致しません(非NULLの値が無ければ両方None、あれば両方Someのはず)".to_string()));
@@ -1511,6 +1534,7 @@ fn validate_column_stats_metadata(
     }
     let mut seen_mcv_values = HashSet::new();
     let mut mcv_row_total: u64 = 0;
+    let mut previous_mcv_count: Option<u64> = None;
     for (value, count) in &stats.mcv {
         if !value_matches_type(value, data_type) {
             return Err(corrupt(format!("MCVの値の型が列の型({data_type:?})と一致しません: {value:?}")));
@@ -1524,6 +1548,18 @@ fn validate_column_stats_metadata(
         if *count == 0 || *count > non_null_rows {
             return Err(corrupt(format!("MCVの出現回数({count})が非NULL行数({non_null_rows})の範囲外です")));
         }
+        // `ColumnStats::mcv`は出現回数の降順であることを契約として文書化して
+        // いる(`crate::statistics::ColumnStats::mcv`のドキュメントコメント)。
+        // `crate::statistics::extract_mcv`はこの順序で組み立てるが、永続化
+        // されたバイト列や`Storage::set_table_stats`への外部入力はこの契約を
+        // 経由しないため、ここで検査して不変条件へ昇格させる(第4部2巡目
+        // レビュー対応)。
+        if let Some(previous_mcv_count) = previous_mcv_count
+            && *count > previous_mcv_count
+        {
+            return Err(corrupt(format!("MCVが出現回数の降順になっていません: {previous_mcv_count} の次に {count}")));
+        }
+        previous_mcv_count = Some(*count);
         mcv_row_total =
             mcv_row_total.checked_add(*count).ok_or_else(|| corrupt("MCVの出現回数の合計がu64の範囲を超えます".to_string()))?;
     }
@@ -2281,6 +2317,104 @@ mod tests {
         let stats = TableStats { row_count: 100, columns: vec![column] };
         let err = expect_err(storage.set_table_stats(table_id, stats));
         assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_table_stats_rejects_distinct_count_zero_when_non_null_rows_exist() {
+        // 非NULL行(10行)があるのにdistinct_count=0は、後段の
+        // `saturating_sub(...).max(1)`という底上げにこの不整合を隠されてしまう
+        // (第4部2巡目レビュー対応)。
+        let path = temp_path("stats-distinct-zero");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        let mut column = valid_column_stats();
+        column.distinct_count = 0;
+        let stats = TableStats { row_count: 100, columns: vec![column] };
+        let err = expect_err(storage.set_table_stats(table_id, stats));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_table_stats_rejects_distinct_count_positive_when_no_non_null_rows_exist() {
+        // 非NULL行が1件も無いのにdistinct_count > 0という、逆方向の不整合。
+        let path = temp_path("stats-distinct-positive");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        let column = ColumnStats { null_count: 100, distinct_count: 1, min: None, max: None, mcv: Vec::new(), histogram: Vec::new() };
+        let stats = TableStats { row_count: 100, columns: vec![column] };
+        let err = expect_err(storage.set_table_stats(table_id, stats));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_table_stats_rejects_distinct_count_below_mcv_len() {
+        // MCVは全体のDistinct値の部分集合であるため、distinct_countがMCVの
+        // 件数を下回ることはありえない。
+        let path = temp_path("stats-distinct-below-mcv");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        let mut column = valid_column_stats();
+        column.distinct_count = 1;
+        column.mcv = vec![(Value::BigInt(0), 5), (Value::BigInt(1), 3)];
+        column.histogram = vec![Bucket { lower: Value::BigInt(2), upper: Value::BigInt(9), row_count: 2 }];
+        let stats = TableStats { row_count: 100, columns: vec![column] };
+        let err = expect_err(storage.set_table_stats(table_id, stats));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn set_table_stats_rejects_mcv_not_sorted_by_count_descending() {
+        let path = temp_path("stats-mcv-order");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("t", one_bigint_schema()).unwrap();
+        let mut column = valid_column_stats();
+        column.distinct_count = 2;
+        column.mcv = vec![(Value::BigInt(0), 3), (Value::BigInt(1), 5)]; // 昇順(不正)
+        column.histogram = Vec::new();
+        let stats = TableStats { row_count: 100, columns: vec![column] };
+        let err = expect_err(storage.set_table_stats(table_id, stats));
+        assert!(matches!(err, DbError::InvalidStats(_)), "err={err:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn open_rejects_a_catalog_whose_distinct_count_is_zero_despite_non_null_rows() {
+        // set_table_statsは常にvalidate_one_table_statsを通すため、この不整合は
+        // `open_rejects_a_catalog_whose_stats_reference_a_missing_table`と同じ
+        // 手順で、カタログのバイト列を直接組み立てて再現する。
+        let path = temp_path("stats-open-distinct-zero");
+        Storage::create(&path).unwrap();
+
+        let mut tables = HashMap::new();
+        let table_id = TableId(0);
+        tables.insert(
+            table_id,
+            TableEntry { info: TableInfo { id: table_id, name: "t".to_string(), schema: one_bigint_schema() }, page_ids: Vec::new() },
+        );
+
+        let mut column = valid_column_stats();
+        column.distinct_count = 0; // 非NULL行(10行)があるのに0
+        let mut stats = HashMap::new();
+        stats.insert(table_id, TableStats { row_count: 100, columns: vec![column] });
+
+        let encoded = encode_catalog(1, &tables, &[], &[], &stats);
+        let mut payload = vec![0u8; PAGE_PAYLOAD_SIZE];
+        payload[..encoded.len()].copy_from_slice(&encoded);
+
+        let mut page = Page::new(CATALOG_PAGE_ID, PageType::Catalog);
+        page.payload_mut().copy_from_slice(&payload);
+        let bytes = page.encode();
+
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        file.write_all(&bytes).unwrap();
+
+        let err = expect_err(Storage::open(&path));
+        assert!(matches!(err, DbError::CorruptCatalog(_)), "err={err:?}");
         std::fs::remove_file(&path).unwrap();
     }
 
