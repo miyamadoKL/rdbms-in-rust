@@ -61,7 +61,7 @@ B+Treeはキーを挿入するたびに、次の3つの性質を保ち続けま�
 - **整列**: どのページの中でも、エントリは常にキーの昇順に並んでいる。
 - **占有率**: どのページも、`PAGE_SIZE`(この章では`PAGE_PAYLOAD_SIZE`)を超えるエントリを保持しない。収まりきらなくなったら、ページを2つに割る(Split)。
 - **親子の区切りキー**: 内部ページのキー`key_i`は「`key_i`以上のキーは`key_i`の右側の子以降にある」という境界を表し、常に子の内容と矛盾しない。
-- **エラーを返す場合は木を変更しない**: `Split`がキーを持て余して`DbError::BTreeKeyTooLarge`を返す場合、`insert`を呼ぶ前の木を一切変更しない。
+- **エラーを返す場合は木を変更しない**: `insert`が`DbError::BTreeKeyTooLarge`を返す場合、呼ぶ前の木を一切変更しない。葉から根までSplitが何段にもわたって連鎖する`insert`全体についての不変条件であり、個々のSplit(`split_leaf`と`split_internal`)がそれぞれ単体として原子的であるだけでは足りない(詳しくは「キー長の上限がSplitの伝播全体を安全にする」を参照)。
 
 この4つを保ったまま木を成長させる操作が、この章の主題である**Split**です。
 
@@ -417,7 +417,9 @@ fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbR
         let max_len = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
         return Err(DbError::BTreeKeyTooLarge(max_len));
     }
-    let mid = entries.len() / 2;
+    // 件数の中央(`entries.len() / 2`)ではなく、バイト容量を基準に分割点を
+    // 選ぶ(モジュールドキュメント「Split中の伝播が安全である理由」を参照)。
+    let mid = leaf_split_point(PAGE_PAYLOAD_SIZE, entries);
     let (left, right) = entries.split_at(mid);
     let separator = right[0].0.clone();
 
@@ -502,7 +504,11 @@ fn split_internal(&self, entries: &[(Vec<u8>, PageId)], leftmost_child: PageId, 
         let max_len = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
         return Err(DbError::BTreeKeyTooLarge(max_len));
     }
-    let mid = entries.len() / 2;
+    // `split_leaf`と同じ理由で、件数の中央ではなくバイト容量を基準に
+    // 分割点を選ぶ。`entries[mid]`自体はどちらの側にも保存されず親へ
+    // 押し上げるだけなので、実際にはこの分割点の計算より右側にさらに
+    // 余裕が生まれる(モジュールドキュメントの証明を参照)。
+    let mid = internal_split_point(PAGE_PAYLOAD_SIZE, entries);
     let separator = entries[mid].0.clone();
     let left_entries = &entries[0..mid];
     let right_leftmost = entries[mid].1;
@@ -574,6 +580,46 @@ fn set_root(&mut self, new_root: PageId) -> DbResult<()> {
 ```
 
 この永続化を忘れると、プロセスを再起動した`BTree::open`が古いRootの`PageId`を読み込み、Root Splitで追い出されたはずの古いページを頂点として扱ってしまいます。
+
+### キー長の上限がSplitの伝播全体を安全にする
+
+`insert_into_leaf`、`insert_into_internal`、`grow_new_root`を下から上へ繰り返す、と書きましたが、この繰り返しの**途中**で`DbError::BTreeKeyTooLarge`が起きたらどうなるでしょうか。
+葉のSplitがすでにディスクへ実ページとして反映された後に、1段上のInternal Splitが収まらずに失敗したとします。
+`split_leaf`と`split_internal`はそれぞれ単体としては原子的(エラーを返す場合はそのページに一切触れない)ですが、それだけでは`insert`全体の原子性は保証されません。
+葉レベルの変更はもう元に戻せないうえ、その変更は`next_leaf`(第24章で導入するLeaf間リンク)によって左隣の葉から辿れてしまうため、`insert`が失敗を報告したはずのキーを`lookup`が1件返すという矛盾した状態が生まれます。
+
+この矛盾を、`insert`が伝播を開始する**前**の入力検証だけで構造的に起こりえなくします。
+鍵は2つあります。
+
+1つ目は、`insert`が受け付けるキー長の上限を、「空のページに**同じ長さのキーを持つエントリを1件**収められる」水準ではなく、「**2件**収められる」水準まで引き下げることです。
+
+```rust
+fn max_key_len(&self) -> usize {
+    leaf_max_key_len_for_two_entries(PAGE_PAYLOAD_SIZE).min(internal_max_key_len_for_two_entries(PAGE_PAYLOAD_SIZE))
+}
+```
+
+`leaf_max_key_len_for_two_entries`と`internal_max_key_len_for_two_entries`は、それぞれLeafとInternal Pageが空の状態から同じ長さのキーを2件受け入れられる上限を計算するだけの、実際のページに触れない純粋な計算です。
+`insert`は、`key_bytes`を求めた直後、木を下り始める前にこの上限を検査します。
+
+```rust
+let key_bytes = encode_key(key)?;
+if key_bytes.len() > self.max_key_len() {
+    return Err(DbError::BTreeKeyTooLarge(key_bytes.len()));
+}
+```
+
+2つ目は、`split_leaf`と`split_internal`の分割点`mid`を、件数の中央ではなくバイト容量で選ぶことです(`leaf_split_point`と`internal_split_point`、前節ですでに使いました)。
+
+この2つを組み合わせると、次が成り立ちます。
+`insert`はSplitのどの階層でも、**すでに収まっていたページへ、ちょうど1件のエントリを追加しようとして初めて溢れます**(葉では新しいキー、それより上の階層では下から押し上げられた区切りキーが、いずれも1つ目の上限を満たす1件だけ追加されます)。
+溢れる前のページの合計は`capacity`(ページの容量)以下、追加される1件は1つ目の上限より`capacity / 2`以下なので、溢れた直後の合計は`capacity + capacity / 2`を超えません。
+バイト容量基準の分割点は、左側の合計が`capacity`を超える直前で止まるため、左側は構成そのものから`capacity`に収まります。
+さらに、それまでに追加した最後の1件を足すと超えていたはずなので、左側の合計は`capacity`から「追加できなかった1件の長さ」を引いた値より大きく、その1件も1つ目の上限(`capacity / 2`以下)を満たすため、左側の合計は`capacity / 2`より大きくなります。
+したがって右側の合計は、全体(`capacity + capacity / 2`以下)から左側(`capacity / 2`より大きい)を引いた`capacity`未満に収まります(Internal Splitで親へ押し上げる区切りキー1件はどちらの側にも保存されないため、この余裕はさらに広がります)。
+
+つまり、`insert`が最初にこの上限でキーを検証してさえいれば、以後伝播するどのSplitも、両側が収まらずに失敗する余地が構造的にありません。
+`split_leaf`、`split_internal`、`grow_new_root`が持つ`DbError::BTreeKeyTooLarge`を返す分岐は、この不変条件が崩れた場合の保険として残しますが、`insert`経由では通常到達しません。
 
 ## テストで確認する
 
@@ -655,9 +701,15 @@ pub fn height(&self) -> DbResult<usize> {
 どの経路をたどっても同じ値になるのは、B+Treeが「全ての葉が同じ深さに揃う」性質を持つからで、これはRoot Splitについて確認した性質そのものです。
 このメソッドを使い、空の木の高さが1であること、十分な件数を挿入するとその高さが実際に増えることも別途確認しています。
 
-`split_leaf`と`split_internal`が「エラーを返す場合は木を変更しない」という不変条件を守っていることも、専用のテストで直接確認します。
+`split_leaf`と`split_internal`が「エラーを返す場合は木を変更しない」という不変条件を守っていることは、まずそれぞれの局所的なテストで確認します。
 `leaf_split_leaves_the_original_page_untouched_when_the_new_side_would_not_fit`は、既存のLeaf Pageがほぼ満杯の状態へ、新しいページ側に収まりようのない巨大キーを挿入し、`DbError::BTreeKeyTooLarge`を受け取った後もRoot、元の葉の`PageId`、Leaf間リンク、既存の全エントリが変化していないことを検証します。
 `internal_split_leaves_the_original_page_untouched_when_the_new_side_would_not_fit`はInternal Page版で、Root Splitで生まれたRoot(Internal Page)の区切りキーへ収まりようのないキーを混ぜて`split_internal`(同じモジュール内のテストなので直接呼べます)を呼び、同じ不変条件を確認します。
+
+これらは`split_leaf`と`split_internal`という私有関数を直接呼ぶテストであり、`insert`全体(葉から根までの多段伝播)の不変条件までは検証しません。
+それを検証するのが、公開APIの`insert`だけを使う一連のテストです。
+`insert_accepts_a_key_exactly_at_the_size_limit_and_rejects_one_byte_more`は、`max_key_len`ちょうどの長さのキーが挿入でき、1バイトでも長いキーは拒否されることを確認します。
+`insert_completes_multi_level_propagation_without_error_for_keys_near_the_size_limit`は、上限ぎりぎりの長さのキーを40件挿入し(1ページに収まるエントリ数が高々2件になるため、高さ3段以上の多段Splitが連鎖します)、`insert`が一度も`DbError::BTreeKeyTooLarge`を返さずに完走し、挿入した全キーが`lookup`で正しく引けることを確認します。
+`insert_leaves_every_reachable_page_byte_identical_when_a_key_exceeds_the_limit_in_a_deep_tree`は、同じように育てた深い木に対して上限を1バイト超えるキーを`insert`し、`DbError::BTreeKeyTooLarge`を受け取った後もRootと到達可能な全ページの生バイト列が呼び出し前と完全に一致することを、個々のページの中身まで直接突き合わせて確認します。
 
 3つ目は、`Storage`(第15章)がすでに使っている「シード固定のXorshiftで決定的な乱数列を作る」という手法を借りたモデルベーステストです。
 5,000件の`BIGINT`キーをシャッフルして挿入しながら、同じキーと`RecordId`を`std::collections::BTreeMap`にも積んでおき、全キーについて`lookup`の結果が`BTreeMap`の記録と一致することを確認します。

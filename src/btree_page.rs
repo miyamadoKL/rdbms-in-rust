@@ -217,6 +217,66 @@ pub fn internal_entries_fit(payload_len: usize, entries: &[(Vec<u8>, PageId)]) -
     required_len(INTERNAL_HEADER_SIZE, entries.iter().map(|(k, _)| k.len()), CHILD_ID_SIZE) <= payload_len
 }
 
+/// キー長`key_len`のエントリを**2件**、空のLeaf Page1枚に書き込めるための、
+/// `key_len`自体の上限を求める。
+///
+/// `crate::btree::BTree::insert`が受け付けるキーの長さをこの上限以下に
+/// 制限すると、多段Splitの伝播が構造的に`DbError::BTreeKeyTooLarge`へ
+/// 到達しないことを保証できる(`crate::btree`モジュールドキュメントの
+/// 「Split中の伝播が安全である理由」を参照)。
+pub fn leaf_max_key_len_for_two_entries(payload_len: usize) -> usize {
+    let overhead = LEAF_HEADER_SIZE + 2 * (DIR_ENTRY_SIZE + RECORD_ID_SIZE);
+    payload_len.saturating_sub(overhead) / 2
+}
+
+/// [`leaf_max_key_len_for_two_entries`]のInternal Page版。
+pub fn internal_max_key_len_for_two_entries(payload_len: usize) -> usize {
+    let overhead = INTERNAL_HEADER_SIZE + 2 * (DIR_ENTRY_SIZE + CHILD_ID_SIZE);
+    payload_len.saturating_sub(overhead) / 2
+}
+
+/// `entries`(キー長の列、キー昇順)を左から貪欲に詰めていき、次の1件を
+/// 足すと`capacity`バイトをはみ出す直前で区切った件数(左側に入る件数)を
+/// 返す。
+///
+/// [`crate::btree::BTree::split_leaf`]・[`crate::btree::BTree::split_internal`]は、
+/// この関数が返す件数を分割点に使う(`entries.len() / 2`のような単純な
+/// 中央値ではない)。中央値による分割は、件数は半分になってもバイト数まで
+/// 半分になる保証が無く、右側に大きいエントリが偏ると収まらないことが
+/// あった。バイト容量そのものを基準に分割点を選ぶことで、
+/// 「1件のエントリが追加されて初めてページが溢れた」という`insert`の
+/// 呼び出しパターンのもとでは、左右どちらの分割結果も必ず収まることを
+/// 構造的に保証できる(証明は`crate::btree`モジュールドキュメントを参照)。
+///
+/// 少なくとも1件は左側に入る(`entries`の1件目は、[`leaf_max_key_len_for_two_entries`]・
+/// [`internal_max_key_len_for_two_entries`]による`insert`の入力検証により、
+/// 単独でも`capacity`に十分収まる長さのキーであることが前提)。
+fn capacity_split_point(header_size: usize, key_lens: impl Iterator<Item = usize>, trailer_size: usize, capacity: usize) -> usize {
+    let mut cursor = header_size;
+    let mut count = 0usize;
+    for key_len in key_lens {
+        let needed = DIR_ENTRY_SIZE + key_len + trailer_size;
+        if count > 0 && cursor + needed > capacity {
+            break;
+        }
+        cursor += needed;
+        count += 1;
+    }
+    count
+}
+
+/// [`capacity_split_point`]のLeaf Page版。[`crate::btree::BTree::split_leaf`]が
+/// 使う。
+pub fn leaf_split_point(payload_len: usize, entries: &[(Vec<u8>, RecordId)]) -> usize {
+    capacity_split_point(LEAF_HEADER_SIZE, entries.iter().map(|(k, _)| k.len()), RECORD_ID_SIZE, payload_len)
+}
+
+/// [`capacity_split_point`]のInternal Page版。[`crate::btree::BTree::split_internal`]が
+/// 使う。
+pub fn internal_split_point(payload_len: usize, entries: &[(Vec<u8>, PageId)]) -> usize {
+    capacity_split_point(INTERNAL_HEADER_SIZE, entries.iter().map(|(k, _)| k.len()), CHILD_ID_SIZE, payload_len)
+}
+
 /// `payload`をLeaf Pageとして読み取り専用で開くビュー。
 pub struct LeafPageRef<'a> {
     payload: &'a [u8],
@@ -717,5 +777,93 @@ mod tests {
         let dir_base_1 = INTERNAL_HEADER_SIZE + DIR_ENTRY_SIZE;
         payload[dir_base_1..dir_base_1 + 2].copy_from_slice(&(offset0 as u16).to_le_bytes());
         assert!(matches!(InternalPageRef::open(&payload), Err(DbError::CorruptPage(_))));
+    }
+
+    // ---- 第3部2巡目レビュー対応: max_key_len_for_two_entries / capacity_split_point ----
+
+    #[test]
+    fn leaf_max_key_len_for_two_entries_actually_fits_two_and_rejects_three() {
+        let max_len = leaf_max_key_len_for_two_entries(PAGE_PAYLOAD_SIZE);
+        let mut payload = fresh_payload();
+        let mut page = LeafPage::init(&mut payload);
+        let key = vec![b'k'; max_len];
+        assert!(page.write_entries(&[(key.clone(), rid(1, 0)), (key.clone(), rid(1, 1))]), "上限ちょうどの長さのキーなら2件収まるはず");
+
+        // 同じ長さのキーが3件目は収まらない(2件を保証する水準であって
+        // それ以上は約束しない)。
+        assert!(!page.write_entries(&[(key.clone(), rid(1, 0)), (key.clone(), rid(1, 1)), (key, rid(1, 2))]));
+
+        // 1バイトでも長いキーは、2件目が収まらない可能性がある
+        // (`leaf_entries_fit`は1件だけなら通ることもあるので、ここでは
+        // 明示的に2件で検査する)。
+        let one_byte_more = vec![b'k'; max_len + 1];
+        assert!(!leaf_entries_fit(PAGE_PAYLOAD_SIZE, &[(one_byte_more.clone(), rid(1, 0)), (one_byte_more, rid(1, 1))]));
+    }
+
+    #[test]
+    fn internal_max_key_len_for_two_entries_actually_fits_two() {
+        let max_len = internal_max_key_len_for_two_entries(PAGE_PAYLOAD_SIZE);
+        let key = vec![b'k'; max_len];
+        assert!(internal_entries_fit(PAGE_PAYLOAD_SIZE, &[(key.clone(), PageId(1)), (key, PageId(2))]));
+    }
+
+    /// `leaf_max_key_len_for_two_entries`は、Leaf(トレイラー`RECORD_ID_SIZE`
+    /// = 10バイト)がInternal(トレイラー`CHILD_ID_SIZE` = 8バイト)より
+    /// オーバーヘッドが大きい分、必ずInternalの上限以下になる。
+    /// `crate::btree::BTree::max_key_len`は両者の小さいほう(Leafの上限)を
+    /// 採用しており、この大小関係がその前提を支えている。
+    #[test]
+    fn leaf_bound_is_never_larger_than_internal_bound() {
+        assert!(leaf_max_key_len_for_two_entries(PAGE_PAYLOAD_SIZE) <= internal_max_key_len_for_two_entries(PAGE_PAYLOAD_SIZE));
+    }
+
+    #[test]
+    fn leaf_split_point_leaves_both_sides_fitting_when_a_capacity_bound_key_is_added_one_at_a_time() {
+        // 「収まっていたページへ、上限ぎりぎりのキーがちょうど1件追加されて
+        // 溢れる」という`insert`の呼び出しパターンを直接再現する。
+        let max_len = leaf_max_key_len_for_two_entries(PAGE_PAYLOAD_SIZE);
+        let mut entries: Vec<(Vec<u8>, RecordId)> = Vec::new();
+        let mut next_key = vec![0u8; max_len];
+        loop {
+            entries.push((next_key.clone(), rid(1, entries.len() as u16)));
+            if !leaf_entries_fit(PAGE_PAYLOAD_SIZE, &entries) {
+                break;
+            }
+            // 次のキーを辞書式に少しだけ大きくして、キー昇順を保ったまま
+            // 別のキーにする。
+            *next_key.last_mut().unwrap() = next_key.last().unwrap().wrapping_add(1);
+        }
+        assert!(entries.len() >= 2, "上限ぎりぎりのキーを積み増しても2件未満で溢れるのは前提が崩れている");
+
+        let mid = leaf_split_point(PAGE_PAYLOAD_SIZE, &entries);
+        assert!(mid >= 1 && mid < entries.len(), "分割点は両側に最低1件ずつ残す位置のはず(実際はmid={mid}, len={})", entries.len());
+        let (left, right) = entries.split_at(mid);
+        assert!(leaf_entries_fit(PAGE_PAYLOAD_SIZE, left), "分割した左側が収まらない");
+        assert!(leaf_entries_fit(PAGE_PAYLOAD_SIZE, right), "分割した右側が収まらない");
+    }
+
+    #[test]
+    fn internal_split_point_leaves_both_sides_fitting_when_a_capacity_bound_key_is_added_one_at_a_time() {
+        let max_len = internal_max_key_len_for_two_entries(PAGE_PAYLOAD_SIZE);
+        let mut entries: Vec<(Vec<u8>, PageId)> = Vec::new();
+        let mut next_key = vec![0u8; max_len];
+        loop {
+            entries.push((next_key.clone(), PageId(entries.len() as u64 + 1)));
+            if !internal_entries_fit(PAGE_PAYLOAD_SIZE, &entries) {
+                break;
+            }
+            *next_key.last_mut().unwrap() = next_key.last().unwrap().wrapping_add(1);
+        }
+        assert!(entries.len() >= 2);
+
+        let mid = internal_split_point(PAGE_PAYLOAD_SIZE, &entries);
+        assert!(mid >= 1 && mid < entries.len());
+        let left = &entries[0..mid];
+        // Internal Splitでは`entries[mid]`自体はどちらの側にも保存されない
+        // ため、`right`は`mid`の次から。除いた分だけ余裕が増えるので、
+        // `right`が収まることは`left`が収まることよりさらに確実である。
+        let right = &entries[mid + 1..];
+        assert!(internal_entries_fit(PAGE_PAYLOAD_SIZE, left), "分割した左側が収まらない");
+        assert!(internal_entries_fit(PAGE_PAYLOAD_SIZE, right), "分割した右側が収まらない");
     }
 }

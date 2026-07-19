@@ -129,12 +129,16 @@
 //!     unique:          u8 (0 または 1)
 //!     primary_key:     u8 (0 または 1)
 //!     key_type:        u8 (0=BOOLEAN, 1=BIGINT, 2=TEXT)
+//!     is_constraint:   u8 (0 または 1、第3部2巡目レビュー対応)
 //! ```
 //!
 //! この章より前(第23章以前)に`Storage::create`で作られたファイルはこの
 //! セクションを持たないため、この章のコードで開こうとすると`index_count`を
 //! 読む前にバイト列が尽き、`DbError::CorruptCatalog`になる(モジュール冒頭の
 //! 「第20章での変更」節と同じ、章をまたいだファイル互換性を約束しない方針)。
+//! `is_constraint`(第3部2巡目レビュー対応で追加)も同じ方針で、この
+//! フィールドを持たない古いファイルは`decode_catalog`がバイト列の途中で
+//! 尽きて`DbError::CorruptCatalog`になる。
 //!
 //! 索引の実データ(`crate::btree::BTree`が持つB+Tree本体)は、この
 //! Catalogページと同じファイルには置かない。**索引ごとに専用のファイル**
@@ -479,7 +483,11 @@ impl Storage {
         let index_names: Vec<String> =
             self.indexes.values().filter(|e| e.info.table_id == id).map(|e| e.info.name.clone()).collect();
         for index_name in index_names {
-            self.drop_index(&index_name)?;
+            // `drop_index`(SQL経由の入口)ではなく、`is_constraint`による
+            // 制限を受けない`drop_index_impl`を直接使う。テーブルごと消す
+            // 以上、`PRIMARY KEY`・`UNIQUE`列に対応する制約索引もまとめて
+            // 消して当然である(第3部2巡目レビュー対応)。
+            self.drop_index_impl(&index_name)?;
         }
 
         self.persist_catalog()?;
@@ -541,27 +549,43 @@ impl Storage {
     /// `index_name`という名前で、`table_name`の`column_name`列を索引化した
     /// B+Tree索引を新しく作る(`CREATE INDEX`、第24章)。`unique`は
     /// `CREATE UNIQUE INDEX`かどうかで、この経路(SQL構文)から作る索引は常に
-    /// [`IndexInfo::primary_key`]が`false`になる。`PRIMARY KEY`列に対応する
-    /// 索引は[`Self::create_constraint_index`]を使う。
+    /// [`IndexInfo::primary_key`]が`false`になる。`PRIMARY KEY`・`UNIQUE`列に
+    /// 対応する索引は[`Self::create_table_with_constraint_indexes`]が作る。
     pub fn create_index(&mut self, index_name: &str, table_name: &str, column_name: &str, unique: bool) -> DbResult<()> {
         self.create_index_impl(index_name, table_name, column_name, unique, false)
     }
 
-    /// `PRIMARY KEY`・`UNIQUE`列に自動でユニーク索引を作る(第24章、
-    /// `Database::execute_create_table`が呼ぶ)。`primary_key`が`true`なら、
-    /// この索引で検出した重複は`DbError::PrimaryKeyViolation`として報告される
-    /// ([`IndexInfo::primary_key`]を参照)。この索引は常に`unique = true`である。
-    pub(crate) fn create_constraint_index(
+    /// [`Self::create_index`]の実装。カタログへの永続化まで含めて1本の
+    /// 索引を作り切る。`CREATE INDEX`(SQL構文)経由の索引は常に
+    /// `is_constraint = false`(制約索引ではない)として作る。
+    fn create_index_impl(
         &mut self,
         index_name: &str,
         table_name: &str,
         column_name: &str,
+        unique: bool,
         primary_key: bool,
     ) -> DbResult<()> {
-        self.create_index_impl(index_name, table_name, column_name, true, primary_key)
+        self.build_index(index_name, table_name, column_name, unique, primary_key, false)?;
+        if let Err(err) = self.persist_catalog() {
+            self.indexes.remove(index_name);
+            let _ = std::fs::remove_file(index_file_path(&self.path, index_name));
+            return Err(err);
+        }
+        Ok(())
     }
 
-    /// [`Self::create_index`]・[`Self::create_constraint_index`]の共通実装。
+    /// 索引1本を作る処理の本体。索引名の予約・テーブルと列の解決・
+    /// Index Build・`self.indexes`への登録までを行うが、カタログへの永続化
+    /// (`persist_catalog`)は呼び出し側に任せる。
+    ///
+    /// [`Self::create_index_impl`](`CREATE INDEX`・単発の制約索引)と
+    /// [`Self::create_table_with_constraint_indexes`](`CREATE TABLE`が
+    /// まとめて作る複数の制約索引)の両方から使う共通の下請けにしたのは、
+    /// 後者が「全索引の準備が整うまで1回も永続化しない」という設計
+    /// (第3部2巡目レビュー対応、同メソッドのドキュメントを参照)を採るため、
+    /// 永続化のタイミングを索引1本ごとの処理から切り離す必要があったから
+    /// である。
     ///
     /// 索引名がすでに使われている場合は`DbError::DuplicateIndex`、テーブルまたは
     /// 列が存在しない場合は`DbError::TableNotFound`・`DbError::CorruptCatalog`
@@ -573,14 +597,15 @@ impl Storage {
     /// 重複するキーがあった場合は、`crate::btree::DbError::BTreeUniqueViolation`を
     /// `primary_key`に応じて第20章と同じ`DbError::PrimaryKeyViolation`・
     /// `DbError::UniqueViolation`(列名つき)へ翻訳して返し、作りかけの
-    /// 索引ファイルを削除する。
-    fn create_index_impl(
+    /// 索引ファイルを削除する。失敗した場合、`self.indexes`への登録は行わない。
+    fn build_index(
         &mut self,
         index_name: &str,
         table_name: &str,
         column_name: &str,
         unique: bool,
         primary_key: bool,
+        is_constraint: bool,
     ) -> DbResult<()> {
         if self.indexes.contains_key(index_name) {
             return Err(DbError::DuplicateIndex(index_name.to_string()));
@@ -621,19 +646,119 @@ impl Storage {
             column_name: column_name.to_string(),
             unique,
             primary_key,
+            is_constraint,
             key_type,
         };
         self.indexes.insert(index_name.to_string(), IndexEntry { info, btree });
-
-        if let Err(err) = self.persist_catalog() {
-            self.indexes.remove(index_name);
-            let _ = std::fs::remove_file(&index_path);
-            return Err(err);
-        }
         Ok(())
     }
 
-    /// `index_name`の索引を削除する(`DROP INDEX`、第24章)。
+    /// テーブルを作り、`constraint_columns`(`(列名, PRIMARY KEYかどうか)`の
+    /// 並び、`PRIMARY KEY`・`UNIQUE`列に対応する)の制約索引もまとめて作る、
+    /// `Database::execute_create_table`(ディスクバックエンド)専用の入口
+    /// (第3部2巡目レビュー対応)。
+    ///
+    /// テーブル単体の`create_table`と、索引単体の`create_constraint_index`を
+    /// 順番に呼ぶだけでは、テーブルの永続化(`persist_catalog`)が先に
+    /// 完了してしまう。索引名の衝突は事前に検査できても、それ以外の理由
+    /// (たとえばテーブル名が長すぎて索引ファイルのパスがOSの上限を超える
+    /// I/Oエラーなど)で後続の索引作成が失敗する経路は残るため、
+    /// テーブルだけが対応する制約索引を持たずにカタログへ残ってしまう
+    /// 余地があった。
+    ///
+    /// この関数は、テーブルと全ての制約索引の準備([`Self::build_index`]、
+    /// 永続化は含まない)が整うまでカタログへの永続化を1回も行わず、
+    /// 最後に1回だけ`persist_catalog`する。索引名の衝突・列の解決・
+    /// Index Build・カタログの永続化のいずれで失敗しても、テーブル・
+    /// 作りかけの索引・索引ファイルのいずれも残さない。
+    pub fn create_table_with_constraint_indexes(
+        &mut self,
+        table_name: &str,
+        schema: Schema,
+        constraint_columns: &[(String, bool)],
+    ) -> DbResult<TableId> {
+        if self.tables.values().any(|t| t.info.name == table_name) {
+            return Err(DbError::DuplicateTable(table_name.to_string()));
+        }
+        let index_names: Vec<String> =
+            constraint_columns.iter().map(|(column_name, _)| format!("{table_name}_{column_name}_idx")).collect();
+        for index_name in &index_names {
+            if self.indexes.contains_key(index_name) {
+                return Err(DbError::DuplicateIndex(index_name.clone()));
+            }
+        }
+
+        let id = TableId(self.next_table_id);
+        let next_table_id = self.next_table_id.checked_add(1).ok_or(DbError::TableIdSpaceExhausted)?;
+        self.next_table_id = next_table_id;
+        self.tables.insert(
+            id,
+            TableEntry { info: TableInfo { id, name: table_name.to_string(), schema }, page_ids: Vec::new() },
+        );
+
+        let mut created_index_names: Vec<String> = Vec::new();
+        for ((column_name, primary_key), index_name) in constraint_columns.iter().zip(&index_names) {
+            if let Err(err) = self.build_index(index_name, table_name, column_name, true, *primary_key, true) {
+                self.rollback_table_creation(id, &created_index_names);
+                return Err(err);
+            }
+            created_index_names.push(index_name.clone());
+        }
+
+        if let Err(err) = self.persist_catalog() {
+            self.rollback_table_creation(id, &created_index_names);
+            return Err(err);
+        }
+        Ok(id)
+    }
+
+    /// [`Self::create_table_with_constraint_indexes`]が、テーブルまたは
+    /// 制約索引の準備が途中で失敗したときに呼ぶ後始末。`id`のテーブル、
+    /// `created_index_names`に集めた(すでに`self.indexes`へ登録済みの)
+    /// 索引とその専用ファイルをすべて取り除き、`next_table_id`も呼び出し前の
+    /// 値へ戻す。この時点ではまだ一度も`persist_catalog`していないため、
+    /// ディスク上のカタログには最初から触れていない。
+    fn rollback_table_creation(&mut self, id: TableId, created_index_names: &[String]) {
+        self.tables.remove(&id);
+        self.next_table_id = id.0;
+        for index_name in created_index_names {
+            self.indexes.remove(index_name);
+            let _ = std::fs::remove_file(index_file_path(&self.path, index_name));
+        }
+    }
+
+    /// `index_name`の索引を削除する(`DROP INDEX`、第24章)。SQLの
+    /// `DROP INDEX`から呼ばれる入口であり、`index_name`が
+    /// [`IndexInfo::is_constraint`]な索引(`PRIMARY KEY`・`UNIQUE`列に
+    /// 対応して自動生成された索引)を指している場合は
+    /// `DbError::CannotDropConstraintIndex`を返して拒否する(第3部2巡目
+    /// レビュー対応)。この索引を`DROP INDEX`で消せてしまうと、対応する列の
+    /// 一意性制約を検査する手段(`crate::index::check_uniqueness_with_index`)を
+    /// 失った状態の`INSERT`・`UPDATE`が、対応する索引が必ずあるという前提
+    /// (テーブルは制約を宣言しているのに検査する索引が無い)を崩し、
+    /// `DbError::CorruptCatalog`を返すようになってしまう。テーブルを丸ごと
+    /// 削除する[`Self::drop_table`]は、この制約索引も一緒に削除する必要が
+    /// あるため、この検査を経由しない[`Self::drop_index_impl`]を直接使う。
+    ///
+    /// 索引が存在しない場合は`DbError::IndexNotFound`を返す。
+    pub fn drop_index(&mut self, index_name: &str) -> DbResult<()> {
+        let info = self.indexes.get(index_name).ok_or_else(|| DbError::IndexNotFound(index_name.to_string()))?;
+        if info.info.is_constraint {
+            return Err(DbError::CannotDropConstraintIndex(index_name.to_string()));
+        }
+        self.drop_index_impl(index_name)
+    }
+
+    /// [`Self::drop_index`]・[`Self::drop_table`]が共通して使う、索引1本を
+    /// 実際に取り除く処理の本体。[`IndexInfo::is_constraint`]による制限を
+    /// 一切受けない、テーブル削除用の内部経路である。
+    ///
+    /// `pub`ではなく`pub(crate)`にとどめてあるのは、SQLの`DROP INDEX`
+    /// (`Database::execute_drop_index`)には必ず[`Self::drop_index`]
+    /// (制約索引を拒否する)を経由させ、この関数へは`crate`内部からしか
+    /// 到達できないようにするためである。テストコード(`crate::index`の
+    /// 回帰テストなど)が「制約索引だけが欠落した」壊れた状態を意図的に
+    /// 再現する際にも、この関数を使う。
     ///
     /// 索引が存在しない場合は`DbError::IndexNotFound`を返す。カタログからの
     /// 削除に成功したら、その索引専用のファイル([`index_file_path`])を
@@ -641,7 +766,7 @@ impl Storage {
     /// 即座にはファイルから取り除かない(Free Page Listへ積むだけ)のとは違い、
     /// 索引は他のどのテーブル・索引ともページを共有しない専用ファイルなので、
     /// そのまま`std::fs::remove_file`できる。
-    pub fn drop_index(&mut self, index_name: &str) -> DbResult<()> {
+    pub(crate) fn drop_index_impl(&mut self, index_name: &str) -> DbResult<()> {
         if self.indexes.remove(index_name).is_none() {
             return Err(DbError::IndexNotFound(index_name.to_string()));
         }
@@ -662,11 +787,15 @@ impl Storage {
     /// 存在するが索引には無い行(Seq Scanでは見えるがIndex Scanでは見えない
     /// 行)が残ってしまう。
     ///
-    /// この検査は`crate::btree::BTree::check_key_fits`(「キー1件が空のページに
-    /// 収まるか」だけを見る)を全索引に対して行うだけで、`index_insert_row`
-    /// 実行の代わりにはならない。実際の`insert`が引き起こすLeaf・Internal
-    /// Splitは、既存ページの空き具合次第でこの検査を通過した後でも失敗する
-    /// 余地を残す(そちらの後始末は`index_insert_row`自身の巻き戻しに任せる)。
+    /// この検査は`crate::btree::BTree::check_key_fits`を全索引に対して行う。
+    /// `BTree::insert`は、キー長が[`crate::btree::BTree`]モジュール
+    /// ドキュメントの「Split中の伝播が安全である理由」で説明する上限を
+    /// 超えていない限り、多段のLeaf・Internal Splitのどの階層でも
+    /// `DbError::BTreeKeyTooLarge`を返さないことが構造的に保証されている
+    /// (第3部2巡目レビュー対応)。`check_key_fits`はその上限と同じ基準で
+    /// 判定するため、この検査を通過した`tuple`に対する`index_insert_row`の
+    /// 呼び出しは、(`BufferPool`自体のI/Oエラーのような無関係な理由を除けば)
+    /// `DbError::BTreeKeyTooLarge`では失敗しない。
     pub fn check_indexes_accept_row(&self, table_id: TableId, tuple: &Tuple) -> DbResult<()> {
         for entry in self.indexes.values().filter(|e| e.info.table_id == table_id) {
             let Some(value) = tuple.get(entry.info.column_index) else { continue };
@@ -696,17 +825,36 @@ impl Storage {
     /// # 第3部レビュー対応: 途中の索引が失敗したら、それより前の索引を戻す
     ///
     /// `table_id`が複数の索引を持つ場合、この関数はそれらを1つずつ順に
-    /// `insert`していく。[`Self::check_indexes_accept_row`]を通過していても、
-    /// Leaf・Internal Split(既存ページの空き具合に依存する)は原理的に
-    /// まだ失敗しうる。途中の索引で失敗したとき、それより前にすでに
-    /// `insert`済みだった索引をそのままにしてエラーを返すと、Heap(この
-    /// 行自体はまだ存在する)・一部の索引(この行を指す)・残りの索引
+    /// `insert`していく。[`Self::check_indexes_accept_row`]を通過していれば、
+    /// 個々の`BTree::insert`は`DbError::BTreeKeyTooLarge`では失敗しない
+    /// ([`Self::check_indexes_accept_row`]のドキュメントを参照)ため、
+    /// 途中の索引が失敗する経路は理論上残っていない。それでもこの巻き戻しを
+    /// 残してあるのは、`check_indexes_accept_row`の呼び出しを怠った場合や、
+    /// `BufferPool`のI/Oエラーのような`BTreeKeyTooLarge`以外の理由で
+    /// 個々の`insert`が失敗した場合の保険である。失敗したとき、それより前に
+    /// すでに`insert`済みだった索引をそのままにしてエラーを返すと、Heap
+    /// (この行自体はまだ存在する)・一部の索引(この行を指す)・残りの索引
     /// (この行を指さない)が食い違ったままになる。この関数はそれを避け、
     /// 失敗した索引より前に成功していた`insert`を逆順に`delete`で
     /// 巻き戻してからエラーを返す。それでもHeap自体(この`rid`の行)は
     /// この関数の責務の外にあるため戻さない。呼び出し側
     /// (`crate::executor::storage_insert`・`storage_update`)が、この関数が
     /// 返したエラーを見てHeap側の巻き戻しを行う。
+    ///
+    /// # 第3部2巡目レビュー対応: 失敗した索引自身に反映が残る問題も解消済み
+    ///
+    /// この関数がまだ`BTree::insert`自体の多段Split伝播の途中でエラーに
+    /// なりうると仮定した初期の設計では、失敗した(まさに今`insert`しようと
+    /// していた)そのB+Tree自身の中に、下位のSplitだけがすでに反映された
+    /// 部分的な状態が残る余地があった。この状態は`insert`(呼び出し元の
+    /// `BTree`)からは失敗として観測されるが、`next_leaf`のリンクを辿る
+    /// `lookup`・`range`からは(部分的に)見えてしまうため、この関数の
+    /// 巻き戻し(失敗した索引より**前**の索引を戻すだけ)では手当てできない
+    /// 種類の不整合だった。`crate::btree::BTree::insert`が多段伝播全体を
+    /// 原子的に扱うよう修正された(モジュールドキュメントの「Split中の
+    /// 伝播が安全である理由」を参照)ことで、個々の`BTree::insert`呼び出しは
+    /// 「完全に成功する」か「呼び出す前のそのB+Treeを一切変更せず失敗する」
+    /// かのどちらかしかなくなり、この問題自体が構造的に起こらなくなった。
     pub fn index_insert_row(&mut self, table_id: TableId, tuple: &Tuple, rid: RecordId) -> DbResult<()> {
         let index_names: Vec<String> =
             self.indexes.values().filter(|e| e.info.table_id == table_id).map(|e| e.info.name.clone()).collect();
@@ -1196,6 +1344,7 @@ fn encode_catalog(
         out.push(u8::from(info.unique));
         out.push(u8::from(info.primary_key));
         out.push(data_type_to_u8(info.key_type));
+        out.push(u8::from(info.is_constraint));
     }
 
     out
@@ -1286,6 +1435,7 @@ fn decode_catalog(bytes: &[u8]) -> DbResult<DecodedCatalog> {
         let unique = take_bool(&mut cursor, "索引のunique")?;
         let primary_key = take_bool(&mut cursor, "索引のprimary_key")?;
         let key_type = data_type_from_u8(take_u8(&mut cursor, "索引のkey_type")?)?;
+        let is_constraint = take_bool(&mut cursor, "索引のis_constraint")?;
 
         if !seen_index_names.insert(name.clone()) {
             // encode_catalogが索引名の一意性を保証しているHashMap<String, _>を
@@ -1293,7 +1443,7 @@ fn decode_catalog(bytes: &[u8]) -> DbResult<DecodedCatalog> {
             // (テーブル名の重複検出=`TableId`の重複検出と同じ理由)。
             return Err(DbError::CorruptCatalog(format!("索引名'{name}'が複数回出現しています")));
         }
-        indexes.push(IndexInfo { name, table_id, column_index, column_name, unique, primary_key, key_type });
+        indexes.push(IndexInfo { name, table_id, column_index, column_name, unique, primary_key, is_constraint, key_type });
     }
 
     Ok(DecodedCatalog {
@@ -2221,6 +2371,108 @@ mod tests {
         let _ = std::fs::remove_file(&idx_path);
     }
 
+    // ---- 第3部2巡目レビュー対応: create_table_with_constraint_indexesの原子性 ----
+
+    #[test]
+    fn create_table_with_constraint_indexes_makes_a_table_and_all_its_constraint_indexes_together() {
+        let path = temp_path("create-table-with-constraints-ok");
+        let mut storage = Storage::create(&path).unwrap();
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::BigInt, false).with_primary_key(),
+            Column::new("email", DataType::Text, true).with_unique(),
+            Column::new("name", DataType::Text, true),
+        ]);
+        let constraint_columns = vec![("id".to_string(), true), ("email".to_string(), false)];
+        let table_id = storage.create_table_with_constraint_indexes("users", schema, &constraint_columns).unwrap();
+
+        assert_eq!(storage.table("users").unwrap().id, table_id);
+        let id_idx = storage.index("users_id_idx").unwrap();
+        assert!(id_idx.unique && id_idx.primary_key);
+        let email_idx = storage.index("users_email_idx").unwrap();
+        assert!(email_idx.unique && !email_idx.primary_key);
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(index_file_path(&path, "users_id_idx"));
+        let _ = std::fs::remove_file(index_file_path(&path, "users_email_idx"));
+    }
+
+    /// レビュー指摘の再現条件: 索引ファイルのパス(`<DBファイル名>.idx.<索引名>`)が
+    /// OSのファイル名長の上限を超えるほど長いテーブル名を`PRIMARY KEY`付きで
+    /// 指定すると、索引ファイルの作成そのものがI/Oエラーで失敗する。この
+    /// 失敗は索引名の衝突ではないため、事前の名前衝突検査では防げない。
+    /// `create_table_with_constraint_indexes`は、テーブルの登録も含めて
+    /// 一度もカタログへ永続化していない時点でこの失敗を検出するため、
+    /// テーブル自体もカタログに一切残らないはずである。
+    #[test]
+    fn create_table_with_constraint_indexes_leaves_no_table_when_the_index_file_path_is_too_long() {
+        let path = temp_path("create-table-with-constraints-name-too-long");
+        let mut storage = Storage::create(&path).unwrap();
+        let long_table_name = "t".repeat(245);
+        let schema = Schema::new(vec![Column::new("id", DataType::BigInt, false).with_primary_key()]);
+        let constraint_columns = vec![("id".to_string(), true)];
+
+        let err = expect_err(storage.create_table_with_constraint_indexes(&long_table_name, schema, &constraint_columns));
+        assert!(matches!(err, DbError::Io(_)), "索引ファイルのパス長超過はI/Oエラーとして観測されるはず: {err:?}");
+
+        // テーブル自体もカタログに残っていないはず。
+        assert!(storage.table(&long_table_name).is_none());
+        let index_name = format!("{long_table_name}_id_idx");
+        assert!(storage.index(&index_name).is_none());
+
+        // 別の(短い)名前なら、直後でも問題なくテーブルを作れる
+        // (next_table_id・カタログのどちらも壊れていないことの確認)。
+        let ok_id = storage
+            .create_table_with_constraint_indexes("users", users_schema(), &[])
+            .unwrap();
+        assert_eq!(storage.table("users").unwrap().id, ok_id);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// 2本目以降の制約索引が失敗したとき、それより前にすでに`self.indexes`へ
+    /// 登録済み・ファイルも作成済みだった1本目の索引まで、テーブルと一緒に
+    /// 巻き戻されることを確認する(索引名の衝突以外でも失敗しうる、という
+    /// 一般的な保険が正しく効くかどうかは、1本目が「すでに出来上がった後」で
+    /// 2本目が失敗するこの順序でしか確認できない)。
+    ///
+    /// 2本目の失敗理由には、無関係な既存テーブル`dummy`が先取りしている
+    /// 索引名との衝突を使う。`dummy`側の索引ファイルは、`users`の作成とは
+    /// 無関係な既存の資産なので、巻き戻しの対象にならず残り続けるはずである
+    /// (巻き戻しが「衝突した名前のファイルを消す」という誤った実装になって
+    /// いないことも合わせて確認する)。
+    #[test]
+    fn create_table_with_constraint_indexes_rolls_back_the_table_and_earlier_indexes_when_a_later_index_fails() {
+        let path = temp_path("create-table-with-constraints-second-index-fails");
+        let idx_id_path = index_file_path(&path, "users_id_idx");
+        let dummy_idx_path = index_file_path(&path, "users_email_idx");
+        let mut storage = Storage::create(&path).unwrap();
+
+        // "users_email_idx"という名前を、無関係な既存テーブル"dummy"の索引と
+        // して先取りしておく。
+        storage.create_table("dummy", users_schema()).unwrap();
+        storage.create_index("users_email_idx", "dummy", "name", false).unwrap();
+        assert!(dummy_idx_path.exists());
+
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::BigInt, false).with_primary_key(),
+            Column::new("email", DataType::Text, true).with_unique(),
+        ]);
+        let constraint_columns = vec![("id".to_string(), true), ("email".to_string(), false)];
+        let err = expect_err(storage.create_table_with_constraint_indexes("users", schema, &constraint_columns));
+        assert!(matches!(err, DbError::DuplicateIndex(name) if name == "users_email_idx"));
+
+        assert!(storage.table("users").is_none(), "テーブルも残っていないはず");
+        assert!(storage.index("users_id_idx").is_none(), "先に出来上がっていた1本目の索引も巻き戻されているはず");
+        assert!(!idx_id_path.exists(), "1本目の索引ファイルも削除されているはず");
+
+        // "dummy"の索引はusersの作成とは無関係なので、そのまま残っている。
+        assert!(storage.index("users_email_idx").unwrap().table_id == storage.table("dummy").unwrap().id);
+        assert!(dummy_idx_path.exists(), "無関係な既存索引のファイルは巻き戻しの対象にならないはず");
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(dummy_idx_path);
+    }
+
     #[test]
     fn create_unique_index_rejects_existing_duplicate_values() {
         let (path, idx_path) = index_test_paths("create-unique-index-existing-dup");
@@ -2252,6 +2504,44 @@ mod tests {
 
         let err = expect_err(storage.drop_index("idx"));
         assert!(matches!(err, DbError::IndexNotFound(name) if name == "idx"));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// 第3部2巡目レビュー対応の回帰テスト: `drop_index`(SQLの`DROP INDEX`が
+    /// 呼ぶ入口)は`IndexInfo::is_constraint`な索引を拒否する。`PRIMARY KEY`・
+    /// `UNIQUE`のどちらの制約索引についても確認したうえで、`drop_table`
+    /// (内部経路、`drop_index_impl`を使う)なら同じ索引を問題なく削除できる
+    /// ことも確認する。
+    #[test]
+    fn drop_index_rejects_a_constraint_index_but_drop_table_can_still_remove_it() {
+        let path = temp_path("drop-index-rejects-constraint");
+        let idx_id_path = index_file_path(&path, "users_id_idx");
+        let idx_email_path = index_file_path(&path, "users_email_idx");
+        let mut storage = Storage::create(&path).unwrap();
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::BigInt, false).with_primary_key(),
+            Column::new("email", DataType::Text, true).with_unique(),
+        ]);
+        storage
+            .create_table_with_constraint_indexes("users", schema, &[("id".to_string(), true), ("email".to_string(), false)])
+            .unwrap();
+        assert!(storage.index("users_id_idx").unwrap().is_constraint);
+        assert!(storage.index("users_email_idx").unwrap().is_constraint);
+
+        let err = expect_err(storage.drop_index("users_id_idx"));
+        assert!(matches!(err, DbError::CannotDropConstraintIndex(name) if name == "users_id_idx"));
+        let err = expect_err(storage.drop_index("users_email_idx"));
+        assert!(matches!(err, DbError::CannotDropConstraintIndex(name) if name == "users_email_idx"));
+        // 拒否されただけで、索引自体はそのまま残っている。
+        assert!(storage.index("users_id_idx").is_some());
+        assert!(idx_id_path.exists());
+
+        storage.drop_table("users").unwrap();
+        assert!(storage.index("users_id_idx").is_none());
+        assert!(storage.index("users_email_idx").is_none());
+        assert!(!idx_id_path.exists());
+        assert!(!idx_email_path.exists());
 
         std::fs::remove_file(&path).unwrap();
     }

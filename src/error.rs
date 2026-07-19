@@ -194,6 +194,14 @@ pub enum DbError {
     /// `DROP INDEX`が、カタログに登録されていない索引名を指定したエラー(第24章)。
     #[error("索引が存在しません: {0}")]
     IndexNotFound(String),
+
+    /// `DROP INDEX`が、`PRIMARY KEY`・`UNIQUE`列に対応して自動生成された
+    /// 制約索引を指定したエラー(第3部2巡目レビュー対応)。この索引を
+    /// `DROP INDEX`で消せてしまうと、対応する列の一意性制約を検査する手段が
+    /// 失われる。`DROP TABLE`はテーブルごとこの索引も取り除くため、
+    /// このエラーの対象にはならない。
+    #[error("索引'{0}'はPRIMARY KEY・UNIQUE制約が自動生成した索引のため、DROP INDEXでは削除できません")]
+    CannotDropConstraintIndex(String),
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

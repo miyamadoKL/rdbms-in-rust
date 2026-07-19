@@ -46,6 +46,20 @@ pub struct IndexInfo {
     /// `UNIQUE`列に自動生成される索引(`Database::execute_create_table`)を
     /// 区別する。
     pub primary_key: bool,
+    /// この索引が、`PRIMARY KEY`・`UNIQUE`列の制約を支えるために
+    /// `Database::execute_create_table`が自動生成した索引かどうか
+    /// (第3部2巡目レビュー対応)。`true`なら`Storage::drop_index`(SQLの
+    /// `DROP INDEX`が呼ぶ入口)は`DbError::CannotDropConstraintIndex`で
+    /// 削除を拒否する(テーブルごと削除する`Storage::drop_table`の内部経路は
+    /// この制限を受けない)。
+    ///
+    /// `primary_key`との違い: `primary_key`は`PRIMARY KEY`と`UNIQUE`の
+    /// どちらの制約由来かを区別するためのフラグで、`UNIQUE`列由来の制約索引は
+    /// `is_constraint = true`かつ`primary_key = false`になる。この場合、
+    /// `unique`列だけを見て`CREATE UNIQUE INDEX`(SQL、`is_constraint =
+    /// false`)由来の索引と区別することはできないため、この2つは独立した
+    /// フィールドとして持つ。
+    pub is_constraint: bool,
     /// 索引キーの型(索引化された列の`DataType`と同じ)。
     pub key_type: DataType,
 }
@@ -158,16 +172,17 @@ mod tests {
         let path = temp_path("missing-constraint-index");
         let mut storage = Storage::create(&path).unwrap();
         let schema = Schema::new(vec![Column::new("id", DataType::BigInt, false).with_primary_key(), Column::new("name", DataType::Text, true)]);
-        let table_id = storage.create_table("users", schema.clone()).unwrap();
-        storage.create_constraint_index("users_id_idx", "users", "id", true).unwrap();
+        let table_id = storage
+            .create_table_with_constraint_indexes("users", schema.clone(), &[("id".to_string(), true)])
+            .unwrap();
 
-        // 通常はCREATE TABLEの一部として自動生成され、CREATE TABLE自身が
-        // 完了した後にユーザーが直接DROP INDEXできる名前でもない
-        // (自動生成索引だと利用者に知る手段が無い)が、ここではテストのために
-        // 直接`Storage::drop_index`で取り除き、「テーブルはPRIMARY KEYを
-        // 持つと申告しているのに、対応する索引が無い」という不変条件違反を
-        // 作る。
-        storage.drop_index("users_id_idx").unwrap();
+        // 通常のSQL経路ではこの索引は制約索引(`IndexInfo::is_constraint`)
+        // なので`Storage::drop_index`(SQLのDROP INDEXが呼ぶ入口)が
+        // `DbError::CannotDropConstraintIndex`で拒否する。ここではテストの
+        // ために、その制限を受けない内部専用の`drop_index_impl`で直接
+        // 取り除き、「テーブルはPRIMARY KEYを持つと申告しているのに、
+        // 対応する索引が無い」という不変条件違反を作る。
+        storage.drop_index_impl("users_id_idx").unwrap();
 
         let candidate = Tuple::new(&schema, vec![crate::types::Value::BigInt(1), crate::types::Value::Text("alice".to_string())]).unwrap();
         let err = check_uniqueness_with_index(&storage, table_id, &schema, &[candidate], &HashSet::new()).unwrap_err();

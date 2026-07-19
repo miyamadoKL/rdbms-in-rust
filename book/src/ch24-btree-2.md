@@ -618,19 +618,35 @@ for (value, rid) in &pairs {
 
 ```rust
 pub fn index_insert_row(&mut self, table_id: TableId, tuple: &Tuple, rid: RecordId) -> DbResult<()> {
-    for entry in self.indexes.values_mut().filter(|e| e.info.table_id == table_id) {
-        let Some(value) = tuple.get(entry.info.column_index) else { continue };
+    let index_names: Vec<String> =
+        self.indexes.values().filter(|e| e.info.table_id == table_id).map(|e| e.info.name.clone()).collect();
+
+    let mut applied: Vec<(String, crate::types::Value)> = Vec::new();
+    for index_name in index_names {
+        let entry = self.indexes.get_mut(&index_name).expect("直前にこのテーブルの索引として集めた名前なので必ず存在する");
+        let Some(value) = tuple.get(entry.info.column_index).cloned() else { continue };
         if value.is_null() {
             continue;
         }
-        entry
-            .btree
-            .insert(value, rid)
-            .map_err(|err| translate_btree_error(err, entry.info.primary_key, &entry.info.column_name, value))?;
+        match entry.btree.insert(&value, rid) {
+            Ok(()) => applied.push((index_name, value)),
+            Err(err) => {
+                let (primary_key, column_name) = (entry.info.primary_key, entry.info.column_name.clone());
+                for (applied_name, applied_value) in applied.into_iter().rev() {
+                    if let Some(applied_entry) = self.indexes.get_mut(&applied_name) {
+                        let _ = applied_entry.btree.delete(&applied_value, rid);
+                    }
+                }
+                return Err(translate_btree_error(err, primary_key, &column_name, &value));
+            }
+        }
     }
     Ok(())
 }
 ```
+
+`index_insert_row`が索引を1本ずつ順に`insert`していく形である以上、1つのテーブルに複数の索引が付いているとき、途中の1本が失敗する余地は残ります(たとえば`BufferPool`のI/Oエラー)。
+それより前にすでに`insert`済みだった索引をそのままにしてエラーを返すと、この行を指す索引と指さない索引が混在してしまうため、`applied`に成功した`(索引名, 値)`を積んでおき、失敗したらそれを逆順に`delete`で巻き戻してからエラーを返します。
 
 `index_delete_row`も同じ形で、`btree.insert`の代わりに`btree.delete`を呼びます。
 どちらも`table_id`が一致する**全索引**(`UNIQUE`かどうかを問わない)を対象にしている点が要です。
@@ -639,14 +655,27 @@ pub fn index_insert_row(&mut self, table_id: TableId, tuple: &Tuple, rid: Record
 `executor::storage_insert`(第16章から続く、`INSERT`の実装)は、行を書き込んだ直後にこのメソッドを呼びます。
 
 ```rust
+for tuple in &planned {
+    storage.check_indexes_accept_row(table_id, tuple)?;
+}
+
 let count = planned.len();
 for tuple in planned {
     let bytes = encode_tuple(schema, &tuple);
     let rid = storage.insert(table_id, &bytes)?;
-    storage.index_insert_row(table_id, &tuple, rid)?;
+    if let Err(err) = storage.index_insert_row(table_id, &tuple, rid) {
+        let _ = storage.delete(table_id, rid);
+        return Err(err);
+    }
 }
 Ok(count)
 ```
+
+`storage.insert`(Heapへの書き込み)と`index_insert_row`(索引への反映)が別々の呼び出しである以上、後者だけが失敗すると、Heapには存在するがどの索引にも登録されていない行が残ってしまいます(Seq Scanでは見えるのにIndex Scanでは見えない行になる)。
+これを2段構えで防ぎます。
+まず`planned`の全行について、`storage.check_indexes_accept_row`で「対象となる全索引にキーが収まるか」をHeapへの書き込みより前に検証します(主防御)。
+次節で見るとおり、`BTree::insert`はこの検査を通過したキーに対して`DbError::BTreeKeyTooLarge`を返さないことが構造的に保証されているため、通常の失敗はここで`storage`に一切触れずに検出できます。
+それでも`index_insert_row`が(`BufferPool`のI/Oエラーのようなまれな理由で)失敗した場合は、その行のために書き込んだHeap行を`storage.delete`で取り除いてからエラーを返します(保険)。
 
 `storage_delete`も同じ形で、`storage.delete`の直後に`index_delete_row`を呼びます。
 
@@ -660,15 +689,38 @@ Ok(count)
 これを避けるため、`storage_update`は値が変わったかどうかを見ず、**常に**「更新前の値を消し、更新後の値(と、実際に確定した新しい`RecordId`)を入れ直す」という形で索引を追従させます。
 
 ```rust
+for (_, _, new_tuple) in &planned {
+    storage.check_indexes_accept_row(table_id, new_tuple)?;
+}
+
 let count = planned.len();
 for (old_rid, old_tuple, new_tuple) in planned {
-    let bytes = encode_tuple(schema, &new_tuple);
-    let new_rid = storage.update(table_id, old_rid, &bytes)?.unwrap_or(old_rid);
-    storage.index_delete_row(table_id, &old_tuple, old_rid)?;
-    storage.index_insert_row(table_id, &new_tuple, new_rid)?;
+    let old_bytes = encode_tuple(schema, &old_tuple);
+    let new_bytes = encode_tuple(schema, &new_tuple);
+    let new_rid = storage.update(table_id, old_rid, &new_bytes)?.unwrap_or(old_rid);
+
+    if let Err(err) = storage.index_delete_row(table_id, &old_tuple, old_rid) {
+        let _ = storage.update(table_id, new_rid, &old_bytes);
+        return Err(err);
+    }
+
+    if let Err(err) = storage.index_insert_row(table_id, &new_tuple, new_rid) {
+        let _ = storage.index_insert_row(table_id, &old_tuple, new_rid);
+        let _ = storage.update(table_id, new_rid, &old_bytes);
+        return Err(err);
+    }
 }
 Ok(count)
 ```
+
+`storage_insert`と同じ理由で、`storage.update`(Heapの書き換え)、`index_delete_row`(旧索引の削除)、`index_insert_row`(新索引への挿入)という3段階のどこかでエラーが起きると、Heapと索引が食い違ったまま残る余地があります。
+`check_indexes_accept_row`による事前検証が主防御であることも`storage_insert`と同じですが、`UPDATE`はこの検証を通過した後の失敗をさらに2箇所で受け止める必要があります。
+
+`index_delete_row`は、`NULL`でも型不一致でもない既存のキーを取り除くだけなので通常は失敗しません(`BTree::delete`が返しうるエラーはどちらもすでに除外済みの入力にしか起こらないからです)が、万一失敗したときはHeapだけでも更新前の内容(`old_bytes`)へ戻します。
+`index_insert_row`が(事前検証を通過していれば通常は起こらない、`BufferPool`のI/Oエラーのような理由で)失敗したときは、直前に削除した旧索引エントリを`new_rid`向けに挿入し直し、Heapも更新前の内容へ戻します。
+`index_insert_row`はここまでに成功していた(あるいは元々存在しなかった)索引への反映をすでに自身で巻き戻し済みなので、呼び出し側であるここでは旧索引を戻すだけでよく、二重に巻き戻す必要はありません。
+どちらの段階が失敗しても、戻す先のHeapは`new_rid`(移動後の位置)であって`old_rid`(移動前の位置)ではない点に注意してください。
+`storage.update`がすでに`old_rid`のスロットを空けてしまっている(または収まらずに`new_rid`へ移していた)可能性があるため、`old_rid`をそのまま復元することはできません。
 
 値も`RecordId`も変わらない`UPDATE`(たとえば`WHERE`に一致した行へ同じ値を書き込む文)まで、この削除→挿入を毎回行うのは無駄に見えるかもしれません。
 実際に無駄ではあるのですが、「値が変わったかどうか」「`RecordId`が変わったかどうか」を先に判定してから経路を分ける実装は、判定を誤ったときに索引が古いエントリを持ち続けるという、気づきにくい形で壊れます。
@@ -770,31 +822,102 @@ if schema.unique_constrained_columns().next().is_some() {
 ### `PRIMARY KEY`と`UNIQUE`列には自動でUNIQUE索引を作る
 
 利用者が明示的に`CREATE INDEX`しなくても、`PRIMARY KEY`と`UNIQUE`の列には自動で索引が付くようにします。
-自動生成する索引名は`"{テーブル名}_{列名}_idx"`という単純な組み立てなので、利用者がまったく同じ名前で先に`CREATE INDEX`していた場合、名前が衝突します。
-`Database::execute_create_table`は、この衝突が起きていないかをテーブルを永続化する**前**にまとめて検査してから、対応する列だけ`create_constraint_index`を呼びます。
+自動生成する索引名は`"{テーブル名}_{列名}_idx"`という単純な組み立てなので、利用者がまったく同じ名前で先に`CREATE INDEX`していたら名前が衝突しますし、索引ファイルのパス(`<データベースファイルのパス>.idx.<索引名>`、モジュール冒頭を参照)がOSのファイル名長の上限を超えて`CREATE INDEX`相当の処理自体がI/Oエラーになることもあります。
+テーブルの登録(`Storage::create_table`)と、対応する制約索引の作成をそれぞれ独立した`persist_catalog`(カタログの永続化)で行うと、後者のどんな理由の失敗であっても「テーブルだけが、対応する制約索引を持たずにカタログへ残る」という状態が生まれてしまいます。
+その状態で`INSERT`すると、`check_uniqueness_with_index`(前節)が「`PRIMARY KEY`や`UNIQUE`の列には自動生成索引が必ずある」という前提で対応する索引を探し、見つからずに`DbError::CorruptCatalog`を返すところまで症状が伝播します。
+
+これを避けるため、`Storage::create_table_with_constraint_indexes`という1つのAPIに、テーブルの登録と全制約索引の作成をまとめます。
 
 ```rust
-let constraint_index_names: Vec<String> =
-    constraint_columns.iter().map(|(column_name, _)| format!("{}_{}_idx", create.table.name, column_name)).collect();
-for index_name in &constraint_index_names {
-    if storage.index(index_name).is_some() {
-        return Err(DbError::DuplicateIndex(index_name.clone()));
+pub fn create_table_with_constraint_indexes(
+    &mut self,
+    table_name: &str,
+    schema: Schema,
+    constraint_columns: &[(String, bool)],
+) -> DbResult<TableId> {
+    if self.tables.values().any(|t| t.info.name == table_name) {
+        return Err(DbError::DuplicateTable(table_name.to_string()));
     }
-}
+    let index_names: Vec<String> =
+        constraint_columns.iter().map(|(column_name, _)| format!("{table_name}_{column_name}_idx")).collect();
+    for index_name in &index_names {
+        if self.indexes.contains_key(index_name) {
+            return Err(DbError::DuplicateIndex(index_name.clone()));
+        }
+    }
 
-storage.create_table(&create.table.name, schema)?;
-for ((column_name, primary_key), index_name) in constraint_columns.iter().zip(&constraint_index_names) {
-    storage.create_constraint_index(index_name, &create.table.name, column_name, *primary_key)?;
+    let id = TableId(self.next_table_id);
+    let next_table_id = self.next_table_id.checked_add(1).ok_or(DbError::TableIdSpaceExhausted)?;
+    self.next_table_id = next_table_id;
+    self.tables.insert(
+        id,
+        TableEntry { info: TableInfo { id, name: table_name.to_string(), schema }, page_ids: Vec::new() },
+    );
+
+    let mut created_index_names: Vec<String> = Vec::new();
+    for ((column_name, primary_key), index_name) in constraint_columns.iter().zip(&index_names) {
+        if let Err(err) = self.build_index(index_name, table_name, column_name, true, *primary_key, true) {
+            self.rollback_table_creation(id, &created_index_names);
+            return Err(err);
+        }
+        created_index_names.push(index_name.clone());
+    }
+
+    if let Err(err) = self.persist_catalog() {
+        self.rollback_table_creation(id, &created_index_names);
+        return Err(err);
+    }
+    Ok(id)
 }
 ```
 
-先に`storage.create_table`でテーブルを永続化してから`create_constraint_index`を呼ぶ順序だと、名前の衝突は`create_constraint_index`が`DbError::DuplicateIndex`を返した時点で初めて発覚します。
-そのときにはテーブルはすでにカタログへ登録済みで、対応する`UNIQUE`索引を持たないまま残ります。
-その状態で`INSERT`すると、`check_uniqueness_with_index`(前節)が「`PRIMARY KEY`や`UNIQUE`の列には自動生成索引が必ずある」という前提で対応する索引を探し、見つからずに`DbError::CorruptCatalog`を返すところまで症状が伝播します。
-索引名の予約(この事前検査)は、症状が起きる場所ではなく、不整合が生まれる場所そのものを塞ぐ修正です。
+`build_index`は、これまで`create_index`(`CREATE INDEX`構文)が1本の索引を作るたびに呼んでいた「索引名の予約、テーブルと列の解決、Index Build、`self.indexes`への登録」をそのまま担いますが、末尾の`persist_catalog`だけは自分では呼びません。
+テーブルの登録も、この時点ではまだメモリ上(`self.tables`)にあるだけで、ディスクのカタログには一切触れていません。
+制約索引を1本ずつ`build_index`していき、途中のどれか1本でも失敗したら、それより前に作った索引(`created_index_names`)とテーブルをまとめて`rollback_table_creation`で取り消します。
+全部の索引が揃って初めて、`persist_catalog`を**1回だけ**呼びます。
+これで、テーブルと全制約索引が「すべて揃った状態」と「(この関数を呼ぶ前の)何も無い状態」のどちらかにしかならず、索引名の衝突以外のどんな理由の失敗であっても、テーブルだけが取り残されることはありません。
 
-`create_constraint_index`は、公開APIの`create_index`(`CREATE INDEX`構文が呼ぶ、常に`unique`だけを指定できる)とは別に用意した内部専用の入口で、`primary_key`まで指定できます。
-`CREATE INDEX`(SQL構文)からは`PRIMARY KEY`を宣言できないので、この経路を公開APIへ混ぜ込む理由がないからです。
+`Database::execute_create_table`(ディスクバックエンド)は、この1つのAPIを呼ぶだけです。
+
+```rust
+storage.create_table_with_constraint_indexes(&create.table.name, schema, &constraint_columns)?;
+```
+
+### 制約索引は`DROP INDEX`で消せない
+
+自動生成された索引の名前(`"{テーブル名}_{列名}_idx"`)は`EXPLAIN`の出力(前節)などから知ることができ、利用者がその名前をそのまま`DROP INDEX`に渡すこと自体は止められません。
+
+```console
+minidb> CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT);
+CREATE TABLE
+minidb> DROP INDEX users_id_idx;
+エラー: 索引'users_id_idx'はPRIMARY KEY・UNIQUE制約が自動生成した索引のため、DROP INDEXでは削除できません
+```
+
+この索引を`DROP INDEX`で消せてしまうと、`id`列が`PRIMARY KEY`を宣言しているのに、それを検査する索引(`check_uniqueness_with_index`が探しに行く索引)が無いという、`CREATE TABLE`の失敗経路と同じ不整合が生まれます。
+それを防ぐため、`IndexInfo`(索引のメタデータ)に`is_constraint`というフィールドを持たせ、`Storage::drop_index`(SQLの`DROP INDEX`が呼ぶ入口)がこれを見て拒否します。
+
+```rust
+pub fn drop_index(&mut self, index_name: &str) -> DbResult<()> {
+    let info = self.indexes.get(index_name).ok_or_else(|| DbError::IndexNotFound(index_name.to_string()))?;
+    if info.info.is_constraint {
+        return Err(DbError::CannotDropConstraintIndex(index_name.to_string()));
+    }
+    self.drop_index_impl(index_name)
+}
+```
+
+実際に索引を取り除く処理そのものは`drop_index_impl`という別のメソッドへ切り出し、`is_constraint`の検査は素通りします。
+`DROP TABLE`(`Storage::drop_table`)は、テーブルを丸ごと消す以上、対応する制約索引もまとめて消して当然なので、`drop_index`ではなくこの`drop_index_impl`を直接呼びます。
+`pub(crate)`にとどめ、クレートの外(SQL経由)からは`drop_index`を通してしか索引を消せないようにしてあるので、この使い分けを取り違える経路は型システムの外からしか起こりません。
+
+`is_constraint`は、既存の`primary_key`フィールドとは別物です。
+`primary_key`は`PRIMARY KEY`と`UNIQUE`のどちらの制約に由来する索引かを区別するためのフィールドで、`UNIQUE`列に由来する制約索引は`is_constraint = true`かつ`primary_key = false`になります。
+この組み合わせは、`unique`列(`true`)だけを見て`CREATE UNIQUE INDEX`(SQL構文、`is_constraint = false`)由来の索引と区別することはできないため、`is_constraint`という独立したフィールドが要ります。
+
+`IndexInfo`はCatalogページへ永続化するメタデータ(モジュール冒頭の表)の1つなので、`is_constraint`を持たせるにはそのレイアウトに1バイト足す必要があります。
+この章より前に作られたファイルはこの1バイトを持たないため、開こうとすると読む前にバイト列が尽きて`DbError::CorruptCatalog`になります。
+この章が一貫して採っている「章をまたいだファイル互換性は約束しない」方針(モジュール冒頭を参照)のとおりです。
 
 ### 走査ベース検査の退役範囲
 
@@ -856,8 +979,10 @@ fn range_matches_a_btreemap_model() {
 ```
 
 `crate::storage`のテストは、`CREATE INDEX`のIndex Build(既存の重複を見逃さないこと)、`DROP INDEX`(索引ファイルとメタデータの両方が消えること)、`drop_table`が付随する索引もまとめて片付けること、索引付きテーブルの再起動を確認します。
+`create_table_with_constraint_indexes`については、テーブルと全制約索引が一括で揃うこと、索引名の衝突や(索引ファイルのパス長超過のような)それ以外の理由での失敗のどちらでもテーブル自体が残らないこと、`drop_index`が制約索引を拒否する一方で`drop_table`はそれをまとめて片付けられることを確認します。
 `crate::database`のテストは、SQL文字列を通した統合テストです。
 メモリバックエンドの走査ベース検査とディスクバックエンドの索引ベース検査が、同じ違反に対して同じ種類のエラー(`to_string()`まで一致する同一メッセージ)を返すことも確認します。
+`DROP INDEX`が制約索引を拒否することは、`PRIMARY KEY`と`UNIQUE`の両方について、拒否された後も制約自体は効き続けていること(`INSERT`が引き続き違反を検出すること)まで含めて確認します。
 
 ```rust
 let mem_err = {
@@ -883,7 +1008,7 @@ assert_eq!(mem_err.to_string(), disk_err.to_string());
 
 ```console
 $ cargo test --lib
-test result: ok. 534 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
+test result: ok. 575 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out
 ```
 
 ## 演習問題
@@ -897,5 +1022,5 @@ test result: ok. 534 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out
 ### 発展課題
 
 1. `Storage::create_index`は、索引ごとに専用のファイルを作るという設計を採りました(モジュール冒頭の説明を参照)。この設計を、テーブル本体と同じファイルに複数の索引を同居させる設計へ書き換えるとすると、`crate::btree::BTree`のMetaページ配置(ページ1固定)をどう変更する必要があるかを設計してください。`Storage`のCatalogページに各索引のMetaページの`PageId`を記録する案と、`BTree::create`に呼び出し側が確保したMetaページの`PageId`を渡させる案の両方を検討し、それぞれが`crate::btree`のテスト(単独のファイルとして`BTree`を使う、第23章からのテスト)にどう影響するかを比較してください。
-2. `Database::execute_create_table`は、自動生成する制約索引名がすでに使われていないかをテーブルの永続化より前にまとめて検査するようになりました(前節)。この検査は「索引名の衝突」という1種類の失敗だけを防ぎます。`PRIMARY KEY`と`UNIQUE`の両方を持つテーブルのように、自動生成する制約索引が2本以上ある場合、1本目の`create_constraint_index`が成功した直後に2本目が(索引名の衝突ではなく)`DbError::CatalogTooLarge`のような別の理由で失敗すると、テーブルは索引を1本だけ持った不完全な状態のままカタログに残ります。この経路を再現するテストを書き、テーブルの永続化そのものを制約索引がすべて揃うまで遅らせる設計と、失敗時にテーブルと作成済みの制約索引を取り除くロールバックを実装する設計の両方を検討してください。
+2. `Storage::create_table_with_constraint_indexes`(前節)は、テーブルの登録と全制約索引の作成が終わるまで`persist_catalog`を1回も呼ばないことで、テーブルだけが取り残される状態を防いでいます。この章のB+Treeはまだシングルスレッド前提(`crate::btree`モジュールドキュメントの「ページへのアクセスと並行性」を参照)ですが、仮に2つのスレッドが同時に`CREATE TABLE`を実行できるようになったとすると、この関数のどこで競合が起こりうるかを検討してください(索引名の予約検査から実際の登録までの間に、別スレッドが同じ名前を使ってしまう余地はないか)。ロックを使わずに検査と登録の間の競合を防ぐ設計と、テーブル単位の粗いロックで防ぐ設計を比較してください。
 3. `RangeScan`は、`next_leaf`をたどりながら1ページずつ`BufferPool::read_page`を呼びます。`Storage::create_index`のIndex Buildと同様に大量の行を読む場面で、`BufferPool::stats()`(第14章)を使ってヒット率を実測し、Point Lookup(`lookup`)を同じ件数繰り返す場合と比べてページI/Oの回数がどう違うかを比較してください。

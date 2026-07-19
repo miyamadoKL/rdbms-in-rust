@@ -135,6 +135,61 @@
 //! 列名が入らない。呼び出し側([`crate::index::check_uniqueness_with_index`])が、
 //! 第20章の`DbError::PrimaryKeyViolation`・`DbError::UniqueViolation`
 //! (列名つき)へ翻訳してから利用者へ返す。
+//!
+//! # Split中の伝播が安全である理由(第3部レビュー対応)
+//!
+//! [`BTree::insert`]は、葉でSplitが起きると、その結果(区切りキー・新しい
+//! ページのId)を親のInternal Pageへ挿入し、親でもSplitが起きればさらに
+//! その親へ……というように、下から上へSplitをRootまで伝播させる
+//! (最悪の場合、木の高さに比例した回数のSplitが連鎖する)。
+//!
+//! [`Self::split_leaf`]・[`Self::split_internal`]それぞれの単体としての
+//! 原子性(片側が収まらなければ、そのページには一切触れず
+//! `DbError::BTreeKeyTooLarge`を返す)だけでは、`insert`全体の原子性は
+//! 保証されない。葉のSplitがすでにディスクへ実ページとして反映された
+//! **後**に、伝播の途中(親・祖父母……のいずれかの階層)のSplitが
+//! `DbError::BTreeKeyTooLarge`で失敗すると、`insert`は呼び出し側へ
+//! エラーを返す一方、葉レベルの変更はもう元に戻せない。しかも、この
+//! 葉レベルの変更は`next_leaf`(第24章)によって左隣の葉から辿れてしまう
+//! ため、`insert`が失敗を報告したはずのキーを`lookup`が1件返すという
+//! 矛盾した状態が生まれる。
+//!
+//! この矛盾を、`insert`が伝播を開始する**前**の入力検証だけで構造的に
+//! 起こりえなくする。鍵は次の2点である。
+//!
+//! 1. **キー長の上限を「2件収まる」水準まで引き下げる**:
+//!    [`crate::btree_page::leaf_max_key_len_for_two_entries`]・
+//!    [`crate::btree_page::internal_max_key_len_for_two_entries`]が計算する、
+//!    「空のページに**同じ長さのキーを持つエントリを2件**書き込める」
+//!    という水準を、`insert`が受け付けるキー長の上限にする
+//!    ([`Self::max_key_len`])。「1件収まる」よりずっと保守的だが、
+//!    後述のとおりこの余裕が伝播全体の安全性を支える。
+//! 2. **分割点を件数の中央でなくバイト容量で選ぶ**:
+//!    [`crate::btree_page::capacity_split_point`]が、キーを左から貪欲に
+//!    詰めて`capacity`を超える直前で区切る。
+//!
+//! この2つを組み合わせると、以下が成り立つ。
+//! `insert`はSplitのどの階層でも、**すでに収まっていたページへ、ちょうど
+//! 1件のエントリを追加しようとして初めて溢れる**(葉では新しいキー、
+//! それより上の階層では下の階層から押し上げられた区切りキーが、いずれも
+//! 1.の上限を満たす1件だけ追加される)。溢れる前のページの合計は
+//! `capacity`以下、追加される1件は1.の上限より`capacity / 2`以下なので、
+//! 溢れた直後の合計は`capacity + capacity / 2`を超えない。
+//! `capacity_split_point`は、左側の合計が`capacity`を超える直前で止まるため、
+//! 左側は構成そのものから`capacity`に収まる。さらに、それまでに追加した
+//! 最後の1件を足すと超えていたはずなので、左側の合計は
+//! `capacity - (追加できなかった1件の長さ)`より大きく、その1件も1.の上限
+//! (`capacity / 2`以下)を満たすため、左側の合計は`capacity / 2`より大きい。
+//! したがって右側の合計は、全体(`capacity + capacity / 2`以下)から左側
+//! (`capacity / 2`より大きい)を引いた`capacity`未満に収まる
+//! (Internal Splitで親へ押し上げる区切りキー1件は、どちらの側にも
+//! 保存されないため、この余裕はさらに広がる)。
+//!
+//! つまり、`insert`が最初に1.の上限でキーを検証してさえいれば、以後
+//! 伝播するどのSplitも、両側が収まらずに失敗する余地が構造的に無い。
+//! [`Self::split_leaf`]・[`Self::split_internal`]・[`Self::grow_new_root`]が
+//! それぞれ持つ`DbError::BTreeKeyTooLarge`を返す分岐は、この不変条件が
+//! 崩れた場合の保険として残すが、`insert`経由では通常到達しない。
 
 use std::ops::Bound;
 
@@ -145,7 +200,9 @@ use crate::page::{PageType, PAGE_PAYLOAD_SIZE};
 use crate::types::{DataType, Value};
 
 use crate::btree_page::{
-    internal_entries_fit, leaf_entries_fit, InternalPage, InternalPageRef, LeafPage, LeafPageRef, NO_NEXT_LEAF,
+    internal_entries_fit, internal_max_key_len_for_two_entries, internal_split_point, leaf_entries_fit,
+    leaf_max_key_len_for_two_entries, leaf_split_point, InternalPage, InternalPageRef, LeafPage, LeafPageRef,
+    NO_NEXT_LEAF,
 };
 
 /// Metaページ(Rootの`PageId`とキー型)の定位置。ページ0はDiskManagerのFile
@@ -421,8 +478,21 @@ impl BTree {
         }
     }
 
-    /// `key`を1件挿入しようとしたときに、空のLeaf Page1枚にすら収まらない
-    /// ほど大きくないかどうかを、実際には何も書き換えずに判定する。
+    /// このツリーが`insert`で受け付けるキーの、エンコード後のバイト長の
+    /// 上限(第3部レビュー対応)。
+    ///
+    /// 「空のLeaf Page(またはInternal Page)に、この長さのキーを持つ
+    /// エントリを1件収められる」ではなく、**2件**収められる水準に固定して
+    /// ある。この余裕が、多段Splitの伝播が構造的に`DbError::BTreeKeyTooLarge`
+    /// へ到達しないことを保証する(モジュールドキュメントの「Split中の
+    /// 伝播が安全である理由」を参照)。Leaf・Internalの両方で2件収まる
+    /// ことを保証する必要があるため、両者のうち小さいほうの上限を使う。
+    fn max_key_len(&self) -> usize {
+        leaf_max_key_len_for_two_entries(PAGE_PAYLOAD_SIZE).min(internal_max_key_len_for_two_entries(PAGE_PAYLOAD_SIZE))
+    }
+
+    /// `key`を1件挿入しようとしたときに、[`Self::max_key_len`]を超えて
+    /// いないかどうかを、実際には何も書き換えずに判定する。
     ///
     /// [`crate::storage::Storage::check_indexes_accept_row`]が、複数の索引を
     /// 横断して1行を挿入・更新する前に「どの索引でもこのキーが収まる」ことを
@@ -433,20 +503,20 @@ impl BTree {
     /// 行そのものはすでに書き込まれている(あるいは書き換わっている)という
     /// 不整合が生まれる(第3部レビューで指摘された)。
     ///
-    /// この検査が見るのは「キー1件が空のページに収まるか」だけである。
-    /// 実際の`insert`が引き起こすLeaf・Internal Splitは、既存ページの
-    /// 空き具合次第でこの検査を通過した後でも`DbError::BTreeKeyTooLarge`に
-    /// なる余地を残す(その場合の後始末は`Storage::index_insert_row`が
-    /// 行う巻き戻しに任せる。この関数は「よくある失敗」をHeapへの書き込み
-    /// より前に防ぐ主防御であり、後者は「まれな失敗」の保険にすぎない)。
+    /// [`Self::insert`]自身も、伝播を開始する前にこの上限で`key`を検証する
+    /// (この関数と同じ判定を内部で行う)。この検査を通過した`key`は、
+    /// `insert`が引き起こす多段のLeaf・Internal Splitのどの階層でも
+    /// `DbError::BTreeKeyTooLarge`にならないことが構造的に保証されているため
+    /// (モジュールドキュメントを参照)、この関数はもう「よくある失敗を
+    /// 早期に防ぐ主防御」ではなく、`insert`が返しうるエラーをHeapへの
+    /// 書き込みより前に完全に予測する検査そのものである。
     ///
     /// `key`が`Value::Null`なら`DbError::NullKeyNotAllowed`、このツリーの
     /// `key_type()`と異なる型なら`DbError::BTreeKeyTypeMismatch`を返す。
     pub fn check_key_fits(&self, key: &Value) -> DbResult<()> {
         self.check_key_type(key)?;
         let key_bytes = encode_key(key)?;
-        let dummy_rid = RecordId::new(PageId(0), crate::ids::SlotId(0));
-        if leaf_entries_fit(PAGE_PAYLOAD_SIZE, &[(key_bytes.clone(), dummy_rid)]) {
+        if key_bytes.len() <= self.max_key_len() {
             Ok(())
         } else {
             Err(DbError::BTreeKeyTooLarge(key_bytes.len()))
@@ -462,16 +532,24 @@ impl BTree {
     ///
     /// `key`が`Value::Null`なら`DbError::NullKeyNotAllowed`、このツリーの
     /// `key_type()`と異なる型なら`DbError::BTreeKeyTypeMismatch`を返す。
-    /// キー1件(またはキー1本の区切りキー)だけでも空のページに収まらない
-    /// ほど大きい場合は`DbError::BTreeKeyTooLarge`を返す。このツリーが
-    /// `unique`(第24章)なら、`key`がすでに存在する場合に
-    /// `DbError::BTreeUniqueViolation`を返す。
+    /// `key`のエンコード後のバイト長が[`Self::max_key_len`]を超える場合は
+    /// `DbError::BTreeKeyTooLarge`を返す。このツリーが`unique`(第24章)なら、
+    /// `key`がすでに存在する場合に`DbError::BTreeUniqueViolation`を返す。
+    ///
+    /// この検査を`key_bytes`の算出直後、木を下り始める**前**に行うことが、
+    /// 多段Splitの伝播全体を原子的にする(モジュールドキュメント「Split中の
+    /// 伝播が安全である理由」を参照)。伝播の途中(葉のSplitが済んだ後)で
+    /// この検査を行っても、すでに葉レベルの変更をディスクへ反映してしまった
+    /// 後では手遅れである。
     pub fn insert(&mut self, key: &Value, rid: RecordId) -> DbResult<()> {
         self.check_key_type(key)?;
         if self.unique && !self.lookup(key)?.is_empty() {
             return Err(DbError::BTreeUniqueViolation);
         }
         let key_bytes = encode_key(key)?;
+        if key_bytes.len() > self.max_key_len() {
+            return Err(DbError::BTreeKeyTooLarge(key_bytes.len()));
+        }
 
         // Rootから葉まで下りながら、通過したInternal Pageの`PageId`を
         // `path`に記録する。分割が起きた場合、この`path`を根の方向へ
@@ -598,7 +676,9 @@ impl BTree {
             let max_len = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
             return Err(DbError::BTreeKeyTooLarge(max_len));
         }
-        let mid = entries.len() / 2;
+        // 件数の中央(`entries.len() / 2`)ではなく、バイト容量を基準に分割点を
+        // 選ぶ(モジュールドキュメント「Split中の伝播が安全である理由」を参照)。
+        let mid = leaf_split_point(PAGE_PAYLOAD_SIZE, entries);
         let (left, right) = entries.split_at(mid);
         let separator = right[0].0.clone();
 
@@ -647,7 +727,11 @@ impl BTree {
             let max_len = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
             return Err(DbError::BTreeKeyTooLarge(max_len));
         }
-        let mid = entries.len() / 2;
+        // `split_leaf`と同じ理由で、件数の中央ではなくバイト容量を基準に
+        // 分割点を選ぶ。`entries[mid]`自体はどちらの側にも保存されず親へ
+        // 押し上げるだけなので、実際にはこの分割点の計算より右側にさらに
+        // 余裕が生まれる(モジュールドキュメントの証明を参照)。
+        let mid = internal_split_point(PAGE_PAYLOAD_SIZE, entries);
         let separator = entries[mid].0.clone();
         let left_entries = &entries[0..mid];
         let right_leftmost = entries[mid].1;
@@ -1306,8 +1390,9 @@ mod tests {
         assert!(!original_entries.is_empty(), "Root Split直後のRootは区切りキーを1本以上持つはず");
 
         // 収まりようがないほど巨大な区切りキーを先頭に混ぜる。
-        // `mid = entries.len() / 2 >= 1`であるため、必ず左側(current_id側)に
-        // 含まれ、事前検査で失敗する。
+        // `internal_split_point`(バイト容量ベースの分割点選択)は先頭の1件を
+        // 必ず左側に含めるため(1件も無い左側は意味を持たない)、この巨大な
+        // キーは必ず左側(current_id側)に含まれ、事前検査で失敗する。
         let huge_key = "x".repeat(crate::page::PAGE_PAYLOAD_SIZE);
         let mut entries = original_entries.clone();
         entries.insert(0, (huge_key.into_bytes(), PageId(999_999)));
@@ -1321,6 +1406,134 @@ mod tests {
         assert_eq!(view.leftmost_child(), leftmost);
         assert_eq!(view.entries(), original_entries);
         assert_eq!(btree.root_page_id(), internal_id, "Root自体も変わっていないはず");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    // ---- 第3部2巡目レビュー対応: insert全体(多段伝播)の原子性 ----
+
+    #[test]
+    fn insert_accepts_a_key_exactly_at_the_size_limit_and_rejects_one_byte_more() {
+        let path = temp_path("insert-boundary");
+        let mut btree = open_btree(&path, DataType::Text);
+        let max_len = btree.max_key_len();
+
+        let ok_key = "x".repeat(max_len);
+        btree.insert(&Value::Text(ok_key.clone()), rid(1, 0)).unwrap();
+        assert_eq!(btree.lookup(&Value::Text(ok_key)).unwrap(), vec![rid(1, 0)]);
+
+        let too_large = "x".repeat(max_len + 1);
+        let err = btree.insert(&Value::Text(too_large), rid(1, 1)).unwrap_err();
+        assert!(matches!(err, DbError::BTreeKeyTooLarge(_)));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn check_key_fits_matches_inserts_actual_size_limit() {
+        let path = temp_path("check-key-fits-matches");
+        let btree = open_btree(&path, DataType::Text);
+        let max_len = btree.max_key_len();
+        assert!(btree.check_key_fits(&Value::Text("x".repeat(max_len))).is_ok());
+        assert!(matches!(btree.check_key_fits(&Value::Text("x".repeat(max_len + 1))), Err(DbError::BTreeKeyTooLarge(_))));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// レビュー指摘の再現条件(修正後は再現しないことの確認): 上限ぎりぎりの
+    /// 長さのキーを繰り返し挿入すると、1枚のLeaf・Internal Pageに収まる
+    /// エントリ数がごく少数(最大でも2件)になるため、わずか数十件の挿入で
+    /// Leaf SplitとInternal Splitが何段にもわたって連鎖する。この状況で
+    /// `insert`が`DbError::BTreeKeyTooLarge`を一度も返さず完走し、挿入した
+    /// 全キーが`lookup`で正しく引けることを確認する
+    /// (`insert`が受け付ける上限を「空のページにキーが2件収まる」水準まで
+    /// 落とし、分割点をバイト容量基準で選ぶことで、多段伝播のどの階層でも
+    /// 容量エラーが起きない構造になっている。モジュールドキュメント
+    /// 「Split中の伝播が安全である理由」を参照)。
+    #[test]
+    fn insert_completes_multi_level_propagation_without_error_for_keys_near_the_size_limit() {
+        let path = temp_path("insert-multilevel-ok");
+        let mut btree = open_btree(&path, DataType::Text);
+        let key_len = btree.max_key_len();
+        let n = 40usize;
+        let mut expected = Vec::new();
+        for i in 0..n {
+            let key = format!("{i:06}{}", "x".repeat(key_len - 6));
+            let record = rid(1, i as u16);
+            btree.insert(&Value::Text(key.clone()), record).unwrap();
+            expected.push((key, record));
+        }
+        let height = btree.height().unwrap();
+        assert!(
+            height >= 3,
+            "上限ぎりぎりのキーを{n}件挿入すれば、葉もInternalも高々2件でSplitするため3段以上になるはず(実際は{height})"
+        );
+
+        for (key, record) in &expected {
+            assert_eq!(btree.lookup(&Value::Text(key.clone())).unwrap(), vec![*record], "key={key}");
+        }
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// `btree`のRoot(`PageId`)と、そこから到達できる全ページの生バイト列を
+    /// (`PageId`昇順で)集めたスナップショット。`insert`が多段伝播の途中で
+    /// エラーを返した後、木が呼び出し前と一切変わっていないことを、個々の
+    /// ページの中身まで直接突き合わせて確認するために使う。
+    fn snapshot_reachable_pages(btree: &BTree) -> (PageId, Vec<(PageId, Vec<u8>)>) {
+        fn collect(pool: &BufferPool, id: PageId, out: &mut Vec<PageId>) {
+            out.push(id);
+            let guard = pool.read_page(id).unwrap();
+            if guard.page_type() == PageType::BTreeInternal {
+                let view = InternalPageRef::open(guard.data()).unwrap();
+                let children: Vec<PageId> =
+                    std::iter::once(view.leftmost_child()).chain(view.entries().into_iter().map(|(_, child)| child)).collect();
+                drop(guard);
+                for child in children {
+                    collect(pool, child, out);
+                }
+            }
+        }
+
+        let mut ids = Vec::new();
+        collect(&btree.pool, btree.root_page_id(), &mut ids);
+        ids.sort_by_key(|id| id.0);
+        ids.dedup();
+        let pages = ids.iter().map(|&id| (id, btree.pool.read_page(id).unwrap().data().to_vec())).collect();
+        (btree.root_page_id(), pages)
+    }
+
+    /// レビュー指摘の直接的な回帰テスト: 上限ぎりぎりのキーで葉・Internalが
+    /// 何段にもわたって分割された深い木に対し、上限を1バイトでも超える
+    /// キーを`insert`すると、`DbError::BTreeKeyTooLarge`を返し、Root・
+    /// 到達可能な全ページの生バイト列・(したがって暗黙にLeaf間リンクも
+    /// 含む)全エントリが呼び出し前と一致することを直接確認する。
+    ///
+    /// 修正前の`insert`は、キー長の検証を伝播の**途中**(各Splitの内部)で
+    /// 行っていたため、葉のSplitがすでにコミットされた後で祖先の階層が
+    /// 失敗し、`insert`はエラーを返す一方で`lookup`はそのキーを見つけて
+    /// しまうという矛盾が生まれた(木の一部が親から辿れない形で残っても、
+    /// Leaf間リンクだけは繋がってしまうため)。この修正後は、キー長の検証を
+    /// 伝播を始める**前**に行うため、失敗した`insert`は木のどのページにも
+    /// 一切触れない。
+    #[test]
+    fn insert_leaves_every_reachable_page_byte_identical_when_a_key_exceeds_the_limit_in_a_deep_tree() {
+        let path = temp_path("insert-atomic-deep-multilevel");
+        let mut btree = open_btree(&path, DataType::Text);
+        let key_len = btree.max_key_len();
+        for i in 0..40usize {
+            let key = format!("{i:06}{}", "x".repeat(key_len - 6));
+            btree.insert(&Value::Text(key), rid(1, i as u16)).unwrap();
+        }
+        assert!(btree.height().unwrap() >= 3, "この木は多段伝播を経て育っているはず(テストの前提が崩れている)");
+
+        let before_snapshot = snapshot_reachable_pages(&btree);
+
+        let too_large = "x".repeat(btree.max_key_len() + 1);
+        let err = btree.insert(&Value::Text(too_large), rid(9, 9)).unwrap_err();
+        assert!(matches!(err, DbError::BTreeKeyTooLarge(_)));
+
+        let after_snapshot = snapshot_reachable_pages(&btree);
+        assert_eq!(before_snapshot, after_snapshot, "Root・到達可能な全ページの中身が呼び出し前と完全に一致するはず");
 
         std::fs::remove_file(&path).unwrap();
     }

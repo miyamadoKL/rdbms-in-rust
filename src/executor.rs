@@ -149,14 +149,17 @@ pub fn insert(
 ///
 /// これを2段構えで防ぐ。まず、`planned`の全行について
 /// `storage.check_indexes_accept_row`で「対象となる全索引にキーが収まるか」を
-/// Heapへの書き込みより前に検証する(**主防御**、通常の失敗はここで
-/// `storage`に一切触れずに検出できる)。それでも`index_insert_row`が
-/// 失敗した場合(既存ページの空き具合次第で起こりうる、まれな経路)は、
-/// その行のために書き込んだHeap行を`storage.delete`で取り除いてから
-/// エラーを返す(**保険**、`index_insert_row`自身がそれより前に成功して
-/// いた索引への反映を巻き戻す処理と対になる)。この行より前に処理した
-/// 行(同じ`INSERT`文の中の他の行)は、モジュールドキュメントに書いた
-/// 既存の割り切りのとおり巻き戻さない。
+/// Heapへの書き込みより前に検証する(**主防御**)。`crate::btree::BTree::insert`は、
+/// この検査を通過したキーに対する多段Split伝播が構造的に
+/// `DbError::BTreeKeyTooLarge`にならないことを保証しているため
+/// (`crate::btree`モジュールドキュメントの「Split中の伝播が安全である
+/// 理由」を参照)、通常の失敗はここで`storage`に一切触れずに検出できる。
+/// それでも`index_insert_row`が失敗した場合(`BufferPool`のI/Oエラーの
+/// ような無関係な理由による、まれな経路)は、その行のために書き込んだ
+/// Heap行を`storage.delete`で取り除いてからエラーを返す(**保険**、
+/// `index_insert_row`自身がそれより前に成功していた索引への反映を巻き戻す
+/// 処理と対になる)。この行より前に処理した行(同じ`INSERT`文の中の他の行)は、
+/// モジュールドキュメントに書いた既存の割り切りのとおり巻き戻さない。
 pub fn storage_insert(
     storage: &mut Storage,
     table_id: TableId,
@@ -347,10 +350,12 @@ pub fn update(
 /// 前に検証する(主防御)。`index_delete_row`は、`NULL`でも型不一致でもない
 /// 既存のキーを取り除くだけなので通常は失敗しない(`BTree::delete`が
 /// 返しうるエラーはどちらもすでに除外済みの入力にしか起こらない)。
-/// `index_insert_row`は、事前検査を通過していてもLeaf・Internal Split
-/// (既存ページの空き具合に依存する)で、なお失敗する余地が残る(まれな
-/// 経路の保険)。いずれの段階が失敗しても、Heap・索引を更新前の内容
-/// (`old_tuple`、ただし物理的な位置は`new_rid`)へ戻してからエラーを返す。
+/// `index_insert_row`は、事前検査を通過していれば`crate::btree::BTree::insert`の
+/// 多段Split伝播が構造的に安全であることにより(`crate::btree`モジュール
+/// ドキュメントの「Split中の伝播が安全である理由」を参照)通常は失敗しないが、
+/// `BufferPool`のI/Oエラーのような無関係な理由でなお失敗する余地は残る
+/// (まれな経路の保険)。いずれの段階が失敗しても、Heap・索引を更新前の
+/// 内容(`old_tuple`、ただし物理的な位置は`new_rid`)へ戻してからエラーを返す。
 pub fn storage_update(
     storage: &mut Storage,
     table_id: TableId,
@@ -405,8 +410,11 @@ pub fn storage_update(
         }
 
         if let Err(err) = storage.index_insert_row(table_id, &new_tuple, new_rid) {
-            // 事前検査(check_indexes_accept_row)をすり抜けた、まれな失敗
-            // (Leaf・Internal Splitが既存ページの空き具合次第で失敗する経路)。
+            // 事前検査(check_indexes_accept_row)を通過していれば、
+            // `crate::btree::BTree::insert`の多段Split伝播が構造的に安全である
+            // ことにより(`crate::btree`モジュールドキュメントの「Split中の
+            // 伝播が安全である理由」を参照)、通常はここに到達しない。万一
+            // `BufferPool`のI/Oエラーのような無関係な理由で失敗しても、
             // 旧索引・旧Heapへ戻す。`index_insert_row`はここまでに成功していた
             // (無かった)索引への反映をすでに自身で巻き戻し済みなので、ここでは
             // 直前に削除した旧索引エントリを`new_rid`向けに挿入し直すだけでよい。
@@ -998,9 +1006,11 @@ mod tests {
         storage.create_index("payload_idx", "items", "payload", false).unwrap();
 
         // fillerでページの大半を埋めてから、更新対象の行を同じページへ入れる。
-        // 更新後の値(oversized_payload)は、たとえ索引の制約が無かったとしても
-        // このページには収まらず、別ページへ移動せざるをえない大きさである。
-        let filler_payload = "y".repeat(3_000);
+        // filler自身はpayload_idxに挿入できる大きさ(BTree::max_key_lenの
+        // 上限以下)に収めつつ、更新後の値(oversized_payload)は、たとえ
+        // 索引の制約が無かったとしてもこのページには収まらず、別ページへ
+        // 移動せざるをえない大きさである。
+        let filler_payload = "y".repeat(2_000);
         let rows = vec![
             vec![expr("true"), expr(&format!("'{filler_payload}'"))],
             vec![expr("false"), expr("'small'")],

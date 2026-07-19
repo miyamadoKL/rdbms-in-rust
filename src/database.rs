@@ -269,35 +269,17 @@ impl Database {
                 storage.create_table(id);
             }
             Backend::Disk { storage } => {
-                // 第3部レビュー対応: 自動生成する索引名(`create_constraint_index`が
-                // 使う`"{table}_{column}_idx"`という命名)が、既存の(手動で
-                // `CREATE INDEX`された)索引名と衝突していないかを、テーブルを
-                // 登録する**前**にすべて検査しておく。これを怠ると、
-                // `storage.create_table`でテーブルを永続化した後に
-                // `create_constraint_index`が`DbError::DuplicateIndex`で
-                // 失敗した場合、テーブルだけが(対応するはずの制約索引を
-                // 持たないまま)カタログに残ってしまう。その状態で
-                // `INSERT`すると、`crate::index::check_uniqueness_with_index`が
-                // 「`PRIMARY KEY`・`UNIQUE`列には自動生成索引が必ずある」という
-                // 前提で対応する索引を探し、見つからずに整合性エラーになる
-                // (詳しくは同関数のドキュメントを参照)。
-                let constraint_index_names: Vec<String> =
-                    constraint_columns.iter().map(|(column_name, _)| format!("{}_{}_idx", create.table.name, column_name)).collect();
-                for index_name in &constraint_index_names {
-                    if storage.index(index_name).is_some() {
-                        return Err(DbError::DuplicateIndex(index_name.clone()));
-                    }
-                }
-
-                storage.create_table(&create.table.name, schema)?;
-                // Index Build: この時点でテーブルは空なので、`create_constraint_index`
-                // が行うIndex Buildは実質何もしない(将来、この後に続けて
-                // `INSERT`が並ぶSQLスクリプトを一括実行するようになっても、
-                // この設計は変わらない)。上の事前検査により、ここから先の
-                // `create_constraint_index`が名前の衝突で失敗することは無い。
-                for ((column_name, primary_key), index_name) in constraint_columns.iter().zip(&constraint_index_names) {
-                    storage.create_constraint_index(index_name, &create.table.name, column_name, *primary_key)?;
-                }
+                // 第3部2巡目レビュー対応: テーブルの登録と、対応する制約索引
+                // 全部の作成を、`Storage::create_table_with_constraint_indexes`
+                // 1回の呼び出しにまとめる。索引名の衝突だけでなく、索引ファイルの
+                // 作成に伴うI/Oエラーなど、`create_constraint_index`が返しうる
+                // どんな理由の失敗であっても、テーブルと(途中まで作った)索引の
+                // 両方をきれいに戻す(詳しくは`Storage::create_table_with_constraint_indexes`
+                // のドキュメントを参照)。テーブルと索引を別々の呼び出しで
+                // 登録し、索引名の衝突だけを個別に事前検査していた以前の実装は、
+                // それ以外の理由での失敗(たとえばテーブル名が長すぎて索引
+                // ファイルのパスがOSの上限を超えるI/Oエラー)を防げなかった。
+                storage.create_table_with_constraint_indexes(&create.table.name, schema, &constraint_columns)?;
             }
         }
         Ok(QueryResult::command("CREATE TABLE"))
@@ -2354,6 +2336,35 @@ mod tests {
         }
     }
 
+    /// 第3部2巡目レビュー対応の回帰テスト: 索引名の衝突ではなく、索引
+    /// ファイルのパス長がOSの上限を超えるI/Oエラーによって制約索引の
+    /// 作成が失敗するケース。修正前は`storage.create_table`でテーブルを
+    /// 先に永続化していたため、この場合もテーブルだけが残り、
+    /// `SELECT COUNT(*)`は成功するのに続く`INSERT`が索引欠落の整合性
+    /// エラーになっていた。
+    #[test]
+    fn create_table_does_not_create_the_table_when_a_constraint_index_file_path_is_too_long() {
+        let path = temp_db_path("create-table-index-file-too-long");
+        let mut db = Database::open(&path).unwrap();
+        let long_table_name = "t".repeat(245);
+
+        let err = expect_error(db.execute(&format!("CREATE TABLE {long_table_name} (id BIGINT PRIMARY KEY)")));
+        assert!(matches!(err, DbError::Io(_)), "索引ファイルのパス長超過はI/Oエラーとして観測されるはず: {err:?}");
+
+        // テーブル自体も作られていないはず(修正前は`SELECT COUNT(*)`が
+        // 成功してしまっていた)。
+        let err = expect_error(db.execute(&format!("SELECT COUNT(*) FROM {long_table_name}")));
+        assert!(matches!(err, DbError::Bind { .. }), "{long_table_name}テーブルは作られていないはず");
+
+        // 同じデータベースへ、通常のテーブルは問題なく作れる
+        // (カタログやnext_table_idが壊れていないことの確認)。
+        db.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(format!("{}.idx.users_id_idx", path.display()));
+    }
+
     #[test]
     fn create_index_and_drop_index_round_trip() {
         let path = temp_db_path("create-drop-index");
@@ -2372,6 +2383,44 @@ mod tests {
         assert!(matches!(err, DbError::Bind { .. }));
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// 第3部2巡目レビュー対応の回帰テスト: `PRIMARY KEY`・`UNIQUE`列に
+    /// 対応して自動生成された制約索引は、`EXPLAIN`で名前が見えていても
+    /// SQLの`DROP INDEX`では削除できない。`PRIMARY KEY`と`UNIQUE`の
+    /// どちらの制約索引についても確認する。
+    #[test]
+    fn drop_index_rejects_a_constraint_index_for_both_primary_key_and_unique() {
+        let path = temp_db_path("drop-index-rejects-constraint");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT UNIQUE, name TEXT)").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'a@example.com', 'Alice')").unwrap();
+
+        // 自動生成された索引名は、EXPLAINが選ぶアクセスパスから確認できる。
+        let plan = db.execute("EXPLAIN SELECT id FROM users WHERE id = 1").unwrap().to_string();
+        assert!(plan.contains("users_id_idx"), "plan={plan}");
+
+        let err = expect_error(db.execute("DROP INDEX users_id_idx"));
+        assert!(matches!(err, DbError::CannotDropConstraintIndex(name) if name == "users_id_idx"));
+        let err = expect_error(db.execute("DROP INDEX users_email_idx"));
+        assert!(matches!(err, DbError::CannotDropConstraintIndex(name) if name == "users_email_idx"));
+
+        // 拒否されただけで、制約自体は引き続き効いている。
+        let err = expect_error(db.execute("INSERT INTO users VALUES (1, 'b@example.com', 'Bob')"));
+        assert!(matches!(err, DbError::PrimaryKeyViolation { ref column, .. } if column == "id"));
+        let err = expect_error(db.execute("INSERT INTO users VALUES (2, 'a@example.com', 'Carol')"));
+        assert!(matches!(err, DbError::UniqueViolation { ref column, .. } if column == "email"));
+
+        // 手動で作った(制約索引ではない)索引は、これまでどおりDROP INDEXできる。
+        db.execute("CREATE INDEX idx_name ON users (name)").unwrap();
+        assert_eq!(db.execute("DROP INDEX idx_name").unwrap().to_string(), "DROP INDEX");
+
+        // DROP TABLEなら、制約索引ごとテーブルを削除できる。
+        assert_eq!(db.execute("DROP TABLE users").unwrap().to_string(), "DROP TABLE");
+        db.execute("CREATE TABLE users (id BIGINT PRIMARY KEY)").unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(format!("{}.idx.users_id_idx", path.display()));
     }
 
     #[test]
