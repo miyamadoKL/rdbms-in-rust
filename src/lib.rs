@@ -46,6 +46,7 @@ pub mod btree_page;
 pub mod buffer_pool;
 pub mod catalog;
 pub mod constraints;
+pub mod cost_model;
 pub mod database;
 pub mod disk_manager;
 pub mod error;

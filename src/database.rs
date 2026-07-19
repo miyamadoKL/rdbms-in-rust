@@ -392,7 +392,7 @@ impl Database {
     /// 候補行、`WHERE`に一致しなかった行)がメモリに残らないという点である。
     fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {
         let plan = rules::optimize(plan, &self.functions);
-        let physical = physical_plan::optimize(plan, self.index_storage());
+        let physical = physical_plan::optimize(plan, self.index_storage(), self);
         let schema = physical.output_schema();
         let mut executor = self.build_query_executor(&physical, None)?;
 
@@ -574,19 +574,19 @@ impl Database {
         match inner {
             BoundStatement::Select(select) => {
                 let logical = rules::optimize(logical_plan::build_select(*select), &self.functions);
-                let physical = physical_plan::optimize(logical, self.index_storage());
+                let physical = physical_plan::optimize(logical, self.index_storage(), self);
                 if analyze {
                     let counters = CounterNode::build(&physical);
                     let mut executor = self.build_query_executor(&physical, Some(&counters))?;
                     while executor.next()?.is_some() {}
-                    Ok(QueryResult::explain(explain_text(&physical, self, Some(&counters))))
+                    Ok(QueryResult::explain(explain_text(&physical, self, self.index_storage(), Some(&counters))))
                 } else {
-                    Ok(QueryResult::explain(explain_text(&physical, self, None)))
+                    Ok(QueryResult::explain(explain_text(&physical, self, self.index_storage(), None)))
                 }
             }
             BoundStatement::Insert(insert) => {
-                let physical = physical_plan::optimize(logical_plan::build_insert(insert.clone()), self.index_storage());
-                let text = explain_text(&physical, self, None);
+                let physical = physical_plan::optimize(logical_plan::build_insert(insert.clone()), self.index_storage(), self);
+                let text = explain_text(&physical, self, self.index_storage(), None);
                 if analyze {
                     let count = self.run_insert(logical_plan::build_insert(insert))?;
                     Ok(QueryResult::explain(append_actual_to_root_line(&text, count)))
@@ -595,8 +595,8 @@ impl Database {
                 }
             }
             BoundStatement::Update(update) => {
-                let physical = physical_plan::optimize(logical_plan::build_update(update.clone()), self.index_storage());
-                let text = explain_text(&physical, self, None);
+                let physical = physical_plan::optimize(logical_plan::build_update(update.clone()), self.index_storage(), self);
+                let text = explain_text(&physical, self, self.index_storage(), None);
                 if analyze {
                     let count = self.run_update(logical_plan::build_update(update))?;
                     Ok(QueryResult::explain(append_actual_to_root_line(&text, count)))
@@ -605,8 +605,8 @@ impl Database {
                 }
             }
             BoundStatement::Delete(delete) => {
-                let physical = physical_plan::optimize(logical_plan::build_delete(delete.clone()), self.index_storage());
-                let text = explain_text(&physical, self, None);
+                let physical = physical_plan::optimize(logical_plan::build_delete(delete.clone()), self.index_storage(), self);
+                let text = explain_text(&physical, self, self.index_storage(), None);
                 if analyze {
                     let count = self.run_delete(logical_plan::build_delete(delete))?;
                     Ok(QueryResult::explain(append_actual_to_root_line(&text, count)))
@@ -1907,35 +1907,38 @@ mod tests {
     fn explain_select_shows_projection_over_filter_over_seq_scan() {
         let mut db = users_db();
         let lines = explain_lines(&mut db, "EXPLAIN SELECT name FROM users WHERE id = 42");
-        assert_eq!(lines, vec!["Projection(name) rows=5", "  └─ Filter(id = 42) rows=5", "    └─ SeqScan(users) rows=1000"]);
+        assert_eq!(
+            lines,
+            vec!["Projection(name) rows=5 cost=40.05", "  └─ Filter(id = 42) rows=5 cost=40.00", "    └─ SeqScan(users) rows=1000 cost=30.00"]
+        );
     }
 
     #[test]
     fn explain_select_without_where_has_no_filter_node() {
         let mut db = users_db();
         let lines = explain_lines(&mut db, "EXPLAIN SELECT id FROM users");
-        assert_eq!(lines, vec!["Projection(id) rows=1000", "  └─ SeqScan(users) rows=1000"]);
+        assert_eq!(lines, vec!["Projection(id) rows=1000 cost=40.00", "  └─ SeqScan(users) rows=1000 cost=30.00"]);
     }
 
     #[test]
     fn explain_insert_shows_insert_over_values() {
         let mut db = users_db();
         let lines = explain_lines(&mut db, "EXPLAIN INSERT INTO users VALUES (1, 'Alice')");
-        assert_eq!(lines, vec!["Insert(users) rows=1", "  └─ Values(1 row) rows=1"]);
+        assert_eq!(lines, vec!["Insert(users) rows=1 cost=0.00", "  └─ Values(1 row) rows=1 cost=0.00"]);
     }
 
     #[test]
     fn explain_update_shows_update_over_seq_scan() {
         let mut db = users_db();
         let lines = explain_lines(&mut db, "EXPLAIN UPDATE users SET name = 'x' WHERE id = 1");
-        assert_eq!(lines, vec!["Update(users) rows=1000", "  └─ SeqScan(users) rows=1000"]);
+        assert_eq!(lines, vec!["Update(users) rows=1000 cost=30.00", "  └─ SeqScan(users) rows=1000 cost=30.00"]);
     }
 
     #[test]
     fn explain_delete_shows_delete_over_seq_scan() {
         let mut db = users_db();
         let lines = explain_lines(&mut db, "EXPLAIN DELETE FROM users WHERE id = 1");
-        assert_eq!(lines, vec!["Delete(users) rows=1000", "  └─ SeqScan(users) rows=1000"]);
+        assert_eq!(lines, vec!["Delete(users) rows=1000 cost=30.00", "  └─ SeqScan(users) rows=1000 cost=30.00"]);
     }
 
     #[test]
@@ -2246,13 +2249,13 @@ mod tests {
         assert_eq!(
             result.to_string(),
             "QUERY PLAN\n----------\n\
-             Limit(limit=5) rows=5\n  \
-             └─ Sort(dept ASC) rows=111\n    \
-             └─ Projection(dept, COUNT(*)) rows=111\n      \
-             └─ Filter(COUNT(*) > 1) rows=111\n        \
-             └─ Aggregate(group_by=[dept], calls=[COUNT(*)]) rows=333\n          \
-             └─ Filter(amount IS NOT NULL) rows=333\n            \
-             └─ SeqScan(orders) rows=1000\n\
+             Limit(limit=5) rows=5 cost=55.31\n  \
+             └─ Sort(dept ASC) rows=111 cost=55.31\n    \
+             └─ Projection(dept, COUNT(*)) rows=111 cost=47.77\n      \
+             └─ Filter(COUNT(*) > 1) rows=111 cost=46.66\n        \
+             └─ Aggregate(group_by=[dept], calls=[COUNT(*)]) rows=333 cost=43.33\n          \
+             └─ Filter(amount IS NOT NULL) rows=333 cost=40.00\n            \
+             └─ SeqScan(orders) rows=1000 cost=30.00\n\
              (7 rows)"
         );
     }
@@ -2323,10 +2326,10 @@ mod tests {
         assert_eq!(
             result.to_string(),
             "QUERY PLAN\n----------\n\
-             Projection(name) rows=1000\n  \
-             └─ Sort(id ASC) rows=1000\n    \
-             └─ Projection(name, id) rows=1000\n      \
-             └─ SeqScan(t) rows=1000\n\
+             Projection(name) rows=1000 cost=149.66\n  \
+             └─ Sort(id ASC) rows=1000 cost=139.66\n    \
+             └─ Projection(name, id) rows=1000 cost=40.00\n      \
+             └─ SeqScan(t) rows=1000 cost=30.00\n\
              (4 rows)"
         );
     }
@@ -2618,8 +2621,15 @@ mod tests {
         let mut db = Database::open(&path).unwrap();
         db.execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT UNIQUE, name TEXT)").unwrap();
         db.execute("INSERT INTO users VALUES (1, 'a@example.com', 'Alice')").unwrap();
-
         // 自動生成された索引名は、EXPLAINが選ぶアクセスパスから確認できる。
+        // 第28章から、アクセスパスはコストで選ぶ(`choose_scan_plan`)ため、
+        // 数行だけのテーブルではSeqScanのほうが安く済んでしまい索引が
+        // 選ばれないことがある。この確認だけを目的に、行数を増やし
+        // `ANALYZE`して点検索を実際に選択的にしておく。
+        let rows: Vec<String> = (2..300).map(|i| format!("({i}, 'user{i}@example.com', 'User{i}')")).collect();
+        db.execute(&format!("INSERT INTO users VALUES {}", rows.join(", "))).unwrap();
+        db.execute("ANALYZE users").unwrap();
+
         let plan = db.execute("EXPLAIN SELECT id FROM users WHERE id = 1").unwrap().to_string();
         assert!(plan.contains("users_id_idx"), "plan={plan}");
 
@@ -2631,7 +2641,7 @@ mod tests {
         // 拒否されただけで、制約自体は引き続き効いている。
         let err = expect_error(db.execute("INSERT INTO users VALUES (1, 'b@example.com', 'Bob')"));
         assert!(matches!(err, DbError::PrimaryKeyViolation { ref column, .. } if column == "id"));
-        let err = expect_error(db.execute("INSERT INTO users VALUES (2, 'a@example.com', 'Carol')"));
+        let err = expect_error(db.execute("INSERT INTO users VALUES (99999, 'a@example.com', 'Carol')"));
         assert!(matches!(err, DbError::UniqueViolation { ref column, .. } if column == "email"));
 
         // 手動で作った(制約索引ではない)索引は、これまでどおりDROP INDEXできる。
@@ -2876,75 +2886,94 @@ mod tests {
         }
     }
 
+    /// 第28章から、アクセスパスの選択はコスト最小のものを選ぶ方式になった
+    /// (`choose_scan_plan`)。数行しかないテーブルでは、実際にSeqScanのほうが
+    /// コストの低い候補になりうる(1ページを読むだけで済むのに対し、
+    /// IndexScanは索引の`lookup`ぶんのRandom I/Oを追加で払うため)。索引が
+    /// 選ばれることを確かめるこの章のテストは、`ANALYZE`済みの、点検索が
+    /// 実際に選択的な規模のテーブル(1,000行)を使う。
+    fn insert_many_orders(db: &mut Database, n: i64) {
+        let rows: Vec<String> = (0..n).map(|i| format!("({i}, {}, 'name{i}')", i * 10)).collect();
+        db.execute(&format!("INSERT INTO orders VALUES {}", rows.join(", "))).unwrap();
+        db.execute("ANALYZE orders").unwrap();
+    }
+
     #[test]
     fn point_predicate_on_an_indexed_column_chooses_index_scan_and_absorbs_the_whole_filter() {
         let path = temp_db_path("index-scan-point");
         let mut db = orders_disk_db(&path);
         db.execute("CREATE INDEX idx_id ON orders (id)").unwrap();
-        db.execute("INSERT INTO orders VALUES (1, 100, 'Alice'), (2, 200, 'Bob')").unwrap();
+        insert_many_orders(&mut db, 1000);
 
-        let plan = db.execute("EXPLAIN SELECT id, amount, name FROM orders WHERE id = 1").unwrap().to_string();
-        assert_eq!(
-            plan,
-            "QUERY PLAN\n----------\nProjection(id, amount, name) rows=5\n  └─ IndexScan(idx_id, id = 1) rows=5\n(2 rows)"
-        );
+        let plan = db.execute("EXPLAIN SELECT id, amount, name FROM orders WHERE id = 42").unwrap().to_string();
+        assert!(plan.contains("IndexScan(idx_id, id = 42)"), "plan={plan}");
+        assert!(!plan.contains("Filter("), "id = 42だけの述語はIndexScanへ丸ごと吸収されるはず: {plan}");
 
-        let result = db.execute("SELECT id, amount, name FROM orders WHERE id = 1").unwrap();
+        let result = db.execute("SELECT id, amount, name FROM orders WHERE id = 42").unwrap();
         assert_eq!(result.rows().len(), 1);
-        assert_eq!(result.rows()[0].values(), &[Value::BigInt(1), Value::BigInt(100), Value::Text("Alice".to_string())]);
+        assert_eq!(result.rows()[0].values(), &[Value::BigInt(42), Value::BigInt(420), Value::Text("name42".to_string())]);
 
         remove_db_and_indexes(&path, &["idx_id"]);
     }
 
     #[test]
     fn point_predicate_leaves_the_rest_of_a_conjunction_in_a_residual_filter() {
-        // `id`だけに索引がある。`id = 1 AND name = 'Alice'`は、`id = 1`だけが
-        // IndexScanに吸収され、`name = 'Alice'`はFilterに残る。
+        // `id`だけに索引がある。`id = 42 AND name = 'name42'`は、`id = 42`だけが
+        // IndexScanに吸収され、`name = 'name42'`はFilterに残る。
         let path = temp_db_path("index-scan-residual-filter");
         let mut db = orders_disk_db(&path);
         db.execute("CREATE INDEX idx_id ON orders (id)").unwrap();
-        db.execute("INSERT INTO orders VALUES (1, 100, 'Alice'), (1, 150, 'Zoe')").unwrap();
+        insert_many_orders(&mut db, 1000);
 
         let plan = db
-            .execute("EXPLAIN SELECT id, amount, name FROM orders WHERE id = 1 AND name = 'Alice'")
+            .execute("EXPLAIN SELECT id, amount, name FROM orders WHERE id = 42 AND name = 'name42'")
             .unwrap()
             .to_string();
-        assert_eq!(
-            plan,
-            "QUERY PLAN\n----------\nProjection(id, amount, name) rows=0\n  └─ Filter(name = 'Alice') rows=0\n    └─ IndexScan(idx_id, id = 1) rows=5\n(3 rows)"
-        );
+        assert!(plan.contains("IndexScan(idx_id, id = 42)"), "plan={plan}");
+        assert!(plan.contains("Filter(name = 'name42')"), "plan={plan}");
 
-        let result = db.execute("SELECT id, amount, name FROM orders WHERE id = 1 AND name = 'Alice'").unwrap();
+        let result = db.execute("SELECT id, amount, name FROM orders WHERE id = 42 AND name = 'name42'").unwrap();
         assert_eq!(result.rows().len(), 1);
-        assert_eq!(result.rows()[0].values()[2], Value::Text("Alice".to_string()));
+        assert_eq!(result.rows()[0].values()[2], Value::Text("name42".to_string()));
 
         remove_db_and_indexes(&path, &["idx_id"]);
     }
 
+    /// 第25章の`choose_access_path`は、Range述語を見つければ常にRange Index
+    /// Scanを選んでいた。第28章のコストベース選択では、事情が変わる。
+    ///
+    /// `crate::estimator`のHistogramは[`crate::statistics::HISTOGRAM_BUCKET_COUNT`]
+    /// (固定10個)のバケツしか持たないため、バケツの境界をまたぐ範囲述語の
+    /// 一致行数は最良でも「バケツ1個ぶん(全体の約10%)」の粒度でしか
+    /// 見積もれない。`cost_model::index_scan_cost`は一致行数1件ごとに
+    /// `RANDOM_PAGE_COST`(Heapページの`Storage::get`、第25章)を払うため、
+    /// 10%程度の一致行数では、その合計コストが`SeqScan`(1ページあたり
+    /// `SEQ_PAGE_COST`)を大きく上回ってしまう。これは索引付きBitmap Scan
+    /// (一致するRecordIdを先にページ順へソートしてからHeapを読む、
+    /// PostgreSQLにもある方式)を持たないこの教材の実装が抱える、正直な
+    /// 限界である。この章はBitmap Scanを実装しない(章末の演習課題に譲る)ため、
+    /// 範囲述語はよほど選択的でない限りSeqScanのままになる。
     #[test]
-    fn range_predicate_on_both_bounds_becomes_a_single_range_index_scan() {
+    fn range_predicate_prefers_seq_scan_when_the_range_is_not_selective_enough() {
         let path = temp_db_path("index-scan-range");
         let mut db = orders_disk_db(&path);
         db.execute("CREATE INDEX idx_amount ON orders (amount)").unwrap();
-        db.execute("INSERT INTO orders VALUES (1, 50, 'a'), (2, 100, 'b'), (3, 150, 'c'), (4, 200, 'd'), (5, 250, 'e')")
-            .unwrap();
+        insert_many_orders(&mut db, 5000);
 
+        // 11行(0.22%)しか一致しない狭い範囲でも、Histogramのバケツ粒度
+        // (10%刻み)のせいで一致行数の見積もりは1バケツぶん(約500行)まで
+        // 膨らみ、SeqScanの方が安く見積もられる。
         let plan = db
             .execute("EXPLAIN SELECT id FROM orders WHERE amount >= 100 AND amount <= 200")
             .unwrap()
             .to_string();
-        assert_eq!(
-            plan,
-            "QUERY PLAN\n----------\nProjection(id) rows=111\n  └─ IndexScan(idx_amount, amount >= 100 AND amount <= 200) rows=111\n(2 rows)"
-        );
+        assert!(plan.contains("SeqScan(orders)"), "plan={plan}");
+        assert!(plan.contains("Filter(amount >= 100 AND amount <= 200)"), "plan={plan}");
 
+        // 選ばれたアクセスパスが変わっても、結果の行集合は変わらない。
         let result = db.execute("SELECT id FROM orders WHERE amount >= 100 AND amount <= 200 ORDER BY id").unwrap();
         let ids: Vec<Value> = result.rows().iter().map(|row| row.values()[0].clone()).collect();
-        assert_eq!(ids, vec![Value::BigInt(2), Value::BigInt(3), Value::BigInt(4)]);
-
-        // 片側だけの境界(`>`のみ)でも同じくRange Index Scanになる。
-        let plan_lower_only = db.execute("EXPLAIN SELECT id FROM orders WHERE amount > 200").unwrap().to_string();
-        assert!(plan_lower_only.contains("IndexScan(idx_amount, amount > 200)"));
+        assert_eq!(ids, vec![Value::BigInt(10), Value::BigInt(11), Value::BigInt(12), Value::BigInt(13), Value::BigInt(14), Value::BigInt(15), Value::BigInt(16), Value::BigInt(17), Value::BigInt(18), Value::BigInt(19), Value::BigInt(20)]);
 
         remove_db_and_indexes(&path, &["idx_amount"]);
     }
@@ -2960,7 +2989,7 @@ mod tests {
         let plan = db.execute("EXPLAIN SELECT id FROM orders WHERE amount = 100").unwrap().to_string();
         assert_eq!(
             plan,
-            "QUERY PLAN\n----------\nProjection(id) rows=5\n  └─ Filter(amount = 100) rows=5\n    └─ SeqScan(orders) rows=1000\n(3 rows)"
+            "QUERY PLAN\n----------\nProjection(id) rows=5 cost=21.05\n  └─ Filter(amount = 100) rows=5 cost=21.00\n    └─ SeqScan(orders) rows=1000 cost=11.00\n(3 rows)"
         );
 
         remove_db_and_indexes(&path, &[]);
@@ -2996,25 +3025,44 @@ mod tests {
         let with_index_path = temp_db_path("index-vs-seq-with-index");
         let without_index_path = temp_db_path("index-vs-seq-without-index");
 
-        let rows: Vec<String> = (0..200).map(|i| format!("({i}, {}, 'name{i}')", i * 3)).collect();
+        // 第28章から、アクセスパスはコストで選ぶ(`choose_scan_plan`)。数百行
+        // 程度のテーブルでは、実ページ数が少なすぎてSeqScanの方が安くなる
+        // ことがある(索引側は`lookup`ぶんのRandom I/Oを追加で払うため)。
+        // ここではIndexScanが実際に有利になる規模(1万行)を使い、`ANALYZE`
+        // して選択率の推定を実際の分布に合わせる(統計が無ければ、
+        // PostgreSQLの`selfuncs.c`にならった慣用のデフォルト定数
+        // (`crate::estimator::DEFAULT_EQ_SEL`等)にフォールバックする、第27章)。
+        let n = 10_000i64;
+        let rows: Vec<String> = (0..n).map(|i| format!("({i}, {}, 'name{i}')", i * 3)).collect();
         let insert_sql = format!("INSERT INTO orders VALUES {}", rows.join(", "));
 
         let mut with_index = orders_disk_db(&with_index_path);
         with_index.execute("CREATE INDEX idx_id ON orders (id)").unwrap();
         with_index.execute("CREATE INDEX idx_amount ON orders (amount)").unwrap();
         with_index.execute(&insert_sql).unwrap();
+        with_index.execute("ANALYZE orders").unwrap();
 
         let mut without_index = orders_disk_db(&without_index_path);
         without_index.execute(&insert_sql).unwrap();
 
-        for query in [
-            "SELECT id, amount, name FROM orders WHERE id = 42",
-            "SELECT id, amount, name FROM orders WHERE amount >= 100 AND amount <= 200",
-            "SELECT id, amount, name FROM orders WHERE amount > 590",
-            "SELECT id, amount, name FROM orders WHERE id = 999", // 一致なし
-        ] {
-            let with_index_plan = with_index.execute(&format!("EXPLAIN {query}")).unwrap().to_string();
-            assert!(with_index_plan.contains("IndexScan"), "索引ありDBはIndexScanを選ぶはず: {with_index_plan}");
+        // Point述語(`id = 定数`)は、`estimate_equality_selectivity`(第27章)が
+        // Histogramのバケツをさらにdistinct値数で割るため、範囲述語より
+        // 細かい粒度で一致行数を見積もれる。この規模(1万行)なら、
+        // Point述語は確実にIndexScanを選ぶ。範囲述語がSeqScanのままなのは
+        // `range_predicate_prefers_seq_scan_when_the_range_is_not_selective_enough`
+        // で確認済みの、Histogramの粒度に起因する正直な限界である。
+        let point_queries = ["SELECT id, amount, name FROM orders WHERE id = 42", "SELECT id, amount, name FROM orders WHERE id = 999999999"];
+        let range_queries = [
+            "SELECT id, amount, name FROM orders WHERE amount >= 100 AND amount <= 130".to_string(),
+            format!("SELECT id, amount, name FROM orders WHERE amount > {}", (n - 3) * 3),
+        ];
+
+        for query in point_queries.iter().map(|q| q.to_string()).chain(range_queries) {
+            let query = query.as_str();
+            if point_queries.contains(&query) {
+                let with_index_plan = with_index.execute(&format!("EXPLAIN {query}")).unwrap().to_string();
+                assert!(with_index_plan.contains("IndexScan"), "索引ありDBはPoint述語ならIndexScanを選ぶはず: {with_index_plan}");
+            }
             let without_index_plan = without_index.execute(&format!("EXPLAIN {query}")).unwrap().to_string();
             assert!(without_index_plan.contains("SeqScan"), "索引無しDBはSeqScanのまま: {without_index_plan}");
 
@@ -3036,14 +3084,14 @@ mod tests {
         let path = temp_db_path("index-scan-after-delete");
         let mut db = orders_disk_db(&path);
         db.execute("CREATE INDEX idx_id ON orders (id)").unwrap();
-        db.execute("INSERT INTO orders VALUES (1, 100, 'Alice'), (2, 200, 'Bob'), (3, 300, 'Carol')").unwrap();
+        insert_many_orders(&mut db, 1000);
 
         assert_eq!(db.execute("DELETE FROM orders WHERE id = 2").unwrap().to_string(), "DELETE 1");
 
         // 削除された`id = 2`はIndexScanでも0行(索引エントリ自体が
         // Index Maintenanceで取り除かれている、第24章)。
         let plan = db.execute("EXPLAIN SELECT id FROM orders WHERE id = 2").unwrap().to_string();
-        assert!(plan.contains("IndexScan(idx_id, id = 2)"));
+        assert!(plan.contains("IndexScan(idx_id, id = 2)"), "plan={plan}");
         assert!(db.execute("SELECT id FROM orders WHERE id = 2").unwrap().rows().is_empty());
 
         // 削除していない行は引き続きIndexScanで見つかる。
@@ -3075,47 +3123,86 @@ mod tests {
 
     #[test]
     fn index_nested_loop_join_is_chosen_when_the_inner_join_column_has_an_index() {
+        // 第28章から、Join方式もコストで選ぶ(`choose_join_plan`)。内側
+        // テーブルを1回全件読むHash Joinのほうが安く済む場合があるため
+        // (第25章の`selective`/`dense`の実測が示すとおり、勝敗はデータの
+        // 分布次第)、`customers`の行数(`n`、外側)をごく少なく、`orders`の
+        // 行数(`m`、内側)を`customers`よりずっと大きく取り、外側の`lookup`
+        // 回数そのものを小さく保ってIndex Nested Loop Joinを有利にする。
+        // `ANALYZE`して統計に基づく選択率で比較する。
         let path = temp_db_path("index-nlj-chosen");
         let mut db = Database::open(&path).unwrap();
         db.execute("CREATE TABLE customers (id BIGINT NOT NULL, name TEXT)").unwrap();
         db.execute("CREATE TABLE orders (id BIGINT, customer_id BIGINT, item TEXT)").unwrap();
         db.execute("CREATE INDEX idx_customer_id ON orders (customer_id)").unwrap();
-        db.execute("INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')").unwrap();
-        db.execute(
-            "INSERT INTO orders VALUES (10, 1, 'apple'), (11, 1, 'banana'), (12, 2, 'cherry'), (13, NULL, 'orphan'), (14, 99, 'nomatch')",
-        )
-        .unwrap();
+
+        let n = 5i64;
+        let m = 5000i64;
+        let modulus = n * 1000;
+        let customers: Vec<String> = (0..n).map(|i| format!("({i}, 'name{i}')")).collect();
+        db.execute(&format!("INSERT INTO customers VALUES {}", customers.join(", "))).unwrap();
+        let orders: Vec<String> = (0..m).map(|i| format!("({i}, {}, 'item{i}')", (i * 97) % modulus)).collect();
+        db.execute(&format!("INSERT INTO orders VALUES {}", orders.join(", "))).unwrap();
+        db.execute("ANALYZE customers").unwrap();
+        db.execute("ANALYZE orders").unwrap();
 
         let plan = db
             .execute("EXPLAIN SELECT customers.name, orders.item FROM customers JOIN orders ON customers.id = orders.customer_id")
             .unwrap()
             .to_string();
-        assert_eq!(
-            plan,
-            "QUERY PLAN\n----------\nProjection(customers.name, orders.item) rows=1000\n  └─ IndexNestedLoopJoin(INNER JOIN, id = customer_id) rows=1000\n    └─ SeqScan(customers) rows=1000\n    └─ IndexScan(idx_customer_id, customer_id = id) rows=1\n(4 rows)"
-        );
+        assert!(plan.contains("IndexNestedLoopJoin"), "plan={plan}");
 
-        let result = db
+        let with_index_rows: Vec<Vec<Value>> = db
             .execute(
                 "SELECT customers.name, orders.item FROM customers JOIN orders ON customers.id = orders.customer_id ORDER BY customers.name, orders.item",
             )
-            .unwrap();
-        let rows: Vec<(String, String)> = result
+            .unwrap()
             .rows()
             .iter()
-            .map(|row| match row.values() {
-                [Value::Text(name), Value::Text(item)] => (name.clone(), item.clone()),
-                other => panic!("予期しない行: {other:?}"),
-            })
+            .map(|row| row.values().to_vec())
             .collect();
-        assert_eq!(
-            rows,
-            vec![
-                ("Alice".to_string(), "apple".to_string()),
-                ("Alice".to_string(), "banana".to_string()),
-                ("Bob".to_string(), "cherry".to_string()),
-            ]
-        );
+        assert!(!with_index_rows.is_empty(), "選択的な結合でも一致する行が無ければテストの前提が崩れている");
+
+        remove_db_and_indexes(&path, &["idx_customer_id"]);
+    }
+
+    /// 第25章の実測ケース(密な結合ではIndex Nested Loop JoinがHash Joinより
+    /// 15倍以上遅い)の回収。`customer_id`を`customers`の総数と同じ範囲に
+    /// 絞り、`orders`のほぼ全行がどれかの`customers`と一致する密な結合を
+    /// 作る。索引が使える(`idx_customer_id`が存在する)にもかかわらず、
+    /// コストベースの選択(`choose_join_plan`)はHash Joinを選ぶ。
+    #[test]
+    fn hash_join_is_chosen_for_a_dense_join_even_when_an_index_exists() {
+        let path = temp_db_path("hash-join-dense-chosen");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE customers (id BIGINT NOT NULL, name TEXT)").unwrap();
+        db.execute("CREATE TABLE orders (id BIGINT, customer_id BIGINT, item TEXT)").unwrap();
+        db.execute("CREATE INDEX idx_customer_id ON orders (customer_id)").unwrap();
+
+        let n = 50i64;
+        let m = 2000i64;
+        let modulus = n; // 密な結合: customer_idの値域をcustomersの総数だけに絞る。
+        let customers: Vec<String> = (0..n).map(|i| format!("({i}, 'name{i}')")).collect();
+        db.execute(&format!("INSERT INTO customers VALUES {}", customers.join(", "))).unwrap();
+        let orders: Vec<String> = (0..m).map(|i| format!("({i}, {}, 'item{i}')", (i * 97) % modulus)).collect();
+        db.execute(&format!("INSERT INTO orders VALUES {}", orders.join(", "))).unwrap();
+        db.execute("ANALYZE customers").unwrap();
+        db.execute("ANALYZE orders").unwrap();
+
+        let plan = db
+            .execute("EXPLAIN SELECT customers.name, orders.item FROM customers JOIN orders ON customers.id = orders.customer_id")
+            .unwrap()
+            .to_string();
+        assert!(plan.contains("HashJoin"), "密な結合ではHash Joinが選ばれるはず(第25章の実測ケースの回収): plan={plan}");
+        assert!(!plan.contains("IndexNestedLoopJoin"), "plan={plan}");
+
+        let rows = db
+            .execute(
+                "SELECT customers.name, orders.item FROM customers JOIN orders ON customers.id = orders.customer_id",
+            )
+            .unwrap();
+        // ほぼ全行が一致するはず(密な結合)。
+        assert!(rows.rows().len() > (m as usize) / 2, "密な結合のはずが一致行数が少なすぎる: {}", rows.rows().len());
 
         remove_db_and_indexes(&path, &["idx_customer_id"]);
     }
@@ -3146,7 +3233,14 @@ mod tests {
 
         let query =
             "SELECT customers.name, orders.item FROM customers JOIN orders ON customers.id = orders.customer_id ORDER BY customers.name, orders.item";
-        assert!(with_index.execute(&format!("EXPLAIN {query}")).unwrap().to_string().contains("IndexNestedLoopJoin"));
+        // `with_index`側がIndex Nested Loop JoinとHash Joinのどちらを選ぶかは、
+        // 第28章からコスト次第である(このテストの数行程度の規模では、内側
+        // テーブルを丸ごと読んでも安いHash Joinが選ばれることがある。
+        // 実際に選択的な結合でIndex Nested Loop Joinが選ばれることは
+        // `index_nested_loop_join_is_chosen_when_the_inner_join_column_has_an_index`
+        // で確認済み)。ここで確かめたいのは結果の一致であり、選ばれた
+        // アルゴリズムそのものではない。`without_index`側は索引が無いので
+        // 引き続きHash Join一択である。
         assert!(without_index.execute(&format!("EXPLAIN {query}")).unwrap().to_string().contains("HashJoin"));
 
         let with_index_rows: Vec<Vec<Value>> =
@@ -3218,6 +3312,17 @@ mod tests {
             with_index.execute(statement).unwrap();
         }
         with_index.execute("CREATE INDEX idx_customer_id ON orders (customer_id)").unwrap();
+        // 第28章から、`with_index`が実際にどちらを選ぶかはコスト次第である
+        // (`choose_join_plan`)。この測定はあくまで2つの実行アルゴリズム
+        // そのものの実測比較が目的なので、`ANALYZE`して実際の分布に近い
+        // 判断をさせたうえで、選ばれたアルゴリズム名も一緒に記録する。
+        // `m`が大きいと、Histogramの境界値(TEXT列)がCatalogページの
+        // 残り容量(第15章)を超えることがある(`DbError::CatalogTooLarge`)。
+        // この測定はコスト計算の正確さそのものを検証する場ではないので、
+        // 失敗しても`unwrap`で落とさず、統計が無いまま(デフォルト選択率、
+        // 第27章)で計測を続ける。
+        let _ = with_index.execute("ANALYZE customers");
+        let _ = with_index.execute("ANALYZE orders");
 
         let mut without_index = Database::open(&without_index_path).unwrap();
         for statement in &setup {
@@ -3225,7 +3330,15 @@ mod tests {
         }
 
         let query = "SELECT customers.name, orders.item FROM customers JOIN orders ON customers.id = orders.customer_id";
-        assert!(with_index.execute(&format!("EXPLAIN {query}")).unwrap().to_string().contains("IndexNestedLoopJoin"));
+        let with_index_plan = with_index.execute(&format!("EXPLAIN {query}")).unwrap().to_string();
+        let chosen = if with_index_plan.contains("IndexNestedLoopJoin") {
+            "IndexNestedLoopJoin"
+        } else {
+            "HashJoin"
+        };
+        // `without_index`は索引が無いので、等値結合の候補はHash Joinしか
+        // 無い(`choose_join_plan`が`IndexNestedLoopJoin`を候補にすら
+        // 加えない)。これは第28章のコストとは無関係に常に成り立つ。
         assert!(without_index.execute(&format!("EXPLAIN {query}")).unwrap().to_string().contains("HashJoin"));
 
         let start = std::time::Instant::now();
@@ -3238,7 +3351,7 @@ mod tests {
 
         assert_eq!(inlj_result.rows().len(), hash_result.rows().len());
         eprintln!(
-            "{label:<9} m={m:>6}  matches={:>6}  IndexNestedLoopJoin={inlj_elapsed:>10?}  HashJoin={hash_elapsed:>10?}",
+            "{label:<9} m={m:>6}  matches={:>6}  chosen={chosen:<21}  with_index={inlj_elapsed:>10?}  without_index(HashJoin)={hash_elapsed:>10?}",
             inlj_result.rows().len()
         );
 
@@ -3249,9 +3362,11 @@ mod tests {
     #[test]
     #[ignore = "実行時間の計測用。cargo test -- --ignored --nocapture で実行する"]
     fn index_nested_loop_join_is_not_always_faster_than_hash_join() {
-        // 単純なルール(索引があればIndex Nested Loop Joinを最優先する、この章の
+        // 単純なルール(索引があればIndex Nested Loop Joinを最優先する、第25章の
         // `physical_plan::optimize`)が、常に正しい選択とは限らないことを
-        // 実測で確認する。
+        // 実測で確認する。この章(第28章)の`optimize`はコストベースで選ぶため、
+        // `with_index`側が実際にどちらを選ぶかはデータの分布に応じて変わる
+        // (`measure_join_once`が選ばれたアルゴリズム名を記録する)。
         //
         // **選択的な結合(selective)**: `customer_id`を`customers`の総数より
         // ずっと広い範囲に散らし、一致する行がごく一部にとどまるようにする。
@@ -3291,13 +3406,13 @@ mod tests {
 
         // ANALYZE前は、統計を持たないテーブルのデフォルト値(1000)が使われる。
         let before = explain_lines(&mut db, "EXPLAIN SELECT id FROM users");
-        assert_eq!(before, vec!["Projection(id) rows=1000", "  └─ SeqScan(users) rows=1000"]);
+        assert_eq!(before, vec!["Projection(id) rows=1000 cost=40.00", "  └─ SeqScan(users) rows=1000 cost=30.00"]);
 
         db.execute("ANALYZE users").unwrap();
 
         // ANALYZE後は、実測した行数(3)が使われる。
         let after = explain_lines(&mut db, "EXPLAIN SELECT id FROM users");
-        assert_eq!(after, vec!["Projection(id) rows=3", "  └─ SeqScan(users) rows=3"]);
+        assert_eq!(after, vec!["Projection(id) rows=3 cost=1.06", "  └─ SeqScan(users) rows=3 cost=1.03"]);
     }
 
     #[test]
@@ -3311,8 +3426,14 @@ mod tests {
         let result = db.execute("ANALYZE").unwrap();
         assert_eq!(result.to_string(), "ANALYZE 2");
 
-        assert_eq!(explain_lines(&mut db, "EXPLAIN SELECT v FROM a"), vec!["Projection(v) rows=2", "  └─ SeqScan(a) rows=2"]);
-        assert_eq!(explain_lines(&mut db, "EXPLAIN SELECT v FROM b"), vec!["Projection(v) rows=5", "  └─ SeqScan(b) rows=5"]);
+        assert_eq!(
+            explain_lines(&mut db, "EXPLAIN SELECT v FROM a"),
+            vec!["Projection(v) rows=2 cost=1.04", "  └─ SeqScan(a) rows=2 cost=1.02"]
+        );
+        assert_eq!(
+            explain_lines(&mut db, "EXPLAIN SELECT v FROM b"),
+            vec!["Projection(v) rows=5 cost=1.10", "  └─ SeqScan(b) rows=5 cost=1.05"]
+        );
     }
 
     #[test]
@@ -3352,7 +3473,7 @@ mod tests {
     fn explain_analyze_insert_shows_actual_only_on_the_root_line() {
         let mut db = users_db();
         let lines = explain_lines(&mut db, "EXPLAIN ANALYZE INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')");
-        assert_eq!(lines, vec!["Insert(users) rows=2 actual=2", "  └─ Values(2 rows) rows=2"]);
+        assert_eq!(lines, vec!["Insert(users) rows=2 cost=0.00 actual=2", "  └─ Values(2 rows) rows=2 cost=0.00"]);
 
         // EXPLAIN ANALYZE INSERTは実際に書き込みを行う(本文で明記する制約)。
         let result = db.execute("SELECT id FROM users").unwrap();
@@ -3364,7 +3485,7 @@ mod tests {
         let mut db = users_db();
         db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')").unwrap();
         let lines = explain_lines(&mut db, "EXPLAIN ANALYZE UPDATE users SET name = 'x' WHERE id <= 2");
-        assert_eq!(lines[0], "Update(users) rows=1000 actual=2");
+        assert_eq!(lines[0], "Update(users) rows=1000 cost=30.00 actual=2");
 
         let result = db.execute("SELECT name FROM users WHERE id <= 2").unwrap();
         for row in result.rows() {
@@ -3377,7 +3498,7 @@ mod tests {
         let mut db = users_db();
         db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')").unwrap();
         let lines = explain_lines(&mut db, "EXPLAIN ANALYZE DELETE FROM users WHERE id <= 2");
-        assert_eq!(lines[0], "Delete(users) rows=1000 actual=2");
+        assert_eq!(lines[0], "Delete(users) rows=1000 cost=30.00 actual=2");
 
         let result = db.execute("SELECT id FROM users").unwrap();
         assert_eq!(result.rows().len(), 1);
@@ -3395,13 +3516,13 @@ mod tests {
 
             // 開いたままでも、統計はすでに実測値(4行)を反映している。
             let lines = explain_lines(&mut db, "EXPLAIN SELECT id FROM orders");
-            assert_eq!(lines, vec!["Projection(id) rows=4", "  └─ SeqScan(orders) rows=4"]);
+            assert_eq!(lines, vec!["Projection(id) rows=4 cost=1.08", "  └─ SeqScan(orders) rows=4 cost=1.04"]);
         }
 
         // ファイルを閉じて(スコープを抜けて`Storage`を破棄して)再度開く。
         let mut reopened = Database::open(&path).unwrap();
         let lines = explain_lines(&mut reopened, "EXPLAIN SELECT id FROM orders");
-        assert_eq!(lines, vec!["Projection(id) rows=4", "  └─ SeqScan(orders) rows=4"]);
+        assert_eq!(lines, vec!["Projection(id) rows=4 cost=1.08", "  └─ SeqScan(orders) rows=4 cost=1.04"]);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -3418,7 +3539,7 @@ mod tests {
 
         // 同名で作り直した新しいテーブルは、前のテーブルの統計を引き継がない。
         let lines = explain_lines(&mut db, "EXPLAIN SELECT v FROM t");
-        assert_eq!(lines, vec!["Projection(v) rows=1000", "  └─ SeqScan(t) rows=1000"]);
+        assert_eq!(lines, vec!["Projection(v) rows=1000 cost=40.00", "  └─ SeqScan(t) rows=1000 cost=30.00"]);
 
         let _ = std::fs::remove_file(&path);
     }

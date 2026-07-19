@@ -518,6 +518,17 @@ impl Storage {
         self.stats.get(&table_id)
     }
 
+    /// `table_id`が現在使っているデータページの枚数(第28章のコストモデルが
+    /// Sequential I/Oコストを見積もるために使う)。
+    ///
+    /// `TableStats::row_count`(第27章)と違い、`ANALYZE`を実行していなくても
+    /// 常に実測値を返す。`page_ids`(モジュール冒頭、`TableEntry`)は
+    /// `INSERT`・`DELETE`のたびに`Storage`自身が追従させている実データであり、
+    /// 統計収集(`ANALYZE`)を経由しない。テーブルが存在しなければ`None`。
+    pub fn table_page_count(&self, table_id: TableId) -> Option<u64> {
+        self.tables.get(&table_id).map(|entry| entry.page_ids.len() as u64)
+    }
+
     /// `ANALYZE`が集計した`stats`を`table_id`の統計情報として登録し、
     /// Catalogページへ永続化する(第27章)。永続化に失敗した場合は登録を
     /// 取り消す(`Self::create_table`と同じロールバックの方針)。

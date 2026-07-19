@@ -41,7 +41,7 @@
 
 - [第26章 ルールベース最適化](ch26-rule-based-optimization.md)
 - [第27章 統計情報とCardinality Estimation](ch27-statistics.md)
-- [第28章 Cost Modelとアクセスパス選択]()
+- [第28章 Cost Modelとアクセスパス選択](ch28-cost-model.md)
 - [第29章 Join OrderとPhysical Properties]()
 
 # 第5部 Transaction: ACIDと並行実行

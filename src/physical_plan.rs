@@ -78,6 +78,7 @@ use std::rc::Rc;
 use crate::ast::{AggregateFunc, BinaryOperator, Expr, JoinKind, UnaryOperator};
 use crate::binder::{AggregateCall, BoundAssignment, BoundExpr, BoundSelectItem};
 use crate::btree::RangeScan;
+use crate::cost_model;
 use crate::error::{DbError, DbResult};
 use crate::estimator;
 use crate::eval::{FunctionRegistry, eval_bound_expr, eval_expr};
@@ -317,16 +318,18 @@ pub struct DeleteNode {
 /// `storage`が`Some`でも、`WHERE`・`ON`に索引の効く述語が無ければやはり
 /// `SeqScan`・`HashJoin`・`NestedLoopJoin`が選ばれる。
 ///
-/// アクセスパスの選択は、この章では単純なルールにとどめる。`Scan`の直上に
-/// `Filter`がある場合だけ`choose_access_path`(後述)で索引を試し、Point
-/// (`col = 定数`)・Range(`col > / >= / < / <=`)の優先順で選ぶ。`JOIN`を挟む
-/// クエリの`WHERE`は、この章ではまだ個々のテーブルへ押し下げない
-/// (Predicate Pushdownは第26章)。`Join`の側も、等値条件がちょうど1本で
-/// 内側テーブルの結合列に索引があるときだけIndex Nested Loop Joinを選び、
-/// それ以外は第22章のルール(等値ならHash Join、それ以外はNested Loop Join)
-/// のままである。どちらも統計情報やコストではなく構文的な性質だけで決める
-/// (コストベースの選択は第28章)。
-pub fn optimize(plan: LogicalPlan, storage: Option<&Storage>) -> PhysicalPlan {
+/// `stats`は`crate::cost_model::plan_cost`が推定行数を求めるために使う
+/// (`crate::estimator`、第27章)。`ANALYZE`を実行していないテーブルは
+/// [`estimator::DEFAULT_ROW_COUNT_ESTIMATE`]にフォールバックする(第27章から
+/// 変更していない)。
+///
+/// アクセスパス・Join方式の選択は、第25章の固定優先順位(Point > Range > Seq、
+/// Index Nested Loop Join > Hash Join)をやめ、**候補をすべて構築してから
+/// [`crate::cost_model::plan_cost`]でコストを見積もり、最小のものを選ぶ**
+/// 方式にした(第28章、`choose_scan_plan`・`choose_join_plan`)。`JOIN`を挟む
+/// クエリの`WHERE`は、この章でもまだ個々のテーブルへ押し下げない
+/// (Predicate Pushdownは第26章)。
+pub fn optimize(plan: LogicalPlan, storage: Option<&Storage>, stats: &dyn StatsLookup) -> PhysicalPlan {
     match plan {
         LogicalPlan::Scan(scan) => PhysicalPlan::SeqScan(SeqScanNode {
             table_id: scan.table_id,
@@ -335,27 +338,15 @@ pub fn optimize(plan: LogicalPlan, storage: Option<&Storage>) -> PhysicalPlan {
         }),
         LogicalPlan::Values(values) => PhysicalPlan::Values(ValuesNode { schema: values.schema, rows: values.rows }),
         LogicalPlan::Filter(filter) => match (storage, *filter.input) {
-            (Some(storage), LogicalPlan::Scan(scan)) => match choose_access_path(storage, &scan, filter.predicate) {
-                AccessPath::Index { node, remaining: Some(predicate) } => {
-                    PhysicalPlan::Filter(FilterNode { input: Box::new(PhysicalPlan::IndexScan(node)), predicate })
-                }
-                AccessPath::Index { node, remaining: None } => PhysicalPlan::IndexScan(node),
-                AccessPath::SeqScan { predicate } => PhysicalPlan::Filter(FilterNode {
-                    input: Box::new(PhysicalPlan::SeqScan(SeqScanNode {
-                        table_id: scan.table_id,
-                        table_name: scan.table_name,
-                        schema: scan.schema,
-                    })),
-                    predicate,
-                }),
-            },
-            (_, input) => {
-                PhysicalPlan::Filter(FilterNode { input: Box::new(optimize(input, storage)), predicate: filter.predicate })
-            }
+            (Some(storage), LogicalPlan::Scan(scan)) => choose_scan_plan(storage, scan, filter.predicate, stats),
+            (_, input) => PhysicalPlan::Filter(FilterNode {
+                input: Box::new(optimize(input, storage, stats)),
+                predicate: filter.predicate,
+            }),
         },
         LogicalPlan::Join(join) => {
-            let left = optimize(*join.left, storage);
-            let right = optimize(*join.right, storage);
+            let left = optimize(*join.left, storage, stats);
+            let right = optimize(*join.right, storage, stats);
             let left_len = left.output_schema().len();
             match split_equi_join_keys(&join.condition, left_len) {
                 Some(keys) => {
@@ -363,26 +354,7 @@ pub fn optimize(plan: LogicalPlan, storage: Option<&Storage>) -> PhysicalPlan {
                         .into_iter()
                         .map(|(left_key, right_key)| (left_key, shift_column_index(&right_key, left_len)))
                         .collect();
-                    match index_scan_target(storage, &right, &keys) {
-                        Some(target) => PhysicalPlan::IndexNestedLoopJoin(IndexNestedLoopJoinNode {
-                            left: Box::new(left),
-                            kind: join.kind,
-                            condition: join.condition,
-                            outer_key: target.outer_key,
-                            table_id: target.table_id,
-                            table_name: target.table_name,
-                            schema: target.schema,
-                            index_name: target.index_name,
-                            column_name: target.column_name,
-                        }),
-                        None => PhysicalPlan::HashJoin(HashJoinNode {
-                            left: Box::new(left),
-                            right: Box::new(right),
-                            kind: join.kind,
-                            keys,
-                            condition: join.condition,
-                        }),
-                    }
+                    choose_join_plan(storage, stats, left, right, join.kind, join.condition, keys)
                 }
                 None => PhysicalPlan::NestedLoopJoin(NestedLoopJoinNode {
                     left: Box::new(left),
@@ -393,23 +365,23 @@ pub fn optimize(plan: LogicalPlan, storage: Option<&Storage>) -> PhysicalPlan {
             }
         }
         LogicalPlan::Aggregate(aggregate) => PhysicalPlan::Aggregate(AggregateNode {
-            input: Box::new(optimize(*aggregate.input, storage)),
+            input: Box::new(optimize(*aggregate.input, storage, stats)),
             group_by: aggregate.group_by,
             calls: aggregate.calls,
             schema: aggregate.schema,
         }),
         LogicalPlan::Projection(projection) => PhysicalPlan::Projection(ProjectionNode {
-            input: Box::new(optimize(*projection.input, storage)),
+            input: Box::new(optimize(*projection.input, storage, stats)),
             projection: projection.projection,
         }),
         LogicalPlan::Distinct(distinct) => {
-            PhysicalPlan::Distinct(DistinctNode { input: Box::new(optimize(*distinct.input, storage)) })
+            PhysicalPlan::Distinct(DistinctNode { input: Box::new(optimize(*distinct.input, storage, stats)) })
         }
         LogicalPlan::Sort(sort) => {
-            PhysicalPlan::Sort(SortNode { input: Box::new(optimize(*sort.input, storage)), keys: sort.keys })
+            PhysicalPlan::Sort(SortNode { input: Box::new(optimize(*sort.input, storage, stats)), keys: sort.keys })
         }
         LogicalPlan::Limit(limit) => PhysicalPlan::Limit(LimitNode {
-            input: Box::new(optimize(*limit.input, storage)),
+            input: Box::new(optimize(*limit.input, storage, stats)),
             limit: limit.limit,
             offset: limit.offset,
         }),
@@ -418,7 +390,7 @@ pub fn optimize(plan: LogicalPlan, storage: Option<&Storage>) -> PhysicalPlan {
             table_name: insert.table_name,
             schema: insert.schema,
             columns: insert.columns,
-            input: Box::new(optimize(*insert.input, storage)),
+            input: Box::new(optimize(*insert.input, storage, stats)),
         }),
         LogicalPlan::Update(update) => PhysicalPlan::Update(UpdateNode {
             table_id: update.table_id,
@@ -426,75 +398,83 @@ pub fn optimize(plan: LogicalPlan, storage: Option<&Storage>) -> PhysicalPlan {
             schema: update.schema,
             assignments: update.assignments,
             predicate: update.predicate,
-            input: Box::new(optimize(*update.input, storage)),
+            input: Box::new(optimize(*update.input, storage, stats)),
         }),
         LogicalPlan::Delete(delete) => PhysicalPlan::Delete(DeleteNode {
             table_id: delete.table_id,
             table_name: delete.table_name,
             schema: delete.schema,
             predicate: delete.predicate,
-            input: Box::new(optimize(*delete.input, storage)),
+            input: Box::new(optimize(*delete.input, storage, stats)),
         }),
     }
+}
+
+/// 複数の候補`PhysicalPlan`から、[`crate::cost_model::plan_cost`]が最小になる
+/// ものを選ぶ。`candidates`は空であってはならない(呼び出し元が必ず1個以上を
+/// 積む)。コストが等しい場合は出現順で最初の候補を選ぶ(`Iterator::min_by`と
+/// 同じ「最初に見つかった最小値を残す」規則、第25章までの優先順位に代わる
+/// 決定的な同点処理)。
+fn cheapest(candidates: Vec<PhysicalPlan>, stats: &dyn StatsLookup, storage: Option<&Storage>) -> PhysicalPlan {
+    candidates
+        .into_iter()
+        .min_by(|a, b| {
+            cost_model::plan_cost(a, stats, storage).value().partial_cmp(&cost_model::plan_cost(b, stats, storage).value()).expect(
+                "コストはNaN・無限大にならない(行数・ページ数はすべて有限のu64からf64へ変換した値であるため)",
+            )
+        })
+        .expect("candidatesは呼び出し元が必ず1個以上積む")
 }
 
 // ------------------------------------------------------------------
 // Scan演算子の物理選択: WHEREの連言から索引の効く述語を抽出する(第25章)
 // ------------------------------------------------------------------
 
-/// `choose_access_path`が返す選択結果。
-enum AccessPath {
-    /// Point・Rangeいずれかの索引述語が見つかった。`remaining`は、抽出した
-    /// 述語を取り除いた残りの連言(すべて索引に吸収された場合は`None`)。
-    Index { node: IndexScanNode, remaining: Option<BoundExpr> },
-    /// 索引の効く述語が無かった。`predicate`は元の`predicate`をそのまま返す
-    /// (`flatten_conjuncts`は参照だけを取り出すため、何も見つからなかった
-    /// 場合はここで初めて所有権を返す。フラット化してから再構築すると
-    /// 元と等価だが同一ではないASTになり、`EXPLAIN`の表示がわずかに変わる
-    /// 余地があるため、それを避けるために所有権をそのまま持ち回す)。
-    SeqScan { predicate: BoundExpr },
-}
-
 /// `scan`(索引を検討する対象のテーブル)に対する`predicate`(`WHERE`の全体)
-/// から、`storage`が持つ索引で引ける述語を探す。
+/// から作れるアクセスパス候補を、`PhysicalPlan`として組み立てられる形式
+/// (索引を吸収した残差条件があれば`Filter`で包んだ木)ですべて列挙する。
 ///
-/// 優先順位はPoint(`col = 定数`)、Range(`col > / >= / < / <=`)、
-/// どちらも無ければ`SeqScan`である。同じ優先順位の中では、`predicate`を
-/// ANDで分解した連言(conjunct)の出現順で最初に見つかった、かつ対応する列に
-/// 索引があるものを選ぶ。`col = NULL`のような`NULL`値を持つ述語は対象外
-/// (`crate::btree::BTree`が`NULL`をキーに持てないため)で、常に残りの`Filter`
-/// 側に残る。
-fn choose_access_path(storage: &Storage, scan: &logical_plan::ScanNode, predicate: BoundExpr) -> AccessPath {
+/// 候補は次の3種類である。
+///
+/// 1. `predicate`をANDで分解した連言(conjunct)のうち、索引付き列への
+///    等値比較1つひとつを取り出したPoint候補(条件が複数あれば、条件の数
+///    だけ候補ができる)。
+/// 2. 索引付き列ごとに下限・上限の候補をまとめたRange候補(列の数だけ
+///    候補ができる。同じ列に複数の下限・上限があっても、出現順で最初の
+///    1本だけを境界に使う。使わなかった側は残差条件として`Filter`に
+///    残るので正しさには影響しない、第25章の解説を参照)。
+/// 3. 索引を一切使わない、`SeqScan`の上に`predicate`全体を載せた候補
+///    (常に1つ、索引が無くても必ず選べる安全な既定)。
+///
+/// `col = NULL`のような`NULL`値を持つ述語はPoint・Rangeどちらの候補からも
+/// 除外する(`crate::btree::BTree`が`NULL`をキーに持てないため、第25章)。
+/// 呼び出し元(`choose_scan_plan`)がこれらをコストで比較し、最小のものを選ぶ。
+fn scan_plan_candidates(storage: &Storage, scan: &logical_plan::ScanNode, predicate: BoundExpr) -> Vec<PhysicalPlan> {
     let mut conjuncts: Vec<&BoundExpr> = Vec::new();
     collect_conjuncts(&predicate, &mut conjuncts);
 
-    // Point: 出現順で最初に見つかった、索引付き列への等値比較。
-    let point = conjuncts.iter().enumerate().find_map(|(i, conjunct)| {
-        let (column_index, op, value) = as_column_literal_comparison(conjunct)?;
-        if op != BinaryOperator::Eq || value.is_null() {
-            return None;
-        }
-        let info = storage.index_for_column(scan.table_id, column_index)?;
-        Some((i, info.name.clone(), info.column_name.clone(), value))
-    });
+    let mut candidates = Vec::new();
 
-    if let Some((i, index_name, column_name, value)) = point {
+    // Point候補: 索引付き列への等値比較を、出現するだけすべて候補にする。
+    for (i, conjunct) in conjuncts.iter().enumerate() {
+        let Some((column_index, op, value)) = as_column_literal_comparison(conjunct) else { continue };
+        if op != BinaryOperator::Eq || value.is_null() {
+            continue;
+        }
+        let Some(info) = storage.index_for_column(scan.table_id, column_index) else { continue };
         let remaining = rebuild_conjunction(exclude(&conjuncts, &[i]));
         let node = IndexScanNode {
             table_id: scan.table_id,
             table_name: scan.table_name.clone(),
             schema: scan.schema.clone(),
-            index_name,
-            column_name,
+            index_name: info.name.clone(),
+            column_name: info.column_name.clone(),
             kind: IndexScanKind::Point(value),
         };
-        return AccessPath::Index { node, remaining };
+        candidates.push(wrap_index_scan(node, remaining));
     }
 
-    // Range: 列ごとに下限・上限の候補を集め、出現順で最初に列挙された
-    // (かつ索引がある)列を選ぶ。同じ列に複数の下限(または上限)があっても
-    // 最初の1本だけを使う(残りは`Filter`に残る残差条件として働くので、
-    // 正しさには影響しない。本文の解説を参照)。
+    // Range候補: 列ごとに下限・上限の候補を集め、索引がある列ごとに1候補作る。
     let mut range_order: Vec<usize> = Vec::new();
     let mut ranges: HashMap<usize, RangeAccum> = HashMap::new();
     for (i, conjunct) in conjuncts.iter().enumerate() {
@@ -548,13 +528,45 @@ fn choose_access_path(storage: &Storage, scan: &logical_plan::ScanNode, predicat
             column_name: info.column_name.clone(),
             kind: IndexScanKind::Range { lower, upper },
         };
-        return AccessPath::Index { node, remaining };
+        candidates.push(wrap_index_scan(node, remaining));
     }
 
-    AccessPath::SeqScan { predicate }
+    // conjunctsは`predicate`を参照するだけの借用なので、ここまでで使い終える。
+    // SeqScan候補はこの章でも常に安全な既定として残す(索引が1つも
+    // 無くても、あるいはすべてのPoint/Range候補よりコストが安ければ選ばれる)。
+    drop(conjuncts);
+    candidates.push(PhysicalPlan::Filter(FilterNode {
+        input: Box::new(PhysicalPlan::SeqScan(SeqScanNode {
+            table_id: scan.table_id,
+            table_name: scan.table_name.clone(),
+            schema: scan.schema.clone(),
+        })),
+        predicate,
+    }));
+
+    candidates
 }
 
-/// [`choose_access_path`]がRange述語を列ごとに集めるための一時的な状態。
+/// `node`(索引に吸収された述語)と`remaining`(索引に吸収されなかった
+/// 残差条件)から、`PhysicalPlan`を組み立てる。`remaining`が`None`なら
+/// `IndexScan`だけ、`Some`ならその上に`Filter`を1段重ねる(第25章と同じ
+/// 組み立て方)。
+fn wrap_index_scan(node: IndexScanNode, remaining: Option<BoundExpr>) -> PhysicalPlan {
+    match remaining {
+        Some(predicate) => PhysicalPlan::Filter(FilterNode { input: Box::new(PhysicalPlan::IndexScan(node)), predicate }),
+        None => PhysicalPlan::IndexScan(node),
+    }
+}
+
+/// `scan`の直上に`Filter(predicate)`がある形の`LogicalPlan`を、
+/// [`scan_plan_candidates`]が列挙した候補の中からコスト最小のものへ変換する
+/// (第28章)。第25章までの固定優先順位(Point > Range > Seq)を置き換える。
+fn choose_scan_plan(storage: &Storage, scan: logical_plan::ScanNode, predicate: BoundExpr, stats: &dyn StatsLookup) -> PhysicalPlan {
+    let candidates = scan_plan_candidates(storage, &scan, predicate);
+    cheapest(candidates, stats, Some(storage))
+}
+
+/// [`scan_plan_candidates`]がRange述語を列ごとに集めるための一時的な状態。
 /// `lower`・`upper`は「連言の中の何番目か・その境界」の対で、`None`は
 /// まだその側の候補が見つかっていないことを表す。
 #[derive(Default)]
@@ -670,7 +682,7 @@ struct IndexJoinTarget {
 ///    `b.x + 1 = a.y`のような式は索引の値として直接引けない。
 /// 3. `right`が`PhysicalPlan::SeqScan`のままであること(`right`側に`Filter`が
 ///    無い)。`FROM`直下の`JOIN`の右辺には`WHERE`が押し下げられない
-///    (`choose_access_path`と同じ理由、Predicate Pushdownは第26章)ため、
+///    (`choose_scan_plan`と同じ理由、Predicate Pushdownは第26章)ため、
 ///    `right`が`Filter`を伴うことはこの章では無い。
 fn index_scan_target(
     storage: Option<&Storage>,
@@ -692,6 +704,46 @@ fn index_scan_target(
     })
 }
 
+/// 等値結合の鍵`keys`が取り出せた場合の候補を組み立て、
+/// [`crate::cost_model::plan_cost`]が最小のものを選ぶ(第28章)。
+///
+/// `HashJoin`は常に候補になる(`right`を索引に頼らず全件読み切れる、
+/// 第22章)。[`index_scan_target`]が内側テーブルの索引を見つけられた場合は
+/// `IndexNestedLoopJoin`も候補に加わる。第25章まではIndex Nested Loop Joinを
+/// 見つかり次第無条件に選んでいたが、第25章末の実測が示すとおり、密な結合
+/// (内側テーブルのほぼ全行が一致する)ではHash Joinの方が15倍以上速い場合が
+/// ある。ここでは2つの候補を実際にコストで比較し、統計情報(第27章)から
+/// 見積もった一致行数に応じてどちらが有利かを判断する。
+fn choose_join_plan(
+    storage: Option<&Storage>,
+    stats: &dyn StatsLookup,
+    left: PhysicalPlan,
+    right: PhysicalPlan,
+    kind: JoinKind,
+    condition: BoundExpr,
+    keys: Vec<(BoundExpr, BoundExpr)>,
+) -> PhysicalPlan {
+    let index_target = index_scan_target(storage, &right, &keys);
+
+    let mut candidates = Vec::new();
+    if let Some(target) = &index_target {
+        candidates.push(PhysicalPlan::IndexNestedLoopJoin(IndexNestedLoopJoinNode {
+            left: Box::new(left.clone()),
+            kind,
+            condition: condition.clone(),
+            outer_key: target.outer_key.clone(),
+            table_id: target.table_id,
+            table_name: target.table_name.clone(),
+            schema: target.schema.clone(),
+            index_name: target.index_name.clone(),
+            column_name: target.column_name.clone(),
+        }));
+    }
+    candidates.push(PhysicalPlan::HashJoin(HashJoinNode { left: Box::new(left), right: Box::new(right), kind, keys, condition }));
+
+    cheapest(candidates, stats, storage)
+}
+
 // ------------------------------------------------------------------
 // Join演算子の物理選択: 等値条件ならHash Join、それ以外はNested Loop Join
 // ------------------------------------------------------------------
@@ -702,10 +754,11 @@ fn index_scan_target(
 /// 参照しない項がある、など)場合は`None`を返し、呼び出し元(`optimize`)は
 /// `NestedLoopJoin`を選ぶ。
 ///
-/// この章の物理選択はこの1点だけを見る単純なルールである。統計情報や
-/// コストを比較して選ぶわけではない(第28章)。等値条件が1つも取り出せない
-/// `ON true`のような結合(実質的な直積)も、この関数が`None`を返すことで
-/// 自然に`NestedLoopJoin`へ倒れる。
+/// `NestedLoopJoin`だけは、この章でもコストで他候補と比較しない。等値条件が
+/// 1つも取り出せない結合(`ON true`のような実質的な直積や、`a.x < b.y`の
+/// ような不等号条件)は、`HashJoin`・`IndexNestedLoopJoin`のどちらの実行
+/// アルゴリズムにも要求する「等値の鍵」を持たないため、比較する候補が
+/// そもそも`NestedLoopJoin`しか無い。
 fn split_equi_join_keys(condition: &BoundExpr, left_len: usize) -> Option<Vec<(BoundExpr, BoundExpr)>> {
     let mut conjuncts = Vec::new();
     collect_conjuncts(condition, &mut conjuncts);
@@ -1330,19 +1383,30 @@ impl CounterNode {
 
 /// `plan`の`EXPLAIN`表示を組み立てる。`actual`が`Some`なら各行へ
 /// ` actual=<実測行数>`も添える(`EXPLAIN ANALYZE`)。`actual`が`None`なら
-/// 推定行数(` rows=<推定値>`)だけを添える(従来の`EXPLAIN`)。
+/// 推定行数(` rows=<推定値>`)だけを添える(従来の`EXPLAIN`)。第28章から、
+/// 推定行数の後ろに常に` cost=<推定コスト>`([`crate::cost_model::plan_cost`]、
+/// 小数点以下2桁)も添える。`storage`は`plan_cost`がページ数・索引の高さの
+/// 実測値を引くために使う(`optimize`の`storage`と同じ、第25章)。
 ///
 /// 木の形・インデント・矢印記法は[`PhysicalPlan`]の`Display`実装
 /// (`write_tree`)と同じ規則に従う。`IndexNestedLoopJoin`の内側テーブルの
 /// 表示(木の子ではなく、深さを1段手動で掘った合成行)も同様に揃える。
-pub fn explain_text(plan: &PhysicalPlan, stats: &dyn StatsLookup, actual: Option<&CounterNode>) -> String {
+pub fn explain_text(plan: &PhysicalPlan, stats: &dyn StatsLookup, storage: Option<&Storage>, actual: Option<&CounterNode>) -> String {
     let mut out = String::new();
-    write_explain_tree(plan, stats, actual, 0, &mut out);
+    write_explain_tree(plan, stats, storage, actual, 0, &mut out);
     out
 }
 
-fn write_explain_tree(plan: &PhysicalPlan, stats: &dyn StatsLookup, actual: Option<&CounterNode>, depth: usize, out: &mut String) {
+fn write_explain_tree(
+    plan: &PhysicalPlan,
+    stats: &dyn StatsLookup,
+    storage: Option<&Storage>,
+    actual: Option<&CounterNode>,
+    depth: usize,
+    out: &mut String,
+) {
     let rows = estimate_rows(plan, stats);
+    let cost = cost_model::plan_cost(plan, stats, storage);
     if depth == 0 {
         out.push_str(&plan.label());
     } else {
@@ -1350,7 +1414,7 @@ fn write_explain_tree(plan: &PhysicalPlan, stats: &dyn StatsLookup, actual: Opti
         out.push_str("└─ ");
         out.push_str(&plan.label());
     }
-    out.push_str(&format!(" rows={rows}"));
+    out.push_str(&format!(" rows={rows} cost={:.2}", cost.value()));
     if let Some(node) = actual {
         out.push_str(&format!(" actual={}", node.count.get()));
     }
@@ -1358,7 +1422,7 @@ fn write_explain_tree(plan: &PhysicalPlan, stats: &dyn StatsLookup, actual: Opti
 
     for (i, child) in plan.children().iter().enumerate() {
         let child_actual = actual.map(|node| &node.children[i]);
-        write_explain_tree(child, stats, child_actual, depth + 1, out);
+        write_explain_tree(child, stats, storage, child_actual, depth + 1, out);
     }
 
     if let PhysicalPlan::IndexNestedLoopJoin(join) = plan {
@@ -1366,19 +1430,22 @@ fn write_explain_tree(plan: &PhysicalPlan, stats: &dyn StatsLookup, actual: Opti
         // (`write_tree`と同じ合成行)。実測値を集める`CountingExec`の対象には
         // していない(`IndexNestedLoopJoinExec`は外側の行ごとに内側を
         // `lookup`するため、この1行だけの実測件数を他の演算子と同じ形では
-        // 数えられない)ので、推定行数だけを添える。
+        // 数えられない)ので、推定行数・推定コストだけを添える。
         // 外側の行ごとに異なる値で`lookup`するため、特定の定数に対する選択率
         // ではなく「平均的な等値検索は何行返すか」(`1 / NDV`)を見積もる。
         let inner_rows = table_row_count(stats, join.table_id);
         let column_stats = column_stats_of(stats, join.table_id, &join.column_name, &join.schema);
         let ndv = column_stats.map(|c| c.distinct_count).filter(|&n| n > 0).unwrap_or(inner_rows).max(1);
         let estimated = (inner_rows as f64 / ndv as f64).round().max(0.0) as u64;
+        let height = storage.and_then(|storage| storage.index_btree(&join.index_name)).and_then(|btree| btree.height().ok());
+        let lookup_cost = cost_model::index_scan_cost(height.map(|h| h as u64).unwrap_or(cost_model::DEFAULT_INDEX_HEIGHT), estimated);
         let indent = "  ".repeat(depth + 1);
         out.push_str(&format!(
-            "{indent}└─ IndexScan({}, {} = {}) rows={estimated}\n",
+            "{indent}└─ IndexScan({}, {} = {}) rows={estimated} cost={:.2}\n",
             join.index_name,
             join.column_name,
-            logical_plan::fmt_bound_expr(&join.outer_key)
+            logical_plan::fmt_bound_expr(&join.outer_key),
+            lookup_cost.value()
         ));
     }
 }
@@ -2343,14 +2410,14 @@ mod tests {
     #[test]
     fn optimize_turns_scan_into_seq_scan() {
         let select = bind_select("SELECT name FROM users WHERE id = 42");
-        let physical = optimize(build_select(select), None);
+        let physical = optimize(build_select(select), None, &NoStats);
         assert_eq!(physical.to_string(), "Projection(name)\n  └─ Filter(id = 42)\n    └─ SeqScan(users)\n");
     }
 
     #[test]
     fn optimize_preserves_output_schema() {
         let select = bind_select("SELECT id, name FROM users");
-        let physical = optimize(build_select(select), None);
+        let physical = optimize(build_select(select), None, &NoStats);
         let schema = physical.output_schema();
         let names: Vec<&str> = schema.columns().iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["id", "name"]);
@@ -2714,7 +2781,7 @@ mod tests {
     fn sort_orders_ascending_with_nulls_first() {
         let select = bind_select_orders("SELECT amount FROM orders ORDER BY amount");
         let logical = crate::logical_plan::build_select(select);
-        let physical = optimize(logical, None);
+        let physical = optimize(logical, None, &NoStats);
         let PhysicalPlan::Sort(sort) = physical else { panic!("Sortを期待した") };
         let functions = FunctionRegistry::with_builtins();
         let rows = vec![amount_only_row(Some(3)), amount_only_row(None), amount_only_row(Some(1))];
@@ -2728,7 +2795,7 @@ mod tests {
     fn sort_desc_puts_nulls_last() {
         let select = bind_select_orders("SELECT amount FROM orders ORDER BY amount DESC");
         let logical = crate::logical_plan::build_select(select);
-        let physical = optimize(logical, None);
+        let physical = optimize(logical, None, &NoStats);
         let PhysicalPlan::Sort(sort) = physical else { panic!("Sortを期待した") };
         let functions = FunctionRegistry::with_builtins();
         let rows = vec![amount_only_row(Some(3)), amount_only_row(None), amount_only_row(Some(1))];
@@ -2743,7 +2810,7 @@ mod tests {
         // `dept`が同じ行同士は、入力に現れた順序のまま残る(安定ソート)。
         let select = bind_select_orders("SELECT dept, amount FROM orders ORDER BY dept");
         let logical = crate::logical_plan::build_select(select);
-        let physical = optimize(logical, None);
+        let physical = optimize(logical, None, &NoStats);
         let PhysicalPlan::Sort(sort) = physical else { panic!("Sortを期待した") };
         let functions = FunctionRegistry::with_builtins();
         let rows = vec![
@@ -2872,14 +2939,14 @@ mod tests {
     #[test]
     fn optimize_chooses_hash_join_for_an_equality_condition() {
         let select = bind_select_ab("SELECT a.id FROM a JOIN b ON a.id = b.id");
-        let physical = optimize(build_select(select), None);
+        let physical = optimize(build_select(select), None, &NoStats);
         assert!(physical.to_string().contains("HashJoin"));
     }
 
     #[test]
     fn optimize_chooses_nested_loop_join_for_a_non_equality_condition() {
         let select = bind_select_ab("SELECT a.id FROM a JOIN b ON a.id > b.id");
-        let physical = optimize(build_select(select), None);
+        let physical = optimize(build_select(select), None, &NoStats);
         assert!(physical.to_string().contains("NestedLoopJoin"));
     }
 
@@ -3013,7 +3080,7 @@ mod tests {
             BoundStatement::Select(select) => *select,
             other => panic!("Selectを期待したが{other:?}が返った"),
         };
-        let physical = optimize(build_select(select), None);
+        let physical = optimize(build_select(select), None, &NoStats);
         // 左深い木: 一番外側(根に近い)のJoinの子にもう1つJoinが現れる。
         let text = physical.to_string();
         assert_eq!(text.matches("Join").count(), 2);
