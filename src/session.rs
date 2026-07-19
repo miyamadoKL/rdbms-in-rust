@@ -117,12 +117,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::ast::{
     DeallocateStatement, ExecuteStatement, Expr, Literal, PrepareStatement, Statement,
 };
 use crate::binder::{AggregateCall, BoundAggregate, BoundAssignment, BoundDelete, BoundExpr, BoundInsert,
     BoundJoinStep, BoundOrderByItem, BoundSelect, BoundSelectItem, BoundStatement, BoundUpdate};
+use crate::cancellation::CancellationToken;
 use crate::database::{QueryResult, SharedDatabase, TxHandle};
 use crate::error::{DbError, DbResult};
 use crate::lexer::Span;
@@ -130,10 +132,31 @@ use crate::types::{DataType, Value};
 
 /// 接続(TCP接続、またはEmbedded/REPLの1プロセス)が持つ状態をまとめたもの。
 /// モジュール冒頭のドキュメントを参照。
+///
+/// # 第38章: 文1本ごとのキャンセル
+///
+/// [`Session`]は接続1本につき1個の`cancel_flag`(`Arc<AtomicBool>`)を持つ。
+/// [`Session::execute`]・[`Session::execute_prepared`]は、文を1本実行するたびに
+/// この`cancel_flag`を`false`へ戻してから、それを元にした
+/// [`crate::cancellation::CancellationToken`]([`SharedDatabase::make_execution_context`]、
+/// 設定済みのタイムアウトがあればその締切も併せ持つ)を作り、その文の実行に
+/// 使う。[`Session::cancellation_handle`]は同じ`cancel_flag`を`clone`して返す
+/// ([`CancellationToken`]自体を返さないのは、締切がまだ確定していない
+/// [`Session::execute`]呼び出し前の時点でも、呼び出し元が先にハンドルを
+/// 取得できるようにするため)。呼び出し元(`crate::server`のクライアント切断
+/// 検知、またはテストコード)がこのハンドルの`cancel`を呼べば、`self`を
+/// `&mut`で借用している`execute`呼び出しとは別のスレッドから、実行中の文を
+/// 打ち切れる(本文・テストを参照)。
 pub struct Session {
     shared: Arc<SharedDatabase>,
     tx: Option<TxHandle>,
     prepared: HashMap<String, PreparedStatement>,
+    cancel_flag: Arc<AtomicBool>,
+    /// [`CancellationToken::checkpoints`]をこの接続の外(`cancellation_handle`)と
+    /// 内(実行中の文が使うトークン)で共有するための`Arc`。テストが「実行中の
+    /// 文が同期ポイントを確かに何度も通過した」ことを外から観測するために使う
+    /// (`crate::cancellation`モジュール冒頭を参照、本番のコードは読まない)。
+    checkpoints: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// `PREPARE`が登録する1件。`bound`は`PREPARE`の時点で束縛済みの文、
@@ -149,7 +172,35 @@ impl Session {
     /// `shared`につながる新しい接続を表すSessionを作る。トランザクション状態は
     /// Autocommit、Prepared Statementの名前空間は空の状態で始まる。
     pub fn new(shared: Arc<SharedDatabase>) -> Self {
-        Session { shared, tx: None, prepared: HashMap::new() }
+        Session {
+            shared,
+            tx: None,
+            prepared: HashMap::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            checkpoints: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// 現在(または次に)実行中の文をキャンセルするためのハンドルを返す
+    /// (第38章)。`&self`だけで呼べるため、`session.execute(...)`(`&mut self`)を
+    /// 呼ぶより前に取得しておき、別スレッドへ持って行って`cancel`を呼べる
+    /// (型冒頭「第38章: 文1本ごとのキャンセル」を参照)。
+    ///
+    /// 1回`cancel`されたハンドルは、以後この`Session`が実行するすべての文を
+    /// キャンセルし続ける(`cancel_flag`は文をまたいで同じ`Arc`のままで、
+    /// `execute`は次の文の開始時に`false`へ戻す。すでに`cancel`済みの
+    /// ハンドルを使い回すことは想定していない)。
+    pub fn cancellation_handle(&self) -> CancellationToken {
+        CancellationToken::with_checkpoints(Arc::clone(&self.cancel_flag), None, Arc::clone(&self.checkpoints))
+    }
+
+    /// この文専用の[`crate::cancellation::ExecutionContext`]を作る。呼ぶたびに
+    /// `cancel_flag`・`checkpoints`を初期状態へ戻すため、前の文の状態が次の文へ
+    /// 漏れることは無い。
+    fn new_execution_context(&self) -> crate::cancellation::ExecutionContext {
+        self.cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.checkpoints.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.shared.make_execution_context(Arc::clone(&self.cancel_flag), Arc::clone(&self.checkpoints))
     }
 
     /// `sql`を1文実行し、結果を返す。
@@ -201,9 +252,10 @@ impl Session {
     /// 前身が`sql`文字列に対して行っていた分岐を、束縛済みの`BoundStatement`
     /// に対して行う形にそのまま引き継ぐ)。
     fn run_bound(&mut self, bound: BoundStatement) -> DbResult<QueryResult> {
+        let ctx = self.new_execution_context();
         match &self.tx {
-            Some(handle) => self.shared.execute_in_tx_bound(handle, &bound),
-            None => self.run_bound_autocommit(bound),
+            Some(handle) => self.shared.execute_in_tx_bound(handle, &bound, &ctx),
+            None => self.run_bound_autocommit(bound, &ctx),
         }
     }
 
@@ -211,9 +263,14 @@ impl Session {
     /// 実行する。成功すればすぐ`commit_tx`、失敗すれば`rollback_tx`し、
     /// どちらの場合もこの文の実行が終わった時点でロックを持ち越さない
     /// (`crate::server`モジュールの旧`execute_autocommit`と同じ規律)。
-    fn run_bound_autocommit(&self, bound: BoundStatement) -> DbResult<QueryResult> {
+    ///
+    /// キャンセル・タイムアウトで打ち切られた場合(`ctx`)も、失敗した文の
+    /// 1つとして`rollback_tx`する。この文が`begin_tx`以降に書き込んだ変更が
+    /// あれば、Autocommitのトランザクション境界に従って取り消される
+    /// (本文「キャンセルされたトランザクションはAbortする」を参照)。
+    fn run_bound_autocommit(&self, bound: BoundStatement, ctx: &crate::cancellation::ExecutionContext) -> DbResult<QueryResult> {
         let handle = self.shared.begin_tx();
-        match self.shared.execute_in_tx_bound(&handle, &bound) {
+        match self.shared.execute_in_tx_bound(&handle, &bound, ctx) {
             Ok(result) => {
                 self.shared.commit_tx(handle)?;
                 Ok(result)
@@ -671,7 +728,8 @@ fn value_to_ast_literal(value: Value, span: Span) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::Database;
+    use crate::database::{Database, ResourceLimits};
+    use std::time::Duration;
 
     fn new_session() -> Session {
         Session::new(Arc::new(SharedDatabase::new(Database::memory())))
@@ -816,5 +874,108 @@ mod tests {
             unsafe_result_count, 0,
             "この例では文字列連結側が実際に全行を返してしまうことを確認する"
         );
+    }
+
+    // ---- 第38章: Cancellation・Timeout・メモリ上限 ----
+
+    /// `id`から`count`件の行を持つテーブル`name`を作る。大きなCartesian積を
+    /// 安価に用意するための共通ヘルパー。
+    fn seed_table(session: &mut Session, name: &str, count: i64) {
+        session.execute(&format!("CREATE TABLE {name} (id BIGINT)")).unwrap();
+        for i in 0..count {
+            session.execute(&format!("INSERT INTO {name} VALUES ({i})")).unwrap();
+        }
+    }
+
+    #[test]
+    fn cancellation_handle_stops_a_long_running_query_from_another_thread() {
+        let mut session = new_session();
+        seed_table(&mut session, "t", 300);
+
+        // `cancellation_handle`は`&self`だけで呼べるため、`execute`(`&mut self`)を
+        // 別スレッドへ`move`する前に取得しておける(型冒頭のドキュメント参照)。
+        let handle = session.cancellation_handle();
+        let worker = std::thread::spawn(move || {
+            // `ON 1 = 1`は等値結合の形をしていない(定数同士の比較)ため
+            // `Nested Loop Join`が選ばれ、300 × 300 = 90,000通りの組み合わせを
+            // すべて`WHERE`と同じ三値論理で評価しながら返す。300行だけでも
+            // `execute_select`の駆動ループ(`crate::cancellation`モジュール冒頭の
+            // 主要な同期ポイント)を実測1,000回以上通過するのに十分な件数である。
+            session.execute("SELECT * FROM t AS a JOIN t AS b ON 1 = 1")
+        });
+
+        // `sleep`による時間待ちではなく、実行中の文が同期ポイントを実際に
+        // 1,000回通過したことを確認してから`cancel`する。総行数(90,000)は
+        // この閾値よりはるかに大きいため、まだ実行の途中であることが保証される。
+        handle.wait_for_checkpoints(1_000);
+        handle.cancel();
+
+        let result = worker.join().expect("ワーカースレッドがpanicした");
+        assert!(matches!(result, Err(DbError::QueryCancelled)), "{result:?}");
+    }
+
+    #[test]
+    fn statement_timeout_aborts_a_query_that_runs_past_the_deadline() {
+        let shared = Arc::new(SharedDatabase::new(Database::memory()));
+        let mut session = Session::new(Arc::clone(&shared));
+        seed_table(&mut session, "t", 700);
+
+        // 締切(1ミリ秒)に対して、700 × 700 = 490,000通りの組み合わせを評価する
+        // クエリは常に十分長くかかる(実測で数十ミリ秒以上)。締切とクエリの
+        // 実行時間の比を大きく取ることで、実行環境の速度差によるflakyさを避ける。
+        shared.set_resource_limits(ResourceLimits { statement_timeout: Some(Duration::from_millis(1)), ..Default::default() });
+        let result = session.execute("SELECT * FROM t AS a JOIN t AS b ON 1 = 1");
+        assert!(matches!(result, Err(DbError::QueryTimeout)), "{result:?}");
+    }
+
+    #[test]
+    fn max_operator_rows_aborts_sort_once_the_collected_rows_exceed_the_limit() {
+        let shared = Arc::new(SharedDatabase::new(Database::memory()));
+        let mut session = Session::new(Arc::clone(&shared));
+        seed_table(&mut session, "t", 10);
+        shared.set_resource_limits(ResourceLimits { max_operator_rows: Some(5), ..Default::default() });
+
+        let result = session.execute("SELECT id FROM t ORDER BY id");
+        assert!(matches!(result, Err(DbError::MemoryLimitExceeded { operator: "Sort", limit: 5 })), "{result:?}");
+    }
+
+    #[test]
+    fn max_operator_rows_allows_sort_within_the_limit() {
+        let shared = Arc::new(SharedDatabase::new(Database::memory()));
+        let mut session = Session::new(Arc::clone(&shared));
+        seed_table(&mut session, "t", 5);
+        shared.set_resource_limits(ResourceLimits { max_operator_rows: Some(5), ..Default::default() });
+
+        let result = session.execute("SELECT id FROM t ORDER BY id").unwrap();
+        assert_eq!(result.rows().len(), 5);
+    }
+
+    #[test]
+    fn max_operator_rows_aborts_hash_join_build_once_the_right_side_exceeds_the_limit() {
+        let shared = Arc::new(SharedDatabase::new(Database::memory()));
+        let mut session = Session::new(Arc::clone(&shared));
+        seed_table(&mut session, "a", 3);
+        seed_table(&mut session, "b", 10);
+        shared.set_resource_limits(ResourceLimits { max_operator_rows: Some(5), ..Default::default() });
+
+        // `b`(Build側、右辺)が上限を超える。`crate::physical_plan::optimize`が
+        // 小さい側をBuildに選ぶとは限らないため、両方が上限を超えるように
+        // `a`・`b`とも上限より多い行を持たせたいところだが、この章のテストでは
+        // どちらがBuild側に選ばれても上限に触れることを狙い、両テーブルとも
+        // 上限(5)を超える行数にしてある。
+        let result = session.execute("SELECT a.id FROM a JOIN b ON a.id = b.id");
+        assert!(matches!(result, Err(DbError::MemoryLimitExceeded { operator: "Hash Join", .. })), "{result:?}");
+    }
+
+    #[test]
+    fn max_operator_rows_aborts_hash_aggregate_once_the_distinct_groups_exceed_the_limit() {
+        let shared = Arc::new(SharedDatabase::new(Database::memory()));
+        let mut session = Session::new(Arc::clone(&shared));
+        seed_table(&mut session, "t", 10);
+        shared.set_resource_limits(ResourceLimits { max_operator_rows: Some(5), ..Default::default() });
+
+        // `id`は1行ごとに異なるので、`GROUP BY id`は10個の別々のグループを作る。
+        let result = session.execute("SELECT id, COUNT(*) FROM t GROUP BY id");
+        assert!(matches!(result, Err(DbError::MemoryLimitExceeded { operator: "Hash Aggregate", .. })), "{result:?}");
     }
 }

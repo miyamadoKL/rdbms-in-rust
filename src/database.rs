@@ -87,6 +87,7 @@ use crate::ast::{
     DropTableStatement, IsolationLevel, RollbackStatement, Statement,
 };
 use crate::binder::{Binder, BoundCreateIndex, BoundExpr, BoundStatement};
+use crate::cancellation::ExecutionContext;
 use crate::catalog::{Catalog, TableInfo};
 use crate::error::{DbError, DbResult};
 use crate::eval::FunctionRegistry;
@@ -169,6 +170,29 @@ pub struct Database {
     /// 「ロックの粒度」節、統合の詳細は`execute_bound_statement`・
     /// `acquire_scan_locks`を参照)。
     lock_manager: LockManager<LockKey>,
+    /// この`Database`が実行する文すべてに既定で課す実行制御の上限(第38章)。
+    /// `crate::session::Session`が文ごとに作る`ExecutionContext`は、この値を
+    /// 元にキャンセルの締切・メモリ上限を組み立てる
+    /// (`SharedDatabase::make_execution_context`を参照)。`Database::execute`・
+    /// `execute_in_tx`(この章より前からある低レベルAPI)はこのフィールドを
+    /// 一切参照せず、常に無制限([`ExecutionContext::unbounded`])で動く
+    /// (`crate::cancellation`モジュール冒頭を参照)。
+    resource_limits: ResourceLimits,
+}
+
+/// [`Database::resource_limits`]の中身。サーバー起動時の引数として設定する
+/// 想定であり(`SET`文のような実行時のSQL構文は追加しない)、`Database::memory`・
+/// `Database::open`のどちらで作っても既定は「無制限」である。`SET`文ではなく
+/// 起動引数を選んだ理由は、この2つの値がセッションではなくサーバープロセス
+/// 全体の運用ポリシー(「1文がどれだけ長く・どれだけのメモリを使ってよいか」)
+/// であり、接続ごとに変える理由が無いためである(本文を参照)。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResourceLimits {
+    /// 1文が実行に使ってよい時間の上限。`None`なら無制限。
+    pub statement_timeout: Option<std::time::Duration>,
+    /// `Sort`・Hash JoinのBuild側・Hash Aggregateが集めてよい行数の上限。
+    /// `None`なら無制限。
+    pub max_operator_rows: Option<usize>,
 }
 
 /// [`Database::begin_tx`]が返す、1本のトランザクションを指す不透明な識別子。
@@ -198,6 +222,7 @@ impl Database {
             next_txn_id: 0,
             harness_contexts: HashMap::new(),
             lock_manager: LockManager::new(),
+            resource_limits: ResourceLimits::default(),
         }
     }
 
@@ -229,7 +254,15 @@ impl Database {
             next_txn_id: 0,
             harness_contexts: HashMap::new(),
             lock_manager: LockManager::new(),
+            resource_limits: ResourceLimits::default(),
         })
+    }
+
+    /// [`Database::resource_limits`]を設定する(第38章)。以後この`Database`が
+    /// (`Session`経由で)実行する文すべての既定値になる。`Database::execute`
+    /// (低レベルAPI)は影響を受けない(型冒頭を参照)。
+    pub fn set_resource_limits(&mut self, limits: ResourceLimits) {
+        self.resource_limits = limits;
     }
 
     /// キャッシュされている変更をすべてディスクへ書き戻し、実ディスクへ同期する。
@@ -429,7 +462,7 @@ impl Database {
     /// この実装で表している部分である。
     fn execute_bound_statement(&mut self, statement: Statement, sql: &str) -> DbResult<QueryResult> {
         let bound = self.bind(statement, sql)?;
-        self.run_bound_statement(bound)
+        self.run_bound_statement(bound, &ExecutionContext::unbounded())
     }
 
     /// すでに束縛済みの文を、束縛をやり直さずに直接実行する(第37章)。
@@ -437,17 +470,30 @@ impl Database {
     /// `EXECUTE`(`Session::execute`)が、`PREPARE`時に確定した`BoundStatement`
     /// へパラメータを差し込んだ結果を渡すために使う。`bind`を経由しない点を
     /// 除けば[`Database::execute_bound_statement`]と全く同じロック・実行の
-    /// 規律(`lock_owner`・Autocommitのロック解放)に従う。
+    /// 規律(`lock_owner`・Autocommitのロック解放)に従う。この関数自身は
+    /// `ExecutionContext::unbounded()`(無制限)で実行する。`Session`が実際に
+    /// キャンセル・タイムアウト・メモリ上限を効かせたい場合は
+    /// [`Database::execute_bound_statement_with_context`]を使う(第38章)。
     pub fn execute_bound_statement_prebound(&mut self, bound: BoundStatement) -> DbResult<QueryResult> {
-        self.run_bound_statement(bound)
+        self.run_bound_statement(bound, &ExecutionContext::unbounded())
+    }
+
+    /// [`Database::execute_bound_statement_prebound`]の、実行制御
+    /// ([`ExecutionContext`]、第38章)を指定できる版。`crate::session::Session`が
+    /// 文を1本実行するたびに、この関数(または[`Database::execute_in_tx_bound`])
+    /// を呼ぶ。
+    pub fn execute_bound_statement_with_context(&mut self, bound: BoundStatement, ctx: &ExecutionContext) -> DbResult<QueryResult> {
+        self.run_bound_statement(bound, ctx)
     }
 
     /// [`Database::execute_bound_statement`]・[`Database::execute_bound_statement_prebound`]
-    /// が共有する、束縛済みの文を実際に実行する本体。
-    fn run_bound_statement(&mut self, bound: BoundStatement) -> DbResult<QueryResult> {
+    /// が共有する、束縛済みの文を実際に実行する本体。`ctx`は`SELECT`の実行
+    /// (`execute_select`・`execute_explain`)にだけ渡す。DDL・`INSERT`・`UPDATE`・
+    /// `DELETE`はこの章の実行制御の対象外である(本文の限界节を参照)。
+    fn run_bound_statement(&mut self, bound: BoundStatement, ctx: &ExecutionContext) -> DbResult<QueryResult> {
         let owner = self.lock_owner();
         let result = match bound {
-            BoundStatement::Select(select) => self.execute_select(logical_plan::build_select(*select), owner),
+            BoundStatement::Select(select) => self.execute_select(logical_plan::build_select(*select), owner, ctx),
             BoundStatement::CreateTable(create) => self.execute_create_table(&create),
             BoundStatement::DropTable(drop) => self.execute_drop_table(&drop),
             BoundStatement::CreateIndex(create) => self.execute_create_index(create),
@@ -455,7 +501,7 @@ impl Database {
             BoundStatement::Insert(insert) => self.execute_insert(logical_plan::build_insert(insert), owner),
             BoundStatement::Update(update) => self.execute_update(logical_plan::build_update(update), owner),
             BoundStatement::Delete(delete) => self.execute_delete(logical_plan::build_delete(delete), owner),
-            BoundStatement::Explain { inner, analyze } => self.execute_explain(*inner, analyze, owner),
+            BoundStatement::Explain { inner, analyze } => self.execute_explain(*inner, analyze, owner, ctx),
             BoundStatement::Analyze(analyze) => self.execute_analyze(analyze),
             BoundStatement::Begin(_) | BoundStatement::Commit(_) | BoundStatement::Rollback(_) | BoundStatement::Checkpoint(_) => {
                 unreachable!("BEGIN・COMMIT・ROLLBACK・CHECKPOINTはexecuteの先頭ですでに処理済み")
@@ -645,9 +691,10 @@ impl Database {
     /// 中で実行するために使う。構文解析・束縛のどちらもやり直さない点だけが
     /// [`Database::execute_in_tx`]と異なり、ロック待ちでの再試行(`WouldBlock`)・
     /// `Aborted`状態での拒否・`finish`によるAbort遷移は共通の`run_in_tx`が
-    /// 同じ規律で扱う。
-    pub fn execute_in_tx_bound(&mut self, handle: &TxHandle, bound: BoundStatement) -> DbResult<QueryResult> {
-        self.run_in_tx(handle, |db| db.run_bound_statement(bound))
+    /// 同じ規律で扱う。`ctx`(第38章、`ExecutionContext`)は`SELECT`の実行にだけ
+    /// 影響する(`run_bound_statement`のドキュメントを参照)。
+    pub fn execute_in_tx_bound(&mut self, handle: &TxHandle, bound: BoundStatement, ctx: &ExecutionContext) -> DbResult<QueryResult> {
+        self.run_in_tx(handle, |db| db.run_bound_statement(bound, ctx))
     }
 
     /// `execute_in_tx`・`execute_in_tx_bound`が共有する、`harness_contexts`との
@@ -886,7 +933,7 @@ impl Database {
     /// (`acquire_scan_locks`)。獲得できなければ`Err(DbError::WouldBlock)`を
     /// 返し、`Executor`は一切組み立てない(ロックを取れなかった`SELECT`は
     /// 1行も読まない)。
-    fn execute_select(&mut self, plan: LogicalPlan, owner: TransactionId) -> DbResult<QueryResult> {
+    fn execute_select(&mut self, plan: LogicalPlan, owner: TransactionId, ctx: &ExecutionContext) -> DbResult<QueryResult> {
         let mut scanned = Vec::new();
         collect_scan_tables(&plan, &mut scanned);
         self.acquire_scan_locks(owner, &scanned, LockMode::Shared)?;
@@ -894,10 +941,18 @@ impl Database {
         let plan = rules::optimize(plan, &self.functions);
         let physical = physical_plan::optimize(plan, self.index_storage(), self);
         let schema = physical.output_schema();
-        let mut executor = self.build_query_executor(&physical, None)?;
+        let mut executor = self.build_query_executor(&physical, None, ctx)?;
 
+        // `Executor::next()`を駆動するこのループが、この章のキャンセル・
+        // タイムアウトの主要な同期ポイントである(`crate::cancellation`モジュール
+        // 冒頭を参照)。`Filter`・`Projection`のようなstreaming演算子は子から
+        // 1行引くたびにこのループへ戻ってくるため、`Sort`のように内部で
+        // 全件を読み切るblocking演算子(`build_query_executor`が組み立てる時点で
+        // すでに`ctx.cancel.check()`を挟んでいる)を除けば、ここでの`check`が
+        // 唯一の確認機会になる。
         let mut rows = Vec::new();
         while let Some(tuple) = executor.next()? {
+            ctx.cancel.check()?;
             rows.push(tuple);
         }
         Ok(QueryResult { schema, rows, command_tag: None })
@@ -1213,8 +1268,9 @@ impl Database {
         &'a self,
         plan: &'a PhysicalPlan,
         counters: Option<&CounterNode>,
+        ctx: &'a ExecutionContext,
     ) -> DbResult<Box<dyn Executor + 'a>> {
-        let exec = self.build_query_executor_inner(plan, counters)?;
+        let exec = self.build_query_executor_inner(plan, counters, ctx)?;
         Ok(match counters {
             Some(node) => Box::new(CountingExec::new(exec, node.count.clone())),
             None => exec,
@@ -1225,6 +1281,7 @@ impl Database {
         &'a self,
         plan: &'a PhysicalPlan,
         counters: Option<&CounterNode>,
+        ctx: &'a ExecutionContext,
     ) -> DbResult<Box<dyn Executor + 'a>> {
         let child = |index: usize| counters.map(|n| &n.children[index]);
         match plan {
@@ -1255,19 +1312,19 @@ impl Database {
                 Ok(Box::new(exec))
             }
             PhysicalPlan::Filter(filter) => {
-                let input = self.build_query_executor(&filter.input, child(0))?;
+                let input = self.build_query_executor(&filter.input, child(0), ctx)?;
                 Ok(Box::new(FilterExec::new(input, &filter.predicate, &self.functions)))
             }
             PhysicalPlan::NestedLoopJoin(join) => {
-                let left = self.build_query_executor(&join.left, child(0))?;
-                let right = self.build_query_executor(&join.right, child(1))?;
-                let exec = NestedLoopJoinExec::new(left, right, &join.condition, &self.functions)?;
+                let left = self.build_query_executor(&join.left, child(0), ctx)?;
+                let right = self.build_query_executor(&join.right, child(1), ctx)?;
+                let exec = NestedLoopJoinExec::new(left, right, &join.condition, &self.functions, ctx)?;
                 Ok(Box::new(exec))
             }
             PhysicalPlan::HashJoin(join) => {
-                let left = self.build_query_executor(&join.left, child(0))?;
-                let right = self.build_query_executor(&join.right, child(1))?;
-                let exec = HashJoinExec::new(left, right, &join.keys, &self.functions)?;
+                let left = self.build_query_executor(&join.left, child(0), ctx)?;
+                let right = self.build_query_executor(&join.right, child(1), ctx)?;
+                let exec = HashJoinExec::new(left, right, &join.keys, &self.functions, ctx)?;
                 Ok(Box::new(exec))
             }
             PhysicalPlan::IndexNestedLoopJoin(join) => {
@@ -1276,7 +1333,7 @@ impl Database {
                 let Backend::Disk { storage } = &self.backend else {
                     unreachable!("IndexNestedLoopJoinはBackend::Diskのときにしかoptimizeが選ばない")
                 };
-                let left = self.build_query_executor(&join.left, child(0))?;
+                let left = self.build_query_executor(&join.left, child(0), ctx)?;
                 let exec = IndexNestedLoopJoinExec::new(
                     left,
                     storage,
@@ -1289,30 +1346,31 @@ impl Database {
                 Ok(Box::new(exec))
             }
             PhysicalPlan::Aggregate(aggregate) => {
-                let input = self.build_query_executor(&aggregate.input, child(0))?;
+                let input = self.build_query_executor(&aggregate.input, child(0), ctx)?;
                 let exec = HashAggregateExec::new(
                     input,
                     &aggregate.group_by,
                     &aggregate.calls,
                     aggregate.schema.clone(),
                     &self.functions,
+                    ctx,
                 )?;
                 Ok(Box::new(exec))
             }
             PhysicalPlan::Projection(projection) => {
-                let input = self.build_query_executor(&projection.input, child(0))?;
+                let input = self.build_query_executor(&projection.input, child(0), ctx)?;
                 Ok(Box::new(ProjectionExec::new(input, &projection.projection, &self.functions)))
             }
             PhysicalPlan::Distinct(distinct) => {
-                let input = self.build_query_executor(&distinct.input, child(0))?;
+                let input = self.build_query_executor(&distinct.input, child(0), ctx)?;
                 Ok(Box::new(DistinctExec::new(input)))
             }
             PhysicalPlan::Sort(sort) => {
-                let input = self.build_query_executor(&sort.input, child(0))?;
-                Ok(Box::new(SortExec::new(input, &sort.keys, &self.functions)?))
+                let input = self.build_query_executor(&sort.input, child(0), ctx)?;
+                Ok(Box::new(SortExec::new(input, &sort.keys, &self.functions, ctx)?))
             }
             PhysicalPlan::Limit(limit) => {
-                let input = self.build_query_executor(&limit.input, child(0))?;
+                let input = self.build_query_executor(&limit.input, child(0), ctx)?;
                 Ok(Box::new(LimitExec::new(input, limit.limit, limit.offset)))
             }
             PhysicalPlan::Insert(_) | PhysicalPlan::Update(_) | PhysicalPlan::Delete(_) => {
@@ -1366,15 +1424,17 @@ impl Database {
     /// おり、ここに`acquire_scan_locks`を差し込むには`execute_select`と
     /// ほぼ同じ配線をもう1箇所複製する必要がある。この章はその複製を見送り、
     /// `EXPLAIN ANALYZE`をロックの対象外として残す(演習課題)。
-    fn execute_explain(&mut self, inner: BoundStatement, analyze: bool, owner: TransactionId) -> DbResult<QueryResult> {
+    fn execute_explain(&mut self, inner: BoundStatement, analyze: bool, owner: TransactionId, ctx: &ExecutionContext) -> DbResult<QueryResult> {
         match inner {
             BoundStatement::Select(select) => {
                 let logical = rules::optimize(logical_plan::build_select(*select), &self.functions);
                 let physical = physical_plan::optimize(logical, self.index_storage(), self);
                 if analyze {
                     let counters = CounterNode::build(&physical);
-                    let mut executor = self.build_query_executor(&physical, Some(&counters))?;
-                    while executor.next()?.is_some() {}
+                    let mut executor = self.build_query_executor(&physical, Some(&counters), ctx)?;
+                    while executor.next()?.is_some() {
+                        ctx.cancel.check()?;
+                    }
                     Ok(QueryResult::explain(explain_text(&physical, self, self.index_storage(), Some(&counters))))
                 } else {
                     Ok(QueryResult::explain(explain_text(&physical, self, self.index_storage(), None)))
@@ -1632,7 +1692,8 @@ impl Database {
             table_name: table_name.to_string(),
             schema: schema.clone(),
         });
-        let mut executor = self.build_query_executor(&plan, None)?;
+        let unbounded = ExecutionContext::unbounded();
+        let mut executor = self.build_query_executor(&plan, None, &unbounded)?;
         let mut collector = StatsCollector::new(schema);
         while let Some(tuple) = executor.next()? {
             collector.add_row(&tuple);
@@ -1762,10 +1823,17 @@ impl SharedDatabase {
     /// `clone`する([`Database::execute_in_tx_bound`]は所有権を取るが、この文は
     /// 一切実行されていないため同じ`bound`をそのまま渡し直せる、`execute_in_tx`
     /// が同じ`sql`をもう一度渡すのと同じ理由)。
-    pub fn execute_in_tx_bound(&self, handle: &TxHandle, bound: &BoundStatement) -> DbResult<QueryResult> {
+    ///
+    /// `ctx`(第38章、[`ExecutionContext`])は`crate::session::Session`が
+    /// [`SharedDatabase::make_execution_context`]で作ったものをそのまま渡す。
+    /// ロック待ちの再試行ループ(`WouldBlock`・`Condvar::wait`)自体は`ctx`を
+    /// 見ない。ロック待ちの間はまだ文の実行が始まっていないため、この章は
+    /// ロック待ちそのものをキャンセル・タイムアウトの対象にしていない(本文の
+    /// 限界节を参照)。
+    pub fn execute_in_tx_bound(&self, handle: &TxHandle, bound: &BoundStatement, ctx: &ExecutionContext) -> DbResult<QueryResult> {
         let mut guard = self.lock();
         loop {
-            let outcome = guard.execute_in_tx_bound(handle, bound.clone());
+            let outcome = guard.execute_in_tx_bound(handle, bound.clone(), ctx);
             self.cvar.notify_all();
             match outcome {
                 Err(DbError::WouldBlock) => {
@@ -1774,6 +1842,32 @@ impl SharedDatabase {
                 other => return other,
             }
         }
+    }
+
+    /// この`Database`に設定された実行制御の上限([`Database::set_resource_limits`]、
+    /// 第38章)を元に、文1本ぶんの[`ExecutionContext`]を作る。`cancel_flag`は
+    /// `crate::session::Session`が接続1本につき持ち回す`Arc<AtomicBool>`で、
+    /// 明示的なキャンセル要求(クライアントの切断検知、または
+    /// `Session::cancellation_handle`経由の要求)を伝える経路になる。
+    /// `checkpoints`も同様に`Session`が持ち回す`Arc<AtomicUsize>`で、
+    /// `Session::cancellation_handle`が返すトークンと同期ポイントの通過回数を
+    /// 共有するために使う(`crate::cancellation::CancellationToken::with_checkpoints`
+    /// のドキュメントを参照)。
+    pub fn make_execution_context(
+        &self,
+        cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        checkpoints: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> ExecutionContext {
+        let limits = self.lock().resource_limits;
+        ExecutionContext {
+            cancel: crate::cancellation::CancellationToken::with_checkpoints(cancel_flag, limits.statement_timeout, checkpoints),
+            max_operator_rows: limits.max_operator_rows,
+        }
+    }
+
+    /// [`Database::set_resource_limits`]のブロッキング版(第38章)。
+    pub fn set_resource_limits(&self, limits: ResourceLimits) {
+        self.lock().set_resource_limits(limits);
     }
 
     /// `handle`が指すトランザクションを確定する([`Database::commit_tx`]を

@@ -305,6 +305,30 @@ pub enum DbError {
         first: DataType,
         second: DataType,
     },
+
+    /// 実行中の文が、`crate::cancellation::CancellationToken::cancel`による
+    /// 明示的なキャンセル要求を受けて打ち切られたエラー(第38章)。クライアントの
+    /// 切断検知(`crate::server`)、または`crate::session::Session::cancellation_handle`
+    /// 経由の明示的な要求のどちらでも、この同じエラーになる。
+    #[error("クエリがキャンセルされました")]
+    QueryCancelled,
+
+    /// 実行中の文が、設定された制限時間を超えたため打ち切られたエラー(第38章)。
+    /// `crate::cancellation::CancellationToken`が持つ締切を、同期ポイントの
+    /// `check`が超過と判定した場合に返る。
+    #[error("クエリの実行時間が上限を超えました")]
+    QueryTimeout,
+
+    /// `Sort`・Hash JoinのBuild側・Hash Aggregateが子から集める行数が、
+    /// 設定された上限(`crate::cancellation::ExecutionContext::max_operator_rows`)を
+    /// 超えたエラー(第38章)。
+    #[error("{operator}の収集行数が上限を超えました(上限{limit}行)")]
+    MemoryLimitExceeded {
+        /// 上限を超えた演算子の名前(`"Sort"`・`"Hash Join"`・`"Hash Aggregate"`)。
+        operator: &'static str,
+        /// 設定されていた上限行数。
+        limit: usize,
+    },
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

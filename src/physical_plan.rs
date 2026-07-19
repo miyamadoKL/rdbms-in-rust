@@ -78,6 +78,7 @@ use std::rc::Rc;
 use crate::ast::{AggregateFunc, BinaryOperator, Expr, JoinKind, UnaryOperator};
 use crate::binder::{AggregateCall, BoundAssignment, BoundExpr, BoundSelectItem};
 use crate::btree::RangeScan;
+use crate::cancellation::ExecutionContext;
 use crate::cost_model;
 use crate::error::{DbError, DbResult};
 use crate::estimator;
@@ -1949,11 +1950,13 @@ impl<'a> NestedLoopJoinExec<'a> {
         mut right: Box<dyn Executor + 'a>,
         condition: &'a BoundExpr,
         functions: &'a FunctionRegistry,
+        ctx: &ExecutionContext,
     ) -> DbResult<Self> {
         let left_schema = left.output_schema().clone();
         let right_schema = right.output_schema().clone();
         let mut right_rows = Vec::new();
         while let Some(tuple) = right.next()? {
+            ctx.cancel.check()?;
             right_rows.push(tuple);
         }
         let schema = logical_plan::join_schema(&left_schema, &right_schema);
@@ -2038,13 +2041,16 @@ impl<'a> HashJoinExec<'a> {
         mut right: Box<dyn Executor + 'a>,
         keys: &'a [(BoundExpr, BoundExpr)],
         functions: &'a FunctionRegistry,
+        ctx: &ExecutionContext,
     ) -> DbResult<Self> {
         let left_schema = left.output_schema().clone();
         let right_schema = right.output_schema().clone();
         let schema = logical_plan::join_schema(&left_schema, &right_schema);
 
         let mut build: HashMap<Vec<Value>, Vec<Tuple>> = HashMap::new();
+        let mut built_rows = 0usize;
         while let Some(tuple) = right.next()? {
+            ctx.cancel.check()?;
             let row = Row::new(&right_schema, &tuple);
             let key: Vec<Value> =
                 keys.iter().map(|(_, right_key)| eval_bound_expr(right_key, functions, Some(&row))).collect::<DbResult<_>>()?;
@@ -2052,6 +2058,8 @@ impl<'a> HashJoinExec<'a> {
                 continue; // NULLキーは結合しない(モジュールのドキュメント参照)
             }
             build.entry(key).or_default().push(tuple);
+            built_rows += 1;
+            ctx.check_row_limit("Hash Join", built_rows)?;
         }
 
         Ok(HashJoinExec { left, left_schema, build, keys, functions, schema, current_left: None, current_key: None, match_index: 0 })
@@ -2300,6 +2308,7 @@ impl HashAggregateExec {
         calls: &[AggregateCall],
         schema: Schema,
         functions: &FunctionRegistry,
+        ctx: &ExecutionContext,
     ) -> DbResult<Self> {
         let input_schema = input.output_schema().clone();
         // グループの出力順序を、HashMapの走査順(非決定的)ではなく、そのグループの
@@ -2312,6 +2321,7 @@ impl HashAggregateExec {
         let mut groups: Vec<(Vec<Value>, Vec<AggState>)> = Vec::new();
 
         while let Some(tuple) = input.next()? {
+            ctx.cancel.check()?;
             let row = Row::new(&input_schema, &tuple);
             let key: Vec<Value> =
                 group_by.iter().map(|expr| eval_bound_expr(expr, functions, Some(&row))).collect::<DbResult<Vec<_>>>()?;
@@ -2320,6 +2330,10 @@ impl HashAggregateExec {
                 groups.push((key, calls.iter().map(|_| AggState::new()).collect()));
                 groups.len() - 1
             });
+            // グループ(`groups`の要素)1つがこの演算子のメモリ使用量の単位。
+            // 新しいグループが増えるたびに上限を検査する(既存グループの
+            // 更新だけでは`groups.len()`は増えないので実質無視できるコスト)。
+            ctx.check_row_limit("Hash Aggregate", groups.len())?;
 
             for (call, state) in calls.iter().zip(groups[index].1.iter_mut()) {
                 let value = match &call.arg {
@@ -2433,15 +2447,17 @@ pub struct SortExec {
 }
 
 impl SortExec {
-    pub fn new(mut input: Box<dyn Executor + '_>, keys: &[SortKey], functions: &FunctionRegistry) -> DbResult<Self> {
+    pub fn new(mut input: Box<dyn Executor + '_>, keys: &[SortKey], functions: &FunctionRegistry, ctx: &ExecutionContext) -> DbResult<Self> {
         let schema = input.output_schema().clone();
 
         let mut keyed: Vec<(Vec<Value>, Tuple)> = Vec::new();
         while let Some(tuple) = input.next()? {
+            ctx.cancel.check()?;
             let row = Row::new(&schema, &tuple);
             let key: Vec<Value> =
                 keys.iter().map(|k| eval_bound_expr(&k.expr, functions, Some(&row))).collect::<DbResult<Vec<_>>>()?;
             keyed.push((key, tuple));
+            ctx.check_row_limit("Sort", keyed.len())?;
         }
 
         keyed.sort_by(|(a, _), (b, _)| {
@@ -2813,6 +2829,7 @@ mod tests {
             &aggregate.calls,
             aggregate.schema.clone(),
             &functions,
+            &ExecutionContext::unbounded(),
         )
         .unwrap();
         let result = collect_all(&mut exec);
@@ -2832,6 +2849,7 @@ mod tests {
             &aggregate.calls,
             aggregate.schema.clone(),
             &functions,
+            &ExecutionContext::unbounded(),
         )
         .unwrap();
         let result = collect_all(&mut exec);
@@ -2851,6 +2869,7 @@ mod tests {
             &aggregate.calls,
             aggregate.schema.clone(),
             &functions,
+            &ExecutionContext::unbounded(),
         )
         .unwrap();
         let result = collect_all(&mut exec);
@@ -2870,6 +2889,7 @@ mod tests {
             &aggregate.calls,
             aggregate.schema.clone(),
             &functions,
+            &ExecutionContext::unbounded(),
         )
         .unwrap();
         assert_eq!(collect_all(&mut exec)[0].values(), &[Value::BigInt(7)]);
@@ -2880,6 +2900,7 @@ mod tests {
             &aggregate.calls,
             aggregate.schema.clone(),
             &functions,
+            &ExecutionContext::unbounded(),
         )
         .unwrap();
         assert_eq!(collect_all(&mut exec_all_null)[0].values(), &[Value::Null]);
@@ -2898,6 +2919,7 @@ mod tests {
             &aggregate.calls,
             aggregate.schema.clone(),
             &functions,
+            &ExecutionContext::unbounded(),
         )
         .unwrap();
         let mut result = collect_all(&mut exec);
@@ -2922,6 +2944,7 @@ mod tests {
             &aggregate.calls,
             aggregate.schema.clone(),
             &functions,
+            &ExecutionContext::unbounded(),
         )
         .unwrap();
         assert!(collect_all(&mut exec).is_empty());
@@ -2938,6 +2961,7 @@ mod tests {
             &aggregate.calls,
             aggregate.schema.clone(),
             &functions,
+            &ExecutionContext::unbounded(),
         )
         .unwrap();
         assert_eq!(collect_all(&mut exec)[0].values(), &[Value::BigInt(1), Value::BigInt(5)]);
@@ -2969,7 +2993,7 @@ mod tests {
         let PhysicalPlan::Sort(sort) = physical else { panic!("Sortを期待した") };
         let functions = FunctionRegistry::with_builtins();
         let rows = vec![amount_only_row(Some(3)), amount_only_row(None), amount_only_row(Some(1))];
-        let mut exec = SortExec::new(exec_over_amount_rows(rows), &sort.keys, &functions).unwrap();
+        let mut exec = SortExec::new(exec_over_amount_rows(rows), &sort.keys, &functions, &ExecutionContext::unbounded()).unwrap();
         let result = collect_all(&mut exec);
         let values: Vec<&Value> = result.iter().map(|t| &t.values()[0]).collect();
         assert_eq!(values, vec![&Value::Null, &Value::BigInt(1), &Value::BigInt(3)]);
@@ -2983,7 +3007,7 @@ mod tests {
         let PhysicalPlan::Sort(sort) = physical else { panic!("Sortを期待した") };
         let functions = FunctionRegistry::with_builtins();
         let rows = vec![amount_only_row(Some(3)), amount_only_row(None), amount_only_row(Some(1))];
-        let mut exec = SortExec::new(exec_over_amount_rows(rows), &sort.keys, &functions).unwrap();
+        let mut exec = SortExec::new(exec_over_amount_rows(rows), &sort.keys, &functions, &ExecutionContext::unbounded()).unwrap();
         let result = collect_all(&mut exec);
         let values: Vec<&Value> = result.iter().map(|t| &t.values()[0]).collect();
         assert_eq!(values, vec![&Value::BigInt(3), &Value::BigInt(1), &Value::Null]);
@@ -3002,7 +3026,7 @@ mod tests {
             order_row(Some("eng"), Some(2)),
             order_row(Some("eng"), Some(3)),
         ];
-        let mut exec = SortExec::new(exec_over_rows(rows), &sort.keys, &functions).unwrap();
+        let mut exec = SortExec::new(exec_over_rows(rows), &sort.keys, &functions, &ExecutionContext::unbounded()).unwrap();
         let result = collect_all(&mut exec);
         let amounts: Vec<&Value> = result.iter().map(|t| &t.values()[1]).collect();
         assert_eq!(amounts, vec![&Value::BigInt(1), &Value::BigInt(2), &Value::BigInt(3)]);
@@ -3151,9 +3175,10 @@ mod tests {
 
         let functions = FunctionRegistry::with_builtins();
         let mut nlj =
-            NestedLoopJoinExec::new(exec_over_a_rows(a_rows.clone()), exec_over_b_rows(b_rows.clone()), &condition, &functions)
+            NestedLoopJoinExec::new(exec_over_a_rows(a_rows.clone()), exec_over_b_rows(b_rows.clone()), &condition, &functions, &ExecutionContext::unbounded())
                 .unwrap();
-        let mut hash = HashJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(b_rows), &keys, &functions).unwrap();
+        let mut hash =
+            HashJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(b_rows), &keys, &functions, &ExecutionContext::unbounded()).unwrap();
 
         let nlj_rows = collect_all(&mut nlj);
         let hash_rows = collect_all(&mut hash);
@@ -3171,7 +3196,8 @@ mod tests {
         let b_rows = vec![b_row(Some(1), "b1"), b_row(None, "bnull")];
 
         let functions = FunctionRegistry::with_builtins();
-        let mut hash = HashJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(b_rows), &keys, &functions).unwrap();
+        let mut hash =
+            HashJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(b_rows), &keys, &functions, &ExecutionContext::unbounded()).unwrap();
         let rows = collect_all(&mut hash);
         assert_eq!(rows.len(), 1);
     }
@@ -3188,7 +3214,8 @@ mod tests {
         let b_rows = vec![b_row(Some(1), "b1"), b_row(None, "bnull")];
 
         let functions = FunctionRegistry::with_builtins();
-        let mut nlj = NestedLoopJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(b_rows), &condition, &functions).unwrap();
+        let mut nlj = NestedLoopJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(b_rows), &condition, &functions, &ExecutionContext::unbounded())
+            .unwrap();
         let rows = collect_all(&mut nlj);
         assert_eq!(rows.len(), 1);
     }
@@ -3203,9 +3230,16 @@ mod tests {
 
         let functions = FunctionRegistry::with_builtins();
         let mut nlj =
-            NestedLoopJoinExec::new(exec_over_a_rows(a_rows.clone()), exec_over_b_rows(Vec::new()), &condition, &functions)
+            NestedLoopJoinExec::new(exec_over_a_rows(a_rows.clone()), exec_over_b_rows(Vec::new()), &condition, &functions, &ExecutionContext::unbounded())
                 .unwrap();
-        let mut hash = HashJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(Vec::new()), &keys, &functions).unwrap();
+        let mut hash = HashJoinExec::new(
+            exec_over_a_rows(a_rows),
+            exec_over_b_rows(Vec::new()),
+            &keys,
+            &functions,
+            &ExecutionContext::unbounded(),
+        )
+        .unwrap();
         assert!(collect_all(&mut nlj).is_empty());
         assert!(collect_all(&mut hash).is_empty());
     }
@@ -3220,9 +3254,16 @@ mod tests {
 
         let functions = FunctionRegistry::with_builtins();
         let mut nlj =
-            NestedLoopJoinExec::new(exec_over_a_rows(Vec::new()), exec_over_b_rows(b_rows.clone()), &condition, &functions)
+            NestedLoopJoinExec::new(exec_over_a_rows(Vec::new()), exec_over_b_rows(b_rows.clone()), &condition, &functions, &ExecutionContext::unbounded())
                 .unwrap();
-        let mut hash = HashJoinExec::new(exec_over_a_rows(Vec::new()), exec_over_b_rows(b_rows), &keys, &functions).unwrap();
+        let mut hash = HashJoinExec::new(
+            exec_over_a_rows(Vec::new()),
+            exec_over_b_rows(b_rows),
+            &keys,
+            &functions,
+            &ExecutionContext::unbounded(),
+        )
+        .unwrap();
         assert!(collect_all(&mut nlj).is_empty());
         assert!(collect_all(&mut hash).is_empty());
     }

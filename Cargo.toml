@@ -13,6 +13,7 @@ name = "minidb-client"
 path = "src/bin/minidb_client.rs"
 
 [dependencies]
+ctrlc = "3.4.7"
 thiserror = "2.0.18"
 
 [dev-dependencies]

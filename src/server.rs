@@ -1,19 +1,21 @@
-//! Blocking I/OのTCPサーバー(第36章)。
+//! Blocking I/OのTCPサーバー(第36章)。ワーカースレッドプールとGraceful
+//! Shutdown(第38章)。
 //!
 //! `crate::protocol`が定義するフレームを使って、複数のTCP接続を受け付け、
 //! `crate::database::SharedDatabase`(第35章)を経由してSQLを実行する。
 //!
-//! # 接続ごとに1本のOSスレッド
+//! # 第38章より前: 接続ごとに1本のOSスレッド
 //!
-//! この章では、接続を受け付けるたびに`std::thread::spawn`でスレッドを1本
-//! 立てる、最も単純な並行モデルを採る。接続数が増えるとスレッド数がそのまま
-//! 増え続けるため、大量の接続を長時間張られる用途には向かない。
-//! スレッドプールで接続をワーカースレッドの集合へ束ねる設計は第38章(実行制御)
-//! に譲り、この章では「複数のクライアントプロセスが同時にこのサーバーへ
-//! つながる」という第35章まで無かった性質だけを、最短の実装で確立する。
+//! 第36章の時点でのこのモジュールは、接続を受け付けるたびに
+//! `std::thread::spawn`でスレッドを1本立てる、最も単純な並行モデルを採っていた。
+//! 接続数が増えるとスレッド数がそのまま増え続けるため、大量の接続を長時間
+//! 張られる用途には向かない。この章はこれを[`crate::thread_pool::WorkerPool`]
+//! (固定サイズのワーカースレッドプール)へ置き換える。同時に処理できる接続数の
+//! 上限、上限を超えた接続をどう扱うかは`crate::thread_pool`モジュール冒頭を
+//! 参照。
 //!
 //! `SharedDatabase`はすでに`Mutex`1本でスレッド間排他を行っている(第35章)ため、
-//! この章のサーバー自身がロックを追加で管理する必要は無い。複数の接続スレッドが
+//! このモジュール自身がロックを追加で管理する必要は無い。複数の接続スレッドが
 //! 同時にSQLを送ってきても、`SharedDatabase`の内側で直列化される。
 //!
 //! # 接続単位の状態: [`crate::session::Session`]
@@ -22,11 +24,7 @@
 //! [`crate::session::Session`](第37章)が一元管理する。このモジュールの
 //! 役目は、TCP接続を受け付けて`Session`を1個作り、フレームを読んでは
 //! `Session::execute`へ渡し、返ってきた`QueryResult`をフレームへ書き戻す
-//! ことだけである。第36章の時点ではこのモジュール自身が接続ごとの
-//! トランザクション状態を持つ`Session`という前身を実装していたが、
-//! Embedded・REPL・Serverの3経路すべてで同じ状態管理を使うために
-//! `crate::session`へ引き上げた(`crate::session`モジュールのドキュメント
-//! 「Embedded・REPL・Serverの統一」を参照)。
+//! ことだけである。
 //!
 //! # 切断時のトランザクション後始末
 //!
@@ -40,39 +38,142 @@
 //! パニックのどの経路でも通るため、後始末を呼び出し側の分岐(切断理由ごとの
 //! `match`)に分散させずに1箇所へ集約できる。
 //!
-//! # Graceful Shutdownの範囲外
+//! # クライアント切断の検知と実行中クエリのキャンセル
 //!
-//! [`Server::run`]は`TcpListener::incoming`を無限にループするだけで、
-//! 外部からの停止要求を受け付ける仕組みを持たない。実行中の接続を待ってから
-//! 止める・新規接続の受付だけを先に止める、といったGraceful Shutdownは
-//! 第38章の範囲であり、この章では単純にプロセスを終了させる(Ctrl-C等)ことで
-//! 止める。
+//! 文を1本実行している間、このモジュールは[`watch_for_disconnect`]という
+//! 別スレッドを立て、`TcpStream::peek`でそのソケットが閉じられていないかを
+//! ポーリングする(`stream.try_clone()`で複製した、書き込みには使わない
+//! 読み取り専用の複製)。`peek`が0バイトを返せば(相手がFIN/RSTを送った)、
+//! そのセッションの[`crate::session::Session::cancellation_handle`]経由で
+//! 実行中の文をキャンセルする。実行中の文が同期ポイント
+//! (`crate::cancellation`モジュール冒頭を参照)へ到達すれば、そこで
+//! `DbError::QueryCancelled`として打ち切られる。
+//!
+//! 明示的なキャンセル要求(クライアントが繋がったまま、別のメッセージで
+//! 「今実行中の文をやめてほしい」と伝える経路)は、この章では追加しない。
+//! PostgreSQLは専用の2本目のTCP接続とシークレットキーでこれを実現するが、
+//! この教材のプロトコル(第36章)へ同じ仕組みを足すのは、接続の生成・
+//! シークレットキーの受け渡しという新しい概念をこの章の範囲外にまで
+//! 広げてしまう。この章では、[`crate::session::Session::cancellation_handle`]を
+//! Rustの公開APIとして提供し(接続の切断検知も内部的にはこのAPIを呼ぶだけである)、
+//! 埋め込み用途・テストコードは別スレッドから直接これを呼んでキャンセルできる
+//! ようにするに留める(章末の演習課題を参照)。
+//!
+//! # Graceful Shutdown
+//!
+//! [`Server::shutdown_handle`]が返す[`ShutdownHandle`]の`trigger`を呼ぶと、
+//! 次の順序で終了する。
+//!
+//! 1. **新規接続の受付停止**: [`Server::run`]の`accept`ループが、この
+//!    フラグを見て抜ける。`TcpListener::accept`はブロッキング呼び出しの
+//!    ままなので、フラグを立てただけでは`accept`の途中で眠っているスレッドは
+//!    起きない。[`ShutdownHandle::trigger`]は、フラグを立てた直後に
+//!    自分自身のアドレスへ`TcpStream::connect`する(**自己接続トリック**)。
+//!    これにより`accept`がその接続を受理して1回だけ戻り、ループの先頭で
+//!    フラグを確認して抜けられる。
+//! 2. **実行中の文の完了(またはキャンセルによる打ち切り)**: 各接続の
+//!    読み取りループは、次のフレームを待つ間`POLL_INTERVAL`ごとにこの
+//!    フラグを確認しており([`wait_for_request_or_shutdown`])、フラグが
+//!    立っていれば次のフレームを待たずに接続を終える。すでに実行中の文が
+//!    あれば、その文が終わる(または[`crate::error::DbError::QueryTimeout`]・
+//!    `QueryCancelled`で打ち切られる)まで待つ。[`crate::thread_pool::WorkerPool::join`]が、
+//!    全ワーカースレッドがこの状態に達するまでブロックする。
+//! 3. **未コミットTxのROLLBACK**: 各接続の`Session`がスコープを抜けるとき、
+//!    `Drop`実装が保持中のトランザクションを`rollback_tx`する(前述)。
+//! 4. **flush/sync**: `WorkerPool::join`が戻ってから(=すべての接続が
+//!    後始末を終えてから)、[`Database::flush`]を呼ぶ。
+//!
+//! REPL(`src/main.rs`)の終了時flushと同じ「最後に1回`flush`する」という
+//! 契約をサーバーでも守っている。REPLは`\q`・標準入力のEOFという単一スレッドの
+//! 制御フローの終わりに直接`flush`を呼ぶだけだが、サーバーは複数の接続
+//! スレッドの終了を`WorkerPool::join`で待ち合わせてから同じことをする点が
+//! 異なる。
 
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
+use crate::cancellation::CancellationToken;
 use crate::database::SharedDatabase;
 use crate::protocol::{ProtocolError, Request, Response};
 use crate::session::Session;
+use crate::thread_pool::WorkerPool;
+
+/// 接続の生死・シャットダウン要求を確認する間隔(第38章)。値が小さいほど
+/// クライアント切断・Graceful Shutdownへの応答性が上がる代わりに、
+/// 何もしていない接続をポーリングするコストが増える。
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// [`Server::bind_with_config`]が受け取る設定。
+#[derive(Debug, Clone, Copy)]
+pub struct ServerConfig {
+    /// 同時に接続を処理するワーカースレッドの本数
+    /// (`crate::thread_pool`モジュール冒頭を参照)。
+    pub workers: usize,
+    /// ワーカーが全て塞がっているときに待たせる接続の上限。
+    pub queue_capacity: usize,
+}
+
+impl Default for ServerConfig {
+    /// ワーカー16本・キュー64、これを超える接続は拒否する
+    /// (`crate::thread_pool`モジュール冒頭「上限を超えたらどうするか」を参照)。
+    fn default() -> Self {
+        ServerConfig { workers: 16, queue_capacity: 64 }
+    }
+}
 
 /// TCP接続を受け付けるサーバー。
 pub struct Server {
     listener: TcpListener,
     shared: Arc<SharedDatabase>,
+    config: ServerConfig,
+    shutdown: Arc<AtomicBool>,
+}
+
+/// [`Server::shutdown_handle`]が返す、Graceful Shutdownの起点(第38章)。
+///
+/// 実際のSIGINT(Ctrl-C)は`src/main.rs`が`ctrlc`クレートで受け取り、この
+/// `trigger`を呼ぶだけの薄い橋渡しに留めている。この分離のおかげで、
+/// テストコードはシグナルを実際に送る代わりに同じ`trigger`を直接呼んで
+/// Graceful Shutdownの手順を検証できる(本文・テストを参照)。
+pub struct ShutdownHandle {
+    flag: Arc<AtomicBool>,
+    local_addr: SocketAddr,
+}
+
+impl ShutdownHandle {
+    /// Graceful Shutdownを開始する(モジュール冒頭の手順を参照)。何度
+    /// 呼んでも安全(2回目以降は`connect`が失敗しても無視するだけ)。
+    pub fn trigger(&self) {
+        self.flag.store(true, Ordering::Release);
+        // `accept`でブロック中のServer::runを起こす自己接続トリック
+        // (モジュール冒頭を参照)。接続を受理させたいだけなので、返る
+        // `TcpStream`はすぐdropしてよい。すでにlistenerが閉じていれば
+        // (二重shutdown、またはrunがすでに戻っている)このconnectは
+        // 失敗するが、その場合はもうaccept自体が残っていないので無視してよい。
+        let _ = TcpStream::connect(self.local_addr);
+    }
 }
 
 impl Server {
-    /// `addr`にbindし、以後の接続が`shared`を共有するサーバーを作る。
+    /// `addr`にbindし、既定の[`ServerConfig`]で以後の接続が`shared`を共有する
+    /// サーバーを作る。
+    pub fn bind(addr: impl ToSocketAddrs, shared: Arc<SharedDatabase>) -> std::io::Result<Self> {
+        Self::bind_with_config(addr, shared, ServerConfig::default())
+    }
+
+    /// [`Server::bind`]の、[`ServerConfig`]を指定できる版(第38章)。
     ///
     /// bindするだけで接続はまだ受け付けない([`Server::run`]が受け付ける)。
     /// テストがOS割り当てのポート(`"127.0.0.1:0"`)を使ってポート衝突による
     /// flakyさを避けられるよう、`bind`と`run`を分け、bind直後に
     /// [`Server::local_addr`]で実際に割り当てられたポートを取得できるようにしている。
-    pub fn bind(addr: impl ToSocketAddrs, shared: Arc<SharedDatabase>) -> std::io::Result<Self> {
+    pub fn bind_with_config(addr: impl ToSocketAddrs, shared: Arc<SharedDatabase>, config: ServerConfig) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
-        Ok(Server { listener, shared })
+        Ok(Server { listener, shared, config, shutdown: Arc::new(AtomicBool::new(false)) })
     }
 
     /// 実際にbindされたアドレス(ポート0を指定した場合はOSが割り当てた実際の
@@ -81,21 +182,71 @@ impl Server {
         self.listener.local_addr()
     }
 
+    /// このサーバーのGraceful Shutdownを起点となる[`ShutdownHandle`]を返す
+    /// (第38章)。[`Server::run`]を呼ぶ前でも後でも取得でき、`run`を実行している
+    /// スレッドとは別のスレッド(シグナルハンドラ、テストコード)から
+    /// `trigger`する。
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle {
+            flag: Arc::clone(&self.shutdown),
+            local_addr: self.listener.local_addr().expect("Server::bindの時点でbind済み"),
+        }
+    }
+
     /// 接続を受け付け続ける。呼び出したスレッドをブロックする。
     ///
-    /// 接続を受け付けるたびに新しいスレッドを立てて[`handle_connection`]へ渡し、
-    /// このスレッド自身はすぐ次の`accept`へ戻る(モジュール冒頭「接続ごとに
-    /// 1本のOSスレッド」を参照)。
+    /// [`ShutdownHandle::trigger`]が呼ばれるまで、接続を受け付けるたびに
+    /// [`crate::thread_pool::WorkerPool`]へ渡す。プールが満杯なら、その接続は
+    /// 拒否応答を書いてから切断する([`reject_connection`])。`trigger`が
+    /// 呼ばれたら、モジュール冒頭のGraceful Shutdownの手順に従って
+    /// `WorkerPool::join`・`SharedDatabase::flush`を行ってから戻る。
     pub fn run(self) -> std::io::Result<()> {
-        for stream in self.listener.incoming() {
-            let stream = stream?;
-            let shared = Arc::clone(&self.shared);
-            thread::spawn(move || {
-                handle_connection(stream, shared);
-            });
+        let Server { listener, shared, config, shutdown } = self;
+        let pool = {
+            let shared = Arc::clone(&shared);
+            let shutdown = Arc::clone(&shutdown);
+            WorkerPool::new(config.workers, config.queue_capacity, move |stream| {
+                handle_connection(stream, Arc::clone(&shared), Arc::clone(&shutdown));
+            })
+        };
+
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if shutdown.load(Ordering::Acquire) {
+                        // 自己接続トリック(`ShutdownHandle::trigger`)自身の接続、
+                        // または受付停止の直前に滑り込んだ接続。どちらも処理せず
+                        // 閉じる。
+                        drop(stream);
+                        break;
+                    }
+                    if let Err(rejected) = pool.dispatch(stream) {
+                        reject_connection(rejected);
+                    }
+                }
+                Err(err) => {
+                    if shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    return Err(err);
+                }
+            }
         }
+
+        pool.join();
+        shared.flush().map_err(std::io::Error::other)?;
         Ok(())
     }
+}
+
+/// ワーカープールが満杯だったため受け付けられなかった接続へ、エラー応答を
+/// 1つ書いてから切断する(`crate::thread_pool`モジュール冒頭「上限を超えたら
+/// どうするか」を参照)。まだ1件も`Request`を読んでいないので`request_id`は
+/// `0`を使う(クライアント側が採番したどの`request_id`とも意味的に対応しない、
+/// 接続そのものへのエラー)。
+fn reject_connection(mut stream: TcpStream) {
+    let response = Response::Error("接続数が上限に達しています。しばらくしてから再接続してください。".to_string());
+    let _ = response.write(&mut stream, 0);
 }
 
 /// 1本のTCP接続を、切断されるまで処理する。
@@ -104,9 +255,14 @@ impl Server {
 /// フレーム長、ペイロードの途中でストリームが終わる等)を受け取ったら、
 /// それ以上このストリームのバイト列を信用できない(`crate::protocol`
 /// モジュール冒頭を参照)ため、エラー応答を試みることさえせず接続を切る。
-fn handle_connection(mut stream: TcpStream, shared: Arc<SharedDatabase>) {
+fn handle_connection(mut stream: TcpStream, shared: Arc<SharedDatabase>, shutdown: Arc<AtomicBool>) {
     let mut session = Session::new(shared);
     loop {
+        match wait_for_request_or_shutdown(&mut stream, &shutdown) {
+            WaitOutcome::Shutdown | WaitOutcome::Disconnected => break,
+            WaitOutcome::Ready => {}
+        }
+
         let request = match Request::read(&mut stream) {
             Ok(request) => request,
             Err(ProtocolError::Io(err)) if err.kind() == ErrorKind::UnexpectedEof => {
@@ -117,7 +273,13 @@ fn handle_connection(mut stream: TcpStream, shared: Arc<SharedDatabase>) {
             Err(_) => break,
         };
 
+        let cancel = session.cancellation_handle();
+        let watcher = DisconnectWatcher::spawn(&stream, cancel);
         let response = Response::from_db_result(session.execute(&request.sql));
+        if let Some(watcher) = watcher {
+            watcher.stop();
+        }
+
         if response.write(&mut stream, request.request_id).is_err() {
             // 応答を書き出せなかった(クライアントが読む前に切断した等)。
             // これ以上このストリームへ書いても仕方が無いので接続を終える。
@@ -126,4 +288,234 @@ fn handle_connection(mut stream: TcpStream, shared: Arc<SharedDatabase>) {
     }
     // `session`がここでdropされ、保持中のトランザクションがあればROLLBACK
     // される(`crate::session::Session`の`Drop`実装、モジュール冒頭を参照)。
+}
+
+enum WaitOutcome {
+    /// 次のフレームの先頭バイトがすでに届いている。`stream`は以後
+    /// ブロッキングモード(読み取りタイムアウト無し)に戻してある。
+    Ready,
+    /// シャットダウンが要求された。
+    Shutdown,
+    /// 相手が切断した(またはソケットが読めなくなった)。
+    Disconnected,
+}
+
+/// 次のリクエストが届く(またはシャットダウン要求・切断)まで、`stream`を
+/// ブロックしすぎずに待つ(モジュール冒頭「Graceful Shutdown」の手順2を参照)。
+///
+/// `TcpStream::peek`はバイト列を消費しない(`Request::read`が最初から
+/// フレーム全体を読み直せる)ため、ポーリングのタイムアウトがフレームの
+/// 途中で発生しても、次のフレーム境界がずれる心配が無い。1バイト以上
+/// 届いていることを確認できた時点で読み取りタイムアウトを外し、以後の
+/// `Request::read`は(実データが来ていると分かっているので)通常どおり
+/// ブロッキングで読む。
+fn wait_for_request_or_shutdown(stream: &mut TcpStream, shutdown: &AtomicBool) -> WaitOutcome {
+    if stream.set_read_timeout(Some(POLL_INTERVAL)).is_err() {
+        return WaitOutcome::Disconnected;
+    }
+    let mut probe = [0u8; 1];
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return WaitOutcome::Shutdown;
+        }
+        match stream.peek(&mut probe) {
+            Ok(0) => return WaitOutcome::Disconnected, // 相手が正常に閉じた(EOF)
+            Ok(_) => {
+                let _ = stream.set_read_timeout(None);
+                return WaitOutcome::Ready;
+            }
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
+            Err(_) => return WaitOutcome::Disconnected,
+        }
+    }
+}
+
+/// 文を1本実行している間、そのクライアントが切断していないかを別スレッドで
+/// 監視する(モジュール冒頭「クライアント切断の検知」を参照)。
+struct DisconnectWatcher {
+    done: Arc<AtomicBool>,
+    handle: thread::JoinHandle<()>,
+}
+
+impl DisconnectWatcher {
+    /// `stream`を`try_clone`できた場合だけ監視スレッドを立てる。`try_clone`が
+    /// 失敗する状況(OSのファイルディスクリプタ枯渇等)は稀であり、失敗しても
+    /// 監視を諦めるだけでこの文自体は通常どおり実行を続けられる(縮退)。
+    fn spawn(stream: &TcpStream, cancel: CancellationToken) -> Option<Self> {
+        let watch_stream = stream.try_clone().ok()?;
+        let done = Arc::new(AtomicBool::new(false));
+        let done_for_thread = Arc::clone(&done);
+        let handle = thread::spawn(move || watch_for_disconnect(watch_stream, &done_for_thread, &cancel));
+        Some(DisconnectWatcher { done, handle })
+    }
+
+    /// 監視を止め、監視スレッドの終了を待つ。文の実行が(打ち切りではなく)
+    /// 正常に終わった場合に呼ぶ。
+    fn stop(self) {
+        self.done.store(true, Ordering::Release);
+        let _ = self.handle.join();
+    }
+}
+
+/// [`DisconnectWatcher`]の監視スレッド本体。`done`が立つまで、`peek`で
+/// ソケットの生死を`POLL_INTERVAL`ごとに確認する。切断を検知したら`cancel`する。
+fn watch_for_disconnect(stream: TcpStream, done: &AtomicBool, cancel: &CancellationToken) {
+    if stream.set_read_timeout(Some(POLL_INTERVAL)).is_err() {
+        return;
+    }
+    let mut probe = [0u8; 1];
+    loop {
+        if done.load(Ordering::Acquire) {
+            return;
+        }
+        match stream.peek(&mut probe) {
+            Ok(0) => {
+                cancel.cancel();
+                return;
+            }
+            // 1バイト以上読めた場合は切断ではない。パイプライン化されたクライアント
+            // (次のリクエストを先読みで送ってくる)を誤ってキャンセルしないよう、
+            // データの中身は見ず読み進めもせずにポーリングを続ける。
+            Ok(_) => continue,
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
+            Err(_) => {
+                cancel.cancel();
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::Database;
+    use crate::protocol::{Request, Response};
+    use std::net::TcpStream;
+
+    fn connect_with_retry(addr: SocketAddr) -> TcpStream {
+        for _ in 0..50 {
+            if let Ok(stream) = TcpStream::connect(addr) {
+                return stream;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        TcpStream::connect(addr).expect("接続に失敗しました")
+    }
+
+    fn send_sql(stream: &mut TcpStream, request_id: u32, sql: &str) -> Response {
+        Request { request_id, sql: sql.to_string() }.write(stream).expect("送信に失敗しました");
+        let (received, response) = Response::read(stream).expect("受信に失敗しました");
+        assert_eq!(received, request_id);
+        response
+    }
+
+    /// [`send_sql`]と違い、拒否応答(`request_id`が`0`固定、`reject_connection`の
+    /// ドキュメント参照)が返っても`request_id`の一致を確認しない。ワーカー
+    /// プールが満杯かどうかを問い合わせるテストで使う。
+    fn send_sql_ignoring_request_id(stream: &mut TcpStream, request_id: u32, sql: &str) -> Response {
+        Request { request_id, sql: sql.to_string() }.write(stream).ok();
+        Response::read(stream).expect("受信に失敗しました").1
+    }
+
+    /// N+1本目の接続の挙動: ワーカー1本・キュー容量0のサーバーでは、1本の
+    /// 接続を張っているだけでその唯一のワーカーを占有し続ける
+    /// (`handle_connection`は次のリクエストを待つ間もワーカースレッドの中に
+    /// 居続けるため、実行中のクエリが無くても"空き"には戻らない)。その間に
+    /// 来た2本目の接続は、キューに空きが無いため即座に拒否応答を受け取る
+    /// (`crate::thread_pool`モジュール冒頭「上限を超えたらどうするか」)。
+    /// 1本目が切断すれば、3本目は通常どおり処理される。
+    #[test]
+    fn the_n_plus_first_connection_is_rejected_while_the_single_worker_is_busy() {
+        let shared = Arc::new(SharedDatabase::new(Database::memory()));
+        let server = Server::bind_with_config("127.0.0.1:0", shared, ServerConfig { workers: 1, queue_capacity: 0 }).unwrap();
+        let addr = server.local_addr().unwrap();
+        let shutdown = server.shutdown_handle();
+        thread::spawn(move || server.run().unwrap());
+
+        // 1本目: 1往復させ、ワーカーが確かにこの接続のハンドラの中にいることを
+        // 確認する。サーバースレッドが立ち上がってワーカーが`recv`で待ち始める
+        // までのわずかな時間は、この接続自身も(空いているワーカーが無いという
+        // 意味で)拒否されうるため、拒否されたら新しい接続でリトライする。
+        let mut first = connect_with_retry(addr);
+        let mut first_response = send_sql_ignoring_request_id(&mut first, 1, "SELECT 1");
+        for _ in 0..100 {
+            if matches!(first_response, Response::Rows { .. }) {
+                break;
+            }
+            first = connect_with_retry(addr);
+            first_response = send_sql_ignoring_request_id(&mut first, 1, "SELECT 1");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(first_response, Response::Rows { .. }), "ワーカーが起動していれば1本目は受理されるはず");
+
+        // ワーカーは1本(queue_capacity=0)。`first`のハンドラは次のリクエストを
+        // 待っている間もワーカースレッドを離れないため、2本目の接続の`dispatch`は
+        // キューに空きが無く即座に失敗し、`reject_connection`が拒否応答を書く。
+        // まだ`Request`を1つも読んでいない拒否応答の`request_id`は`0`固定
+        // (`reject_connection`のドキュメント参照)なので、ここでは`request_id`の
+        // 一致は確認せず`Response`の種別だけを見る。
+        let mut second = connect_with_retry(addr);
+        Request { request_id: 2, sql: "SELECT 1".to_string() }.write(&mut second).ok();
+        let (_, response) = Response::read(&mut second).expect("拒否応答を受信できませんでした");
+        assert!(matches!(response, Response::Error(_)), "唯一のワーカーが1本目の接続に占有されている間、2本目は拒否されるはず");
+        drop(second);
+
+        drop(first);
+        // 1本目が切れれば(`wait_for_request_or_shutdown`がPOLL_INTERVALごとに
+        // 検知する)ワーカーが空く。検知までの猶予はsleepで決め打ちせず、
+        // 「まだ拒否される」応答が返る間はリトライする形で待つ。
+        let mut third_result = None;
+        for _ in 0..100 {
+            let mut third = connect_with_retry(addr);
+            let response = send_sql_ignoring_request_id(&mut third, 3, "SELECT 1");
+            if matches!(response, Response::Rows { .. }) {
+                third_result = Some(response);
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(third_result, Some(Response::Rows { .. })), "1本目が切断した後の3本目は通常どおり処理されるはず");
+
+        shutdown.trigger();
+    }
+
+    /// Graceful Shutdown: シグナルの代わりに`ShutdownHandle::trigger`(内部API)を
+    /// 呼び、(a)未コミットのトランザクションがROLLBACKされ、(b)`run`が戻り、
+    /// (c)flush済みでファイルを再オープンできることを確認する。
+    #[test]
+    fn graceful_shutdown_rolls_back_and_flushes_before_run_returns() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "minidb-server-shutdown-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let db = Database::open(&path).unwrap();
+        let shared = Arc::new(SharedDatabase::new(db));
+        let server = Server::bind("127.0.0.1:0", shared).unwrap();
+        let addr = server.local_addr().unwrap();
+        let shutdown = server.shutdown_handle();
+        let run_handle = thread::spawn(move || server.run());
+
+        let mut stream = connect_with_retry(addr);
+        assert!(matches!(send_sql(&mut stream, 1, "CREATE TABLE t (id BIGINT)"), Response::Command(_)));
+        assert!(matches!(send_sql(&mut stream, 2, "BEGIN"), Response::Command(_)));
+        assert!(matches!(send_sql(&mut stream, 3, "INSERT INTO t VALUES (1)"), Response::Command(_)));
+        // COMMITしないまま、接続を保持したままshutdownする。
+
+        shutdown.trigger();
+        run_handle.join().expect("runがpanicした").expect("runがErrを返した");
+
+        // 再オープンして、コミットしていなかったINSERTが残っていないこと
+        // (ROLLBACKされたこと)と、`CREATE TABLE`自体はflushされていることを
+        // 確認する。
+        drop(stream);
+        let reopened = Database::open(&path).unwrap();
+        let mut session = crate::session::Session::new(Arc::new(SharedDatabase::new(reopened)));
+        let result = session.execute("SELECT * FROM t").unwrap();
+        assert!(result.rows().is_empty(), "COMMITしていないINSERTはROLLBACKされ、再オープン後も残らないはず");
+
+        std::fs::remove_file(&path).unwrap();
+    }
 }
