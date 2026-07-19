@@ -345,23 +345,38 @@ pub fn optimize(plan: LogicalPlan, storage: Option<&Storage>, stats: &dyn StatsL
             }),
         },
         LogicalPlan::Join(join) => {
-            let left = optimize(*join.left, storage, stats);
-            let right = optimize(*join.right, storage, stats);
-            let left_len = left.output_schema().len();
-            match split_equi_join_keys(&join.condition, left_len) {
-                Some(keys) => {
-                    let keys: Vec<(BoundExpr, BoundExpr)> = keys
-                        .into_iter()
-                        .map(|(left_key, right_key)| (left_key, shift_column_index(&right_key, left_len)))
-                        .collect();
-                    choose_join_plan(storage, stats, left, right, join.kind, join.condition, keys)
+            // 左深いJoinの連鎖をすべて葉(`Scan`または`Filter(Scan)`)と`ON`条件へ
+            // 平らにする(`flatten_join_chain`)。葉が3個以上(`JOIN`が2個以上)
+            // なら、この段全体を[`join_order::optimize_join_order`](第29章)が
+            // 引き取り、構文順とは限らない左深い木を組み立てる。葉が2個
+            // (`JOIN`1個)なら、探索する順序の余地が無いため、第22〜28章までと
+            // 同じ経路(このまま2引数の[`choose_join_plan`])で済ませる。
+            let mut leaves = Vec::new();
+            let mut conditions = Vec::new();
+            flatten_join_chain(LogicalPlan::Join(join), &mut leaves, &mut conditions);
+            if leaves.len() >= 3 {
+                crate::join_order::optimize_join_order(leaves, conditions, storage, stats)
+            } else {
+                let mut leaves = leaves.into_iter();
+                let left = optimize(leaves.next().expect("葉は2個以上"), storage, stats);
+                let right = optimize(leaves.next().expect("葉は2個以上"), storage, stats);
+                let condition = conditions.into_iter().next().expect("JOIN1個の条件は必ず1個");
+                let left_len = left.output_schema().len();
+                match split_equi_join_keys(&condition, left_len) {
+                    Some(keys) => {
+                        let keys: Vec<(BoundExpr, BoundExpr)> = keys
+                            .into_iter()
+                            .map(|(left_key, right_key)| (left_key, shift_column_index(&right_key, left_len)))
+                            .collect();
+                        choose_join_plan(storage, stats, left, right, JoinKind::Inner, condition, keys)
+                    }
+                    None => PhysicalPlan::NestedLoopJoin(NestedLoopJoinNode {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        kind: JoinKind::Inner,
+                        condition,
+                    }),
                 }
-                None => PhysicalPlan::NestedLoopJoin(NestedLoopJoinNode {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                    kind: join.kind,
-                    condition: join.condition,
-                }),
             }
         }
         LogicalPlan::Aggregate(aggregate) => PhysicalPlan::Aggregate(AggregateNode {
@@ -378,7 +393,15 @@ pub fn optimize(plan: LogicalPlan, storage: Option<&Storage>, stats: &dyn StatsL
             PhysicalPlan::Distinct(DistinctNode { input: Box::new(optimize(*distinct.input, storage, stats)) })
         }
         LogicalPlan::Sort(sort) => {
-            PhysicalPlan::Sort(SortNode { input: Box::new(optimize(*sort.input, storage, stats)), keys: sort.keys })
+            let input = optimize(*sort.input, storage, stats);
+            // Required Ordering(`sort.keys`)が`input`のPhysical Property
+            // (`output_ordering`)ですでに満たされていれば、`Sort`そのものを
+            // 積まずに`input`をそのまま返す(第29章、`sort_is_already_satisfied`)。
+            if sort_is_already_satisfied(&sort.keys, &input) {
+                input
+            } else {
+                PhysicalPlan::Sort(SortNode { input: Box::new(input), keys: sort.keys })
+            }
         }
         LogicalPlan::Limit(limit) => PhysicalPlan::Limit(LimitNode {
             input: Box::new(optimize(*limit.input, storage, stats)),
@@ -410,12 +433,34 @@ pub fn optimize(plan: LogicalPlan, storage: Option<&Storage>, stats: &dyn StatsL
     }
 }
 
+/// 左深い`Join`の連鎖を、`n`個の葉(`Scan`または`Filter(Scan)`)と`n-1`個の
+/// `ON`条件へ平らにする(第29章)。
+///
+/// `crate::logical_plan::build_from`が組み立てる木は常に`((t0 JOIN t1) JOIN
+/// t2) JOIN ...`という形で、`right`は常にその段で新しく加わった1個の葉、
+/// `left`はさらに`Join`か最初の葉である。`rules::optimize`のPredicate
+/// Pushdown(第26章)は`left`・`right`の直上に`Filter`を追加することはあっても
+/// `Join`の構造そのもの(どの2つが結合されるか)は変えないため、この前提は
+/// 物理計画への変換時点でも保たれている。`JoinKind`はこのcrateでは`Inner`
+/// しか無い(`crate::ast::JoinKind`)ため、`kind`は引き継がず呼び出し側が
+/// `JoinKind::Inner`を使う。
+pub(crate) fn flatten_join_chain(plan: LogicalPlan, leaves: &mut Vec<LogicalPlan>, conditions: &mut Vec<BoundExpr>) {
+    match plan {
+        LogicalPlan::Join(join) => {
+            flatten_join_chain(*join.left, leaves, conditions);
+            conditions.push(join.condition);
+            leaves.push(*join.right);
+        }
+        other => leaves.push(other),
+    }
+}
+
 /// 複数の候補`PhysicalPlan`から、[`crate::cost_model::plan_cost`]が最小になる
 /// ものを選ぶ。`candidates`は空であってはならない(呼び出し元が必ず1個以上を
 /// 積む)。コストが等しい場合は出現順で最初の候補を選ぶ(`Iterator::min_by`と
 /// 同じ「最初に見つかった最小値を残す」規則、第25章までの優先順位に代わる
 /// 決定的な同点処理)。
-fn cheapest(candidates: Vec<PhysicalPlan>, stats: &dyn StatsLookup, storage: Option<&Storage>) -> PhysicalPlan {
+pub(crate) fn cheapest(candidates: Vec<PhysicalPlan>, stats: &dyn StatsLookup, storage: Option<&Storage>) -> PhysicalPlan {
     candidates
         .into_iter()
         .min_by(|a, b| {
@@ -714,7 +759,7 @@ fn index_scan_target(
 /// (内側テーブルのほぼ全行が一致する)ではHash Joinの方が15倍以上速い場合が
 /// ある。ここでは2つの候補を実際にコストで比較し、統計情報(第27章)から
 /// 見積もった一致行数に応じてどちらが有利かを判断する。
-fn choose_join_plan(
+pub(crate) fn choose_join_plan(
     storage: Option<&Storage>,
     stats: &dyn StatsLookup,
     left: PhysicalPlan,
@@ -759,7 +804,7 @@ fn choose_join_plan(
 /// ような不等号条件)は、`HashJoin`・`IndexNestedLoopJoin`のどちらの実行
 /// アルゴリズムにも要求する「等値の鍵」を持たないため、比較する候補が
 /// そもそも`NestedLoopJoin`しか無い。
-fn split_equi_join_keys(condition: &BoundExpr, left_len: usize) -> Option<Vec<(BoundExpr, BoundExpr)>> {
+pub(crate) fn split_equi_join_keys(condition: &BoundExpr, left_len: usize) -> Option<Vec<(BoundExpr, BoundExpr)>> {
     let mut conjuncts = Vec::new();
     collect_conjuncts(condition, &mut conjuncts);
 
@@ -1045,6 +1090,81 @@ impl PhysicalPlan {
             )?;
         }
         Ok(())
+    }
+}
+
+// ==================================================================
+// Physical Properties: Required Orderingを満たすIndex Range Scanの出力順序(第29章)
+// ==================================================================
+
+/// `plan`の出力が、`plan`自身の出力スキーマ上のどの列について昇順に並んで
+/// いるかを返す。並びを保証できる根拠が無ければ`None`(第29章)。
+///
+/// 並び順という**Physical Property**を持ちうるのは次の演算子だけである。
+///
+/// * [`PhysicalPlan::IndexScan`]の`Range`(第25章、`BTree::range`が昇順を
+///   返す)。`Point`は一致行が常に同じキー値を持つため、「並んでいる」と
+///   言っても次段の`Sort`を省略する役には立たず、この章では対象にしない。
+/// * [`PhysicalPlan::Sort`]自身(単一列・昇順のときに限る)。
+/// * [`PhysicalPlan::Filter`]は行を間引くだけで列の意味も行の相対順序も
+///   変えないため、子の順序をそのまま引き継ぐ。
+/// * [`PhysicalPlan::Projection`]は、子が持つ順序列がそのまま`ColumnRef`と
+///   して出力項目に残っていれば、その出力位置へ付け替えて引き継ぐ。
+/// * `NestedLoopJoin`・`HashJoin`・`IndexNestedLoopJoin`は、いずれも
+///   `left`の行を1件ずつ`next()`で引いた順序をそのまま外側ループに使う
+///   (`NestedLoopJoinExec`・`HashJoinExec`・`IndexNestedLoopJoinExec`の
+///   `next`実装を参照)。`right`側は先に`Vec`やハッシュテーブルへ読み切って
+///   から中身を引くため、`right`の順序は失われるが、`left`側の順序は
+///   結合後スキーマでも同じ列添字のまま(`left`は結合後スキーマの先頭側を
+///   占める)保たれる。
+///
+/// それ以外(`SeqScan`、`HashJoin`のBuild側由来の順序、`Aggregate`、
+/// `Distinct`、`Limit`)は順序を保証しない。`SeqScan`はHeap File上の格納順
+/// (第13章)を返すだけで、どの列の値とも対応しない。
+pub(crate) fn output_ordering(plan: &PhysicalPlan) -> Option<usize> {
+    match plan {
+        PhysicalPlan::IndexScan(scan) => match &scan.kind {
+            IndexScanKind::Range { .. } => scan.schema.index_of(&scan.column_name),
+            IndexScanKind::Point(_) => None,
+        },
+        PhysicalPlan::Filter(filter) => output_ordering(&filter.input),
+        PhysicalPlan::Sort(sort) => match sort.keys.as_slice() {
+            [key] if !key.desc => match &key.expr {
+                BoundExpr::ColumnRef { column_index, .. } => Some(*column_index),
+                _ => None,
+            },
+            _ => None,
+        },
+        PhysicalPlan::NestedLoopJoin(join) => output_ordering(&join.left),
+        PhysicalPlan::HashJoin(join) => output_ordering(&join.left),
+        PhysicalPlan::IndexNestedLoopJoin(join) => output_ordering(&join.left),
+        PhysicalPlan::Projection(projection) => {
+            let input_order = output_ordering(&projection.input)?;
+            projection.projection.iter().position(|item| {
+                matches!(&item.expr, BoundExpr::ColumnRef { column_index, .. } if *column_index == input_order)
+            })
+        }
+        PhysicalPlan::SeqScan(_)
+        | PhysicalPlan::Values(_)
+        | PhysicalPlan::Aggregate(_)
+        | PhysicalPlan::Distinct(_)
+        | PhysicalPlan::Limit(_)
+        | PhysicalPlan::Insert(_)
+        | PhysicalPlan::Update(_)
+        | PhysicalPlan::Delete(_) => None,
+    }
+}
+
+/// `keys`(`Sort`が要求する並び順、Required Ordering)が、`input`の
+/// [`output_ordering`](Physical Property)ですでに満たされているかを判定する。
+/// `keys`が単一列・昇順の場合だけを対象にする(この章が扱う最小限の
+/// Interesting Order、モジュール冒頭のドキュメントを参照)。
+pub(crate) fn sort_is_already_satisfied(keys: &[logical_plan::SortKey], input: &PhysicalPlan) -> bool {
+    match keys {
+        [logical_plan::SortKey { expr: BoundExpr::ColumnRef { column_index, .. }, desc: false }] => {
+            output_ordering(input) == Some(*column_index)
+        }
+        _ => false,
     }
 }
 
@@ -3084,5 +3204,172 @@ mod tests {
         // 左深い木: 一番外側(根に近い)のJoinの子にもう1つJoinが現れる。
         let text = physical.to_string();
         assert_eq!(text.matches("Join").count(), 2);
+    }
+
+    // ---- Physical Properties: output_ordering・sort_is_already_satisfied(第29章) ----
+    //
+    // 第28章の限界(`ch28-cost-model.md`の「この章の限界」)がまだ残っている
+    // ため、`cheapest`が実際にIndex Range Scanを選ぶ場面(Histogramの粒度に
+    // 対して、この章のコスト定数ではIndex Range ScanがSeqScanにほぼ勝てない)
+    // をANALYZE統計だけで自然に再現するのは難しい。ここでは`output_ordering`と
+    // `sort_is_already_satisfied`(`optimize`の`LogicalPlan::Sort`の分岐が
+    // 実際に呼ぶのと同じ関数)を、`PhysicalPlan`を直接組み立てて検証する。
+
+    fn orders_index_scan_schema() -> Schema {
+        Schema::new(vec![Column::new("id", DataType::BigInt, false), Column::new("amount", DataType::BigInt, true)])
+    }
+
+    fn range_index_scan_on_amount() -> PhysicalPlan {
+        PhysicalPlan::IndexScan(IndexScanNode {
+            table_id: TableId(0),
+            table_name: "orders".to_string(),
+            schema: orders_index_scan_schema(),
+            index_name: "idx_amount".to_string(),
+            column_name: "amount".to_string(),
+            kind: IndexScanKind::Range { lower: Bound::Included(Value::BigInt(100)), upper: Bound::Unbounded },
+        })
+    }
+
+    fn point_index_scan_on_amount() -> PhysicalPlan {
+        PhysicalPlan::IndexScan(IndexScanNode {
+            table_id: TableId(0),
+            table_name: "orders".to_string(),
+            schema: orders_index_scan_schema(),
+            index_name: "idx_amount".to_string(),
+            column_name: "amount".to_string(),
+            kind: IndexScanKind::Point(Value::BigInt(100)),
+        })
+    }
+
+    fn asc_sort_key(column_index: usize) -> logical_plan::SortKey {
+        logical_plan::SortKey {
+            expr: BoundExpr::ColumnRef {
+                table_ordinal: 0,
+                column_index,
+                name: "amount".to_string(),
+                data_type: DataType::BigInt,
+                span: crate::lexer::Span::new(0, 0),
+            },
+            desc: false,
+        }
+    }
+
+    #[test]
+    fn output_ordering_range_index_scan_returns_the_scanned_column() {
+        assert_eq!(output_ordering(&range_index_scan_on_amount()), Some(1));
+    }
+
+    #[test]
+    fn output_ordering_point_index_scan_returns_none() {
+        // 一致行が常に同じキー値を持つため、Sortを省く役に立たない
+        // (`output_ordering`のドキュメント参照)。
+        assert_eq!(output_ordering(&point_index_scan_on_amount()), None);
+    }
+
+    #[test]
+    fn output_ordering_seq_scan_returns_none() {
+        let scan = PhysicalPlan::SeqScan(SeqScanNode { table_id: TableId(0), table_name: "orders".to_string(), schema: orders_index_scan_schema() });
+        assert_eq!(output_ordering(&scan), None);
+    }
+
+    #[test]
+    fn output_ordering_passes_through_filter_unchanged() {
+        let filter = PhysicalPlan::Filter(FilterNode { input: Box::new(range_index_scan_on_amount()), predicate: bound_true_predicate() });
+        assert_eq!(output_ordering(&filter), Some(1));
+    }
+
+    #[test]
+    fn output_ordering_survives_a_projection_that_keeps_the_ordered_column() {
+        // `amount`(添字1)だけを残す`Projection`。出力側では添字0になる。
+        let projection = PhysicalPlan::Projection(ProjectionNode {
+            input: Box::new(range_index_scan_on_amount()),
+            projection: vec![BoundSelectItem { expr: asc_sort_key(1).expr, output_name: "amount".to_string() }],
+        });
+        assert_eq!(output_ordering(&projection), Some(0));
+    }
+
+    #[test]
+    fn output_ordering_is_lost_when_a_projection_drops_the_ordered_column() {
+        let projection = PhysicalPlan::Projection(ProjectionNode {
+            input: Box::new(range_index_scan_on_amount()),
+            projection: vec![BoundSelectItem {
+                expr: BoundExpr::ColumnRef { table_ordinal: 0, column_index: 0, name: "id".to_string(), data_type: DataType::BigInt, span: crate::lexer::Span::new(0, 0) },
+                output_name: "id".to_string(),
+            }],
+        });
+        assert_eq!(output_ordering(&projection), None);
+    }
+
+    #[test]
+    fn output_ordering_survives_the_left_side_of_every_join_kind() {
+        // `HashJoin`・`NestedLoopJoin`・`IndexNestedLoopJoin`は、どれも
+        // `left`の行を1件ずつ`next()`で引いた順序を外側ループに使うため、
+        // `left`の出力順序をそのまま引き継ぐ(`output_ordering`のドキュメント
+        // 参照)。`right`(内側)は素通しの対象外であることも合わせて確認する。
+        let left = range_index_scan_on_amount(); // 出力順序 = Some(1)
+        let right_schema = Schema::new(vec![Column::new("id", DataType::BigInt, false)]);
+        let right_scan = || PhysicalPlan::SeqScan(SeqScanNode { table_id: TableId(1), table_name: "b".to_string(), schema: right_schema.clone() });
+
+        let hash = PhysicalPlan::HashJoin(HashJoinNode { left: Box::new(left.clone()), right: Box::new(right_scan()), kind: JoinKind::Inner, keys: Vec::new(), condition: bound_true_predicate() });
+        assert_eq!(output_ordering(&hash), Some(1));
+
+        let nlj = PhysicalPlan::NestedLoopJoin(NestedLoopJoinNode { left: Box::new(left.clone()), right: Box::new(right_scan()), kind: JoinKind::Inner, condition: bound_true_predicate() });
+        assert_eq!(output_ordering(&nlj), Some(1));
+
+        let inlj = PhysicalPlan::IndexNestedLoopJoin(IndexNestedLoopJoinNode {
+            left: Box::new(left),
+            kind: JoinKind::Inner,
+            condition: bound_true_predicate(),
+            outer_key: asc_sort_key(1).expr,
+            table_id: TableId(1),
+            table_name: "b".to_string(),
+            schema: right_schema.clone(),
+            index_name: "idx_b".to_string(),
+            column_name: "id".to_string(),
+        });
+        assert_eq!(output_ordering(&inlj), Some(1));
+
+        // `right`側に順序があっても(内側は素通しの対象外なので)引き継がれない。
+        let right_ordered = range_index_scan_on_amount();
+        let hash_from_right =
+            PhysicalPlan::HashJoin(HashJoinNode { left: Box::new(right_scan()), right: Box::new(right_ordered), kind: JoinKind::Inner, keys: Vec::new(), condition: bound_true_predicate() });
+        assert_eq!(output_ordering(&hash_from_right), None);
+    }
+
+    #[test]
+    fn output_ordering_hash_join_build_side_does_not_count_as_ordered() {
+        // `HashJoin`自身(`left`が順序を持たない場合)はNone。ハッシュテーブル
+        // 経由の内側走査順は未規定であるという前提を裏から確認する。
+        let left = PhysicalPlan::SeqScan(SeqScanNode { table_id: TableId(0), table_name: "a".to_string(), schema: orders_index_scan_schema() });
+        let right = range_index_scan_on_amount();
+        let hash = PhysicalPlan::HashJoin(HashJoinNode { left: Box::new(left), right: Box::new(right), kind: JoinKind::Inner, keys: Vec::new(), condition: bound_true_predicate() });
+        assert_eq!(output_ordering(&hash), None);
+    }
+
+    #[test]
+    fn sort_is_already_satisfied_for_a_single_ascending_key_matching_a_range_scan() {
+        assert!(sort_is_already_satisfied(&[asc_sort_key(1)], &range_index_scan_on_amount()));
+    }
+
+    #[test]
+    fn sort_is_already_satisfied_rejects_a_descending_key() {
+        let mut key = asc_sort_key(1);
+        key.desc = true;
+        assert!(!sort_is_already_satisfied(&[key], &range_index_scan_on_amount()));
+    }
+
+    #[test]
+    fn sort_is_already_satisfied_rejects_multiple_keys() {
+        assert!(!sort_is_already_satisfied(&[asc_sort_key(1), asc_sort_key(0)], &range_index_scan_on_amount()));
+    }
+
+    #[test]
+    fn sort_is_already_satisfied_rejects_a_different_column() {
+        assert!(!sort_is_already_satisfied(&[asc_sort_key(0)], &range_index_scan_on_amount()));
+    }
+
+    #[test]
+    fn sort_is_already_satisfied_rejects_a_point_scan() {
+        assert!(!sort_is_already_satisfied(&[asc_sort_key(1)], &point_index_scan_on_amount()));
     }
 }

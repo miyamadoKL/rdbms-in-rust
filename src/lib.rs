@@ -57,6 +57,7 @@ pub mod free_space_map;
 pub mod heap_file;
 pub mod ids;
 pub mod index;
+pub mod join_order;
 pub mod lexer;
 pub mod logical_plan;
 pub mod page;

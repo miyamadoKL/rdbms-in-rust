@@ -934,7 +934,10 @@ impl std::fmt::Display for QueryResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cost_model;
     use crate::error::DbError;
+    use crate::join_order;
+    use crate::parser;
 
     #[test]
     fn executes_integer_literal() {
@@ -3543,4 +3546,123 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    // ==================================================================
+    // 第29章: Join OrderとPhysical Properties
+    // ==================================================================
+
+    /// `customers`(5行、選択的な外部キー)・`orders`(2,000行、ハブ)・
+    /// `shipments`(2,000行、`country`という低NDV列だけを共有する粗い結合)の
+    /// 3テーブル。`FROM`には`shipments`を先に書く(構文順どおりに結合すると
+    /// `orders`・`shipments`という低NDVどうしの結合を先に行うことになり、
+    /// 中間結果が大きく膨らむ)。
+    fn join_order_fixture() -> Database {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE customers (id BIGINT NOT NULL, name TEXT)").unwrap();
+        db.execute("CREATE TABLE orders (id BIGINT NOT NULL, customer_id BIGINT, country BIGINT)").unwrap();
+        db.execute("CREATE TABLE shipments (id BIGINT NOT NULL, country BIGINT)").unwrap();
+
+        let customers: Vec<String> = (0..5).map(|i| format!("({i}, 'name{i}')")).collect();
+        db.execute(&format!("INSERT INTO customers VALUES {}", customers.join(", "))).unwrap();
+        // customer_idは0..399へ広く散らし、customersの5件とだけ選択的に一致
+        // させる(NDV(customer_id)=400)。countryは0..9の低カーディナリティ
+        // (NDV(country)=10)。
+        let orders: Vec<String> = (0..2000).map(|i| format!("({i}, {}, {})", i % 400, i % 10)).collect();
+        db.execute(&format!("INSERT INTO orders VALUES {}", orders.join(", "))).unwrap();
+        let shipments: Vec<String> = (0..2000).map(|i| format!("({i}, {})", i % 10)).collect();
+        db.execute(&format!("INSERT INTO shipments VALUES {}", shipments.join(", "))).unwrap();
+
+        db.execute("ANALYZE customers").unwrap();
+        db.execute("ANALYZE orders").unwrap();
+        db.execute("ANALYZE shipments").unwrap();
+        db
+    }
+
+    /// `sql`(`SELECT`文)を束縛・ルールベース最適化まで通した`LogicalPlan`を返す。
+    fn bind_and_optimize_logically(db: &Database, sql: &str) -> LogicalPlan {
+        let select = match Binder::new(db.catalog(), &db.functions, sql).bind(parser::parse_statement(sql).unwrap()).unwrap() {
+            BoundStatement::Select(select) => *select,
+            other => panic!("Selectのはず: {other:?}"),
+        };
+        rules::optimize(logical_plan::build_select(select), &db.functions)
+    }
+
+    #[test]
+    fn join_order_dp_reorders_a_three_table_chain_away_from_syntax_order() {
+        let mut db = join_order_fixture();
+        let sql = "SELECT customers.name, orders.id FROM shipments JOIN orders ON shipments.country = orders.country JOIN customers ON orders.customer_id = customers.id";
+
+        let plan = db.execute(&format!("EXPLAIN {sql}")).unwrap().to_string();
+
+        // 構文順(shipments→orders→customers)のままなら、木の一番内側
+        // (根から最も遠い葉)がshipmentsになるはずである。DPが選んだ計画は
+        // それと逆に、選択的なcustomersの結合を先に(内側に)済ませ、低NDV
+        // どうしのshipmentsとの結合を最後(根に一番近い側)に回す。`EXPLAIN`の
+        // インデント付きツリーでは、根に近い行ほど先(文字列中で手前)に
+        // 現れるので、customersが先、shipmentsが後という並びを確認する。
+        assert!(plan.contains("HashJoin"), "plan={plan}");
+        let customers_pos = plan.find("SeqScan(customers)").expect("SeqScan(customers)があるはず");
+        let shipments_pos = plan.find("SeqScan(shipments)").expect("SeqScan(shipments)があるはず");
+        assert!(
+            customers_pos < shipments_pos,
+            "customersが先(内側)、shipmentsが後(根に近い側)に結合されるはず: plan={plan}"
+        );
+
+        // コストが実際に構文順より安いことも、cost_model越しに直接確認する
+        // (`join_order`単体テストと同じ比較を、実際のANALYZE統計で行う)。
+        let logical = bind_and_optimize_logically(&db, sql);
+        let mut leaves = Vec::new();
+        let mut conditions = Vec::new();
+        let join_root = match &logical {
+            LogicalPlan::Projection(p) => p.input.as_ref().clone(),
+            other => other.clone(),
+        };
+        physical_plan::flatten_join_chain(join_root, &mut leaves, &mut conditions);
+        let leaf_plans: Vec<PhysicalPlan> =
+            leaves.into_iter().map(|leaf| physical_plan::optimize(leaf, db.index_storage(), &db)).collect();
+        let syntactic = join_order::combine_in_syntactic_order(leaf_plans, conditions, db.index_storage(), &db);
+        let syntactic_cost = cost_model::plan_cost(&syntactic, &db, db.index_storage()).value();
+        let chosen = physical_plan::optimize(logical, db.index_storage(), &db);
+        let chosen_cost = cost_model::plan_cost(&chosen, &db, db.index_storage()).value();
+        assert!(chosen_cost < syntactic_cost, "chosen={chosen_cost} syntactic={syntactic_cost}");
+    }
+
+    #[test]
+    fn join_order_reordering_and_syntax_order_return_the_same_rows() {
+        let mut db = join_order_fixture();
+        let sql = "SELECT customers.name, orders.id, shipments.id FROM shipments JOIN orders ON shipments.country = orders.country JOIN customers ON orders.customer_id = customers.id ORDER BY customers.name, orders.id, shipments.id";
+        let reordered = db.execute(sql).unwrap();
+
+        let sql_syntactic_by_construction = "SELECT customers.name, orders.id, shipments.id FROM customers JOIN orders ON customers.id = orders.customer_id JOIN shipments ON orders.country = shipments.country ORDER BY customers.name, orders.id, shipments.id";
+        let same_set = db.execute(sql_syntactic_by_construction).unwrap();
+        assert_eq!(reordered.rows(), same_set.rows());
+        assert!(!reordered.rows().is_empty(), "テストの前提として一致する行が無ければ意味が無い");
+    }
+
+    #[test]
+    fn cartesian_product_appears_only_when_no_on_condition_connects_a_table() {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE a (id BIGINT NOT NULL)").unwrap();
+        db.execute("CREATE TABLE b (id BIGINT NOT NULL)").unwrap();
+        db.execute("CREATE TABLE c (id BIGINT NOT NULL)").unwrap();
+        db.execute("INSERT INTO a VALUES (1), (2)").unwrap();
+        db.execute("INSERT INTO b VALUES (1), (2)").unwrap();
+        db.execute("INSERT INTO c VALUES (1), (2)").unwrap();
+        db.execute("ANALYZE a").unwrap();
+        db.execute("ANALYZE b").unwrap();
+        db.execute("ANALYZE c").unwrap();
+
+        // bとcの間には結合条件が無い(`ON true`)。DPは連結できる拡張が無い
+        // ときに限りCartesian Productを許す(NestedLoopJoin、モジュール
+        // ドキュメント参照)。
+        let plan = db.execute("EXPLAIN SELECT a.id FROM a JOIN b ON a.id = b.id JOIN c ON true").unwrap().to_string();
+        assert!(plan.contains("NestedLoopJoin"), "plan={plan}");
+
+        let result = db.execute("SELECT a.id FROM a JOIN b ON a.id = b.id JOIN c ON true").unwrap();
+        // aとbは2行ずつ一致し(id同士)、cは無条件に2行とも掛かるので、
+        // 2 (a=b一致) × 2 (c) = 4行になる。
+        assert_eq!(result.rows().len(), 4, "rows={:?}", result.rows());
+    }
 }
+
+
