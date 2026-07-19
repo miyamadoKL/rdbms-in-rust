@@ -85,6 +85,20 @@ pub enum Keyword {
     Commit,
     /// `ROLLBACK`文(第30章)。
     Rollback,
+    /// `BEGIN ISOLATION LEVEL ...`(第32章)の`ISOLATION`。
+    Isolation,
+    /// `BEGIN ISOLATION LEVEL ...`(第32章)の`LEVEL`。
+    Level,
+    /// `READ UNCOMMITTED` / `READ COMMITTED`(第32章)の`READ`。
+    Read,
+    /// `READ UNCOMMITTED`(第32章)の`UNCOMMITTED`。
+    Uncommitted,
+    /// `READ COMMITTED`(第32章)の`COMMITTED`。
+    Committed,
+    /// `REPEATABLE READ`(第32章)の`REPEATABLE`。
+    Repeatable,
+    /// `SERIALIZABLE`(第32章)。
+    Serializable,
 }
 
 impl Keyword {
@@ -133,6 +147,13 @@ impl Keyword {
             "BEGIN" => Keyword::Begin,
             "COMMIT" => Keyword::Commit,
             "ROLLBACK" => Keyword::Rollback,
+            "ISOLATION" => Keyword::Isolation,
+            "LEVEL" => Keyword::Level,
+            "READ" => Keyword::Read,
+            "UNCOMMITTED" => Keyword::Uncommitted,
+            "COMMITTED" => Keyword::Committed,
+            "REPEATABLE" => Keyword::Repeatable,
+            "SERIALIZABLE" => Keyword::Serializable,
             _ => return None,
         };
         Some(keyword)

@@ -24,8 +24,8 @@
 use crate::ast::{
     AggregateFunc, AnalyzeStatement, Assignment, BeginStatement, BinaryOperator, ColumnDef, CommitStatement,
     CreateIndexStatement, CreateTableStatement, DeleteStatement, DropIndexStatement, DropTableStatement,
-    ExplainStatement, Expr, FromClause, Ident, InsertStatement, JoinClause, JoinKind, OrderByItem, RollbackStatement,
-    SelectItem, SelectStatement, Statement, UnaryOperator, UpdateStatement,
+    ExplainStatement, Expr, FromClause, Ident, InsertStatement, IsolationLevel, JoinClause, JoinKind, OrderByItem,
+    RollbackStatement, SelectItem, SelectStatement, Statement, UnaryOperator, UpdateStatement,
 };
 use crate::error::{DbError, DbResult};
 use crate::lexer::{self, Keyword, Span, Token, TokenKind};
@@ -249,11 +249,49 @@ impl<'a> Parser<'a> {
 
     // ---- BEGIN / COMMIT / ROLLBACK(第30章) ----
 
-    /// `BEGIN`単体を読む。`BEGIN TRANSACTION`・`BEGIN WORK`のような修飾語は、
-    /// このSQLサブセットでは受理しない(第30章の本文を参照)。
+    /// `BEGIN`単体、または`BEGIN ISOLATION LEVEL <level>`(第32章)を読む。
+    /// `BEGIN TRANSACTION`・`BEGIN WORK`のような修飾語は、このSQLサブセットでは
+    /// 受理しない(第30章の本文を参照)。
     fn parse_begin_statement(&mut self) -> DbResult<BeginStatement> {
-        let span = self.expect_keyword(Keyword::Begin, "BEGIN")?;
-        Ok(BeginStatement { span })
+        let start = self.expect_keyword(Keyword::Begin, "BEGIN")?;
+        if !matches!(self.peek_kind(), TokenKind::Keyword(Keyword::Isolation)) {
+            return Ok(BeginStatement { isolation_level: None, span: start });
+        }
+        self.advance();
+        self.expect_keyword(Keyword::Level, "LEVEL")?;
+        let (level, end) = self.parse_isolation_level()?;
+        Ok(BeginStatement { isolation_level: Some(level), span: Span { start: start.start, end } })
+    }
+
+    /// `READ UNCOMMITTED` / `READ COMMITTED` / `REPEATABLE READ` / `SERIALIZABLE`
+    /// のいずれかを読み、`IsolationLevel`と末尾位置を返す(第32章)。
+    fn parse_isolation_level(&mut self) -> DbResult<(IsolationLevel, usize)> {
+        match self.peek_kind() {
+            TokenKind::Keyword(Keyword::Read) => {
+                self.advance();
+                match self.peek_kind() {
+                    TokenKind::Keyword(Keyword::Uncommitted) => {
+                        let end = self.advance().span.end;
+                        Ok((IsolationLevel::ReadUncommitted, end))
+                    }
+                    TokenKind::Keyword(Keyword::Committed) => {
+                        let end = self.advance().span.end;
+                        Ok((IsolationLevel::ReadCommitted, end))
+                    }
+                    _ => Err(self.unexpected("UNCOMMITTED・COMMITTEDのいずれか")),
+                }
+            }
+            TokenKind::Keyword(Keyword::Repeatable) => {
+                self.advance();
+                let end = self.expect_keyword(Keyword::Read, "READ")?.end;
+                Ok((IsolationLevel::RepeatableRead, end))
+            }
+            TokenKind::Keyword(Keyword::Serializable) => {
+                let end = self.advance().span.end;
+                Ok((IsolationLevel::Serializable, end))
+            }
+            _ => Err(self.unexpected("READ UNCOMMITTED・READ COMMITTED・REPEATABLE READ・SERIALIZABLEのいずれか")),
+        }
     }
 
     fn parse_commit_statement(&mut self) -> DbResult<CommitStatement> {
@@ -1818,5 +1856,69 @@ mod tests {
     fn propagates_lex_error() {
         let err = parse_statement("SELECT 'abc").unwrap_err();
         assert!(matches!(err, DbError::Lex { .. }));
+    }
+
+    // ---- BEGIN ISOLATION LEVEL(第32章) ----
+
+    fn parse_begin(sql: &str) -> crate::ast::BeginStatement {
+        match parse_statement(sql).unwrap() {
+            Statement::Begin(begin) => begin,
+            other => panic!("BEGIN文を期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn plain_begin_has_no_isolation_level() {
+        assert_eq!(parse_begin("BEGIN").isolation_level, None);
+    }
+
+    #[test]
+    fn parses_all_four_isolation_levels() {
+        use crate::ast::IsolationLevel;
+
+        assert_eq!(
+            parse_begin("BEGIN ISOLATION LEVEL READ UNCOMMITTED").isolation_level,
+            Some(IsolationLevel::ReadUncommitted)
+        );
+        assert_eq!(
+            parse_begin("BEGIN ISOLATION LEVEL READ COMMITTED").isolation_level,
+            Some(IsolationLevel::ReadCommitted)
+        );
+        assert_eq!(
+            parse_begin("BEGIN ISOLATION LEVEL REPEATABLE READ").isolation_level,
+            Some(IsolationLevel::RepeatableRead)
+        );
+        assert_eq!(
+            parse_begin("BEGIN ISOLATION LEVEL SERIALIZABLE").isolation_level,
+            Some(IsolationLevel::Serializable)
+        );
+    }
+
+    #[test]
+    fn isolation_level_keywords_are_case_insensitive() {
+        use crate::ast::IsolationLevel;
+
+        assert_eq!(
+            parse_begin("begin isolation level serializable").isolation_level,
+            Some(IsolationLevel::Serializable)
+        );
+    }
+
+    #[test]
+    fn begin_isolation_level_rejects_an_unknown_level() {
+        let err = parse_statement("BEGIN ISOLATION LEVEL SNAPSHOT").unwrap_err();
+        assert!(matches!(err, DbError::Parse { .. }));
+    }
+
+    #[test]
+    fn begin_isolation_level_rejects_read_without_a_qualifier() {
+        let err = parse_statement("BEGIN ISOLATION LEVEL READ").unwrap_err();
+        assert!(matches!(err, DbError::Parse { .. }));
+    }
+
+    #[test]
+    fn begin_isolation_level_rejects_repeatable_without_read() {
+        let err = parse_statement("BEGIN ISOLATION LEVEL REPEATABLE").unwrap_err();
+        assert!(matches!(err, DbError::Parse { .. }));
     }
 }

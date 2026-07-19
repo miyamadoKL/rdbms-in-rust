@@ -80,7 +80,7 @@ pub mod transaction;
 pub mod tuple_codec;
 pub mod types;
 
-pub use ast::{Expr, Statement};
+pub use ast::{Expr, IsolationLevel, Statement};
 pub use binder::{Binder, BoundExpr, BoundStatement, CatalogLookup};
 pub use btree::BTree;
 pub use buffer_pool::{BufferPool, BufferPoolStats, PageReadGuard, PageWriteGuard};

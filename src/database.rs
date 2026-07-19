@@ -84,14 +84,14 @@ use std::collections::HashMap;
 
 use crate::ast::{
     AnalyzeStatement, BeginStatement, CommitStatement, CreateTableStatement, DropIndexStatement, DropTableStatement,
-    RollbackStatement, Statement,
+    IsolationLevel, RollbackStatement, Statement,
 };
 use crate::binder::{Binder, BoundCreateIndex, BoundExpr, BoundStatement};
 use crate::catalog::{Catalog, TableInfo};
 use crate::error::{DbError, DbResult};
 use crate::eval::FunctionRegistry;
 use crate::executor;
-use crate::ids::{RecordId, TableId, TransactionId};
+use crate::ids::{TableId, TransactionId};
 use crate::lock_manager::{LockKey, LockManager, LockMode, LockResult};
 use crate::logical_plan::{self, DeleteNode, InsertNode, LogicalPlan, UpdateNode};
 use crate::physical_plan::{
@@ -330,7 +330,7 @@ impl Database {
                 if let Some(tx) = &self.tx
                     && tx.state == TransactionState::Aborted
                 {
-                    return Err(DbError::TransactionAborted);
+                    return Err(aborted_error(tx.victim_of_deadlock));
                 }
                 let result = self.execute_bound_statement(statement, sql);
                 self.finish(result)
@@ -419,13 +419,25 @@ impl Database {
 
     /// `BEGIN`を実行する。すでに`Active`なトランザクションがあれば、その
     /// 入れ子を許さずエラーにする(本文「BEGINの入れ子をどう扱うか」を参照)。
-    fn execute_begin(&mut self, _begin: BeginStatement) -> DbResult<QueryResult> {
+    ///
+    /// # 分離レベルの既定値(第32章)
+    ///
+    /// `BEGIN ISOLATION LEVEL ...`を省略した`BEGIN`単体は`RepeatableRead`を
+    /// 既定にする。PostgreSQLの既定(`Read Committed`)とは異なる選択だが、
+    /// このクレートは第31章の時点ですでにStrict 2PL(Shared LockもCOMMITまで
+    /// 保持する、`RepeatableRead`相当の規律)で動いていた。`Read Committed`を
+    /// 既定にすると、第31章までに書いた`BEGIN`を伴うテスト・本文の例すべてが
+    /// (読み取りロックを文の終わりで解放する挙動へ)無言で意味を変えてしまう。
+    /// 明示的に`BEGIN ISOLATION LEVEL ...`と書いた場合にだけ、その分離レベルの
+    /// 規律に従う。
+    fn execute_begin(&mut self, begin: BeginStatement) -> DbResult<QueryResult> {
         if self.tx.is_some() {
             return Err(DbError::TransactionAlreadyActive);
         }
         let id = TransactionId(self.next_txn_id);
         self.next_txn_id += 1;
-        self.tx = Some(TransactionContext::new(id));
+        let level = begin.isolation_level.unwrap_or(IsolationLevel::RepeatableRead);
+        self.tx = Some(TransactionContext::new(id, level));
         Ok(QueryResult::command("BEGIN"))
     }
 
@@ -439,7 +451,7 @@ impl Database {
     fn execute_commit(&mut self, _commit: CommitStatement) -> DbResult<QueryResult> {
         match &self.tx {
             None => Err(DbError::NoActiveTransaction),
-            Some(tx) if tx.state == TransactionState::Aborted => Err(DbError::TransactionAborted),
+            Some(tx) if tx.state == TransactionState::Aborted => Err(aborted_error(tx.victim_of_deadlock)),
             Some(_) => {
                 let tx = self.tx.take().expect("直前のmatchでSomeを確認済み");
                 self.lock_manager.release_all(tx.id);
@@ -504,10 +516,21 @@ impl Database {
     /// 新しいトランザクションを開始し、以後`execute_in_tx`・`commit_tx`・
     /// `rollback_tx`で参照する`TxHandle`を返す。通常のSQL経路の`self.tx`には
     /// 触れないため、`execute`(`BEGIN`を含む)と`begin_tx`は互いに独立している。
+    ///
+    /// 分離レベルは`RepeatableRead`が既定になる(`execute_begin`が`BEGIN`単体に
+    /// 対して選ぶ既定と同じ、理由も同じ)。他の分離レベルで開始したい場合は
+    /// [`Database::begin_tx_with_isolation`]を使う。
     pub fn begin_tx(&mut self) -> TxHandle {
+        self.begin_tx_with_isolation(IsolationLevel::RepeatableRead)
+    }
+
+    /// [`Database::begin_tx`]と同じだが、分離レベルを明示的に指定できる
+    /// (第32章)。ハーネスのテストが`READ UNCOMMITTED`・`READ COMMITTED`・
+    /// `SERIALIZABLE`でのインターリーブを組み立てるときに使う。
+    pub fn begin_tx_with_isolation(&mut self, isolation_level: IsolationLevel) -> TxHandle {
         let id = TransactionId(self.next_txn_id);
         self.next_txn_id += 1;
-        self.harness_contexts.insert(id, TransactionContext::new(id));
+        self.harness_contexts.insert(id, TransactionContext::new(id, isolation_level));
         TxHandle(id)
     }
 
@@ -534,8 +557,9 @@ impl Database {
             .remove(&handle.0)
             .expect("TxHandleはすでにcommit_tx・rollback_tx済み、または他のDatabaseのものです");
         if ctx.state == TransactionState::Aborted {
+            let err = aborted_error(ctx.victim_of_deadlock);
             self.harness_contexts.insert(handle.0, ctx);
-            return Err(DbError::TransactionAborted);
+            return Err(err);
         }
 
         // 通常のSQL経路が使う`self.tx`を、この文の間だけ`ctx`に差し替える。
@@ -564,8 +588,9 @@ impl Database {
             .remove(&handle.0)
             .expect("TxHandleはすでにcommit_tx・rollback_tx済み、または他のDatabaseのものです");
         if ctx.state == TransactionState::Aborted {
+            let err = aborted_error(ctx.victim_of_deadlock);
             self.harness_contexts.insert(handle.0, ctx);
-            return Err(DbError::TransactionAborted);
+            return Err(err);
         }
         self.lock_manager.release_all(ctx.id);
         Ok(())
@@ -771,47 +796,238 @@ impl Database {
         Ok(QueryResult { schema, rows, command_tag: None })
     }
 
+    /// `owner`の分離レベル(第32章)。通常のSQL経路の`self.tx`(`owner`と
+    /// `TransactionId`が一致すれば)、無ければハーネスの`harness_contexts`を
+    /// 見る。どちらにも無ければ`owner`はAutocommit用に`lock_owner`が
+    /// その場で割り当てた一時IDであり(`TransactionContext`自体が存在しない)、
+    /// `RepeatableRead`を返す。Autocommitの1文はそれ自体が完結したトランザク
+    /// ションであり、文の終わりに`execute_bound_statement`がロックを一括で
+    /// 手放す(`RepeatableRead`か`ReadCommitted`かで、文の**途中**の解放
+    /// タイミングに違いは出ない)。
+    fn isolation_level_of(&self, owner: TransactionId) -> IsolationLevel {
+        if let Some(tx) = &self.tx
+            && tx.id == owner
+        {
+            return tx.isolation_level;
+        }
+        if let Some(ctx) = self.harness_contexts.get(&owner) {
+            return ctx.isolation_level;
+        }
+        IsolationLevel::RepeatableRead
+    }
+
+    /// `owner`名義で`key`に`mode`のロックを1つ獲得する。`Blocked`になった場合は
+    /// [`Database::detect_deadlock`]でWait-for Graphを調べ、循環を検出できれば
+    /// Victimを強制的に`Aborted`へ倒してから再試行する(第32章、本文
+    /// 「デッドロックの検出と解決」を参照)。
+    ///
+    /// # 3つの結果
+    ///
+    /// 1. `Granted`(またはBlockedを検出・解決できて再試行が`Granted`): `Ok(())`。
+    /// 2. 循環が見つからない(単に他のトランザクションが保持中): `Err(WouldBlock)`。
+    /// 3. 循環が見つかり、`owner`自身がVictimに選ばれた: `Err(DeadlockDetected)`。
+    ///    この場合`owner`のトランザクションはすでに`Aborted`へ遷移済みである。
+    fn acquire_lock_or_detect_deadlock(&mut self, owner: TransactionId, key: LockKey, mode: LockMode) -> DbResult<()> {
+        if self.lock_manager.acquire(owner, key, mode) == LockResult::Granted {
+            return Ok(());
+        }
+        match self.detect_deadlock(owner)? {
+            None => Err(DbError::WouldBlock),
+            Some(victim) if victim == owner => Err(DbError::DeadlockDetected),
+            Some(_) => {
+                // 別のトランザクションをVictimとして倒したことで、`owner`が
+                // 待ち行列の中ですでに昇格しているかもしれない
+                // (`LockManager::release_all`の`promote_waiters`を参照)。
+                // 昇格していれば`acquire`は`Granted`をその場で返す。まだ
+                // 昇格していなければ(循環は解けたが、循環に含まれない
+                // 別のトランザクションがまだ`key`を保持している場合)、
+                // 通常の`WouldBlock`として呼び出し元に再試行を委ねる。
+                if self.lock_manager.acquire(owner, key, mode) == LockResult::Granted {
+                    Ok(())
+                } else {
+                    Err(DbError::WouldBlock)
+                }
+            }
+        }
+    }
+
+    /// `owner`が新しく作った待ち要求を起点に、Wait-for Graphへ循環が生じて
+    /// いないか調べる(第32章)。
+    ///
+    /// # Wait-for Graphの組み立てとVictim Selection
+    ///
+    /// `LockManager::wait_for_edges`が返す「誰が誰を待っているか」の辺から
+    /// 隣接表を作り、`owner`を起点にDFSで`owner`自身へ戻ってくる経路を探す。
+    /// 見つかった経路が閉路であり、この実装が検出する循環はすべて`owner`を
+    /// 含む(`owner`を経由しない、無関係な部分にある循環までは探索しない。
+    /// この単純化を選んだ理由は本文「検出のタイミング」を参照)。
+    ///
+    /// 循環が見つかったら、その中で最も**新しい**`TransactionId`(最若、
+    /// 最後に`BEGIN`したトランザクション)をVictimに選ぶ
+    /// (`crate::transaction`モジュールの`TransactionId`は単調増加で採番される、
+    /// 本文「Victim Selection: 最若TxIDを選ぶ」で理由を説明する)。選んだ
+    /// Victimは[`Database::abort_transaction`]で即座に強制Abortし、循環を
+    /// 物理的に断ち切ってから`Some(victim)`を返す。循環が見つからなければ
+    /// `None`を返す(呼び出し元は通常の`WouldBlock`を返す)。
+    fn detect_deadlock(&mut self, owner: TransactionId) -> DbResult<Option<TransactionId>> {
+        let edges = self.lock_manager.wait_for_edges();
+        let mut adjacency: HashMap<TransactionId, Vec<TransactionId>> = HashMap::new();
+        for (waiter, holder) in edges {
+            adjacency.entry(waiter).or_default().push(holder);
+        }
+        for neighbors in adjacency.values_mut() {
+            neighbors.sort_by_key(|t| t.0);
+            neighbors.dedup();
+        }
+
+        let Some(cycle) = find_cycle_containing(&adjacency, owner) else {
+            return Ok(None);
+        };
+        let victim = cycle.into_iter().max_by_key(|t| t.0).expect("循環は少なくとも1つの要素を持つ");
+        self.abort_transaction(victim)?;
+        Ok(Some(victim))
+    }
+
+    /// `victim`を強制的に`Aborted`へ倒す(第32章のVictim Selection、または
+    /// 将来の章がタイムアウト等の理由で呼ぶことを想定した共通経路)。
+    ///
+    /// `victim`のトランザクションコンテキストは、通常のSQL経路の`self.tx`
+    /// (`id`が一致する場合)か、ハーネスの`harness_contexts`のどちらかに
+    /// ある。見つけた側から`undo_log`を取り出して`ROLLBACK`と同じ逆順適用を
+    /// 行い、`state`を`Aborted`、`victim_of_deadlock`を`true`にする。
+    ///
+    /// `TransactionContext`自体は`self.tx`・`harness_contexts`のどちらの
+    /// スロットからも取り除かない(`Option`を`None`にしたり`HashMap`から
+    /// 取り除いたりしない)。呼び出し元がすでに`self.tx`や`harness_contexts`の
+    /// 該当エントリを前提にした後始末(`execute_in_tx`が`self.tx.take()`で
+    /// 対応表へ戻す、など)を書いているため、ここでスロットの形を変えると
+    /// その前提が壊れる。この関数は中身(`state`・`undo_log`)だけを書き換える。
+    fn abort_transaction(&mut self, victim: TransactionId) -> DbResult<()> {
+        let undo_log = if let Some(tx) = &mut self.tx
+            && tx.id == victim
+        {
+            std::mem::take(&mut tx.undo_log)
+        } else if let Some(ctx) = self.harness_contexts.get_mut(&victim) {
+            std::mem::take(&mut ctx.undo_log)
+        } else {
+            return Ok(());
+        };
+
+        match &mut self.backend {
+            Backend::Memory { storage, .. } => transaction::apply_undo_memory(storage, undo_log),
+            Backend::Disk { storage } => transaction::apply_undo_disk(storage, undo_log)?,
+        }
+        self.lock_manager.release_all(victim);
+
+        if let Some(tx) = &mut self.tx
+            && tx.id == victim
+        {
+            tx.state = TransactionState::Aborted;
+            tx.victim_of_deadlock = true;
+        } else if let Some(ctx) = self.harness_contexts.get_mut(&victim) {
+            ctx.state = TransactionState::Aborted;
+            ctx.victim_of_deadlock = true;
+        }
+        Ok(())
+    }
+
+    /// `table_ids`が指すテーブルのうち、`SELECT`が実際にロックすべき対象の
+    /// 鍵を列挙する(第31・32章)。`Backend::Memory`は`LockKey::Table`を、
+    /// `Backend::Disk`はその時点でテーブルに**存在する**行の`LockKey::Tuple`を
+    /// 返す(絞り込みの単純化は本文「タプルロックの対象をどこまで絞るか」を
+    /// 参照)。`&self`だけで完結させているのは、`Backend::Disk`の`storage`への
+    /// 借用を先に終わらせ、続く`acquire_lock_or_detect_deadlock`(`&mut self`が
+    /// 要る)の呼び出しと衝突させないためである。
+    fn scan_lock_keys(&self, table_ids: &[TableId]) -> DbResult<Vec<LockKey>> {
+        match &self.backend {
+            Backend::Memory { .. } => Ok(table_ids.iter().map(|&id| LockKey::Table(id)).collect()),
+            Backend::Disk { storage } => {
+                let mut keys = Vec::new();
+                for &table_id in table_ids {
+                    for entry in storage.scan(table_id)? {
+                        let (rid, _) = entry?;
+                        keys.push(LockKey::Tuple(table_id, rid));
+                    }
+                }
+                Ok(keys)
+            }
+        }
+    }
+
     /// `owner`名義で、`table_ids`が指すテーブルに対して`mode`のロックを
     /// 獲得する(第31章)。`execute_select`(`SELECT`はテーブル全体を読みうる)と、
     /// `run_insert`のMemory分岐(`INSERT`はテーブル全体にExclusiveを取る)が
     /// 使う。`Backend`によってロックの粒度を切り替える理由は`crate::database`
     /// モジュール冒頭「ロックの粒度」を参照。
     ///
-    /// `Backend::Disk`では、`WHERE`で絞り込む前に、その時点でテーブルに
-    /// 存在する行の`RecordId`すべてを対象にする。`SELECT`は列も`WHERE`も
-    /// 多様な形を取りうり、`LogicalPlan`の木から「結局どの行を読むか」を
-    /// 一般には特定できない(`Filter`が複数重なる、`JOIN`をまたぐ、など)ため、
-    /// この章では絞り込み前の全行をロック対象にするという単純化を選んだ
-    /// (本文「タプルロックの対象をどこまで絞るか」を参照)。書き込み側
-    /// (`UPDATE`・`DELETE`)は対象がただ1個の`table_id`と`predicate`に
-    /// 決まるため、`acquire_write_locks`でより絞り込んだロックを取る。
+    /// # 分離レベルによる読み取りロックの規律(第32章)
+    ///
+    /// `mode`が`Shared`(=読み取り)のときだけ、`owner`の分離レベルに応じて
+    /// 次のように振る舞いを変える。`mode`が`Exclusive`(書き込み)のときは
+    /// 分離レベルを見ない。書き込みロックの規律(Strict 2PL、COMMITまで保持)は
+    /// 4つの分離レベルすべてで共通であり、変えているのは常に「読み取りに
+    /// ロックをどこまで効かせるか」だけである(本文「分離レベルが変えるのは
+    /// 読み取りの規律だけ」を参照)。
+    ///
+    /// - `ReadUncommitted`: 読み取りロックを一切取らない(Dirty Readを許す)。
+    ///   `Ok(())`を即座に返し、`LockManager`にすら触れない。
+    /// - `ReadCommitted`: 通常どおり獲得したうえで、この関数を抜ける直前に
+    ///   [`LockManager::release_keys`]で**この統計のために取った鍵だけ**を
+    ///   即座に手放す(Non-repeatable Readを許す)。`owner`が他に持っている
+    ///   (書き込みロック等の)鍵には触れない。
+    /// - `RepeatableRead`: 何もせず、獲得したロックをそのまま`COMMIT`まで
+    ///   保持させる(第31章から変わらない挙動)。
+    /// - `Serializable`(`Backend::Disk`のみ): 上の`RepeatableRead`と同じ
+    ///   Tuple Lockに加え、`LockKey::Table(table_id)`にも`Shared`を取る。この
+    ///   追加の1本が、Phantomを起こす`INSERT`(`run_insert`が同じ分離レベルで
+    ///   取る`LockKey::Table`への`Exclusive`)と衝突する(本文「Serializableは
+    ///   どうPhantomを防ぐか」を参照)。`Backend::Memory`は元から`LockKey::Table`
+    ///   だけを使うため、この追加は不要である。
     fn acquire_scan_locks(&mut self, owner: TransactionId, table_ids: &[TableId], mode: LockMode) -> DbResult<()> {
-        match &self.backend {
-            Backend::Memory { .. } => {
-                for &table_id in table_ids {
-                    if self.lock_manager.acquire(owner, LockKey::Table(table_id), mode) == LockResult::Blocked {
-                        return Err(DbError::WouldBlock);
-                    }
-                }
-            }
-            Backend::Disk { storage } => {
-                for &table_id in table_ids {
-                    let rids: Vec<RecordId> =
-                        storage.scan(table_id)?.map(|entry| entry.map(|(rid, _)| rid)).collect::<DbResult<_>>()?;
-                    for rid in rids {
-                        let key = LockKey::Tuple(table_id, rid);
-                        if self.lock_manager.acquire(owner, key, mode) == LockResult::Blocked {
-                            return Err(DbError::WouldBlock);
-                        }
-                    }
-                }
-            }
+        let level = self.isolation_level_of(owner);
+        if level == IsolationLevel::ReadUncommitted && mode == LockMode::Shared {
+            return Ok(());
+        }
+
+        let mut keys = self.scan_lock_keys(table_ids)?;
+        if level == IsolationLevel::Serializable && mode == LockMode::Shared && matches!(&self.backend, Backend::Disk { .. })
+        {
+            keys.extend(table_ids.iter().map(|&id| LockKey::Table(id)));
+        }
+
+        for &key in &keys {
+            self.acquire_lock_or_detect_deadlock(owner, key, mode)?;
+        }
+
+        if level == IsolationLevel::ReadCommitted && mode == LockMode::Shared {
+            self.lock_manager.release_keys(owner, &keys);
         }
         Ok(())
     }
 
+    /// `table_id`のうち`predicate`に一致する行の鍵を列挙する(第31・32章、
+    /// `acquire_write_locks`が使う)。`scan_lock_keys`と同じ理由で`&self`だけで
+    /// 完結させている。
+    fn write_lock_keys(
+        &self,
+        table_id: TableId,
+        schema: &Schema,
+        predicate: Option<&BoundExpr>,
+    ) -> DbResult<Vec<LockKey>> {
+        match &self.backend {
+            Backend::Memory { .. } => Ok(vec![LockKey::Table(table_id)]),
+            Backend::Disk { storage } => {
+                let rids = executor::storage_matching_rids(storage, table_id, schema, &self.functions, predicate)?;
+                Ok(rids.into_iter().map(|rid| LockKey::Tuple(table_id, rid)).collect())
+            }
+        }
+    }
+
     /// `owner`名義で、`table_id`のうち`predicate`に一致する行にExclusive
-    /// ロックを獲得する(第31章、`run_update`・`run_delete`が使う)。
+    /// ロックを獲得する(第31章、`run_update`・`run_delete`が使う)。書き込み
+    /// ロックの規律は分離レベルに関係なく常にStrict 2PLであるため
+    /// (`acquire_scan_locks`のドキュメントを参照)、この関数は`isolation_level_of`
+    /// を見ない。
     ///
     /// `Backend::Memory`はテーブル全体のExclusiveを取る(`acquire_scan_locks`と
     /// 同じ粒度)。`Backend::Disk`は`crate::executor::storage_matching_rids`で
@@ -829,22 +1045,9 @@ impl Database {
         schema: &Schema,
         predicate: Option<&BoundExpr>,
     ) -> DbResult<()> {
-        match &self.backend {
-            Backend::Memory { .. } => {
-                if self.lock_manager.acquire(owner, LockKey::Table(table_id), LockMode::Exclusive) == LockResult::Blocked
-                {
-                    return Err(DbError::WouldBlock);
-                }
-            }
-            Backend::Disk { storage } => {
-                let rids = executor::storage_matching_rids(storage, table_id, schema, &self.functions, predicate)?;
-                for rid in rids {
-                    let key = LockKey::Tuple(table_id, rid);
-                    if self.lock_manager.acquire(owner, key, LockMode::Exclusive) == LockResult::Blocked {
-                        return Err(DbError::WouldBlock);
-                    }
-                }
-            }
+        let keys = self.write_lock_keys(table_id, schema, predicate)?;
+        for key in keys {
+            self.acquire_lock_or_detect_deadlock(owner, key, LockMode::Exclusive)?;
         }
         Ok(())
     }
@@ -1140,6 +1343,14 @@ impl Database {
         };
         if matches!(&self.backend, Backend::Memory { .. }) {
             self.acquire_scan_locks(owner, &[table_id], LockMode::Exclusive)?;
+        } else if self.isolation_level_of(owner) == IsolationLevel::Serializable {
+            // `Backend::Disk`の`INSERT`は通常どこもロックしない(モジュール
+            // 冒頭「ロックの粒度」を参照、新しい行の`RecordId`は挿入が終わる
+            // までロックする対象自体が無い)。`Serializable`のときだけ例外で、
+            // `acquire_scan_locks`が同じ分離レベルの`SELECT`に取らせる
+            // `LockKey::Table`のSharedと衝突させるため、`Exclusive`を先に
+            // 取る(本文「SerializableはどうPhantomを防ぐか」を参照)。
+            self.acquire_lock_or_detect_deadlock(owner, LockKey::Table(table_id), LockMode::Exclusive)?;
         }
 
         let mut undo = Vec::new();
@@ -1436,6 +1647,60 @@ impl std::fmt::Display for QueryResult {
 /// (自己結合などで)複数回現れても構わない。`LockManager::acquire`は同じ
 /// `(txn, key)`への再要求を無害に素通りさせる(`crate::lock_manager`を参照)
 /// ため、ここで重複を取り除く必要は無い。
+/// `adjacency`(Wait-for Graphの隣接表)の中で、`start`を含む循環を1つ探す
+/// (第32章、`Database::detect_deadlock`が使う)。
+///
+/// `start`からDFSで辺をたどり、`start`へ戻ってくる経路が見つかれば、その
+/// 経路(`start`を含む、循環を構成するノードの列)を返す。`start`を経由しない
+/// 循環(たとえば`start`から到達できる先で、`start`とは無関係などうしが
+/// 待ち合っている場合)は探索しない。探索中に同じノードを2回訪れそうになったら
+/// (`start`自身への到達を除く)、そこで探索を打ち切る(無関係な循環に迷い込んで
+/// 無限に回り続けないための番人)。`adjacency`の各隣接リストは
+/// `detect_deadlock`が`TransactionId`の昇順にソート済みであり、複数の循環が
+/// 存在する場合でもこの関数は毎回同じ経路を決定的に返す。
+fn find_cycle_containing(
+    adjacency: &HashMap<TransactionId, Vec<TransactionId>>,
+    start: TransactionId,
+) -> Option<Vec<TransactionId>> {
+    fn dfs(
+        node: TransactionId,
+        start: TransactionId,
+        adjacency: &HashMap<TransactionId, Vec<TransactionId>>,
+        path: &mut Vec<TransactionId>,
+        on_path: &mut std::collections::HashSet<TransactionId>,
+    ) -> Option<Vec<TransactionId>> {
+        let neighbors = adjacency.get(&node)?;
+        for &next in neighbors {
+            if next == start {
+                return Some(path.clone());
+            }
+            if on_path.contains(&next) {
+                continue;
+            }
+            on_path.insert(next);
+            path.push(next);
+            if let Some(cycle) = dfs(next, start, adjacency, path, on_path) {
+                return Some(cycle);
+            }
+            path.pop();
+            on_path.remove(&next);
+        }
+        None
+    }
+
+    let mut path = vec![start];
+    let mut on_path = std::collections::HashSet::from([start]);
+    dfs(start, start, adjacency, &mut path, &mut on_path)
+}
+
+/// `Aborted`状態のトランザクションへ以後の操作を拒むときのエラーを選ぶ
+/// (第32章)。デッドロックのVictimとして強制的に`Aborted`へ倒された場合は
+/// `DbError::DeadlockDetected`を、それ以外(Statement Error時のAbort・
+/// 明示的な`ROLLBACK`後)は従来どおり`DbError::TransactionAborted`を返す。
+fn aborted_error(victim_of_deadlock: bool) -> DbError {
+    if victim_of_deadlock { DbError::DeadlockDetected } else { DbError::TransactionAborted }
+}
+
 fn collect_scan_tables(plan: &LogicalPlan, tables: &mut Vec<TableId>) {
     match plan {
         LogicalPlan::Scan(scan) => tables.push(scan.table_id),
@@ -4547,6 +4812,42 @@ mod tests {
         assert_eq!(balance(&mut db, 1), 70);
         assert_eq!(balance(&mut db, 2), 80);
         assert_eq!(db.transaction_state(), None);
+    }
+
+    /// `BEGIN`単体(`ISOLATION LEVEL`を省略)は`RepeatableRead`を既定にする
+    /// (第32章、`execute_begin`のドキュメント「分離レベルの既定値」を参照)。
+    /// 分離レベル自体は`Database`の外から直接観測できないため、`RepeatableRead`
+    /// の規律(Sharedロックも`COMMIT`まで保持する)が働いていることを、
+    /// Non-repeatable Readが起きないことで間接的に確認する。
+    #[test]
+    fn begin_without_isolation_level_defaults_to_repeatable_read() {
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        assert_eq!(balance(&mut db, 1), 100);
+
+        let t2 = db.begin_tx();
+        assert!(matches!(
+            db.execute_in_tx(&t2, "UPDATE accounts SET balance = 999 WHERE id = 1"),
+            Err(DbError::WouldBlock)
+        ));
+        db.execute("COMMIT").unwrap();
+    }
+
+    /// `BEGIN ISOLATION LEVEL READ UNCOMMITTED`をSQL経由で発行すると、
+    /// 読み取りロックを一切取らなくなる(第32章)。`db.execute`の通常のSQL経路
+    /// (`self.tx`)でも、ハーネス(`begin_tx_with_isolation`)と同じ分離レベルの
+    /// 規律が働くことを確認する。
+    #[test]
+    fn begin_isolation_level_read_uncommitted_over_sql_allows_dirty_read() {
+        let mut db = accounts_db();
+        let t1 = db.begin_tx();
+        db.execute_in_tx(&t1, "UPDATE accounts SET balance = 70 WHERE id = 1").unwrap();
+
+        db.execute("BEGIN ISOLATION LEVEL READ UNCOMMITTED").unwrap();
+        assert_eq!(balance(&mut db, 1), 70, "READ UNCOMMITTEDは未コミットの値を読める(Dirty Read)");
+        db.execute("COMMIT").unwrap();
+
+        db.rollback_tx(t1).unwrap();
     }
 
     #[test]

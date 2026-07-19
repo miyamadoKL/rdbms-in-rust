@@ -48,7 +48,7 @@
 
 - [第30章 トランザクション境界とAtomicity](ch30-transactions.md)
 - [第31章 Lock ManagerとStrict 2PL](ch31-lock-manager.md)
-- [第32章 Isolation LevelとDeadlock]()
+- [第32章 Isolation LevelとDeadlock](ch32-isolation-deadlock.md)
 - [第33章 Write-Ahead Logging]()
 - [第34章 Crash RecoveryとCheckpoint]()
 - [第35章 Latchと並行B+Tree]()

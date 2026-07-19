@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 
+use crate::ast::IsolationLevel;
 use crate::error::DbResult;
 use crate::ids::{RecordId, TableId, TransactionId};
 use crate::storage::Storage;
@@ -86,11 +87,29 @@ pub(crate) struct TransactionContext {
     /// この本文で実行した順にUndoレコードを積んだ列。`ROLLBACK`はこれを
     /// 逆順(LIFO)に適用する。
     pub undo_log: Vec<UndoRecord>,
+    /// このトランザクションが読み取りロックをどう扱うか(第32章)。
+    /// `BEGIN ISOLATION LEVEL ...`で指定しなければ`RepeatableRead`が既定
+    /// (`crate::database::execute_begin`のドキュメントを参照)。
+    pub isolation_level: IsolationLevel,
+    /// `true`なら、この`state`が`Aborted`になった理由はデッドロック検出の
+    /// Victim Selection(第32章)である。`false`なら、Statement Error時の
+    /// Abort(第30章)、または明示的な`ROLLBACK`によるものである。この
+    /// フラグは、`Database`がこのトランザクションへの以後の操作に
+    /// `DbError::TransactionAborted`(通常のAbort)と
+    /// `DbError::DeadlockDetected`(デッドロックのVictim)のどちらを返すかを
+    /// 決める(`crate::database`の該当箇所を参照)。
+    pub victim_of_deadlock: bool,
 }
 
 impl TransactionContext {
-    pub fn new(id: TransactionId) -> Self {
-        TransactionContext { id, state: TransactionState::Active, undo_log: Vec::new() }
+    pub fn new(id: TransactionId, isolation_level: IsolationLevel) -> Self {
+        TransactionContext {
+            id,
+            state: TransactionState::Active,
+            undo_log: Vec::new(),
+            isolation_level,
+            victim_of_deadlock: false,
+        }
     }
 }
 

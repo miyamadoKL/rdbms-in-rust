@@ -266,6 +266,21 @@ impl<K: Eq + Hash + Clone> LockManager<K> {
         self.entries.get(key).and_then(|entry| entry.holder_mode(txn))
     }
 
+    /// `txn`が保持している`keys`のロックだけを手放す(第32章、Read Committedの
+    /// 「読み取りロックを文の終わりで解放する」を実現する)。[`LockManager::release_all`]
+    /// と違い、`txn`が他に持っている(または待っている)ロックには一切触れない。
+    /// 呼び出し側(`Database::acquire_scan_locks`)は、この文のために新しく
+    /// 獲得した`Shared`ロックの鍵だけを`keys`に渡す。解放したキーごとに
+    /// [`LockManager::promote_waiters`]を呼び、空いたキーの待ち行列を再評価する。
+    pub(crate) fn release_keys(&mut self, txn: TransactionId, keys: &[K]) {
+        for key in keys {
+            if let Some(entry) = self.entries.get_mut(key) {
+                entry.holders.retain(|(t, _)| *t != txn);
+                self.promote_waiters(key);
+            }
+        }
+    }
+
     /// `key`の待ち行列に並んでいる`TransactionId`を、先頭から順に返す。
     /// テスト専用(FIFO順序の検証に使う)。
     #[cfg(test)]
@@ -274,11 +289,43 @@ impl<K: Eq + Hash + Clone> LockManager<K> {
     }
 
     /// 現在、待ち行列に1件以上並んでいる(=`Blocked`のまま止まっている)
-    /// トランザクションの集合。デッドロックの**観測**用(この章は検出・解決を
-    /// 行わない、本文「デッドロックはこの章では検出しない」を参照)。
+    /// トランザクションの集合。デッドロックの**観測**用。
     #[cfg(test)]
     fn blocked_transactions(&self) -> std::collections::HashSet<TransactionId> {
         self.entries.values().flat_map(|entry| entry.waiters.iter().map(|w| w.txn)).collect()
+    }
+
+    /// **Wait-for Graph**の辺を`(待っている側, 待たれている側)`の組として
+    /// 列挙する(第32章、`Database::detect_deadlock`が使う)。
+    ///
+    /// この`LockManager`自身はデッドロックを検出しない(この型の責務は
+    /// あくまでロックの獲得・解放であり、複数のトランザクションをまたいだ
+    /// グラフ探索は1段上の`Database`に置く、という役割分担は第31章から変えて
+    /// いない)。この関数は、`Database`がWait-for Graphを組み立てるために
+    /// 必要な生データ(誰が誰を待っているか)を提供するだけである。
+    ///
+    /// 待ち行列の**順序**(FIFOの公平性)によるブロック(先頭のExclusive要求を
+    /// 追い越せない後続のShared要求など)は辺に含めない。ここで返すのは、
+    /// 要求されたモードと実際に保持されているモードが**両立しない**という、
+    /// 本物のロック衝突だけである。Upgrade要求(`is_upgrade`)は、自分以外の
+    /// 保持者全員と衝突するとみなす(唯一の保持者であれば`acquire`の時点で
+    /// 即座に`Granted`になっており、待ち行列に残ること自体がない)。
+    pub(crate) fn wait_for_edges(&self) -> Vec<(TransactionId, TransactionId)> {
+        let mut edges = Vec::new();
+        for entry in self.entries.values() {
+            for waiter in &entry.waiters {
+                for &(holder, held_mode) in &entry.holders {
+                    if holder == waiter.txn {
+                        continue;
+                    }
+                    let conflicts = if waiter.is_upgrade { true } else { !held_mode.compatible_with(waiter.mode) };
+                    if conflicts {
+                        edges.push((waiter.txn, holder));
+                    }
+                }
+            }
+        }
+        edges
     }
 }
 
@@ -433,8 +480,14 @@ mod tests {
         assert_eq!(lm.holder_mode(T2, &table(1)), None, "取り下げた要求は昇格しない");
     }
 
-    // ---- デッドロックの観測(検出はしない) ----
+    // ---- デッドロックの観測とWait-for Graph(検出・解決は1段上のDatabaseが行う) ----
 
+    /// この`LockManager`自身は、循環したまま両者ともブロックされ続ける状況を
+    /// 防げない。デッドロックの**検出**と**解決**(Wait-for Graphの構築、
+    /// Victim Selection、強制Abort)は第32章で`crate::database::Database`が
+    /// 1段上のレイヤとして持つ責務であり、`LockManager`はそのために必要な
+    /// 生データ(`wait_for_edges`)を提供するだけにとどめる(この型自身の責務を
+    /// 「ロックの獲得・解放」に絞る設計は第31章から変えていない)。
     #[test]
     fn mutual_wait_leaves_both_transactions_blocked_without_detection() {
         let mut lm = LockManager::new();
@@ -445,11 +498,37 @@ mod tests {
         assert_eq!(lm.acquire(T1, table(2), LockMode::Exclusive), LockResult::Blocked);
         assert_eq!(lm.acquire(T2, table(1), LockMode::Exclusive), LockResult::Blocked);
 
-        // どちらも自動的には解決されない。このLock Manager自身はデッドロック
-        // 検出を行わないため、2つとも待ち行列に残ったままである
-        // (検出・解決は第32章のWait-for Graph)。
+        // どちらも自動的には解決されない。2つとも待ち行列に残ったままである。
         let blocked = lm.blocked_transactions();
         assert!(blocked.contains(&T1));
         assert!(blocked.contains(&T2));
+    }
+
+    /// `wait_for_edges`が、上と同じ状況からT1⇄T2の両方向の辺を返すことを
+    /// 確認する。`Database::detect_deadlock`はこの辺の集合からWait-for Graphの
+    /// 隣接表を組み立て、循環を探す(第32章)。
+    #[test]
+    fn wait_for_edges_reports_both_directions_of_a_mutual_wait() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Exclusive), LockResult::Granted);
+        assert_eq!(lm.acquire(T2, table(2), LockMode::Exclusive), LockResult::Granted);
+        assert_eq!(lm.acquire(T1, table(2), LockMode::Exclusive), LockResult::Blocked);
+        assert_eq!(lm.acquire(T2, table(1), LockMode::Exclusive), LockResult::Blocked);
+
+        let mut edges = lm.wait_for_edges();
+        edges.sort_by_key(|(waiter, holder)| (waiter.0, holder.0));
+        assert_eq!(edges, vec![(T1, T2), (T2, T1)]);
+    }
+
+    /// 両立するShared同士は衝突ではないため、`wait_for_edges`は辺を作らない。
+    #[test]
+    fn wait_for_edges_ignores_compatible_shared_waiters() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Shared), LockResult::Granted);
+        // T2のSharedはT1のSharedと両立するが、待ち行列が空でないと即座には
+        // 通らない規則(FIFO公平性)により、待ち行列が空でなければ末尾に積まれる。
+        // ここでは待ち行列が空なので即座にGrantedになり、辺は生まれない。
+        assert_eq!(lm.acquire(T2, table(1), LockMode::Shared), LockResult::Granted);
+        assert!(lm.wait_for_edges().is_empty());
     }
 }
