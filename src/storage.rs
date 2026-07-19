@@ -285,13 +285,14 @@
 //! 両方から呼ぶ。検査項目の詳細は`validate_stats_metadata`のドキュメントを
 //! 参照。
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::btree::BTree;
-use crate::buffer_pool::BufferPool;
+use crate::buffer_pool::{BufferPool, BufferPoolStats};
 use crate::catalog::TableInfo;
 use crate::disk_manager::DiskManager;
 use crate::error::{DbError, DbResult};
@@ -378,6 +379,14 @@ pub struct Storage {
     /// `ANALYZE`で収集された統計情報(第27章)。キーは`TableId`。`ANALYZE`を
     /// 一度も実行していないテーブルはここに現れない。
     stats: HashMap<TableId, TableStats>,
+    /// 索引名ごとの`BTree::lookup`・`BTree::range`の呼び出し回数(第39章、
+    /// `SHOW STATS`が表示する)。`IndexScanExec`・`IndexNestedLoopJoinExec`
+    /// (`crate::physical_plan`)が索引を1回引くたびに1つ増える。永続化しない
+    /// (プロセスの起動からの累積値であり、`FreeSpaceMap`と同じくディスク上の
+    /// カタログには書かない)。`Storage`を`&self`のまま読む実行経路
+    /// (`IndexScanExec`等は`&'a Storage`しか持たない)から増やす必要が
+    /// あるため、`RefCell`で内部可変性を持たせる。
+    index_usage: RefCell<HashMap<String, u64>>,
     /// このテーブル本体用のWAL(第33章)。`<path>.wal`という専用ファイルを持ち、
     /// `pool`(テーブル本体の`BufferPool`)に[`BufferPool::attach_wal`]で
     /// 結線してある。`Database`は`Storage::wal`経由でこの`Arc`を共有し、
@@ -389,6 +398,17 @@ pub struct Storage {
     /// `Storage::open`が実行したCrash Recovery(第34章)の要約。
     /// `Storage::create`(新規作成)では常に`None`(Recoveryを行わないため)。
     last_recovery: Option<crate::recovery::RecoveryReport>,
+}
+
+/// `Storage::vacuum_table`が1テーブルぶんの回収結果として返す要約
+/// (第39章)。`Database::execute_vacuum`のコマンドタグと、テストが回収の
+/// 効果を実測するために使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VacuumReport {
+    /// Free Page Listへ返した(完全に空になった)データページの枚数。
+    pub reclaimed_pages: usize,
+    /// 作り直した索引の本数。
+    pub rebuilt_indexes: usize,
 }
 
 impl Storage {
@@ -428,6 +448,7 @@ impl Storage {
             fsm: FreeSpaceMap::new(),
             indexes: HashMap::new(),
             stats: HashMap::new(),
+            index_usage: RefCell::new(HashMap::new()),
             wal,
             last_recovery: None,
         };
@@ -539,6 +560,7 @@ impl Storage {
             fsm,
             indexes,
             stats: decoded.stats,
+            index_usage: RefCell::new(HashMap::new()),
             wal,
             last_recovery: None,
         };
@@ -813,6 +835,63 @@ impl Storage {
         Ok((temp_path, index_path))
     }
 
+    /// `table_id`のテーブルを物理的に回収する(`VACUUM`、第39章)。
+    ///
+    /// 1. このテーブルの各データページを[`SlottedPage::compact`]し、
+    ///    Tombstone化されたタプルの死んだバイト列と、`UPDATE`でサイズが
+    ///    変わって取り残された古いバイト列を回収する。
+    /// 2. compact後にOccupiedなスロットが1つも残っていないページ
+    ///    ([`SlottedPage::is_empty`])は、このテーブルの`page_ids`から外し、
+    ///    Free Page Listへ返す(`Self::drop_table`がテーブル削除時に行うのと
+    ///    同じ扱い)。
+    /// 3. このテーブルに対応する全索引を、[`Self::rebuild_one_index_after_recovery`]
+    ///    (第34章、Crash Recoveryが索引を作り直すのと同じ関数)でLazy Delete
+    ///    済みのエントリを含まないB+Treeへ作り直す。
+    ///
+    /// 呼び出し側([`crate::database::Database::execute_vacuum`])は、この
+    /// 呼び出しの前にこのテーブルへのExclusiveロックを獲得しておく必要がある
+    /// (本文「VACUUMの排他」を参照)。`vacuum_table`自身はロックを取らない。
+    ///
+    /// 索引の作り直し(手順3)は、`rebuild_one_index_after_recovery`が返す
+    /// 一時ファイルを索引ごとに即座に`rename`する。Crash Recovery(第34章)が
+    /// 全索引ぶんの`rename`をAnalysis・Redo・Undoの完了後にまとめて行うのとは
+    /// 違い、`VACUUM`はクラッシュ安全性を主張しない(本文の限界节を参照)。
+    /// 複数の索引を持つテーブルの`VACUUM`中にI/Oエラーが起きた場合、すでに
+    /// 作り直し終えた索引と、まだ手つかずの索引が混在した状態で処理が止まる。
+    pub fn vacuum_table(&mut self, table_id: TableId) -> DbResult<VacuumReport> {
+        let page_ids = self.table_entry(table_id)?.page_ids.clone();
+        let mut reclaimed_pages = 0usize;
+        let mut remaining = Vec::with_capacity(page_ids.len());
+        for page_id in page_ids {
+            let mut guard = self.pool.write_page(page_id)?;
+            let mut page = SlottedPage::open(guard.data_mut())?;
+            page.compact();
+            let is_empty = page.is_empty();
+            let free = page.free_space();
+            drop(guard);
+            if is_empty {
+                self.fsm.remove(page_id);
+                self.free_pages.push(page_id);
+                reclaimed_pages += 1;
+            } else {
+                self.fsm.update(page_id, free);
+                remaining.push(page_id);
+            }
+        }
+        self.tables.get_mut(&table_id).expect("直前にtable_entryで存在を確認済み").page_ids = remaining;
+
+        let index_names: Vec<String> =
+            self.indexes.values().filter(|e| e.info.table_id == table_id).map(|e| e.info.name.clone()).collect();
+        let rebuilt_indexes = index_names.len();
+        for index_name in &index_names {
+            let (temp_path, index_path) = self.rebuild_one_index_after_recovery(index_name)?;
+            std::fs::rename(&temp_path, &index_path)?;
+        }
+
+        self.persist_catalog()?;
+        Ok(VacuumReport { reclaimed_pages, rebuilt_indexes })
+    }
+
     /// 手動`CHECKPOINT`(第34章)。全dirtyページ(データ・カタログ・索引)を
     /// flush・syncした**あとで**、Checkpointレコード(現在アクティブな
     /// トランザクションの一覧つき)をWALへ書き、そのLSNまで同期する。
@@ -1017,6 +1096,28 @@ impl Storage {
     /// (呼び出し側のバグ)。
     pub(crate) fn index_btree(&self, index_name: &str) -> Option<&BTree> {
         self.indexes.get(index_name).map(|e| &e.btree)
+    }
+
+    /// `index_name`の索引が1回引かれたことを記録する(第39章)。
+    /// `IndexScanExec::new`・`IndexNestedLoopJoinExec::next`(`crate::physical_plan`)が、
+    /// `BTree::lookup`・`BTree::range`を呼ぶ直前にそれぞれ1箇所ずつ呼ぶ。
+    pub(crate) fn record_index_use(&self, index_name: &str) {
+        *self.index_usage.borrow_mut().entry(index_name.to_string()).or_insert(0) += 1;
+    }
+
+    /// 登録されている全索引の名前と利用回数を返す(第39章、`SHOW STATS`)。
+    /// 一度も引かれていない索引も`0`回として含める(`self.indexes`のキーを
+    /// 一次情報にし、`index_usage`はまだ1件も記録の無い索引を欠かすため)。
+    /// 順序は保証しない。
+    pub fn index_usage_counts(&self) -> Vec<(String, u64)> {
+        let usage = self.index_usage.borrow();
+        self.indexes.keys().map(|name| (name.clone(), usage.get(name).copied().unwrap_or(0))).collect()
+    }
+
+    /// この`Storage`が使う`BufferPool`のヒット/ミス統計を返す(第39章、
+    /// `SHOW STATS`)。
+    pub fn buffer_pool_stats(&self) -> BufferPoolStats {
+        self.pool.stats()
     }
 
     /// `table_id`のテーブルの`column_index`番目の列に対応する`UNIQUE`索引の
@@ -1253,6 +1354,8 @@ impl Storage {
         if self.indexes.remove(index_name).is_none() {
             return Err(DbError::IndexNotFound(index_name.to_string()));
         }
+        // 利用回数(第39章)も、もう存在しない索引の分を残さない。
+        self.index_usage.borrow_mut().remove(index_name);
         self.persist_catalog()?;
         let index_path = index_file_path(&self.path, index_name);
         std::fs::remove_file(&index_path)?;
@@ -3760,6 +3863,123 @@ mod tests {
         storage.create_index("idx", "users", "name", false).unwrap();
         let err = expect_err(storage.create_index("idx", "users", "id", false));
         assert!(matches!(err, DbError::DuplicateIndex(name) if name == "idx"));
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&idx_path);
+    }
+
+    // ---- 第39章: 索引利用回数・Buffer Pool統計 ----
+
+    #[test]
+    fn index_usage_counts_starts_at_zero_and_increases_with_record_index_use() {
+        let (path, idx_path) = index_test_paths("index-usage");
+        let mut storage = Storage::create(&path).unwrap();
+        storage.create_table("users", users_schema()).unwrap();
+        storage.create_index("idx", "users", "name", false).unwrap();
+
+        assert_eq!(storage.index_usage_counts(), vec![("idx".to_string(), 0)]);
+
+        storage.record_index_use("idx");
+        storage.record_index_use("idx");
+        assert_eq!(storage.index_usage_counts(), vec![("idx".to_string(), 2)]);
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&idx_path);
+    }
+
+    #[test]
+    fn drop_index_forgets_its_usage_count() {
+        let (path, idx_path) = index_test_paths("index-usage-drop");
+        let mut storage = Storage::create(&path).unwrap();
+        storage.create_table("users", users_schema()).unwrap();
+        storage.create_index("idx", "users", "name", false).unwrap();
+        storage.record_index_use("idx");
+
+        storage.drop_index("idx").unwrap();
+        assert!(storage.index_usage_counts().is_empty());
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&idx_path);
+    }
+
+    #[test]
+    fn buffer_pool_stats_reflects_hits_and_misses() {
+        let path = temp_path("buffer-pool-stats");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("users", users_schema()).unwrap();
+        insert_user_row(&mut storage, table_id, 1, "alice");
+
+        let before = storage.buffer_pool_stats();
+        let _ = storage.scan(table_id).unwrap().count();
+        let after = storage.buffer_pool_stats();
+        assert!(after.hits + after.misses > before.hits + before.misses);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    // ---- 第39章: VACUUM ----
+
+    #[test]
+    fn vacuum_table_reclaims_fully_emptied_pages_into_the_free_page_list() {
+        let path = temp_path("vacuum-reclaim");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("users", users_schema()).unwrap();
+
+        let long_name = "x".repeat(300);
+        let mut rids = Vec::new();
+        for i in 0..80i64 {
+            rids.push(insert_user_row(&mut storage, table_id, i, &long_name));
+        }
+        let pages_before = storage.table_page_count(table_id).unwrap();
+        assert!(pages_before > 1, "複数ページにまたがっているはず: {pages_before}");
+
+        for &rid in &rids {
+            assert!(storage.delete(table_id, rid).unwrap());
+        }
+        assert_eq!(
+            storage.table_page_count(table_id).unwrap(),
+            pages_before,
+            "DELETEだけ(compactを挟まない)ではページ数は減らない(Tombstoneのまま)"
+        );
+
+        let report = storage.vacuum_table(table_id).unwrap();
+        assert_eq!(report.reclaimed_pages, pages_before as usize, "全行を削除したので全ページが回収されるはず");
+        assert_eq!(storage.table_page_count(table_id).unwrap(), 0);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn vacuum_table_does_not_reclaim_a_page_that_still_holds_a_live_row() {
+        let path = temp_path("vacuum-partial");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("users", users_schema()).unwrap();
+
+        let r1 = insert_user_row(&mut storage, table_id, 1, "alice");
+        let _r2 = insert_user_row(&mut storage, table_id, 2, "bob");
+        assert!(storage.delete(table_id, r1).unwrap());
+
+        let pages_before = storage.table_page_count(table_id).unwrap();
+        let report = storage.vacuum_table(table_id).unwrap();
+        assert_eq!(report.reclaimed_pages, 0, "bobがまだ生きているのでページは回収されない");
+        assert_eq!(storage.table_page_count(table_id).unwrap(), pages_before);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn vacuum_table_reports_the_number_of_rebuilt_indexes() {
+        let (path, idx_path) = index_test_paths("vacuum-rebuilt-count");
+        let mut storage = Storage::create(&path).unwrap();
+        let table_id = storage.create_table("users", users_schema()).unwrap();
+        insert_user_row(&mut storage, table_id, 1, "alice");
+        storage.create_index("idx", "users", "name", false).unwrap();
+
+        let report = storage.vacuum_table(table_id).unwrap();
+        assert_eq!(report.rebuilt_indexes, 1);
+        // 索引は`rename`によって同じ名前のまま引き続き使える。
+        assert!(storage.index("idx").is_some());
+        assert_eq!(storage.index_btree("idx").unwrap().lookup(&Value::Text("alice".to_string())).unwrap().len(), 1);
 
         std::fs::remove_file(&path).unwrap();
         let _ = std::fs::remove_file(&idx_path);

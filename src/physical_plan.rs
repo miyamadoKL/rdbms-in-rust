@@ -1798,6 +1798,9 @@ impl<'a> IndexScanExec<'a> {
         let btree = storage
             .index_btree(index_name)
             .unwrap_or_else(|| unreachable!("optimizeが選んだ索引'{index_name}'はStorageに必ず存在する"));
+        // SHOW STATS(第39章)が表示する索引利用回数。この索引で実際に
+        // lookup/rangeを行う直前に1回だけ数える。
+        storage.record_index_use(index_name);
         let source = match kind {
             IndexScanKind::Point(value) => IndexScanSource::Point(btree.lookup(value)?.into_iter()),
             IndexScanKind::Range { lower, upper } => IndexScanSource::Range(btree.range(lower.as_ref(), upper.as_ref())?),
@@ -2199,6 +2202,9 @@ impl<'a> Executor for IndexNestedLoopJoinExec<'a> {
                     .storage
                     .index_btree(self.index_name)
                     .unwrap_or_else(|| unreachable!("optimizeが選んだ索引'{}'はStorageに必ず存在する", self.index_name));
+                // SHOW STATS(第39章)が表示する索引利用回数。外側の1行ごとに
+                // 内側の索引を1回引くので、その都度数える。
+                self.storage.record_index_use(self.index_name);
                 btree.lookup(&key)?.into_iter()
             };
         }

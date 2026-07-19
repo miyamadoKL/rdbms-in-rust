@@ -24,9 +24,10 @@
 use crate::ast::{
     AggregateFunc, AnalyzeStatement, Assignment, BeginStatement, BinaryOperator, CheckpointStatement, ColumnDef,
     CommitStatement, CreateIndexStatement, CreateTableStatement, DeallocateStatement, DeleteStatement,
-    DropIndexStatement, DropTableStatement, ExecuteStatement, ExplainStatement, Expr, FromClause, Ident,
-    InsertStatement, IsolationLevel, JoinClause, JoinKind, Literal, OrderByItem, PrepareStatement, RollbackStatement,
-    SelectItem, SelectStatement, Statement, UnaryOperator, UpdateStatement,
+    DescribeStatement, DropIndexStatement, DropTableStatement, ExecuteStatement, ExplainStatement, Expr, FromClause,
+    Ident, InsertStatement, IsolationLevel, JoinClause, JoinKind, Literal, OrderByItem, PrepareStatement,
+    RollbackStatement, SelectItem, SelectStatement, ShowIndexesStatement, ShowStatsStatement, ShowTablesStatement,
+    Statement, UnaryOperator, UpdateStatement, VacuumStatement,
 };
 use crate::error::{DbError, DbResult};
 use crate::lexer::{self, Keyword, Span, Token, TokenKind};
@@ -172,10 +173,18 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Prepare) => self.parse_prepare_statement().map(Statement::Prepare),
             TokenKind::Keyword(Keyword::Execute) => self.parse_execute_statement().map(Statement::Execute),
             TokenKind::Keyword(Keyword::Deallocate) => self.parse_deallocate_statement().map(Statement::Deallocate),
+            TokenKind::Keyword(Keyword::Show) => self.parse_show_statement(),
+            // `DESC`(`ORDER BY`の並び順修飾語、第21章)は文の先頭には現れない
+            // ため、`DESCRIBE`の省略形として文頭でだけ再利用する(第39章、
+            // 新しいキーワードを増やさずに済む)。
+            TokenKind::Keyword(Keyword::Describe) | TokenKind::Keyword(Keyword::Desc) => {
+                self.parse_describe_statement().map(Statement::Describe)
+            }
+            TokenKind::Keyword(Keyword::Vacuum) => self.parse_vacuum_statement().map(Statement::Vacuum),
             _ => Err(self.unexpected(
                 "SELECT・CREATE TABLE・DROP TABLE・CREATE INDEX・DROP INDEX・INSERT INTO・UPDATE・\
                  DELETE FROM・EXPLAIN・ANALYZE・BEGIN・COMMIT・ROLLBACK・CHECKPOINT・PREPARE・EXECUTE・\
-                 DEALLOCATEのいずれか",
+                 DEALLOCATE・SHOW・DESCRIBE・VACUUMのいずれか",
             )),
         }
     }
@@ -315,6 +324,64 @@ impl<'a> Parser<'a> {
     fn parse_checkpoint_statement(&mut self) -> DbResult<CheckpointStatement> {
         let span = self.expect_keyword(Keyword::Checkpoint, "CHECKPOINT")?;
         Ok(CheckpointStatement { span })
+    }
+
+    // ---- SHOW / DESCRIBE / VACUUM(第39章) ----
+
+    /// `SHOW TABLES` / `SHOW INDEXES [FROM <table>]` / `SHOW STATS [FROM <table>]`を
+    /// 解析する。`SHOW`の次のキーワードで3種類を振り分ける。
+    fn parse_show_statement(&mut self) -> DbResult<Statement> {
+        let start = self.expect_keyword(Keyword::Show, "SHOW")?.start;
+        match self.peek_kind() {
+            TokenKind::Keyword(Keyword::Tables) => {
+                let end = self.advance().span.end;
+                Ok(Statement::ShowTables(ShowTablesStatement { span: Span::new(start, end) }))
+            }
+            TokenKind::Keyword(Keyword::Indexes) => {
+                self.advance();
+                let table = self.parse_optional_from_table()?;
+                let end = table.as_ref().map(|t| t.span.end).unwrap_or(start + "SHOW INDEXES".len());
+                Ok(Statement::ShowIndexes(ShowIndexesStatement { table, span: Span::new(start, end) }))
+            }
+            TokenKind::Keyword(Keyword::Stats) => {
+                self.advance();
+                let table = self.parse_optional_from_table()?;
+                let end = table.as_ref().map(|t| t.span.end).unwrap_or(start + "SHOW STATS".len());
+                Ok(Statement::ShowStats(ShowStatsStatement { table, span: Span::new(start, end) }))
+            }
+            _ => Err(self.unexpected("TABLES・INDEXES・STATSのいずれか")),
+        }
+    }
+
+    /// `[FROM <table>]`を読む。無ければ`None`を返す(`SHOW INDEXES`・`SHOW STATS`が共有)。
+    fn parse_optional_from_table(&mut self) -> DbResult<Option<Ident>> {
+        if matches!(self.peek_kind(), TokenKind::Keyword(Keyword::From)) {
+            self.advance();
+            Ok(Some(self.expect_ident()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// `DESCRIBE <table>`(`DESC <table>`)を解析する。
+    fn parse_describe_statement(&mut self) -> DbResult<DescribeStatement> {
+        let start = self.advance().span.start; // DESCRIBE または DESC
+        let table = self.expect_ident()?;
+        let end = table.span.end;
+        Ok(DescribeStatement { table, span: Span::new(start, end) })
+    }
+
+    /// `VACUUM [テーブル名]`を解析する。テーブル名を省略した場合は`table`が
+    /// `None`になり、`Database::execute`が登録済みの全テーブルを対象にする
+    /// (`ANALYZE`と同じ形、`parse_analyze_statement`を参照)。
+    fn parse_vacuum_statement(&mut self) -> DbResult<VacuumStatement> {
+        let start = self.expect_keyword(Keyword::Vacuum, "VACUUM")?.start;
+        let table = match self.peek_kind() {
+            TokenKind::Ident(_) => Some(self.expect_ident()?),
+            _ => None,
+        };
+        let end = table.as_ref().map(|t| t.span.end).unwrap_or(start + "VACUUM".len());
+        Ok(VacuumStatement { table, span: Span::new(start, end) })
     }
 
     // ---- PREPARE / EXECUTE / DEALLOCATE(第37章) ----

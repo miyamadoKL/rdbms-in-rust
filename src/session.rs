@@ -242,7 +242,10 @@ impl Session {
             Statement::Deallocate(deallocate) => self.execute_deallocate(&deallocate),
             other => {
                 let bound = self.shared.bind_statement(other, sql)?;
-                self.run_bound(bound)
+                let started = std::time::Instant::now();
+                let result = self.run_bound(bound);
+                crate::slow_query_log::maybe_log(self.shared.slow_query_threshold(), sql, started.elapsed(), &result);
+                result
             }
         }
     }

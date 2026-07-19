@@ -83,8 +83,9 @@ use std::path::Path;
 use std::collections::HashMap;
 
 use crate::ast::{
-    AnalyzeStatement, BeginStatement, CheckpointStatement, CommitStatement, CreateTableStatement, DropIndexStatement,
-    DropTableStatement, IsolationLevel, RollbackStatement, Statement,
+    AnalyzeStatement, BeginStatement, CheckpointStatement, CommitStatement, CreateTableStatement, DescribeStatement,
+    DropIndexStatement, DropTableStatement, IsolationLevel, RollbackStatement, ShowIndexesStatement,
+    ShowStatsStatement, Statement, VacuumStatement,
 };
 use crate::binder::{Binder, BoundCreateIndex, BoundExpr, BoundStatement};
 use crate::cancellation::ExecutionContext;
@@ -93,6 +94,7 @@ use crate::error::{DbError, DbResult};
 use crate::eval::FunctionRegistry;
 use crate::executor;
 use crate::ids::{Lsn, TableId, TransactionId};
+use crate::index::IndexInfo;
 use crate::lock_manager::{LockKey, LockManager, LockMode, LockResult};
 use crate::logical_plan::{self, DeleteNode, InsertNode, LogicalPlan, UpdateNode};
 use crate::physical_plan::{
@@ -178,6 +180,35 @@ pub struct Database {
     /// 一切参照せず、常に無制限([`ExecutionContext::unbounded`])で動く
     /// (`crate::cancellation`モジュール冒頭を参照)。
     resource_limits: ResourceLimits,
+    /// 文の実行時間の累積(第39章)。`run_bound_statement`が文を1本実行する
+    /// たびに更新し、`SHOW STATS`(テーブル指定なし)のQuery Timingとして
+    /// 表示する。
+    query_timing: QueryTimingStats,
+}
+
+/// [`Database::query_timing`]が持つ、文の実行時間の累積(第39章)。
+#[derive(Debug, Clone, Copy, Default)]
+struct QueryTimingStats {
+    /// `run_bound_statement`が実行した文の本数。
+    count: u64,
+    /// その合計実行時間。
+    total: std::time::Duration,
+}
+
+impl QueryTimingStats {
+    fn record(&mut self, elapsed: std::time::Duration) {
+        self.count += 1;
+        self.total += elapsed;
+    }
+
+    /// 1文あたりの平均実行時間(ミリ秒)。1文も実行していなければ`0.0`。
+    fn average_ms(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.total.as_secs_f64() * 1000.0 / self.count as f64
+        }
+    }
 }
 
 /// [`Database::resource_limits`]の中身。サーバー起動時の引数として設定する
@@ -193,6 +224,13 @@ pub struct ResourceLimits {
     /// `Sort`・Hash JoinのBuild側・Hash Aggregateが集めてよい行数の上限。
     /// `None`なら無制限。
     pub max_operator_rows: Option<usize>,
+    /// Slow Query Logの閾値(第39章)。実行時間がこれを超えた文をSQL文・
+    /// 実行時間・行数つきでstderrへ記録する。`None`なら記録しない。
+    /// `Database::execute_bound_statement`(REPL・`Database::execute`が使う
+    /// 低レベルAPI)と`crate::session::Session::execute`が、それぞれ自分の
+    /// 実行経路で完結する形でこの閾値を参照する(`crate::slow_query_log`の
+    /// モジュールドキュメントを参照)。
+    pub slow_query_threshold: Option<std::time::Duration>,
 }
 
 /// [`Database::begin_tx`]が返す、1本のトランザクションを指す不透明な識別子。
@@ -223,6 +261,7 @@ impl Database {
             harness_contexts: HashMap::new(),
             lock_manager: LockManager::new(),
             resource_limits: ResourceLimits::default(),
+            query_timing: QueryTimingStats::default(),
         }
     }
 
@@ -255,6 +294,7 @@ impl Database {
             harness_contexts: HashMap::new(),
             lock_manager: LockManager::new(),
             resource_limits: ResourceLimits::default(),
+            query_timing: QueryTimingStats::default(),
         })
     }
 
@@ -462,7 +502,10 @@ impl Database {
     /// この実装で表している部分である。
     fn execute_bound_statement(&mut self, statement: Statement, sql: &str) -> DbResult<QueryResult> {
         let bound = self.bind(statement, sql)?;
-        self.run_bound_statement(bound, &ExecutionContext::unbounded())
+        let started = std::time::Instant::now();
+        let result = self.run_bound_statement(bound, &ExecutionContext::unbounded());
+        crate::slow_query_log::maybe_log(self.resource_limits.slow_query_threshold, sql, started.elapsed(), &result);
+        result
     }
 
     /// すでに束縛済みの文を、束縛をやり直さずに直接実行する(第37章)。
@@ -492,6 +535,7 @@ impl Database {
     /// `DELETE`はこの章の実行制御の対象外である(本文の限界节を参照)。
     fn run_bound_statement(&mut self, bound: BoundStatement, ctx: &ExecutionContext) -> DbResult<QueryResult> {
         let owner = self.lock_owner();
+        let started = std::time::Instant::now();
         let result = match bound {
             BoundStatement::Select(select) => self.execute_select(logical_plan::build_select(*select), owner, ctx),
             BoundStatement::CreateTable(create) => self.execute_create_table(&create),
@@ -503,10 +547,18 @@ impl Database {
             BoundStatement::Delete(delete) => self.execute_delete(logical_plan::build_delete(delete), owner),
             BoundStatement::Explain { inner, analyze } => self.execute_explain(*inner, analyze, owner, ctx),
             BoundStatement::Analyze(analyze) => self.execute_analyze(analyze),
+            BoundStatement::ShowTables(_) => self.execute_show_tables(),
+            BoundStatement::Describe(describe) => self.execute_describe(describe),
+            BoundStatement::ShowIndexes(show) => self.execute_show_indexes(show),
+            BoundStatement::ShowStats(show) => self.execute_show_stats(show),
+            BoundStatement::Vacuum(vacuum) => self.execute_vacuum(vacuum, owner),
             BoundStatement::Begin(_) | BoundStatement::Commit(_) | BoundStatement::Rollback(_) | BoundStatement::Checkpoint(_) => {
                 unreachable!("BEGIN・COMMIT・ROLLBACK・CHECKPOINTはexecuteの先頭ですでに処理済み")
             }
         };
+        // Query Timing(第39章、`SHOW STATS`)。文の成否を問わず数える
+        // (失敗した文もエンジンが時間を使ったことに変わりは無い)。
+        self.query_timing.record(started.elapsed());
         if self.tx.is_none() {
             self.lock_manager.release_all(owner);
         }
@@ -1479,7 +1531,12 @@ impl Database {
             | BoundStatement::Begin(_)
             | BoundStatement::Commit(_)
             | BoundStatement::Rollback(_)
-            | BoundStatement::Checkpoint(_) => {
+            | BoundStatement::Checkpoint(_)
+            | BoundStatement::ShowTables(_)
+            | BoundStatement::Describe(_)
+            | BoundStatement::ShowIndexes(_)
+            | BoundStatement::ShowStats(_)
+            | BoundStatement::Vacuum(_) => {
                 unreachable!(
                     "ParserがEXPLAINの対象をSELECT・INSERT INTO・UPDATE・DELETE FROMに制限している"
                 )
@@ -1685,6 +1742,278 @@ impl Database {
         Ok(QueryResult::command_with_count("ANALYZE", targets.len()))
     }
 
+    /// `SHOW TABLES`を実行する(第39章)。カタログに登録されている全テーブルを
+    /// 名前順に、テーブル名・行数概算・ページ数の3列で返す。
+    ///
+    /// 行数は、`Backend::Memory`では`MemStorage`が実際に持つ行を数え直した
+    /// 正確な値(メモリ上のVecなので、数え直しても`O(n)`のコピーは発生しない)、
+    /// `Backend::Disk`では`ANALYZE`(第27章)が最後に集めた`row_count`(一度も
+    /// `ANALYZE`していなければ`NULL`)を使う。両者の性質が異なる(片方は
+    /// 常に最新、片方は最後の`ANALYZE`時点のスナップショット)ことは、本文で
+    /// 明示する。ページ数は`Backend::Memory`には存在しない概念のため常に
+    /// `NULL`、`Backend::Disk`では`Storage::table_page_count`(実測値)を使う。
+    fn execute_show_tables(&self) -> DbResult<QueryResult> {
+        let schema = Schema::new(vec![
+            Column::new("table_name", DataType::Text, false),
+            Column::new("rows", DataType::BigInt, true),
+            Column::new("pages", DataType::BigInt, true),
+        ]);
+        let mut names: Vec<(TableId, String)> = self.all_table_infos().map(|info| (info.id, info.name)).collect();
+        names.sort_by(|a, b| a.1.cmp(&b.1));
+
+        let mut rows = Vec::with_capacity(names.len());
+        for (table_id, name) in names {
+            let (row_count, pages) = match &self.backend {
+                Backend::Memory { storage, .. } => {
+                    let count = storage.table(table_id).map(|t| t.rows().len() as i64).unwrap_or(0);
+                    (Value::BigInt(count), Value::Null)
+                }
+                Backend::Disk { storage } => {
+                    let row_count =
+                        storage.table_stats(table_id).map(|s| Value::BigInt(s.row_count as i64)).unwrap_or(Value::Null);
+                    let pages =
+                        storage.table_page_count(table_id).map(|p| Value::BigInt(p as i64)).unwrap_or(Value::Null);
+                    (row_count, pages)
+                }
+            };
+            rows.push(
+                Tuple::new(&schema, vec![Value::Text(name), row_count, pages])
+                    .expect("table_name・rows・pagesの3値はschemaに適合する"),
+            );
+        }
+        Ok(QueryResult::table(schema, rows))
+    }
+
+    /// `DESCRIBE <table>`を実行する(第39章)。列名・型・`NOT NULL`・
+    /// `PRIMARY KEY`・`UNIQUE`・その列を対象にした索引名の一覧を、Schema上の
+    /// 並び順で返す。
+    fn execute_describe(&self, describe: DescribeStatement) -> DbResult<QueryResult> {
+        let info = self
+            .table_info(&describe.table.name)
+            .ok_or_else(|| DbError::TableNotFound(describe.table.name.clone()))?;
+        let schema = Schema::new(vec![
+            Column::new("column_name", DataType::Text, false),
+            Column::new("data_type", DataType::Text, false),
+            Column::new("not_null", DataType::Boolean, false),
+            Column::new("primary_key", DataType::Boolean, false),
+            Column::new("unique", DataType::Boolean, false),
+            Column::new("indexes", DataType::Text, false),
+        ]);
+        // `Backend::Memory`は索引という概念自体を持たない(`execute_create_index`の
+        // ドキュメントを参照)ため、`indexes`列は常に空になる。
+        let index_infos: Vec<IndexInfo> = match &self.backend {
+            Backend::Disk { storage } => storage.indexes_for_table(info.id).cloned().collect(),
+            Backend::Memory { .. } => Vec::new(),
+        };
+
+        let mut rows = Vec::with_capacity(info.schema.len());
+        for (column_index, column) in info.schema.columns().iter().enumerate() {
+            let mut index_names: Vec<&str> =
+                index_infos.iter().filter(|ix| ix.column_index == column_index).map(|ix| ix.name.as_str()).collect();
+            index_names.sort_unstable();
+            rows.push(
+                Tuple::new(
+                    &schema,
+                    vec![
+                        Value::Text(column.name.clone()),
+                        Value::Text(column.data_type.to_string()),
+                        Value::Boolean(!column.nullable),
+                        Value::Boolean(column.primary_key),
+                        Value::Boolean(column.unique),
+                        Value::Text(index_names.join(", ")),
+                    ],
+                )
+                .expect("6値はschemaに適合する"),
+            );
+        }
+        Ok(QueryResult::table(schema, rows))
+    }
+
+    /// `SHOW INDEXES [FROM <table>]`を実行する(第39章)。`Backend::Memory`は
+    /// 索引を持たないため`DbError::NotImplemented`を返す(`execute_create_index`
+    /// と同じ制約)。
+    fn execute_show_indexes(&self, show: ShowIndexesStatement) -> DbResult<QueryResult> {
+        let Backend::Disk { storage } = &self.backend else {
+            return Err(DbError::NotImplemented(
+                "SHOW INDEXESはDatabase::open(ディスクバックエンド)でのみサポートされています".to_string(),
+            ));
+        };
+        let schema = Schema::new(vec![
+            Column::new("index_name", DataType::Text, false),
+            Column::new("table_name", DataType::Text, false),
+            Column::new("column_name", DataType::Text, false),
+            Column::new("unique", DataType::Boolean, false),
+            Column::new("primary_key", DataType::Boolean, false),
+            Column::new("uses", DataType::BigInt, false),
+        ]);
+
+        let target_table_id = match &show.table {
+            Some(ident) => {
+                Some(storage.table(&ident.name).ok_or_else(|| DbError::TableNotFound(ident.name.clone()))?.id)
+            }
+            None => None,
+        };
+        let table_names: HashMap<TableId, &str> =
+            storage.tables().map(|info| (info.id, info.name.as_str())).collect();
+        let usage: HashMap<String, u64> = storage.index_usage_counts().into_iter().collect();
+
+        let mut infos: Vec<&IndexInfo> = storage
+            .tables()
+            .flat_map(|info| storage.indexes_for_table(info.id))
+            .filter(|ix| target_table_id.is_none_or(|id| ix.table_id == id))
+            .collect();
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let mut rows = Vec::with_capacity(infos.len());
+        for ix in infos {
+            let table_name = table_names.get(&ix.table_id).copied().unwrap_or("?");
+            let uses = usage.get(&ix.name).copied().unwrap_or(0);
+            rows.push(
+                Tuple::new(
+                    &schema,
+                    vec![
+                        Value::Text(ix.name.clone()),
+                        Value::Text(table_name.to_string()),
+                        Value::Text(ix.column_name.clone()),
+                        Value::Boolean(ix.unique),
+                        Value::Boolean(ix.primary_key),
+                        Value::BigInt(uses as i64),
+                    ],
+                )
+                .expect("6値はschemaに適合する"),
+            );
+        }
+        Ok(QueryResult::table(schema, rows))
+    }
+
+    /// `SHOW STATS [FROM <table>]`を実行する(第39章)。
+    fn execute_show_stats(&self, show: ShowStatsStatement) -> DbResult<QueryResult> {
+        match &show.table {
+            Some(ident) => self.execute_show_stats_for_table(&ident.name),
+            None => self.execute_show_stats_global(),
+        }
+    }
+
+    /// `SHOW STATS FROM <table>`。`ANALYZE`(第27章)が集めた列ごとの統計を
+    /// 列ごと1行で返す。`ANALYZE`を一度も実行していなければ
+    /// `DbError::TableNotAnalyzed`を返す(空の結果を黙って返すより、
+    /// まだ何も集めていないことを明示するほうが利用者の勘違いを防げる)。
+    fn execute_show_stats_for_table(&self, table_name: &str) -> DbResult<QueryResult> {
+        let info = self.table_info(table_name).ok_or_else(|| DbError::TableNotFound(table_name.to_string()))?;
+        let stats = self.table_stats(info.id).ok_or_else(|| DbError::TableNotAnalyzed(table_name.to_string()))?;
+
+        let schema = Schema::new(vec![
+            Column::new("column_name", DataType::Text, false),
+            Column::new("null_count", DataType::BigInt, false),
+            Column::new("distinct_count", DataType::BigInt, false),
+            Column::new("min", DataType::Text, true),
+            Column::new("max", DataType::Text, true),
+            Column::new("mcv_count", DataType::BigInt, false),
+            Column::new("histogram_buckets", DataType::BigInt, false),
+        ]);
+        let mut rows = Vec::with_capacity(stats.columns.len());
+        for (column, column_stats) in info.schema.columns().iter().zip(&stats.columns) {
+            rows.push(
+                Tuple::new(
+                    &schema,
+                    vec![
+                        Value::Text(column.name.clone()),
+                        Value::BigInt(column_stats.null_count as i64),
+                        Value::BigInt(column_stats.distinct_count as i64),
+                        column_stats.min.as_ref().map(|v| Value::Text(v.to_string())).unwrap_or(Value::Null),
+                        column_stats.max.as_ref().map(|v| Value::Text(v.to_string())).unwrap_or(Value::Null),
+                        Value::BigInt(column_stats.mcv.len() as i64),
+                        Value::BigInt(column_stats.histogram.len() as i64),
+                    ],
+                )
+                .expect("7値はschemaに適合する"),
+            );
+        }
+        Ok(QueryResult::table(schema, rows))
+    }
+
+    /// `SHOW STATS`(テーブル指定なし)。Buffer Poolのヒット率・索引ごとの
+    /// 利用回数・Query Timingという、テーブルを問わないエンジン全体の統計を
+    /// `metric`・`value`の2列で返す(本文「観測性: metric/value形式を選んだ
+    /// 理由」を参照)。`Backend::Memory`は`BufferPool`を持たないため
+    /// `DbError::NotImplemented`を返す。
+    fn execute_show_stats_global(&self) -> DbResult<QueryResult> {
+        let Backend::Disk { storage } = &self.backend else {
+            return Err(DbError::NotImplemented(
+                "SHOW STATS(テーブル指定なし)はDatabase::open(ディスクバックエンド)でのみサポートされています".to_string(),
+            ));
+        };
+        let schema =
+            Schema::new(vec![Column::new("metric", DataType::Text, false), Column::new("value", DataType::Text, false)]);
+
+        let bp = storage.buffer_pool_stats();
+        let total = bp.hits + bp.misses;
+        let hit_rate_pct = if total == 0 { 0.0 } else { bp.hits as f64 / total as f64 * 100.0 };
+
+        let mut rows = vec![
+            metric_row(&schema, "buffer_pool_hits", bp.hits.to_string()),
+            metric_row(&schema, "buffer_pool_misses", bp.misses.to_string()),
+            metric_row(&schema, "buffer_pool_hit_rate_pct", format!("{hit_rate_pct:.1}")),
+            metric_row(&schema, "query_count", self.query_timing.count.to_string()),
+            metric_row(&schema, "query_avg_ms", format!("{:.3}", self.query_timing.average_ms())),
+        ];
+
+        let mut usage = storage.index_usage_counts();
+        usage.sort_by(|a, b| a.0.cmp(&b.0));
+        for (index_name, count) in usage {
+            rows.push(metric_row(&schema, &format!("index_uses:{index_name}"), count.to_string()));
+        }
+
+        Ok(QueryResult::table(schema, rows))
+    }
+
+    /// `VACUUM [<table>]`を実行する(第39章)。
+    ///
+    /// 対象テーブルごとに、[`Self::acquire_scan_locks`]で`LockMode::Exclusive`の
+    /// ロックを獲得してから[`Storage::vacuum_table`]を呼ぶ。`acquire_scan_locks`は
+    /// `SELECT`の`Shared`ロック([`crate::database`モジュール冒頭「ロックの粒度」)
+    /// と対になる、書き込み版の「テーブル全体」ロックである。`Backend::Disk`では
+    /// その時点でテーブルに存在する行の`RecordId`すべてに`LockKey::Tuple`の
+    /// Exclusiveを掛けるため、`UPDATE`・`DELETE`が行単位で保持している
+    /// Exclusiveロック(`acquire_write_locks`)や、Serializable分離レベルの
+    /// `SELECT`が保持するShared行ロックと衝突する。テーブル全体を対象にした
+    /// 単一の`LockKey::Table`だけを取る設計では、行単位のロックしか持たない
+    /// `Backend::Disk`の`UPDATE`・`DELETE`と噛み合わず、排他が効かない
+    /// (本文「VACUUMの排他」を参照)。
+    ///
+    /// ロックが獲得できなければ他の文と同じ`DbError::WouldBlock`を返し、
+    /// `SharedDatabase::execute_in_tx`・`execute_in_tx_bound`(第35章)の
+    /// 再試行ループがスレッドを眠らせて待つ。`VACUUM`が`Active`なトランザクション
+    /// の中で呼ばれれば、このロックはCOMMIT/ROLLBACKまで保持される(Strict 2PLの
+    /// 規律そのまま)。Autocommitであれば`run_bound_statement`が文の終わりで
+    /// 解放する(他の文と同じ規律、`execute_bound_statement`のドキュメントを
+    /// 参照)。`Backend::Memory`はページも索引ファイルも持たないため
+    /// `DbError::NotImplemented`を返す。
+    fn execute_vacuum(&mut self, vacuum: VacuumStatement, owner: TransactionId) -> DbResult<QueryResult> {
+        if matches!(&self.backend, Backend::Memory { .. }) {
+            return Err(DbError::NotImplemented(
+                "VACUUMはDatabase::open(ディスクバックエンド)でのみサポートされています".to_string(),
+            ));
+        }
+        let targets: Vec<TableId> = match &vacuum.table {
+            Some(ident) => {
+                let info = self.table_info(&ident.name).ok_or_else(|| DbError::TableNotFound(ident.name.clone()))?;
+                vec![info.id]
+            }
+            None => self.all_table_infos().map(|info| info.id).collect(),
+        };
+        for &table_id in &targets {
+            self.acquire_scan_locks(owner, &[table_id], LockMode::Exclusive)?;
+        }
+        let Backend::Disk { storage } = &mut self.backend else {
+            unreachable!("この関数の先頭でBackend::Diskであることを確認済み");
+        };
+        for &table_id in &targets {
+            storage.vacuum_table(table_id)?;
+        }
+        Ok(QueryResult::command_with_count("VACUUM", targets.len()))
+    }
+
     /// `table_id`を`SeqScan`で全件走査し、[`StatsCollector`]で統計を集める。
     fn collect_table_stats(&self, table_id: TableId, table_name: &str, schema: &Schema) -> DbResult<TableStats> {
         let plan = PhysicalPlan::SeqScan(SeqScanNode {
@@ -1870,6 +2199,12 @@ impl SharedDatabase {
         self.lock().set_resource_limits(limits);
     }
 
+    /// Slow Query Log(第39章)の閾値を取り出す。[`crate::session::Session::execute`]が
+    /// 文を1本実行するたびに呼ぶ。
+    pub(crate) fn slow_query_threshold(&self) -> Option<std::time::Duration> {
+        self.lock().resource_limits.slow_query_threshold
+    }
+
     /// `handle`が指すトランザクションを確定する([`Database::commit_tx`]を
     /// 参照)。ロックを解放するため、成功・失敗によらず`notify_all`する。
     pub fn commit_tx(&self, handle: TxHandle) -> DbResult<()> {
@@ -1922,6 +2257,12 @@ impl StatsLookup for Database {
 /// 使う。根のノードは常に1行目に現れる(`explain_text`・`write_tree`の
 /// 深さ0の行はインデント無しの1行になる)ため、改行までの部分文字列に
 /// 追記するだけでよい。
+/// `SHOW STATS`(テーブル指定なし、第39章)の`metric`/`value`形式の1行を
+/// 組み立てる。
+fn metric_row(schema: &Schema, metric: &str, value: String) -> Tuple {
+    Tuple::new(schema, vec![Value::Text(metric.to_string()), Value::Text(value)]).expect("metric・valueの2値はschemaに適合する")
+}
+
 fn append_actual_to_root_line(text: &str, count: usize) -> String {
     match text.split_once('\n') {
         Some((first_line, rest)) => format!("{first_line} actual={count}\n{rest}"),
@@ -1985,6 +2326,29 @@ impl QueryResult {
                     .expect("QUERY PLAN列はTEXTなので必ず成功する")
             })
             .collect();
+        QueryResult { schema, rows, command_tag: None }
+    }
+
+    /// `SHOW TABLES`・`DESCRIBE`・`SHOW INDEXES`・`SHOW STATS`(第39章)が
+    /// 完了したことを表す`QueryResult`を作る。
+    ///
+    /// この4つの文は、専用のSQL構文を追加したうえで、実行結果を`SELECT`と
+    /// 同じ形(`Schema`と`Vec<Tuple>`)の`QueryResult`として合成する方式を
+    /// 採った(本文「System TableをどうSQLへ橋渡しするか」を参照)。System
+    /// Catalogを実テーブルとして`information_schema`のように公開し、通常の
+    /// `SELECT`でクエリできるようにする方式(仮想テーブル方式)も考えられるが、
+    /// `Backend::Memory`・`Backend::Disk`のどちらの実データにも触れずメタ
+    /// 情報だけを返すこの4文にとって、`Binder`・`physical_plan`を経由する
+    /// 仮想テーブル方式は実装コストに見合わない。`explain`(第19章、`EXPLAIN`)
+    /// が採った方式をそのまま踏襲した。
+    fn table(schema: Schema, rows: Vec<Tuple>) -> Self {
+        QueryResult { schema, rows, command_tag: None }
+    }
+
+    /// `crate::slow_query_log`のテストが、任意の行数を持つ成功結果を作るために
+    /// 使う(第39章)。本番コードからは呼ばない。
+    #[cfg(test)]
+    pub(crate) fn for_test(schema: Schema, rows: Vec<Tuple>) -> Self {
         QueryResult { schema, rows, command_tag: None }
     }
 
@@ -5561,5 +5925,338 @@ mod tests {
         // t1の2つの更新はコミット済み、t2の更新は取り消し済み。
         assert_eq!(balance(&mut db, 1), 71);
         assert_eq!(balance(&mut db, 2), 50);
+    }
+
+    // ---- 第39章: SHOW TABLES / DESCRIBE / SHOW INDEXES / SHOW STATS / VACUUM ----
+
+    fn show_tables_row<'a>(result: &'a QueryResult, table_name: &str) -> &'a [Value] {
+        result
+            .rows()
+            .iter()
+            .find(|r| r.values()[0] == Value::Text(table_name.to_string()))
+            .unwrap_or_else(|| panic!("SHOW TABLESに{table_name}が見当たらない: {result}"))
+            .values()
+    }
+
+    #[test]
+    fn show_tables_on_memory_backend_reports_the_exact_row_count_and_null_pages() {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE t (id BIGINT NOT NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+        let result = db.execute("SHOW TABLES").unwrap();
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(show_tables_row(&result, "t"), &[Value::Text("t".to_string()), Value::BigInt(3), Value::Null]);
+    }
+
+    #[test]
+    fn show_tables_on_disk_backend_shows_null_rows_before_analyze_and_the_row_count_after() {
+        let path = temp_db_path("show-tables-disk");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id BIGINT NOT NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+
+        let before = db.execute("SHOW TABLES").unwrap();
+        let row = show_tables_row(&before, "t");
+        assert_eq!(row[1], Value::Null, "ANALYZE前はrowsがNULL");
+        assert_ne!(row[2], Value::Null, "pagesは常に実測値");
+
+        db.execute("ANALYZE t").unwrap();
+        let after = db.execute("SHOW TABLES").unwrap();
+        assert_eq!(show_tables_row(&after, "t")[1], Value::BigInt(2));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn describe_lists_columns_with_constraints_and_index_names() {
+        let path = temp_db_path("describe");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, email TEXT UNIQUE, name TEXT)").unwrap();
+        db.execute("CREATE INDEX t_name_idx ON t (name)").unwrap();
+
+        let result = db.execute("DESCRIBE t").unwrap();
+        assert_eq!(result.rows().len(), 3);
+
+        let id_row = result.rows()[0].values();
+        assert_eq!(
+            id_row,
+            &[
+                Value::Text("id".to_string()),
+                Value::Text("BIGINT".to_string()),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::Text("t_id_idx".to_string()),
+            ]
+        );
+
+        let email_row = result.rows()[1].values();
+        assert_eq!(email_row[3], Value::Boolean(false), "primary_keyではない");
+        assert_eq!(email_row[4], Value::Boolean(true), "unique");
+        assert_eq!(email_row[5], Value::Text("t_email_idx".to_string()));
+
+        let name_row = result.rows()[2].values();
+        assert_eq!(name_row[5], Value::Text("t_name_idx".to_string()));
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(format!("{}.idx.t_id_idx", path.display()));
+        let _ = std::fs::remove_file(format!("{}.idx.t_email_idx", path.display()));
+        let _ = std::fs::remove_file(format!("{}.idx.t_name_idx", path.display()));
+    }
+
+    #[test]
+    fn describe_rejects_an_unknown_table() {
+        let mut db = Database::memory();
+        assert!(matches!(db.execute("DESCRIBE nope"), Err(DbError::Bind { .. })));
+    }
+
+    #[test]
+    fn show_indexes_lists_all_or_filtered_by_table_and_counts_usage() {
+        let path = temp_db_path("show-indexes");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)").unwrap();
+        db.execute("CREATE TABLE u (id BIGINT NOT NULL)").unwrap();
+        db.execute("CREATE INDEX t_k_idx ON t (k)").unwrap();
+        for i in 0..300i64 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, {i})")).unwrap();
+        }
+        // コストベース最適化(第28章)に、`k = 5`が1行しか一致しない選択的な
+        // 述語であることを実測させる。これが無いと(統計が無い)デフォルトの
+        // 選択率のもとではSeqScanのほうが安く見積もられ、索引が選ばれない。
+        db.execute("ANALYZE t").unwrap();
+
+        let all = db.execute("SHOW INDEXES").unwrap();
+        assert_eq!(all.rows().len(), 2, "t_id_idx(PK自動生成)とt_k_idx: {all}");
+
+        let filtered = db.execute("SHOW INDEXES FROM t").unwrap();
+        assert_eq!(filtered.rows().len(), 2);
+
+        // 索引が実際に選ばれるクエリを実行してから利用回数を確認する
+        // (`physical_plan::optimize`が索引を選ぶことを`EXPLAIN`で先に確かめる)。
+        let plan = db.execute("EXPLAIN SELECT id FROM t WHERE k = 5").unwrap().to_string();
+        assert!(plan.contains("IndexScan(t_k_idx"), "{plan}");
+        db.execute("SELECT id FROM t WHERE k = 5").unwrap();
+
+        let after = db.execute("SHOW INDEXES FROM t").unwrap();
+        let k_idx_row = after.rows().iter().find(|r| r.values()[0] == Value::Text("t_k_idx".to_string())).unwrap();
+        assert_eq!(k_idx_row.values()[5], Value::BigInt(1));
+        let id_idx_row = after.rows().iter().find(|r| r.values()[0] == Value::Text("t_id_idx".to_string())).unwrap();
+        assert_eq!(id_idx_row.values()[5], Value::BigInt(0), "t_id_idxは一度も引かれていない");
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(format!("{}.idx.t_id_idx", path.display()));
+        let _ = std::fs::remove_file(format!("{}.idx.t_k_idx", path.display()));
+    }
+
+    #[test]
+    fn show_indexes_on_memory_backend_is_not_implemented() {
+        let mut db = Database::memory();
+        assert!(matches!(db.execute("SHOW INDEXES"), Err(DbError::NotImplemented(_))));
+    }
+
+    #[test]
+    fn show_stats_for_table_requires_analyze_first_then_reports_column_stats() {
+        let path = temp_db_path("show-stats-table");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id BIGINT NOT NULL, status BIGINT NOT NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 0), (2, 0), (3, 1)").unwrap();
+
+        assert!(matches!(db.execute("SHOW STATS FROM t"), Err(DbError::TableNotAnalyzed(name)) if name == "t"));
+
+        db.execute("ANALYZE t").unwrap();
+        let result = db.execute("SHOW STATS FROM t").unwrap();
+        assert_eq!(result.rows().len(), 2);
+
+        let status_row = result.rows()[1].values();
+        assert_eq!(status_row[0], Value::Text("status".to_string()));
+        assert_eq!(status_row[1], Value::BigInt(0), "null_count");
+        assert_eq!(status_row[2], Value::BigInt(2), "distinct_count(0と1)");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn show_stats_global_reports_buffer_pool_index_usage_and_query_count() {
+        let path = temp_db_path("show-stats-global");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id BIGINT NOT NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+
+        // ここまでで2文(CREATE TABLE・INSERT)実行済み。SHOW STATS自身は
+        // 完了後に記録されるため、この時点のquery_countにはまだ含まれない。
+        let result = db.execute("SHOW STATS").unwrap();
+        let metrics: HashMap<String, String> = result
+            .rows()
+            .iter()
+            .map(|r| {
+                let (Value::Text(k), Value::Text(v)) = (&r.values()[0], &r.values()[1]) else {
+                    panic!("metric/valueはどちらもTEXT: {r:?}")
+                };
+                (k.clone(), v.clone())
+            })
+            .collect();
+        assert!(metrics.contains_key("buffer_pool_hits"), "{metrics:?}");
+        assert!(metrics.contains_key("buffer_pool_misses"), "{metrics:?}");
+        assert!(metrics.contains_key("buffer_pool_hit_rate_pct"), "{metrics:?}");
+        assert_eq!(metrics["query_count"], "2");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn show_stats_global_on_memory_backend_is_not_implemented() {
+        let mut db = Database::memory();
+        assert!(matches!(db.execute("SHOW STATS"), Err(DbError::NotImplemented(_))));
+    }
+
+    /// 「INSERT/DELETEを繰り返すたびに肥大化し続けるファイル」対「VACUUMで
+    /// 頭打ちにしたファイル」を、同じワークロードで実測する(第39章、本文
+    /// 「実測: VACUUMの有無でファイルサイズはどう変わるか」)。
+    #[test]
+    #[ignore = "実行時間の計測用。cargo test -- --ignored --nocapture で実行する"]
+    fn without_vacuum_the_file_keeps_growing_while_with_vacuum_it_plateaus() {
+        let payload = "x".repeat(400);
+        const ROWS_PER_CYCLE: i64 = 600;
+        const CYCLES: i64 = 5;
+
+        let grow_path = temp_db_path("vacuum-measure-grow");
+        let mut grow_db = Database::open(&grow_path).unwrap();
+        grow_db.execute("CREATE TABLE logs (id BIGINT NOT NULL, payload TEXT NOT NULL)").unwrap();
+        let mut next_id = 0i64;
+        for _ in 0..CYCLES {
+            for _ in 0..ROWS_PER_CYCLE {
+                grow_db.execute(&format!("INSERT INTO logs VALUES ({next_id}, '{payload}')")).unwrap();
+                next_id += 1;
+            }
+            grow_db.execute(&format!("DELETE FROM logs WHERE id < {}", next_id - 50)).unwrap();
+            eprintln!("without VACUUM: pages={}", table_pages(&mut grow_db, "logs"));
+        }
+        drop(grow_db);
+        let grow_size = std::fs::metadata(&grow_path).unwrap().len();
+        eprintln!("without VACUUM: file_size={grow_size}bytes");
+
+        let stable_path = temp_db_path("vacuum-measure-stable");
+        let mut stable_db = Database::open(&stable_path).unwrap();
+        stable_db.execute("CREATE TABLE logs (id BIGINT NOT NULL, payload TEXT NOT NULL)").unwrap();
+        let mut next_id = 0i64;
+        for _ in 0..CYCLES {
+            for _ in 0..ROWS_PER_CYCLE {
+                stable_db.execute(&format!("INSERT INTO logs VALUES ({next_id}, '{payload}')")).unwrap();
+                next_id += 1;
+            }
+            stable_db.execute(&format!("DELETE FROM logs WHERE id < {}", next_id - 50)).unwrap();
+            stable_db.execute("VACUUM logs").unwrap();
+            eprintln!("with VACUUM: pages={}", table_pages(&mut stable_db, "logs"));
+        }
+        drop(stable_db);
+        let stable_size = std::fs::metadata(&stable_path).unwrap().len();
+        eprintln!("with VACUUM: file_size={stable_size}bytes");
+
+        assert!(stable_size < grow_size);
+        std::fs::remove_file(&grow_path).unwrap();
+        std::fs::remove_file(&stable_path).unwrap();
+    }
+
+    #[test]
+    fn vacuum_reclaims_pages_after_bulk_delete_and_leaves_remaining_rows_readable() {
+        let path = temp_db_path("vacuum-reclaim");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id BIGINT NOT NULL, payload TEXT NOT NULL)").unwrap();
+        let payload = "x".repeat(500);
+        for i in 0..200i64 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, '{payload}')")).unwrap();
+        }
+
+        let pages_before = table_pages(&mut db, "t");
+        assert!(pages_before > 1, "{pages_before}");
+
+        db.execute("DELETE FROM t WHERE id < 190").unwrap();
+        assert_eq!(table_pages(&mut db, "t"), pages_before, "DELETEだけではページは減らない");
+
+        db.execute("VACUUM t").unwrap();
+        let pages_after = table_pages(&mut db, "t");
+        assert!(pages_after < pages_before, "before={pages_before} after={pages_after}");
+
+        let remaining = db.execute("SELECT id FROM t ORDER BY id").unwrap();
+        assert_eq!(remaining.rows().len(), 10);
+        assert_eq!(remaining.rows()[0].values(), &[Value::BigInt(190)]);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    fn table_pages(db: &mut Database, table: &str) -> i64 {
+        let result = db.execute("SHOW TABLES").unwrap();
+        match show_tables_row(&result, table)[2] {
+            Value::BigInt(n) => n,
+            ref other => panic!("pagesはBigIntのはず: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vacuum_rebuilds_indexes_and_lookup_range_stay_correct() {
+        let path = temp_db_path("vacuum-index-rebuild");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id BIGINT NOT NULL, k BIGINT NOT NULL)").unwrap();
+        db.execute("CREATE INDEX t_k_idx ON t (k)").unwrap();
+        for i in 0..100i64 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, {i})")).unwrap();
+        }
+        // 半分削除し、索引にLazy Delete済みのエントリを残す。
+        db.execute("DELETE FROM t WHERE k < 50").unwrap();
+        db.execute("VACUUM t").unwrap();
+
+        let point = db.execute("SELECT id FROM t WHERE k = 75").unwrap();
+        assert_eq!(point.rows().len(), 1);
+        assert_eq!(point.rows()[0].values(), &[Value::BigInt(75)]);
+
+        let deleted = db.execute("SELECT id FROM t WHERE k = 10").unwrap();
+        assert_eq!(deleted.rows().len(), 0, "VACUUM前に削除済みのキーは見つからないまま");
+
+        let range = db.execute("SELECT id FROM t WHERE k >= 60 AND k < 70").unwrap();
+        assert_eq!(range.rows().len(), 10);
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(format!("{}.idx.t_k_idx", path.display()));
+    }
+
+    #[test]
+    fn vacuum_without_a_table_name_targets_every_table() {
+        let path = temp_db_path("vacuum-all");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE a (id BIGINT NOT NULL)").unwrap();
+        db.execute("CREATE TABLE b (id BIGINT NOT NULL)").unwrap();
+
+        assert_eq!(db.execute("VACUUM").unwrap().to_string(), "VACUUM 2");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn vacuum_on_memory_backend_is_not_implemented() {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE t (id BIGINT NOT NULL)").unwrap();
+        assert!(matches!(db.execute("VACUUM t"), Err(DbError::NotImplemented(_))));
+    }
+
+    /// `VACUUM`は、他のトランザクションがこのテーブルの行を保持している間は
+    /// 待たされ(`DbError::WouldBlock`)、そのトランザクションがコミットして
+    /// ロックを手放せば実行できる(本文「VACUUMの排他」を参照)。
+    #[test]
+    fn vacuum_blocks_while_another_transaction_holds_a_row_lock_and_succeeds_after_commit() {
+        let path = temp_db_path("vacuum-lock");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id BIGINT NOT NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+
+        let t1 = db.begin_tx();
+        db.execute_in_tx(&t1, "UPDATE t SET id = 100 WHERE id = 1").unwrap();
+
+        assert!(matches!(db.execute("VACUUM t"), Err(DbError::WouldBlock)));
+
+        db.commit_tx(t1).unwrap();
+        db.execute("VACUUM t").unwrap();
+
+        std::fs::remove_file(&path).unwrap();
     }
 }

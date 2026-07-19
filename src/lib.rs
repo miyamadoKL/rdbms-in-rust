@@ -82,6 +82,7 @@ pub mod rules;
 pub mod server;
 pub mod session;
 pub mod slotted_page;
+pub mod slow_query_log;
 pub mod statistics;
 pub mod storage;
 pub mod storage_mem;

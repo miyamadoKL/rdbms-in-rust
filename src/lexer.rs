@@ -107,6 +107,18 @@ pub enum Keyword {
     Execute,
     /// `DEALLOCATE`文(第37章)。
     Deallocate,
+    /// `SHOW TABLES` / `SHOW INDEXES` / `SHOW STATS`(第39章)の`SHOW`。
+    Show,
+    /// `DESCRIBE <table>`(第39章)。
+    Describe,
+    /// `VACUUM [<table>]`(第39章)。
+    Vacuum,
+    /// `SHOW TABLES`(第39章)の`TABLES`。
+    Tables,
+    /// `SHOW INDEXES [FROM <table>]`(第39章)の`INDEXES`。
+    Indexes,
+    /// `SHOW STATS [FROM <table>]`(第39章)の`STATS`。
+    Stats,
 }
 
 impl Keyword {
@@ -166,6 +178,12 @@ impl Keyword {
             "PREPARE" => Keyword::Prepare,
             "EXECUTE" => Keyword::Execute,
             "DEALLOCATE" => Keyword::Deallocate,
+            "SHOW" => Keyword::Show,
+            "DESCRIBE" => Keyword::Describe,
+            "VACUUM" => Keyword::Vacuum,
+            "TABLES" => Keyword::Tables,
+            "INDEXES" => Keyword::Indexes,
+            "STATS" => Keyword::Stats,
             _ => return None,
         };
         Some(keyword)

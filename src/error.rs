@@ -329,6 +329,13 @@ pub enum DbError {
         /// 設定されていた上限行数。
         limit: usize,
     },
+
+    /// `SHOW STATS FROM <table>`(第39章)が、`ANALYZE`を一度も実行していない
+    /// テーブルを指定したエラー。列ごとの統計は`ANALYZE`(第27章)が集める
+    /// ものであり、集めたことのない統計を空の表として黙って返すより、
+    /// 「まだ何も集めていない」ことを明示するほうが利用者の勘違いを防げる。
+    #[error("テーブル{0}はまだANALYZEが実行されていません")]
+    TableNotAnalyzed(String),
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

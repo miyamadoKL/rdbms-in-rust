@@ -23,16 +23,17 @@
 //! 接続すると、REPLと同じ対話UIでSQLを実行できる(`src/bin/minidb_client.rs`)。
 //!
 //! ワーカースレッド数・接続キュー容量・文の実行時間の上限・Sort/Hash Join/Hash
-//! Aggregateの収集行数の上限は、追加の`--key value`引数(`<db-path>`の後、
-//! 順不同)で指定する(第38章、`crate::database::ResourceLimits`・
-//! `crate::server::ServerConfig`を参照)。`SET`文のような実行時のSQL構文では
-//! なく起動引数にしたのは、これらがセッションではなくサーバープロセス全体の
-//! 運用ポリシーだからである(`crate::database::ResourceLimits`のドキュメント
-//! を参照)。
+//! Aggregateの収集行数の上限・Slow Query Logの閾値(第39章)は、追加の
+//! `--key value`引数(`<db-path>`の後、順不同)で指定する(第38章、
+//! `crate::database::ResourceLimits`・`crate::server::ServerConfig`を参照)。
+//! `SET`文のような実行時のSQL構文ではなく起動引数にしたのは、これらが
+//! セッションではなくサーバープロセス全体の運用ポリシーだからである
+//! (`crate::database::ResourceLimits`のドキュメントを参照)。
 //!
 //! ```text
 //! cargo run -- --serve 127.0.0.1:5432 example.db \
-//!     --workers 8 --queue 32 --statement-timeout-ms 5000 --max-rows 1000000
+//!     --workers 8 --queue 32 --statement-timeout-ms 5000 --max-rows 1000000 \
+//!     --slow-query-threshold-ms 100
 //! ```
 //!
 //! # Graceful Shutdown
@@ -64,10 +65,10 @@ fn main() {
     }
 }
 
-/// `--serve <addr> [db-path] [--workers N] [--queue N] [--statement-timeout-ms N] [--max-rows N]`を処理する。
+/// `--serve <addr> [db-path] [--workers N] [--queue N] [--statement-timeout-ms N] [--max-rows N] [--slow-query-threshold-ms N]`を処理する。
 fn run_server(mut args: env::Args) {
     let Some(addr) = args.next() else {
-        eprintln!("使い方: minidb --serve <addr> [db-path] [--workers N] [--queue N] [--statement-timeout-ms N] [--max-rows N]");
+        eprintln!("使い方: minidb --serve <addr> [db-path] [--workers N] [--queue N] [--statement-timeout-ms N] [--max-rows N] [--slow-query-threshold-ms N]");
         std::process::exit(1);
     };
 
@@ -115,8 +116,9 @@ fn run_server(mut args: env::Args) {
     }
 }
 
-/// `--workers`・`--queue`・`--statement-timeout-ms`・`--max-rows`を`config`・
-/// `limits`へ反映する。順不同の`--key value`ペアの並びとして解釈する。
+/// `--workers`・`--queue`・`--statement-timeout-ms`・`--max-rows`・
+/// `--slow-query-threshold-ms`を`config`・`limits`へ反映する。順不同の
+/// `--key value`ペアの並びとして解釈する。
 fn parse_server_options(options: &[String], config: &mut ServerConfig, limits: &mut ResourceLimits) -> Result<(), String> {
     let mut iter = options.iter();
     while let Some(key) = iter.next() {
@@ -126,6 +128,9 @@ fn parse_server_options(options: &[String], config: &mut ServerConfig, limits: &
             "--queue" => config.queue_capacity = parse_nonnegative(key, value)?,
             "--statement-timeout-ms" => limits.statement_timeout = Some(Duration::from_millis(parse_nonnegative(key, value)? as u64)),
             "--max-rows" => limits.max_operator_rows = Some(parse_positive(key, value)?),
+            "--slow-query-threshold-ms" => {
+                limits.slow_query_threshold = Some(Duration::from_millis(parse_nonnegative(key, value)? as u64))
+            }
             other => return Err(format!("未知のオプションです: {other}")),
         }
     }

@@ -52,9 +52,10 @@ use std::collections::HashSet;
 
 use crate::ast::{
     AggregateFunc, AnalyzeStatement, Assignment, BeginStatement, BinaryOperator, CheckpointStatement, CommitStatement,
-    CreateIndexStatement, CreateTableStatement, DeleteStatement, DropIndexStatement, DropTableStatement, Expr,
-    FromClause, Ident, InsertStatement, JoinKind, RollbackStatement, SelectItem, SelectStatement, Statement,
-    UnaryOperator, UpdateStatement,
+    CreateIndexStatement, CreateTableStatement, DeleteStatement, DescribeStatement, DropIndexStatement,
+    DropTableStatement, Expr, FromClause, Ident, InsertStatement, JoinKind, RollbackStatement, SelectItem,
+    SelectStatement, ShowIndexesStatement, ShowStatsStatement, ShowTablesStatement, Statement, UnaryOperator,
+    UpdateStatement, VacuumStatement,
 };
 use crate::catalog::{Catalog, TableInfo};
 use crate::error::{DbError, DbResult};
@@ -149,6 +150,19 @@ pub enum BoundStatement {
     /// `CHECKPOINT`(第34章)。`Begin`・`Commit`・`Rollback`と同じ理由で、
     /// ASTのバリアントをそのまま持ち回す。
     Checkpoint(CheckpointStatement),
+    /// `SHOW TABLES`(第39章)。対象を持たないため、ASTのバリアントをそのまま
+    /// 持ち回す。
+    ShowTables(ShowTablesStatement),
+    /// `DESCRIBE <table>`(第39章)。`Analyze`と同じく、テーブル名の存在を
+    /// ここで確認する。
+    Describe(DescribeStatement),
+    /// `SHOW INDEXES [FROM <table>]`(第39章)。
+    ShowIndexes(ShowIndexesStatement),
+    /// `SHOW STATS [FROM <table>]`(第39章)。
+    ShowStats(ShowStatsStatement),
+    /// `VACUUM [<table>]`(第39章)。`Analyze`と同じ理由でASTのバリアントを
+    /// そのまま持ち回す。
+    Vacuum(VacuumStatement),
 }
 
 /// 束縛済みの`CREATE INDEX`(第24章)。
@@ -534,6 +548,11 @@ impl<'a> Binder<'a> {
             Statement::Commit(commit) => Ok(BoundStatement::Commit(commit)),
             Statement::Rollback(rollback) => Ok(BoundStatement::Rollback(rollback)),
             Statement::Checkpoint(checkpoint) => Ok(BoundStatement::Checkpoint(checkpoint)),
+            Statement::ShowTables(show) => Ok(BoundStatement::ShowTables(show)),
+            Statement::Describe(describe) => self.bind_describe(describe),
+            Statement::ShowIndexes(show) => self.bind_show_indexes(show),
+            Statement::ShowStats(show) => self.bind_show_stats(show),
+            Statement::Vacuum(vacuum) => self.bind_vacuum(vacuum),
             // `PREPARE`・`EXECUTE`・`DEALLOCATE`(第37章)は`Session`が
             // `Database::execute`より前に横取りする文であり、ここまで
             // 到達しない(`crate::session`モジュールのドキュメント参照)。
@@ -565,6 +584,47 @@ impl<'a> Binder<'a> {
                 .ok_or_else(|| self.error_at(table.span, format!("テーブルが見つかりません: {}", table.name)))?;
         }
         Ok(BoundStatement::Analyze(analyze))
+    }
+
+    /// `DESCRIBE <table>`のテーブル名を解決する(第39章)。`table`は`ANALYZE`と
+    /// 違って省略できないため、必ずここで存在を確認する。
+    fn bind_describe(&self, describe: DescribeStatement) -> DbResult<BoundStatement> {
+        self.catalog
+            .table(&describe.table.name)
+            .ok_or_else(|| self.error_at(describe.table.span, format!("テーブルが見つかりません: {}", describe.table.name)))?;
+        Ok(BoundStatement::Describe(describe))
+    }
+
+    /// `SHOW INDEXES [FROM <table>]`のテーブル名を解決する(第39章)。
+    /// `bind_analyze`と同じく、省略されていれば検査せずそのまま通す。
+    fn bind_show_indexes(&self, show: ShowIndexesStatement) -> DbResult<BoundStatement> {
+        if let Some(table) = &show.table {
+            self.catalog
+                .table(&table.name)
+                .ok_or_else(|| self.error_at(table.span, format!("テーブルが見つかりません: {}", table.name)))?;
+        }
+        Ok(BoundStatement::ShowIndexes(show))
+    }
+
+    /// `SHOW STATS [FROM <table>]`のテーブル名を解決する(第39章)。
+    fn bind_show_stats(&self, show: ShowStatsStatement) -> DbResult<BoundStatement> {
+        if let Some(table) = &show.table {
+            self.catalog
+                .table(&table.name)
+                .ok_or_else(|| self.error_at(table.span, format!("テーブルが見つかりません: {}", table.name)))?;
+        }
+        Ok(BoundStatement::ShowStats(show))
+    }
+
+    /// `VACUUM [<table>]`のテーブル名を解決する(第39章)。`bind_analyze`と
+    /// 同じ形。
+    fn bind_vacuum(&self, vacuum: VacuumStatement) -> DbResult<BoundStatement> {
+        if let Some(table) = &vacuum.table {
+            self.catalog
+                .table(&table.name)
+                .ok_or_else(|| self.error_at(table.span, format!("テーブルが見つかりません: {}", table.name)))?;
+        }
+        Ok(BoundStatement::Vacuum(vacuum))
     }
 
     fn error_at(&self, span: Span, message: impl Into<String>) -> DbError {

@@ -58,5 +58,5 @@
 - [第36章 Wire ProtocolとClient/Server](ch36-wire-protocol.md)
 - [第37章 SessionとPrepared Statement](ch37-session-prepared.md)
 - [第38章 実行制御](ch38-execution-control.md)
-- [第39章 System Catalogとメンテナンス]()
+- [第39章 System Catalogとメンテナンス](ch39-system-catalog.md)
 - [第40章 テスト、Fuzzing、Benchmark、リリース]()
