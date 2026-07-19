@@ -9,11 +9,15 @@
 //!    位置情報付きの`DbError::Bind`として検出される。
 //! 3. **論理計画**(`logical_plan::build_*`): `BoundStatement`(`Select`・`Insert`・
 //!    `Update`・`Delete`)を、関係代数の演算子木である[`LogicalPlan`]へ変換する。
-//! 4. **物理計画**(`physical_plan::optimize`): `LogicalPlan`を、実行アルゴリズムを
-//!    確定した[`crate::physical_plan::PhysicalPlan`]へ変換する。索引がまだ無いこの
-//!    章では`Scan`は必ず`SeqScan`になる(第25章でIndex Scanが加わると、ここが
-//!    本当の意味での選択になる)。
-//! 5. **実行**: `CREATE TABLE`・`DROP TABLE`はどちらの計画も経由せず、テーブル
+//! 4. **ルールベース最適化**(`rules::optimize`、第26章): `SELECT`が組み立てた
+//!    `LogicalPlan`を、意味を変えない書き換え(Constant Folding、Boolean
+//!    Simplification、Filter Merge、Predicate Pushdown、Projection Pruning)が
+//!    固定点まで反復して書き換える。`INSERT`・`UPDATE`・`DELETE`はこの段階を
+//!    経由しない(対象行が変わりうる書き換えはまだ無いので、今のところ通しても
+//!    意味が無い)。
+//! 5. **物理計画**(`physical_plan::optimize`): 書き換え後の`LogicalPlan`を、
+//!    実行アルゴリズムを確定した[`crate::physical_plan::PhysicalPlan`]へ変換する。
+//! 6. **実行**: `CREATE TABLE`・`DROP TABLE`はどちらの計画も経由せず、テーブル
 //!    定義を直接登録・削除する(`CREATE TABLE`が`Binder`を素通りするのと同じ理由。
 //!    モジュール冒頭の説明は[`crate::binder`]を参照)。`SELECT`は
 //!    `PhysicalPlan`を`Box<dyn Executor>`の木へ組み立て(`build_query_executor`)、
@@ -56,6 +60,7 @@ use crate::physical_plan::{
     self, DiskSeqScanExec, DistinctExec, Executor, FilterExec, HashAggregateExec, HashJoinExec, IndexNestedLoopJoinExec,
     IndexScanExec, LimitExec, MemSeqScanExec, NestedLoopJoinExec, PhysicalPlan, ProjectionExec, SortExec, ValuesExec,
 };
+use crate::rules;
 use crate::storage::Storage;
 use crate::storage_mem::MemStorage;
 use crate::types::{Column, DataType, Schema, Tuple, Value};
@@ -345,8 +350,9 @@ impl Database {
 
     /// `LogicalPlan`に組み立てた`SELECT`を実行する。
     ///
-    /// `logical_plan::build_select`が返す木を`physical_plan::optimize`で
-    /// [`PhysicalPlan`]へ変換し、`build_query_executor`で`Box<dyn Executor>`の
+    /// `logical_plan::build_select`が返す木をまず`rules::optimize`(第26章)に
+    /// 通し、意味を変えない書き換えを固定点まで適用してから、`physical_plan::optimize`
+    /// で[`PhysicalPlan`]へ変換し、`build_query_executor`で`Box<dyn Executor>`の
     /// 木を組み立てる。`Executor::next()`を`None`が返るまで呼び続け、返った
     /// タプルを`rows`に集める。
     ///
@@ -367,6 +373,7 @@ impl Database {
     /// 実行が効くのは、あくまで計画の中間段階(`Filter`を通過する前の
     /// 候補行、`WHERE`に一致しなかった行)がメモリに残らないという点である。
     fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {
+        let plan = rules::optimize(plan, &self.functions);
         let physical = physical_plan::optimize(plan, self.index_storage());
         let schema = physical.output_schema();
         let mut executor = self.build_query_executor(&physical)?;
@@ -491,12 +498,17 @@ impl Database {
     /// `EXPLAIN`を実行する。対象の文を`LogicalPlan`・`PhysicalPlan`へ変換し、
     /// その木を文字列化しただけの`QueryResult`を返す(実際には何も実行しない)。
     ///
+    /// `SELECT`は`execute_select`と同じく`rules::optimize`(第26章)を経由する。
+    /// `EXPLAIN`が見せる計画は、実際に実行される計画そのものでなければならない
+    /// (ここだけルールベース最適化を素通りすると、`EXPLAIN`の表示と実際の
+    /// 実行計画が食い違ってしまう)。
+    ///
     /// `inner`は`Parser`(第19章)がすでに`SELECT`・`INSERT INTO`・`UPDATE`・
     /// `DELETE FROM`の4種類に絞っているため、`CreateTable`・`DropTable`・
     /// `CreateIndex`・`DropIndex`(第24章)・入れ子の`Explain`はここに渡ってこない。
     fn execute_explain(&self, inner: BoundStatement) -> DbResult<QueryResult> {
         let logical = match inner {
-            BoundStatement::Select(select) => logical_plan::build_select(*select),
+            BoundStatement::Select(select) => rules::optimize(logical_plan::build_select(*select), &self.functions),
             BoundStatement::Insert(insert) => logical_plan::build_insert(insert),
             BoundStatement::Update(update) => logical_plan::build_update(update),
             BoundStatement::Delete(delete) => logical_plan::build_delete(delete),

@@ -568,7 +568,7 @@ fn exclude(conjuncts: &[&BoundExpr], skip: &[usize]) -> Vec<BoundExpr> {
 /// `conjuncts`(すでにANDで分解済み、これ以上分解できない項の並び)を、
 /// 左結合の`AND`の木へ組み立て直す。0個なら`None`(残差条件が無い)、1個
 /// なら`Filter`を挟まずそのまま使えるようその1個だけを返す。
-fn rebuild_conjunction(conjuncts: Vec<BoundExpr>) -> Option<BoundExpr> {
+pub(crate) fn rebuild_conjunction(conjuncts: Vec<BoundExpr>) -> Option<BoundExpr> {
     let mut iter = conjuncts.into_iter();
     let first = iter.next()?;
     Some(iter.fold(first, |acc, next| {
@@ -724,7 +724,7 @@ fn split_equi_join_keys(condition: &BoundExpr, left_len: usize) -> Option<Vec<(B
 /// `AND`で結ばれた式木を、これ以上`AND`で分解できない項(conjunct)の並びへ
 /// 展開する。`Paren`は素通しする(`(a = b) AND (c = d)`のような書き方でも
 /// 分解できるようにするため)。
-fn collect_conjuncts<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
+pub(crate) fn collect_conjuncts<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
     match strip_paren(expr) {
         BoundExpr::BinaryOp { op: BinaryOperator::And, lhs, rhs, .. } => {
             collect_conjuncts(lhs, out);
@@ -734,7 +734,7 @@ fn collect_conjuncts<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
     }
 }
 
-fn strip_paren(expr: &BoundExpr) -> &BoundExpr {
+pub(crate) fn strip_paren(expr: &BoundExpr) -> &BoundExpr {
     match expr {
         BoundExpr::Paren { expr, .. } => strip_paren(expr),
         other => other,
@@ -751,7 +751,7 @@ fn strip_paren(expr: &BoundExpr) -> &BoundExpr {
 /// 1つの値を取り出して比較する式であるべきで、定数だけの項を残差条件として
 /// 切り出す最適化(Hash Joinの鍵とFilterの併用)はこの章の範囲外である
 /// (章末の演習課題)。
-fn columns_side(expr: &BoundExpr, left_len: usize) -> Option<Side> {
+pub(crate) fn columns_side(expr: &BoundExpr, left_len: usize) -> Option<Side> {
     let mut side = None;
     if !collect_column_side(expr, left_len, &mut side) {
         return None;
@@ -791,7 +791,7 @@ fn collect_column_side(expr: &BoundExpr, left_len: usize, side: &mut Option<Side
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Side {
+pub(crate) enum Side {
     Left,
     Right,
 }
@@ -804,7 +804,7 @@ enum Side {
 /// 対してこの鍵を評価する必要がある。この関数は、結合後スキーマ上の添字
 /// (`>= left_len`のはず)を`right`単体のスキーマ上のローカルな添字へ
 /// 変換するために、木を再帰的に組み立て直す。
-fn shift_column_index(expr: &BoundExpr, delta: usize) -> BoundExpr {
+pub(crate) fn shift_column_index(expr: &BoundExpr, delta: usize) -> BoundExpr {
     match expr {
         BoundExpr::ColumnRef { table_ordinal, column_index, name, data_type, span } => BoundExpr::ColumnRef {
             table_ordinal: *table_ordinal,

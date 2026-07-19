@@ -60,6 +60,7 @@ pub mod logical_plan;
 pub mod page;
 pub mod parser;
 pub mod physical_plan;
+pub mod rules;
 pub mod slotted_page;
 pub mod storage;
 pub mod storage_mem;

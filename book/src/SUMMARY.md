@@ -39,7 +39,7 @@
 
 # 第4部 Query Optimizer: よりよい実行計画を選ぶ
 
-- [第26章 ルールベース最適化]()
+- [第26章 ルールベース最適化](ch26-rule-based-optimization.md)
 - [第27章 統計情報とCardinality Estimation]()
 - [第28章 Cost Modelとアクセスパス選択]()
 - [第29章 Join OrderとPhysical Properties]()
