@@ -1056,6 +1056,33 @@ fn min_rid_index_after(view: &LeafPageRef<'_>, lo: usize, hi: usize, after: Opti
         .min_by_key(|&i| view.record_id(i))
 }
 
+/// `index`(`view.entry_count()`を含みうる)が指す物理位置が属するキーの
+/// 重複範囲について、その範囲内で`RecordId`が最小のエントリの添字を返す
+/// (`index`がすでに`view.entry_count()`、つまりこの葉にもう無いことを
+/// 表すなら、そのまま返す)。
+///
+/// [`ScanPosition::Start`]の3つの境界(`Unbounded`、存在する/しない
+/// `Included`、`Excluded`)はどれも、最初に`view.find`(二分探索)などで
+/// **物理的な**添字へ着地したあと、この関数を通して`RecordId`最小の位置へ
+/// 正規化する。正規化しないまま`ScanPosition::After`へ引き継ぐと、
+/// [`min_rid_index_after`]が前提とする「直前に返したエントリより`RecordId`
+/// が大きいものだけを次に返す」という不変条件が崩れる。たとえば同じキーへ
+/// `RecordId`のslotを3、1、2の順で挿入すると、`leaf_insert_position`は
+/// 挿入順のまま物理添字0・1・2へ並べる(この葉自身は`RecordId`順に並んで
+/// いない)。ここを経由せず物理添字0(slot=3、範囲内で最大の`RecordId`)を
+/// そのまま最初のエントリとして返すと、次の`ScanPosition::After`は
+/// 「slot=3より大きい`RecordId`」を探すことになり、範囲内に残っている
+/// slot=1・2(どちらもslot=3より小さい)を1件も返せないまま範囲を読み終えた
+/// と誤判定してしまう(この章のレビュー2巡目で実際に指摘された不具合、
+/// `delete`が1件も絡まない`Unbounded`の`range`だけでも再現する)。
+fn start_of_run_containing(view: &LeafPageRef<'_>, index: usize) -> usize {
+    if index >= view.entry_count() {
+        return index;
+    }
+    let (lo, hi) = same_key_range(view, view.key(index));
+    min_rid_index_after(view, lo, hi, None).expect("空でない範囲には必ず最小のRecordIdが1件ある")
+}
+
 /// `view`(ある時点の葉の中身)の中で、`position`が指す位置を今の中身に
 /// 対して探し直し、次に返すべきエントリの添字を返す(無ければ
 /// `view.entry_count()`、この葉にはもう無いという意味)。
@@ -1065,27 +1092,31 @@ fn min_rid_index_after(view: &LeafPageRef<'_>, lo: usize, hi: usize, after: Opti
 /// 並行`insert`でこの葉が育っても壊れない理由そのものである。
 fn locate_within_leaf(view: &LeafPageRef<'_>, position: &ScanPosition) -> usize {
     match position {
-        ScanPosition::Start(Bound::Unbounded) => 0,
+        ScanPosition::Start(Bound::Unbounded) => start_of_run_containing(view, 0),
         ScanPosition::Start(Bound::Included(k)) => {
-            let (lo, hi) = same_key_range(view, k);
-            if lo == hi {
-                // `k`自体は無い(挿入位置)。`same_key_range`が`Err`から
-                // 返した位置をそのまま使う。
-                return lo;
-            }
-            // 重複キーの範囲では、`RecordId`が最小のエントリから走査を
-            // 始める(`min_rid_index_after`のドキュメントを参照)。
-            min_rid_index_after(view, lo, hi, None).expect("空でない範囲には必ず最小のRecordIdが1件ある")
-        }
-        ScanPosition::Start(Bound::Excluded(k)) => match view.find(k) {
-            Ok(mut hi) => {
-                while hi + 1 < view.entry_count() && view.key(hi + 1) == k.as_slice() {
-                    hi += 1;
+            let physical = match view.find(k) {
+                Ok(mut i) => {
+                    while i > 0 && view.key(i - 1) == k.as_slice() {
+                        i -= 1;
+                    }
+                    i
                 }
-                hi + 1
-            }
-            Err(i) => i,
-        },
+                Err(i) => i,
+            };
+            start_of_run_containing(view, physical)
+        }
+        ScanPosition::Start(Bound::Excluded(k)) => {
+            let physical = match view.find(k) {
+                Ok(mut hi) => {
+                    while hi + 1 < view.entry_count() && view.key(hi + 1) == k.as_slice() {
+                        hi += 1;
+                    }
+                    hi + 1
+                }
+                Err(i) => i,
+            };
+            start_of_run_containing(view, physical)
+        }
         ScanPosition::After(key, rid) => {
             let (lo, hi) = same_key_range(view, key);
             // 同じキーが連続する範囲(重複キー、モジュールドキュメントを
@@ -1944,6 +1975,106 @@ mod tests {
         let mut expected: Vec<RecordId> = rids.iter().copied().filter(|&r| r != first_rid).collect();
         expected.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
         assert_eq!(remaining, expected, "削除されなかった残り2件を、取りこぼさずすべて返すはず");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// レビュー2巡目の再現条件: `delete`が1件も絡まない、単純な`Unbounded`の
+    /// `range`だけでも重複キーの行を欠落させる。
+    ///
+    /// 1巡目の修正(`ScanPosition::After`が`RecordId`の大小で次のエントリを
+    /// 探し直す)は、`ScanPosition::Start(Bound::Unbounded)`が物理添字0を
+    /// そのまま返す点を直していなかった。同じキーへ`RecordId`のslotを
+    /// 3、1、2の順で挿入すると、`leaf_insert_position`は挿入順のまま物理
+    /// 添字0・1・2へ並べる(slot=3が物理的に先頭)。修正前は、この物理的な
+    /// 先頭(slot=3、範囲内で最大の`RecordId`)を最初のエントリとして返して
+    /// しまい、続く`ScanPosition::After`が「slot=3より大きい`RecordId`」を
+    /// 探すため、範囲に残っているslot=1・2(どちらもslot=3より小さい)を
+    /// 1件も返せないまま読み終えたと誤判定していた。
+    #[test]
+    fn range_scan_from_unbounded_start_does_not_drop_duplicates_inserted_out_of_record_id_order() {
+        let path = temp_path("range-unbounded-out-of-order-duplicates");
+        let btree = open_btree(&path, DataType::BigInt);
+        // 挿入順はslot 3, 1, 2。`RecordId`の大小順(1, 2, 3)とは一致しない。
+        let insertion_order = [rid(1, 3), rid(1, 1), rid(1, 2)];
+        for &r in &insertion_order {
+            btree.insert(&Value::BigInt(5), r).unwrap();
+        }
+
+        let mut found: Vec<RecordId> = collect_range(&btree, Bound::Unbounded, Bound::Unbounded).into_iter().map(|(_, r)| r).collect();
+        found.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        let mut expected = insertion_order.to_vec();
+        expected.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        assert_eq!(found, expected, "挿入順によらず、重複キーの3件すべてを取りこぼさないはず");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// 上と同じ挿入順序(slot 3, 1, 2)を、`Bound::Included`・`Bound::Excluded`
+    /// で走査を始めた場合でも確認する。どちらも最終的に`locate_within_leaf`の
+    /// 同じ正規化(`start_of_run_containing`)を経由するはずである。
+    #[test]
+    fn range_scan_from_included_and_excluded_start_does_not_drop_duplicates_inserted_out_of_record_id_order() {
+        let path = temp_path("range-bounded-out-of-order-duplicates");
+        let btree = open_btree(&path, DataType::BigInt);
+        btree.insert(&Value::BigInt(4), rid(1, 0)).unwrap();
+        let insertion_order = [rid(1, 3), rid(1, 1), rid(1, 2)];
+        for &r in &insertion_order {
+            btree.insert(&Value::BigInt(5), r).unwrap();
+        }
+
+        let mut expected = insertion_order.to_vec();
+        expected.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+
+        // Included(5): `same_key_range`の`Ok`分岐から`start_of_run_containing`
+        // を経由する。
+        let mut via_included: Vec<RecordId> =
+            collect_range(&btree, Bound::Included(&Value::BigInt(5)), Bound::Included(&Value::BigInt(5)))
+                .into_iter()
+                .map(|(_, r)| r)
+                .collect();
+        via_included.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        assert_eq!(via_included, expected, "Bound::Includedで始めても3件すべてを取りこぼさないはず");
+
+        // Excluded(4): キー4を通り過ぎた直後の物理位置(キー5の先頭)から
+        // `start_of_run_containing`を経由する。
+        let mut via_excluded: Vec<RecordId> =
+            collect_range(&btree, Bound::Excluded(&Value::BigInt(4)), Bound::Unbounded).into_iter().map(|(_, r)| r).collect();
+        via_excluded.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        assert_eq!(via_excluded, expected, "Bound::Excludedで始めても3件すべてを取りこぼさないはず");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// 上の再現条件を、Leaf Splitで複数の葉にまたがる規模の重複キーと、
+    /// 走査途中の`delete`の両方と組み合わせる。
+    ///
+    /// `RecordId`の挿入順を`RecordId`の大小順の**逆順**(降順)にすることで、
+    /// 各葉の中でも常に「物理的に先頭のエントリが、その範囲内で最大の
+    /// `RecordId`」という、この不具合が起きる条件を保つ。
+    #[test]
+    fn range_scan_resumes_correctly_after_delete_when_duplicates_span_multiple_leaves_inserted_in_descending_record_id_order() {
+        let path = temp_path("range-delete-mid-scan-split-descending");
+        let btree = open_btree(&path, DataType::Text);
+        let wide_value = "x".repeat(120);
+        let n = 200usize;
+        // slot n-1, n-2, ..., 0の順で挿入する(RecordId降順)。
+        let insertion_order: Vec<RecordId> = (0..n).rev().map(|i| rid(1, i as u16)).collect();
+        for &r in &insertion_order {
+            btree.insert(&Value::Text(wide_value.clone()), r).unwrap();
+        }
+        assert!(btree.height().unwrap() >= 2, "重複キーの葉分割が起きているはず");
+
+        let key = Value::Text(wide_value.clone());
+        let mut scan = btree.range(Bound::Included(&key), Bound::Included(&key)).unwrap();
+        let (_, first_rid) = scan.next().unwrap().unwrap();
+        assert!(btree.delete(&Value::Text(wide_value.clone()), first_rid).unwrap());
+
+        let mut remaining: Vec<RecordId> = scan.map(|entry| entry.unwrap().1).collect();
+        remaining.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        let mut expected: Vec<RecordId> = insertion_order.iter().copied().filter(|&r| r != first_rid).collect();
+        expected.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        assert_eq!(remaining, expected, "降順挿入・葉分割・走査途中のdeleteを組み合わせても取りこぼさないはず");
 
         std::fs::remove_file(&path).unwrap();
     }

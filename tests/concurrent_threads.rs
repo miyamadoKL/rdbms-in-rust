@@ -502,6 +502,92 @@ fn three_way_deadlock_closed_only_by_fifo_wait_queue_order_is_detected_on_real_t
     assert_eq!(tb_v, 3, "T3のtbへの更新は生き残る(VictimになったT1のtbへの書き込みはUndoされる)");
 }
 
+/// READ COMMITTEDのSELECTが実スレッドで一度`WouldBlock`により`Condvar::wait`
+/// で眠り、先行トランザクションのCOMMITによって待ち行列から起こされて
+/// Sharedロックを引き継いだ場合でも、そのSharedロックは文末で正しく解放
+/// されなければならない(`tests/isolation_levels.rs`の
+/// `read_committed_select_granted_after_waiting_is_still_released_at_statement_end`
+/// と同じ状況を、`SharedDatabase`経由の実スレッドで確認する。第5部レビュー
+/// 2巡目対応)。
+///
+/// ロックの初期状態(T1がExclusiveを保持、T2が`WouldBlock`で待ち行列に
+/// 並んだところ)は、`tests/deadlock.rs`と同じ理由で決定的な(単一スレッドの)
+/// `Database`の上で先に組み立てる。組み立てたあとの`Database`を
+/// `SharedDatabase`で包み、T2の再試行を実スレッドとして再発行させることで、
+/// 「待ち行列からの昇格によって、`Condvar`で本当に眠っていたスレッドが
+/// 正しく起き上がり、かつその文の終わりでShared Lockを正しく手放す」ことを
+/// 実スレッド上で確認する。
+///
+/// 実スレッドが本当にデッドロック・ハングしたまま止まっていれば、この
+/// テスト自体がハングする。ハングしたままCIを止めないよう、完了通知に
+/// 上限時間を設ける。
+#[test]
+fn read_committed_shared_lock_granted_after_a_real_thread_wait_is_still_released_at_statement_end() {
+    let path = common::temp_db_path("real-thread-read-committed-granted-after-wait");
+    let mut db = minidb::Database::open(&path).unwrap();
+    db.execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)").unwrap();
+    db.execute("INSERT INTO accounts VALUES (1, 100)").unwrap();
+
+    let t1 = db.begin_tx();
+    let t2 = db.begin_tx_with_isolation(minidb::IsolationLevel::ReadCommitted);
+    let t3 = db.begin_tx_with_isolation(minidb::IsolationLevel::ReadCommitted);
+
+    // T1がExclusiveを獲得する。
+    db.execute_in_tx(&t1, "UPDATE accounts SET balance = 70 WHERE id = 1").unwrap();
+    // T2のSELECTはT1のExclusiveとぶつかりWouldBlock(待ち行列に並ぶ)。
+    assert!(matches!(
+        db.execute_in_tx(&t2, "SELECT balance FROM accounts WHERE id = 1"),
+        Err(DbError::WouldBlock)
+    ));
+
+    let shared = Arc::new(SharedDatabase::new(db));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+    // T2は同じ文をもう一度発行する。待ち行列にはすでに自分自身が並んでいる
+    // ので結果は変わらず、今度こそ`SharedDatabase`が本物の`Condvar::wait`で
+    // スレッドを眠らせる。
+    let t2_thread = {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || {
+            let result = shared.execute_in_tx(&t2, "SELECT balance FROM accounts WHERE id = 1");
+            let _ = done_tx.send(());
+            result
+        })
+    };
+
+    // T1がCOMMITすると、待ち行列に並んでいたT2のSharedが昇格し、notify_all
+    // で眠っていたT2のスレッドが起こされる。
+    shared.commit_tx(t1).unwrap();
+
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("実スレッドが起こされていない(Condvarで待機したスレッドが永久に眠り続けている可能性がある)");
+    let t2_result = t2_thread.join().unwrap();
+    assert!(t2_result.is_ok(), "T2のSELECTはT1のCOMMIT後に成功するはず");
+    let Value::BigInt(balance) = t2_result.unwrap().rows()[0].values()[0] else { panic!("BigInt") };
+    assert_eq!(balance, 70);
+
+    // T2のSELECTがすでに完了しているので、READ COMMITTEDの規律どおり
+    // T2のSharedはこの時点で解放済みのはずである。T3のUPDATEはブロック
+    // されずに進めなければならない。
+    assert!(
+        shared.execute_in_tx(&t3, "UPDATE accounts SET balance = 999 WHERE id = 1").is_ok(),
+        "実スレッド上で待ち行列から付与されたSharedロックが、文末で解放されずに残っている"
+    );
+    shared.commit_tx(t2).unwrap();
+    shared.commit_tx(t3).unwrap();
+
+    let handle = shared.begin_tx();
+    let result = shared.execute_in_tx(&handle, "SELECT balance FROM accounts WHERE id = 1").unwrap();
+    shared.commit_tx(handle).unwrap();
+    let Value::BigInt(balance) = result.rows()[0].values()[0] else { panic!("BigInt") };
+    assert_eq!(balance, 999);
+
+    drop(shared);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(minidb_wal_path(&path)).ok();
+}
+
 /// `Database::open`が使うWALファイルのパス(`{path}.wal`)。テスト後の後片付け
 /// にだけ使う。
 fn minidb_wal_path(db_path: &std::path::Path) -> std::path::PathBuf {

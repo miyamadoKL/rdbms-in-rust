@@ -284,6 +284,56 @@ fn read_committed_select_after_update_does_not_release_the_update_s_exclusive_lo
     assert_eq!(int_value(&db.execute("SELECT balance FROM accounts").unwrap(), 0, 0), 999);
 }
 
+/// READ COMMITTEDのSELECTが一度`WouldBlock`で待たされ、先行トランザクション
+/// のCOMMIT後にShared Lockが**待ち行列から**付与されたケースでも、その
+/// Sharedロックは文末で正しく解放されなければならない。
+///
+/// 修正前は、獲得する**前**に`held_mode`を見て「すでに保持していれば既存の
+/// ロック」と判定していた。ところが、T1のCOMMITで待ち行列からT2へ昇格した
+/// Sharedロックは、T2がこの文を再試行して`acquire`を呼ぶ**前から**すでに
+/// `Some(Shared)`になっている。そのため「以前から持っていた」と誤判定され、
+/// 文末解放から漏れる(この章のレビュー2巡目で実際に指摘された不具合)。
+/// この漏れの結果、T2のSELECTが完了したあとも第三のトランザクションT3の
+/// `UPDATE`が`WouldBlock`のままになってしまう。
+#[test]
+fn read_committed_select_granted_after_waiting_is_still_released_at_statement_end() {
+    let mut db = temp_db();
+    db.execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)").unwrap();
+    db.execute("INSERT INTO accounts VALUES (1, 100)").unwrap();
+
+    let t1 = db.begin_tx();
+    let t2 = db.begin_tx_with_isolation(IsolationLevel::ReadCommitted);
+    let t3 = db.begin_tx_with_isolation(IsolationLevel::ReadCommitted);
+
+    // T1がExclusiveを獲得する。
+    db.execute_in_tx(&t1, "UPDATE accounts SET balance = 70 WHERE id = 1").unwrap();
+
+    // T2のSELECTはT1のExclusiveとぶつかりWouldBlock(待ち行列に並ぶ)。
+    assert!(matches!(
+        db.execute_in_tx(&t2, "SELECT balance FROM accounts WHERE id = 1"),
+        Err(DbError::WouldBlock)
+    ));
+
+    // T1がCOMMITすると、待ち行列に並んでいたT2のSharedが即座に昇格する
+    // (T2がまだこの文を再試行してすらいない時点で、である)。
+    db.commit_tx(t1).unwrap();
+
+    // T2がSELECTを再試行すると、今度は成功する。
+    let read = db.execute_in_tx(&t2, "SELECT balance FROM accounts WHERE id = 1").unwrap();
+    assert_eq!(int_value(&read, 0, 0), 70);
+
+    // READ COMMITTEDの規律どおり、この文の終わりでT2のSharedは解放されて
+    // いるはずである。T3のUPDATEはブロックされずに進めなければならない。
+    assert!(
+        db.execute_in_tx(&t3, "UPDATE accounts SET balance = 999 WHERE id = 1").is_ok(),
+        "待ち行列から付与されたSharedロックが、文末で解放されずに残っている"
+    );
+    db.commit_tx(t2).unwrap();
+    db.commit_tx(t3).unwrap();
+
+    assert_eq!(int_value(&db.execute("SELECT balance FROM accounts").unwrap(), 0, 0), 999);
+}
+
 // ==== REPEATABLE READ: 4つとも防がれる(Memoryバックエンド) ====
 
 #[test]
@@ -515,6 +565,40 @@ fn read_committed_select_after_update_does_not_release_the_update_s_exclusive_lo
 
     db.execute_in_tx(&t2, "UPDATE accounts SET balance = 999 WHERE id = 1").unwrap();
     db.commit_tx(t2).unwrap();
+
+    assert_eq!(int_value(&db.execute("SELECT balance FROM accounts").unwrap(), 0, 0), 999);
+    std::fs::remove_file(&path).unwrap();
+}
+
+/// `read_committed_select_granted_after_waiting_is_still_released_at_statement_end`
+/// のDiskバックエンド版(第5部レビュー2巡目対応)。
+#[test]
+fn read_committed_select_granted_after_waiting_is_still_released_at_statement_end_on_disk() {
+    let (mut db, path) = accounts_disk_db("isolation-read-committed-granted-after-wait");
+    db.execute("INSERT INTO accounts VALUES (1, 100)").unwrap();
+
+    let t1 = db.begin_tx();
+    let t2 = db.begin_tx_with_isolation(IsolationLevel::ReadCommitted);
+    let t3 = db.begin_tx_with_isolation(IsolationLevel::ReadCommitted);
+
+    db.execute_in_tx(&t1, "UPDATE accounts SET balance = 70 WHERE id = 1").unwrap();
+
+    assert!(matches!(
+        db.execute_in_tx(&t2, "SELECT balance FROM accounts WHERE id = 1"),
+        Err(DbError::WouldBlock)
+    ));
+
+    db.commit_tx(t1).unwrap();
+
+    let read = db.execute_in_tx(&t2, "SELECT balance FROM accounts WHERE id = 1").unwrap();
+    assert_eq!(int_value(&read, 0, 0), 70);
+
+    assert!(
+        db.execute_in_tx(&t3, "UPDATE accounts SET balance = 999 WHERE id = 1").is_ok(),
+        "待ち行列から付与されたTuple Lockが、文末で解放されずに残っている"
+    );
+    db.commit_tx(t2).unwrap();
+    db.commit_tx(t3).unwrap();
 
     assert_eq!(int_value(&db.execute("SELECT balance FROM accounts").unwrap(), 0, 0), 999);
     std::fs::remove_file(&path).unwrap();

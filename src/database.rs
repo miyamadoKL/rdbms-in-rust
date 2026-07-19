@@ -1052,7 +1052,11 @@ impl Database {
     ///   さもないと、`UPDATE`で確定前の変更をExclusiveロックで守っていたはず
     ///   の行が、直後の`SELECT`が同じ行をなぞっただけで解放されてしまい、
     ///   他のトランザクションがその未確定の行を書き換えられてしまう。この
-    ///   章のレビューで実際に指摘された不具合)。
+    ///   章のレビューで実際に指摘された不具合)。「新規に取得した」かどうかは
+    ///   [`LockManager::take_pending_shared_grants`]がその都度教えてくれる
+    ///   (この関数が自前で判定しない理由は同メソッドのドキュメントを参照。
+    ///   `WouldBlock`で一度待たされたあとの再試行でも正しく判定できることが
+    ///   この委譲の要点である)。
     /// - `RepeatableRead`: 何もせず、獲得したロックをそのまま`COMMIT`まで
     ///   保持させる(第31章から変わらない挙動)。
     /// - `Serializable`(`Backend::Disk`のみ): 上の`RepeatableRead`と同じ
@@ -1073,20 +1077,12 @@ impl Database {
             keys.extend(table_ids.iter().map(|&id| LockKey::Table(id)));
         }
 
-        // READ COMMITTEDが文末に解放してよいのは、この文で新規に取得した
-        // Sharedロックだけである。`owner`がこの鍵をすでに(先行する`UPDATE`の
-        // Exclusive等で)保持しているかどうかを、実際に獲得する**前**に
-        // 記録しておく。
-        let mut newly_acquired = Vec::new();
         for &key in &keys {
-            let already_held = self.lock_manager.held_mode(owner, &key).is_some();
             self.acquire_lock_or_detect_deadlock(owner, key, mode)?;
-            if !already_held {
-                newly_acquired.push(key);
-            }
         }
 
         if level == IsolationLevel::ReadCommitted && mode == LockMode::Shared {
+            let newly_acquired = self.lock_manager.take_pending_shared_grants(owner);
             self.lock_manager.release_keys(owner, &newly_acquired);
         }
         Ok(())

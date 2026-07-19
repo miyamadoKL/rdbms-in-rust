@@ -133,11 +133,21 @@ impl LockEntry {
 /// 段でも1文字も変わらない。
 pub struct LockManager<K: Eq + Hash + Clone> {
     entries: HashMap<K, LockEntry>,
+    /// `txn`が`Shared`として新規に(=以前は持っていなかった状態から)獲得した
+    /// 鍵の列。`acquire`が即座に`Granted`を返した場合と、[`Self::
+    /// promote_waiters`]が待ち行列から昇格させた場合の両方をここに積む
+    /// (第32章、READ COMMITTEDの「文末解放」がこれを使う。詳しい理由は
+    /// [`Self::take_pending_shared_grants`]のドキュメントを参照)。
+    ///
+    /// `Shared`は`Database::acquire_scan_locks`(`SELECT`)からしか要求され
+    /// ないため、この記録は`SELECT`が新規に獲得したShared Lockだけを指す
+    /// (`Exclusive`の獲得・Upgradeはここに積まない)。
+    pending_shared_grants: HashMap<TransactionId, Vec<K>>,
 }
 
 impl<K: Eq + Hash + Clone> Default for LockManager<K> {
     fn default() -> Self {
-        LockManager { entries: HashMap::new() }
+        LockManager { entries: HashMap::new(), pending_shared_grants: HashMap::new() }
     }
 }
 
@@ -169,7 +179,7 @@ impl<K: Eq + Hash + Clone> LockManager<K> {
     ///    (`Blocked`になった理由・待ち行列の並び順の意味は
     ///    [`LockManager::release_all`]のFIFOに関する説明を参照)。
     pub fn acquire(&mut self, txn: TransactionId, key: K, mode: LockMode) -> LockResult {
-        let entry = self.entries.entry(key).or_default();
+        let entry = self.entries.entry(key.clone()).or_default();
 
         if let Some(held) = entry.holder_mode(txn) {
             if held == LockMode::Exclusive || held == mode {
@@ -188,6 +198,9 @@ impl<K: Eq + Hash + Clone> LockManager<K> {
 
         if entry.waiters.is_empty() && entry.compatible_with_holders(mode) {
             entry.holders.push((txn, mode));
+            if mode == LockMode::Shared {
+                self.pending_shared_grants.entry(txn).or_default().push(key);
+            }
             return LockResult::Granted;
         }
         if !entry.waiters.iter().any(|w| w.txn == txn) {
@@ -219,6 +232,12 @@ impl<K: Eq + Hash + Clone> LockManager<K> {
                 self.promote_waiters(&key);
             }
         }
+        // `txn`自体がCOMMIT・ROLLBACK・強制Abortで終わる以上、
+        // `pending_shared_grants`に積んだままの記録(まだ`take_pending_shared_grants`
+        // で回収されていない、READ COMMITTEDの文末解放待ちの記録)はもう
+        // 意味を持たない。放置すると、二度と回収されないエントリが
+        // `HashMap`に残り続ける。
+        self.pending_shared_grants.remove(&txn);
     }
 
     /// `key`の待ち行列を先頭から見て、今の保持者集合と両立する限り昇格させる。
@@ -252,6 +271,9 @@ impl<K: Eq + Hash + Clone> LockManager<K> {
             }
             entry.waiters.pop_front();
             entry.holders.push((txn, mode));
+            if mode == LockMode::Shared {
+                self.pending_shared_grants.entry(txn).or_default().push(key.clone());
+            }
         }
         if entry.holders.is_empty() && entry.waiters.is_empty() {
             self.entries.remove(key);
@@ -266,13 +288,33 @@ impl<K: Eq + Hash + Clone> LockManager<K> {
         self.entries.get(key).and_then(|entry| entry.holder_mode(txn))
     }
 
-    /// `key`に対して`txn`が現在保持しているロックの強さ。`Database::acquire_scan_locks`
-    /// が、これから獲得しようとするロックが「今回の文で新規に取得したもの」か
-    /// 「以前から(たとえば同じトランザクションの先行`UPDATE`から)保持していた
-    /// もの」かを区別するために使う(第32章、READ COMMITTEDが文末に解放して
-    /// よいのは前者だけであるため)。
-    pub(crate) fn held_mode(&self, txn: TransactionId, key: &K) -> Option<LockMode> {
-        self.entries.get(key).and_then(|entry| entry.holder_mode(txn))
+    /// `txn`が`Shared`として新規に獲得し、まだ回収していない鍵をすべて
+    /// 返し、その記録を空にする(第32章、READ COMMITTEDの文末解放)。
+    ///
+    /// # なぜ「獲得する前に`held_mode`を見る」方式ではないか(第5部レビュー
+    /// 2巡目対応)
+    ///
+    /// 最初の実装は、`acquire_scan_locks`が各鍵を獲得する**前**に
+    /// `held_mode`でその時点の保持状況を見て、「既に持っていなければ
+    /// 新規」と判定していた。この方式は、`SELECT`が`WouldBlock`で一度
+    /// 待たされたケースで壊れる。`SELECT`を先行トランザクションのCOMMIT後に
+    /// 再試行すると、その鍵はすでに待ち行列から昇格して`Some(Shared)`に
+    /// なっている。再試行の`acquire_scan_locks`はこの`Some`を見て「以前から
+    /// 持っていた」と誤判定し、`newly_acquired`に入れ損なう。結果、この文が
+    /// 実際に新規獲得したShared Lockが文末解放から漏れ、`READ COMMITTED`の
+    /// 規律(この文の読み取りロックは文末で手放す)が破れる。
+    ///
+    /// この方式は、「新規に獲得した」という事実を**獲得が実際に起きた
+    /// 瞬間**([`Self::acquire`]が即座に`Granted`を返す瞬間、または
+    /// [`Self::promote_waiters`]が待ち行列から昇格させる瞬間)に`LockManager`
+    /// 自身が記録することで、`WouldBlock`をまたいだ再試行の回数によらず
+    /// 正しく追跡する。獲得のタイミングと「誰かがそれを尋ねるタイミング」が
+    /// ずれても壊れないという点で、呼び出し側(`Database`)がその都度
+    /// `held_mode`を覗き見る方式より堅牢であり、ロックの獲得・解放という
+    /// この型自身の責務にも自然に収まる(モジュール冒頭のドキュメントを
+    /// 参照)。
+    pub(crate) fn take_pending_shared_grants(&mut self, txn: TransactionId) -> Vec<K> {
+        self.pending_shared_grants.remove(&txn).unwrap_or_default()
     }
 
     /// `txn`が保持している`keys`のロックだけを手放す(第32章、Read Committedの

@@ -208,19 +208,12 @@ fn acquire_scan_locks(&mut self, owner: TransactionId, table_ids: &[TableId], mo
         keys.extend(table_ids.iter().map(|&id| LockKey::Table(id)));
     }
 
-    // READ COMMITTEDが文末に解放してよいのは、この文で新規に取得した
-    // Sharedロックだけである。`owner`がこの鍵をすでに保持しているかを、
-    // 実際に獲得する前に記録しておく。
-    let mut newly_acquired = Vec::new();
     for &key in &keys {
-        let already_held = self.lock_manager.held_mode(owner, &key).is_some();
         self.acquire_lock_or_detect_deadlock(owner, key, mode)?;
-        if !already_held {
-            newly_acquired.push(key);
-        }
     }
 
     if level == IsolationLevel::ReadCommitted && mode == LockMode::Shared {
+        let newly_acquired = self.lock_manager.take_pending_shared_grants(owner);
         self.lock_manager.release_keys(owner, &newly_acquired);
     }
     Ok(())
@@ -235,16 +228,65 @@ fn acquire_scan_locks(&mut self, owner: TransactionId, table_ids: &[TableId], mo
 読み取りロックが無いので、他のトランザクションが持つExclusiveロックと衝突しようがありません。
 これがDirty Readを許す理由そのものです。
 
-**Read Committed**は、いったん通常どおりロックを獲得してから、関数を抜ける直前に、この文で**新規に**獲得した鍵だけを手放します。
+**Read Committed**は、いったん通常どおりロックを獲得してから、関数を抜ける直前に、この文で**新規に**獲得した`Shared`ロックだけを手放します。
 「取ってすぐ返す」ため、Shared Lockを取る瞬間には他のトランザクションの未確定なExclusiveと衝突判定が働き(Dirty Readは防げます)、読み終えたあとは何にも縛られません(次の文の実行時点では、他のトランザクションが自由に書き換えられるため、Non-repeatable Readは防げません)。
 
 「新規に」を強調したのには理由があります。
 `owner`が同じトランザクションの先行する`UPDATE`によって、すでにこの鍵にExclusiveロックを持っていることがあります。
 このとき`self.lock_manager.acquire`はすでに十分なロックを持っている(`Exclusive`は`Shared`の要求も満たす)と判断してその場で`Granted`を返しますが、これは「新しく獲得した」わけではありません。
-`keys`に積まれた鍵をそのまま`release_keys`に渡してしまうと、`UPDATE`が確定前の変更を守っていたはずのExclusiveロックを、直後の`SELECT`が同じ行をなぞっただけで解放してしまいます。
+このような鍵まで一緒に手放してしまうと、`UPDATE`が確定前の変更を守っていたはずのExclusiveロックを、直後の`SELECT`が同じ行をなぞっただけで解放してしまいます。
 そうなれば、`COMMIT`の前にもかかわらず、他のトランザクションがその未確定の行を書き換えられてしまいます。
-このため、鍵ごとに獲得する**前**の保持状況を`held_mode`で確認し、`newly_acquired`(今回の文で本当に新しく取得した鍵だけ)を`release_keys`に渡します。
-この「読み終えたら、今回新しく取った分だけ即解放」を担うのが`LockManager::release_keys`です。
+
+「新規に獲得した鍵」をどう特定するかには、実は2つの方式を試しました。
+最初に書いたのは、鍵ごとに獲得する**前**の保持状況を(`LockManager`に一時的に用意した`held_mode`のようなメソッドで)確認し、「まだ持っていなければ新規」と判定する方式でした。
+この方式は、`SELECT`が一度`WouldBlock`で待たされるケースで壊れます。
+先行トランザクションのCOMMITによって、待ち行列に並んでいたこのSharedロックが**`owner`がこの文を再試行する前に**昇格していることがあるからです。
+再試行した`acquire_scan_locks`が獲得の直前に見る保持状況は、すでに`Some(Shared)`になっており、「以前から持っていた」と誤判定してしまいます。
+「獲得する前に尋ねる」というやり方は、獲得(または待ち行列からの昇格)が実際に起きた**タイミング**と、それを尋ねる**タイミング**が一致している前提に頼っており、`WouldBlock`をまたぐ再試行ではその前提が崩れるのです。
+
+採用したのは、「新規に獲得した」という事実そのものを、獲得が実際に起きた瞬間に`LockManager`自身に記録させる方式です。
+
+```rust
+pub(crate) fn take_pending_shared_grants(&mut self, txn: TransactionId) -> Vec<K> {
+    self.pending_shared_grants.remove(&txn).unwrap_or_default()
+}
+```
+
+`LockManager`は`pending_shared_grants: HashMap<TransactionId, Vec<K>>`というフィールドを新しく持ちます。
+`acquire`が即座に`Granted`を返す瞬間と、`promote_waiters`が待ち行列から昇格させる瞬間のどちらでも、対象が`Shared`であれば`pending_shared_grants[txn]`にその鍵を積みます(`Shared`は`acquire_scan_locks`からしか要求されないため、この記録は常に「`SELECT`が新規に獲得したShared Lock」だけを指します)。
+`take_pending_shared_grants`は、この記録を`txn`ごと丸ごと取り出して空にするだけの単純なメソッドです。
+
+この方式なら、`acquire_scan_locks`が獲得を試みた**呼び出しの回数**(`WouldBlock`をまたいで何回再試行したか)によらず、正しく追跡できます。
+T1のCOMMITによって待ち行列からT2のSharedが昇格したのが、T2がこの文をまだ一度も再試行していないタイミングだったとしても、`pending_shared_grants[T2]`にはその瞬間に記録が積まれます。
+T2が実際に文を再試行して`acquire`を呼んだときは、すでに保持しているので「十分なロックを持っている」分岐(その場で`Granted`)を通るだけで、新たに何かを積む必要はありません。
+`acquire_scan_locks`は、獲得ループを終えたあとで`take_pending_shared_grants`を呼ぶだけで、いつ、何回の呼び出しをまたいで昇格したかを気にせず、正しい鍵の集合を受け取れます。
+
+`pending_shared_grants`は`txn`ごとに積み上がる記録なので、`txn`自体が`COMMIT`、`ROLLBACK`、強制Abortで終わるときに片付けておかないと、二度と回収されないエントリが残り続けます。
+第31章の`release_all`の末尾に、この後始末を1行加えます。
+
+```rust
+pub fn release_all(&mut self, txn: TransactionId) {
+    let keys: Vec<K> = self
+        .entries
+        .iter()
+        .filter(|(_, entry)| {
+            entry.holders.iter().any(|(t, _)| *t == txn) || entry.waiters.iter().any(|w| w.txn == txn)
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+
+    for key in keys {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.holders.retain(|(t, _)| *t != txn);
+            entry.waiters.retain(|w| w.txn != txn);
+            self.promote_waiters(&key);
+        }
+    }
+    self.pending_shared_grants.remove(&txn);
+}
+```
+
+`release_keys`自体(渡された鍵だけを解放する部分)は前の版から変わっていません。
 
 ```rust
 pub(crate) fn release_keys(&mut self, txn: TransactionId, keys: &[K]) {
@@ -260,7 +302,7 @@ pub(crate) fn release_keys(&mut self, txn: TransactionId, keys: &[K]) {
 第31章の`release_all`は`txn`が持つロックを**全部**手放しました。
 `release_keys`はそれと違い、渡された`keys`だけを狙い撃ちします。
 `Active`なトランザクションの中で`Read Committed`のSELECTを実行しても、そのトランザクションが別の文ですでに獲得しているExclusiveロック(書き込みロック)には一切触れません。
-手放すのは、まさにこの文のために取った読み取りロックだけです。
+手放すのは、まさに`take_pending_shared_grants`が返した、この文のために新しく取った読み取りロックだけです。
 
 **Repeatable Read**は、この関数に何も特別なことをさせません。
 獲得したロックはそのまま残り、`COMMIT`まで保持されます。
@@ -390,7 +432,7 @@ fn serializable_prevents_phantom_read_on_disk_backend() {
 
 ```console
 $ cargo test --test isolation_levels
-test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 ## デッドロックの検出とVictim Selection
