@@ -1767,7 +1767,13 @@ pub struct QueryResult {
 
 impl QueryResult {
     /// DDL文が完了したことを表す`QueryResult`を作る。
-    fn command(tag: &'static str) -> Self {
+    ///
+    /// `pub(crate)`にしているのは、`crate::server`の`Session`が`BEGIN`・
+    /// `COMMIT`・`ROLLBACK`をSQLの構文解析を経由せず自前で処理する際に
+    /// (`SharedDatabase`の`TxHandle`API越しに実行するため、`execute_begin`
+    /// 等のSQL経路を通らない、`crate::server`モジュールドキュメント参照)、
+    /// 同じ形のコマンドタグを組み立てる必要があるため。
+    pub(crate) fn command(tag: &'static str) -> Self {
         QueryResult {
             schema: Schema::new(Vec::new()),
             rows: Vec::new(),

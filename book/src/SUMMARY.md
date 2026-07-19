@@ -55,7 +55,7 @@
 
 # 第6部 Server、運用、品質保証
 
-- [第36章 Wire ProtocolとClient/Server]()
+- [第36章 Wire ProtocolとClient/Server](ch36-wire-protocol.md)
 - [第37章 SessionとPrepared Statement]()
 - [第38章 実行制御]()
 - [第39章 System Catalogとメンテナンス]()

@@ -44,7 +44,10 @@
 //! `INSERT`・`UPDATE`・`DELETE`は成功のたびに逆操作を記録する。第31章では、
 //! Shared/ExclusiveロックとWait Queueを管理する`lock_manager`が加わり、
 //! `database`の`SELECT`・`INSERT`・`UPDATE`・`DELETE`はStrict 2PLに従って
-//! ロックを獲得してから実行するようになる。
+//! ロックを獲得してから実行するようになる。第36章では、独自の長さ付き
+//! フレームプロトコルを扱う`protocol`と、それをTCP接続の上で処理する
+//! `server`が加わり、`database::SharedDatabase`(第35章)を別プロセスの
+//! クライアントから利用できるようになる。
 
 pub mod ast;
 pub mod binder;
@@ -72,8 +75,10 @@ pub mod logical_plan;
 pub mod page;
 pub mod parser;
 pub mod physical_plan;
+pub mod protocol;
 pub mod recovery;
 pub mod rules;
+pub mod server;
 pub mod slotted_page;
 pub mod statistics;
 pub mod storage;
@@ -105,7 +110,9 @@ pub use page::{
 pub use estimator::{DEFAULT_EQ_SEL, DEFAULT_INEQ_SEL, RangeOp};
 pub use parser::parse_statement;
 pub use physical_plan::{Executor, PhysicalPlan};
+pub use protocol::{MAX_FRAME_PAYLOAD_LEN, ProtocolError, Request, Response};
 pub use recovery::RecoveryReport;
+pub use server::Server;
 pub use slotted_page::{SLOT_ENTRY_SIZE, SLOTTED_HEADER_SIZE, SlotStatus, SlottedPage, SlottedPageRef};
 pub use statistics::{Bucket, ColumnStats, HISTOGRAM_BUCKET_COUNT, StatsCollector, TableStats};
 pub use storage::Storage;
