@@ -1061,26 +1061,70 @@ fn min_rid_index_after(view: &LeafPageRef<'_>, lo: usize, hi: usize, after: Opti
 /// (`index`がすでに`view.entry_count()`、つまりこの葉にもう無いことを
 /// 表すなら、そのまま返す)。
 ///
-/// [`ScanPosition::Start`]の3つの境界(`Unbounded`、存在する/しない
-/// `Included`、`Excluded`)はどれも、最初に`view.find`(二分探索)などで
-/// **物理的な**添字へ着地したあと、この関数を通して`RecordId`最小の位置へ
-/// 正規化する。正規化しないまま`ScanPosition::After`へ引き継ぐと、
-/// [`min_rid_index_after`]が前提とする「直前に返したエントリより`RecordId`
-/// が大きいものだけを次に返す」という不変条件が崩れる。たとえば同じキーへ
-/// `RecordId`のslotを3、1、2の順で挿入すると、`leaf_insert_position`は
-/// 挿入順のまま物理添字0・1・2へ並べる(この葉自身は`RecordId`順に並んで
-/// いない)。ここを経由せず物理添字0(slot=3、範囲内で最大の`RecordId`)を
-/// そのまま最初のエントリとして返すと、次の`ScanPosition::After`は
-/// 「slot=3より大きい`RecordId`」を探すことになり、範囲内に残っている
-/// slot=1・2(どちらもslot=3より小さい)を1件も返せないまま範囲を読み終えた
-/// と誤判定してしまう(この章のレビュー2巡目で実際に指摘された不具合、
-/// `delete`が1件も絡まない`Unbounded`の`range`だけでも再現する)。
+/// # この葉の中で「まだ1件も読んでいない新しいキー」へ着地する経路は、
+/// # 必ずこの関数を通す(この章のレビュー2・3巡目で実際に指摘された不具合)
+///
+/// [`locate_within_leaf`]の中で、二分探索や範囲境界の計算によって求めた
+/// **物理的な**添字が「これから読み始める新しいキーの先頭」を意味する場面は
+/// 4か所ある。[`ScanPosition::Start`]の3つの境界(`Unbounded`、存在する/
+/// しない`Included`、`Excluded`)と、[`ScanPosition::After`]が今のキーの
+/// 範囲を読み尽くして次のキーへ移る`fallback`である。この4か所はすべて、
+/// 求めた物理添字をそのまま返すのではなく、この関数を経由して`RecordId`
+/// 最小の位置へ正規化しなければならない。
+///
+/// 正規化しないまま返すと、次に呼ばれる`ScanPosition::After`(この関数が
+/// 前提とする「直前に返したエントリより`RecordId`が大きいものだけを次に
+/// 返す」という不変条件、[`min_rid_index_after`]を参照)と噛み合わなくなる。
+/// たとえば同じキーへ`RecordId`のslotを3、1、2の順で挿入すると、
+/// `leaf_insert_position`は挿入順のまま物理添字0・1・2へ並べる(この葉
+/// 自身は`RecordId`順に並んでいない)。正規化せず物理添字0(slot=3、範囲内
+/// で最大の`RecordId`)をそのまま最初のエントリとして返すと、次の
+/// `ScanPosition::After`は「slot=3より大きい`RecordId`」を探すことになり、
+/// 範囲内に残っているslot=1・2(どちらもslot=3より小さい)を1件も返せない
+/// まま範囲を読み終えたと誤判定してしまう。
+///
+/// `ScanPosition::After`のfallback(今のキーを読み尽くして次のキーへ
+/// 移る、または今のキー自体が`delete`で消えていて`same_key_range`が空に
+/// なる)がこの正規化を経由していなかったことが、3巡目のレビューで
+/// 実際に指摘された不具合である。次のキーの物理的な先頭エントリ(この
+/// 関数を経由する前の生の`hi`)が、そのキーの範囲内で最大の`RecordId`
+/// だと、上と同じ理屈で次のキーの残りを取りこぼす。
 fn start_of_run_containing(view: &LeafPageRef<'_>, index: usize) -> usize {
     if index >= view.entry_count() {
         return index;
     }
     let (lo, hi) = same_key_range(view, view.key(index));
     min_rid_index_after(view, lo, hi, None).expect("空でない範囲には必ず最小のRecordIdが1件ある")
+}
+
+/// `Bound::Included(k)`の下限に対応する、`k`の範囲の**物理的な**先頭添字を
+/// 求める(まだ`RecordId`最小への正規化はしない、`locate_within_leaf`が
+/// 呼び出し側で必ず[`start_of_run_containing`]を通す)。
+fn physical_lower_bound_included(view: &LeafPageRef<'_>, k: &[u8]) -> usize {
+    match view.find(k) {
+        Ok(mut i) => {
+            while i > 0 && view.key(i - 1) == k {
+                i -= 1;
+            }
+            i
+        }
+        Err(i) => i,
+    }
+}
+
+/// `Bound::Excluded(k)`の下限に対応する、`k`を通り過ぎた直後の**物理的な**
+/// 添字を求める(まだ`RecordId`最小への正規化はしない、理由は
+/// [`physical_lower_bound_included`]と同じ)。
+fn physical_lower_bound_excluded(view: &LeafPageRef<'_>, k: &[u8]) -> usize {
+    match view.find(k) {
+        Ok(mut hi) => {
+            while hi + 1 < view.entry_count() && view.key(hi + 1) == k {
+                hi += 1;
+            }
+            hi + 1
+        }
+        Err(i) => i,
+    }
 }
 
 /// `view`(ある時点の葉の中身)の中で、`position`が指す位置を今の中身に
@@ -1090,33 +1134,21 @@ fn start_of_run_containing(view: &LeafPageRef<'_>, index: usize) -> usize {
 /// [`ScanPosition`]のドキュメントに書いたとおり、この関数は`view`を読む
 /// たびに毎回呼ばれる。前回の結果を数値のまま持ち越さないことが、
 /// 並行`insert`でこの葉が育っても壊れない理由そのものである。
+///
+/// 4つの分岐のうち、`Start`の3つと`After`の`fallback`(今のキーを読み尽くした、
+/// または今のキー自体が無い)は、どれも「まだ1件も読んでいない新しいキーへ
+/// 着地する」場面であり、必ず[`start_of_run_containing`]を経由して`RecordId`
+/// 最小の位置へ正規化する(この関数の呼び出しがちょうど4か所あるのはこの
+/// ためであり、新しい分岐を足すときもこの規則を外さないこと)。唯一の例外は
+/// `After`が今のキーの範囲内で次のエントリを見つけた場合(`min_rid_index_after`
+/// が`Some`を返す通常の1歩)で、これは「新しいキーへの着地」ではなく「同じ
+/// キー内で前進しただけ」なので正規化しない(すでに`RecordId`の大小関係で
+/// 正しく選ばれている)。
 fn locate_within_leaf(view: &LeafPageRef<'_>, position: &ScanPosition) -> usize {
     match position {
         ScanPosition::Start(Bound::Unbounded) => start_of_run_containing(view, 0),
-        ScanPosition::Start(Bound::Included(k)) => {
-            let physical = match view.find(k) {
-                Ok(mut i) => {
-                    while i > 0 && view.key(i - 1) == k.as_slice() {
-                        i -= 1;
-                    }
-                    i
-                }
-                Err(i) => i,
-            };
-            start_of_run_containing(view, physical)
-        }
-        ScanPosition::Start(Bound::Excluded(k)) => {
-            let physical = match view.find(k) {
-                Ok(mut hi) => {
-                    while hi + 1 < view.entry_count() && view.key(hi + 1) == k.as_slice() {
-                        hi += 1;
-                    }
-                    hi + 1
-                }
-                Err(i) => i,
-            };
-            start_of_run_containing(view, physical)
-        }
+        ScanPosition::Start(Bound::Included(k)) => start_of_run_containing(view, physical_lower_bound_included(view, k)),
+        ScanPosition::Start(Bound::Excluded(k)) => start_of_run_containing(view, physical_lower_bound_excluded(view, k)),
         ScanPosition::After(key, rid) => {
             let (lo, hi) = same_key_range(view, key);
             // 同じキーが連続する範囲(重複キー、モジュールドキュメントを
@@ -1125,9 +1157,11 @@ fn locate_within_leaf(view: &LeafPageRef<'_>, position: &ScanPosition) -> usize 
             // 残っていても(通常の1歩)、削除されてもう無くても(この章の
             // レビューで指摘された不具合の再現条件)、どちらでも同じ規則で
             // 「まだ返していない、次に小さいエントリ」を安定して選べる。
-            // 該当が無ければ、この範囲を読み尽くしたということなので、
-            // 範囲の終わり(`hi`)を返す。
-            min_rid_index_after(view, lo, hi, Some(*rid)).unwrap_or(hi)
+            // 該当が無ければ、この範囲(または、今のキー自体が削除されて
+            // 空になった範囲)を読み尽くしたということなので、次のキーの
+            // 物理的な先頭(`hi`)を`start_of_run_containing`で正規化して
+            // 返す(このドキュメントコメントを参照)。
+            min_rid_index_after(view, lo, hi, Some(*rid)).unwrap_or_else(|| start_of_run_containing(view, hi))
         }
     }
 }
@@ -2042,6 +2076,93 @@ mod tests {
             collect_range(&btree, Bound::Excluded(&Value::BigInt(4)), Bound::Unbounded).into_iter().map(|(_, r)| r).collect();
         via_excluded.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
         assert_eq!(via_excluded, expected, "Bound::Excludedで始めても3件すべてを取りこぼさないはず");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// レビュー3巡目の再現条件: `ScanPosition::After`が今のキーを読み終えて
+    /// 次のキーへ移る`fallback`(`min_rid_index_after(...).unwrap_or(hi)`)が、
+    /// 次のキーの**物理的に先頭**のエントリをそのまま返しており、そのキーの
+    /// `RecordId`が非順序に挿入されていると欠落させていた。
+    ///
+    /// 2巡目の修正は`ScanPosition::Start`の3境界だけを`start_of_run_containing`
+    /// で正規化しており、`After`が次のキーへ移る`fallback`はまだ生の物理添字
+    /// (`hi`)を返していた。この再現条件では、同じ葉にキー4(`RecordId`1件、
+    /// slot 0)とキー5(slot 3, 1, 2の順で挿入)を作り、`range(Unbounded,
+    /// Unbounded)`で両方のキーをまたいで走査する。キー4を読み終えたあと、
+    /// `After`の`fallback`はキー5の物理的な先頭(slot=3、キー5の範囲内で
+    /// 最大の`RecordId`)をそのまま返してしまい、続く`ScanPosition::After`が
+    /// 「slot=3より大きい`RecordId`」を探すため、キー5の残り(slot=1, 2)を
+    /// 1件も返せないまま読み終えたと誤判定していた。修正前は
+    /// `[(4,0),(5,3)]`の2件しか返らない。
+    #[test]
+    fn range_scan_across_a_key_boundary_does_not_drop_the_next_keys_duplicates_inserted_out_of_record_id_order() {
+        let path = temp_path("range-unbounded-key-boundary-out-of-order");
+        let btree = open_btree(&path, DataType::BigInt);
+        btree.insert(&Value::BigInt(4), rid(1, 0)).unwrap();
+        let key5_insertion_order = [rid(1, 3), rid(1, 1), rid(1, 2)];
+        for &r in &key5_insertion_order {
+            btree.insert(&Value::BigInt(5), r).unwrap();
+        }
+
+        let found = collect_range(&btree, Bound::Unbounded, Bound::Unbounded);
+        let mut by_key: std::collections::HashMap<i64, Vec<RecordId>> = std::collections::HashMap::new();
+        for (key, r) in found {
+            by_key.entry(key).or_default().push(r);
+        }
+
+        assert_eq!(by_key.get(&4).cloned().unwrap_or_default(), vec![rid(1, 0)], "キー4の1件は読めているはず");
+        let mut key5_found = by_key.get(&5).cloned().unwrap_or_default();
+        key5_found.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        let mut key5_expected = key5_insertion_order.to_vec();
+        key5_expected.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        assert_eq!(key5_found, key5_expected, "キー境界をまたいだ直後でも、次のキーの3件を取りこぼさないはず");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// 上と同じキー境界の再現条件を、`Bound::Included`・`Bound::Excluded`の
+    /// 開始点、および「現在のキー(4)が走査中に`delete`されて消える」
+    /// 経路(`same_key_range`が空になった状態から`fallback`する経路)とも
+    /// 組み合わせる。
+    #[test]
+    fn range_scan_across_a_key_boundary_after_the_current_key_is_deleted_mid_scan_does_not_drop_the_next_keys_duplicates() {
+        let path = temp_path("range-key-boundary-current-key-deleted");
+        let btree = open_btree(&path, DataType::BigInt);
+        btree.insert(&Value::BigInt(4), rid(1, 0)).unwrap();
+        let key5_insertion_order = [rid(1, 3), rid(1, 1), rid(1, 2)];
+        for &r in &key5_insertion_order {
+            btree.insert(&Value::BigInt(5), r).unwrap();
+        }
+        let mut key5_expected = key5_insertion_order.to_vec();
+        key5_expected.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+
+        // Bound::Includedでキー4から走査を始め、キー4を読んだ直後にキー4自体
+        // をdeleteする。次の`next()`は`same_key_range(view, 4)`が空になった
+        // 状態から`fallback`し、キー5の先頭へ正規化して着地しなければならない。
+        let mut scan = btree.range(Bound::Included(&Value::BigInt(4)), Bound::Unbounded).unwrap();
+        let (key, r) = scan.next().unwrap().unwrap();
+        let Value::BigInt(key) = key else { panic!("BigInt") };
+        assert_eq!((key, r), (4, rid(1, 0)));
+        assert!(btree.delete(&Value::BigInt(4), r).unwrap(), "直前に読んだキー4のエントリを削除する");
+
+        let mut key5_found: Vec<RecordId> = scan
+            .map(|entry| {
+                let (k, r) = entry.unwrap();
+                let Value::BigInt(k) = k else { panic!("BigInt") };
+                assert_eq!(k, 5, "キー4は削除済みなので残りはすべてキー5のはず");
+                r
+            })
+            .collect();
+        key5_found.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        assert_eq!(key5_found, key5_expected, "現在のキーが走査途中でdeleteされても、次のキーの3件を取りこぼさないはず");
+
+        // Bound::Excludedの下限からも同じ状況を確認する(すでにキー4は
+        // 削除済みなので、Excluded(4)はキー5の先頭から始まる)。
+        let mut via_excluded: Vec<RecordId> =
+            collect_range(&btree, Bound::Excluded(&Value::BigInt(4)), Bound::Unbounded).into_iter().map(|(_, r)| r).collect();
+        via_excluded.sort_by_key(|r| (r.page_id.0, r.slot_id.0));
+        assert_eq!(via_excluded, key5_expected, "Bound::Excludedから始めても3件すべてを取りこぼさないはず");
 
         std::fs::remove_file(&path).unwrap();
     }
