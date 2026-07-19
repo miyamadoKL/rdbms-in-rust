@@ -41,7 +41,10 @@
 //! 第30章では、`BEGIN`・`COMMIT`・`ROLLBACK`によるトランザクション境界と、
 //! それを取り消すためのメモリ上のUndo Recordを扱う`transaction`が加わる。
 //! `database`は`Active`なトランザクションを高々1本持てるようになり、
-//! `INSERT`・`UPDATE`・`DELETE`は成功のたびに逆操作を記録する。
+//! `INSERT`・`UPDATE`・`DELETE`は成功のたびに逆操作を記録する。第31章では、
+//! Shared/ExclusiveロックとWait Queueを管理する`lock_manager`が加わり、
+//! `database`の`SELECT`・`INSERT`・`UPDATE`・`DELETE`はStrict 2PLに従って
+//! ロックを獲得してから実行するようになる。
 
 pub mod ast;
 pub mod binder;
@@ -63,6 +66,7 @@ pub mod ids;
 pub mod index;
 pub mod join_order;
 pub mod lexer;
+pub mod lock_manager;
 pub mod logical_plan;
 pub mod page;
 pub mod parser;

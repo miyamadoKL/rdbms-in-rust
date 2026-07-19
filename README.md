@@ -5,7 +5,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 
 ## 目次
 
-現在執筆済みなのは[はじめに](book/src/index.md)と第1〜30章のみで、第31章以降は準備中です。
+現在執筆済みなのは[はじめに](book/src/index.md)と第1〜31章のみで、第32章以降は準備中です。
 
 ### 第0部 設計と開発環境
 
@@ -54,7 +54,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 ### 第5部 Transaction: ACIDと並行実行
 
 - [第30章 トランザクション境界とAtomicity](book/src/ch30-transactions.md)
-- 第31章 Lock ManagerとStrict 2PL
+- [第31章 Lock ManagerとStrict 2PL](book/src/ch31-lock-manager.md)
 - 第32章 Isolation LevelとDeadlock
 - 第33章 Write-Ahead Logging
 - 第34章 Crash RecoveryとCheckpoint

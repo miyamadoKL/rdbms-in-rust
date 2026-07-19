@@ -536,6 +536,40 @@ pub fn storage_delete(
     Ok(count)
 }
 
+/// `table_id`のうち`predicate`に一致する行の`RecordId`だけを、何も書き換え
+/// ずに集める(第31章)。
+///
+/// `crate::database::run_update`・`run_delete`が、実際の書き換えに入る前に
+/// Tuple Lockの対象(`predicate`に一致する行だけ)を確定させるために呼ぶ。
+/// `storage_update`・`storage_delete`の冒頭にある走査とまったく同じ絞り込みを
+/// もう一度行うため`predicate`を二重に評価することになるが、ロックの獲得と
+/// 実際の書き込みを1回の走査に統合する配線はこの章の範囲を超えるため見送った
+/// (ロックを獲得したあとで書き換え対象が変わる余地は無い。単一スレッドの
+/// 決定的インターリーブハーネスの上では、ロック獲得から書き込みまでの間に
+/// 割り込む余地が無いためである)。
+pub fn storage_matching_rids(
+    storage: &Storage,
+    table_id: TableId,
+    schema: &Schema,
+    functions: &FunctionRegistry,
+    predicate: Option<&BoundExpr>,
+) -> DbResult<Vec<RecordId>> {
+    let mut matched = Vec::new();
+    for entry in storage.scan(table_id)? {
+        let (rid, bytes) = entry?;
+        let tuple = decode_tuple(schema, &bytes)?;
+        let row = Row::new(schema, &tuple);
+        let is_match = match predicate {
+            None => true,
+            Some(pred) => predicate_matches(eval_bound_expr(pred, functions, Some(&row))?)?,
+        };
+        if is_match {
+            matched.push(rid);
+        }
+    }
+    Ok(matched)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
