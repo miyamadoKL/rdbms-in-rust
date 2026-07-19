@@ -86,6 +86,12 @@ impl Catalog {
     pub fn table(&self, name: &str) -> Option<&TableInfo> {
         self.tables.get(name)
     }
+
+    /// 登録されている全テーブルの`TableInfo`を返す(第27章、`ANALYZE`が
+    /// テーブル名を省略した場合に使う)。順序は保証しない。
+    pub fn tables(&self) -> impl Iterator<Item = &TableInfo> {
+        self.tables.values()
+    }
 }
 
 #[cfg(test)]

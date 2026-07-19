@@ -21,7 +21,7 @@
 //! 優先順位は低い順に`OR` < `AND` < `NOT` < 比較 < `+` `-` < `*` `/` < 単項`-`。
 
 use crate::ast::{
-    AggregateFunc, Assignment, BinaryOperator, ColumnDef, CreateIndexStatement, CreateTableStatement,
+    AggregateFunc, AnalyzeStatement, Assignment, BinaryOperator, ColumnDef, CreateIndexStatement, CreateTableStatement,
     DeleteStatement, DropIndexStatement, DropTableStatement, ExplainStatement, Expr, FromClause, Ident,
     InsertStatement, JoinClause, JoinKind, OrderByItem, SelectItem, SelectStatement, Statement, UnaryOperator,
     UpdateStatement,
@@ -160,9 +160,12 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Explain) => {
                 self.parse_explain_statement().map(Statement::Explain)
             }
+            TokenKind::Keyword(Keyword::Analyze) => {
+                self.parse_analyze_statement().map(Statement::Analyze)
+            }
             _ => Err(self.unexpected(
                 "SELECT・CREATE TABLE・DROP TABLE・CREATE INDEX・DROP INDEX・INSERT INTO・UPDATE・\
-                 DELETE FROM・EXPLAINのいずれか",
+                 DELETE FROM・EXPLAIN・ANALYZEのいずれか",
             )),
         }
     }
@@ -189,7 +192,7 @@ impl<'a> Parser<'a> {
 
     // ---- EXPLAIN ----
 
-    /// `EXPLAIN <SELECT|INSERT INTO|UPDATE|DELETE FROM>`を解析する。
+    /// `EXPLAIN [ANALYZE] <SELECT|INSERT INTO|UPDATE|DELETE FROM>`を解析する。
     ///
     /// 対象を`SELECT`・`INSERT INTO`・`UPDATE`・`DELETE FROM`の4種類に限るのは、
     /// `EXPLAIN`が見せるのはLogical Plan/Physical Planに変換できる文だけだから
@@ -197,8 +200,20 @@ impl<'a> Parser<'a> {
     /// (`Database::execute_create_table`等を直接呼ぶ)ため対象に含めない。
     /// `EXPLAIN EXPLAIN ...`のような入れ子も、この関数が生の`parse_statement`
     /// ではなく`SELECT`等4種の解析関数だけを呼ぶことで、構文の時点で拒否される。
+    ///
+    /// `EXPLAIN`の直後に`ANALYZE`キーワードが続けば(第27章、PostgreSQLの
+    /// `EXPLAIN ANALYZE`に相当)、対象の文を実際に実行して実測行数も見せる
+    /// `ExplainStatement::analyze = true`として解析する。`ANALYZE`が無ければ
+    /// 従来どおり推定のみの`EXPLAIN`(`analyze = false`)になる。
     fn parse_explain_statement(&mut self) -> DbResult<ExplainStatement> {
         let start = self.expect_keyword(Keyword::Explain, "EXPLAIN")?.start;
+
+        let analyze = if let TokenKind::Keyword(Keyword::Analyze) = self.peek_kind() {
+            self.advance();
+            true
+        } else {
+            false
+        };
 
         let statement = match self.peek_kind() {
             TokenKind::Keyword(Keyword::Select) => self.parse_select_statement().map(|s| Statement::Select(Box::new(s)))?,
@@ -209,7 +224,23 @@ impl<'a> Parser<'a> {
         };
 
         let end = statement.span().end;
-        Ok(ExplainStatement { statement: Box::new(statement), span: Span { start, end } })
+        Ok(ExplainStatement { statement: Box::new(statement), analyze, span: Span { start, end } })
+    }
+
+    // ---- ANALYZE(第27章) ----
+
+    /// `ANALYZE [テーブル名]`を解析する。テーブル名を省略した場合は`table`が
+    /// `None`になり、`Database::execute`が登録済みの全テーブルを対象にする。
+    fn parse_analyze_statement(&mut self) -> DbResult<AnalyzeStatement> {
+        let start = self.expect_keyword(Keyword::Analyze, "ANALYZE")?.start;
+
+        let table = match self.peek_kind() {
+            TokenKind::Ident(_) => Some(self.expect_ident()?),
+            _ => None,
+        };
+        let end = table.as_ref().map(|t| t.span.end).unwrap_or(start + "ANALYZE".len());
+
+        Ok(AnalyzeStatement { table, span: Span::new(start, end) })
     }
 
     // ---- SELECT ----
@@ -1619,6 +1650,60 @@ mod tests {
     fn explain_rejects_nested_explain() {
         let err = parse_statement("EXPLAIN EXPLAIN SELECT id FROM users").unwrap_err();
         assert!(matches!(err, DbError::Parse { .. }));
+    }
+
+    #[test]
+    fn parses_explain_without_analyze_as_false() {
+        let statement = parse_statement("EXPLAIN SELECT id FROM users").unwrap();
+        let Statement::Explain(explain) = statement else {
+            panic!("EXPLAIN文を期待した");
+        };
+        assert!(!explain.analyze);
+    }
+
+    #[test]
+    fn parses_explain_analyze_select() {
+        let statement = parse_statement("EXPLAIN ANALYZE SELECT id FROM users").unwrap();
+        let Statement::Explain(explain) = statement else {
+            panic!("EXPLAIN文を期待した");
+        };
+        assert!(explain.analyze);
+        assert!(matches!(*explain.statement, Statement::Select(_)));
+    }
+
+    #[test]
+    fn parses_explain_analyze_insert_update_delete() {
+        for sql in [
+            "EXPLAIN ANALYZE INSERT INTO users VALUES (1)",
+            "EXPLAIN ANALYZE UPDATE users SET id = 1",
+            "EXPLAIN ANALYZE DELETE FROM users",
+        ] {
+            let statement = parse_statement(sql).unwrap();
+            let Statement::Explain(explain) = statement else {
+                panic!("{sql}: EXPLAIN文を期待した");
+            };
+            assert!(explain.analyze, "{sql}: analyze=trueを期待した");
+        }
+    }
+
+    // ---- ANALYZE(第27章) ----
+
+    #[test]
+    fn parses_analyze_with_a_table_name() {
+        let statement = parse_statement("ANALYZE users").unwrap();
+        let Statement::Analyze(analyze) = statement else {
+            panic!("ANALYZE文を期待した");
+        };
+        assert_eq!(analyze.table.map(|t| t.name), Some("users".to_string()));
+    }
+
+    #[test]
+    fn parses_analyze_without_a_table_name() {
+        let statement = parse_statement("ANALYZE").unwrap();
+        let Statement::Analyze(analyze) = statement else {
+            panic!("ANALYZE文を期待した");
+        };
+        assert_eq!(analyze.table, None);
     }
 
     #[test]

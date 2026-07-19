@@ -34,11 +34,15 @@ pub enum Statement {
     Update(UpdateStatement),
     /// `DELETE FROM`文。
     Delete(DeleteStatement),
-    /// `EXPLAIN`文。`SELECT`・`INSERT INTO`・`UPDATE`・`DELETE FROM`のいずれか
-    /// 1本を対象に取れる(第19章)。`CREATE TABLE`・`DROP TABLE`はLogical
-    /// Plan/Physical Planを経由しない文であり、`EXPLAIN`する対象を持たないため
-    /// 対象に含めない。
+    /// `EXPLAIN [ANALYZE]`文。`SELECT`・`INSERT INTO`・`UPDATE`・`DELETE FROM`の
+    /// いずれか1本を対象に取れる(第19章)。`CREATE TABLE`・`DROP TABLE`は
+    /// Logical Plan/Physical Planを経由しない文であり、`EXPLAIN`する対象を
+    /// 持たないため対象に含めない。`ANALYZE`修飾(第27章)は
+    /// `ExplainStatement::analyze`が持つ。
     Explain(ExplainStatement),
+    /// `ANALYZE [テーブル名]`文(第27章)。統計情報を収集する。テーブル名を
+    /// 省略した場合はカタログに登録されている全テーブルが対象になる。
+    Analyze(AnalyzeStatement),
 }
 
 impl Statement {
@@ -54,6 +58,7 @@ impl Statement {
             Statement::Update(s) => s.span,
             Statement::Delete(s) => s.span,
             Statement::Explain(s) => s.span,
+            Statement::Analyze(s) => s.span,
         }
     }
 }
@@ -304,11 +309,24 @@ pub struct DeleteStatement {
     pub span: Span,
 }
 
-/// `EXPLAIN`文。`statement`は`EXPLAIN`の直後に続く1本のSQL文。
+/// `EXPLAIN [ANALYZE]`文。`statement`は`EXPLAIN`(または`EXPLAIN ANALYZE`)の
+/// 直後に続く1本のSQL文。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExplainStatement {
     pub statement: Box<Statement>,
+    /// `ANALYZE`修飾があったかどうか(第27章)。`false`なら推定行数だけを
+    /// 表示する従来の`EXPLAIN`、`true`なら実際に実行して実測行数も
+    /// 併記する`EXPLAIN ANALYZE`(PostgreSQLの`EXPLAIN ANALYZE`に相当)。
+    pub analyze: bool,
     /// `EXPLAIN`キーワードから対象の文の末尾までを覆う範囲。
+    pub span: Span,
+}
+
+/// `ANALYZE [テーブル名]`文(第27章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnalyzeStatement {
+    /// 対象テーブル名。`None`ならカタログに登録されている全テーブルが対象。
+    pub table: Option<Ident>,
     pub span: Span,
 }
 

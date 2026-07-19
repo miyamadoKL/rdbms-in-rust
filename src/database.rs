@@ -49,18 +49,23 @@
 
 use std::path::Path;
 
-use crate::ast::{CreateTableStatement, DropIndexStatement, DropTableStatement, Statement};
+use std::collections::HashMap;
+
+use crate::ast::{AnalyzeStatement, CreateTableStatement, DropIndexStatement, DropTableStatement, Statement};
 use crate::binder::{Binder, BoundCreateIndex, BoundStatement};
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, TableInfo};
 use crate::error::{DbError, DbResult};
 use crate::eval::FunctionRegistry;
 use crate::executor;
+use crate::ids::TableId;
 use crate::logical_plan::{self, DeleteNode, InsertNode, LogicalPlan, UpdateNode};
 use crate::physical_plan::{
-    self, DiskSeqScanExec, DistinctExec, Executor, FilterExec, HashAggregateExec, HashJoinExec, IndexNestedLoopJoinExec,
-    IndexScanExec, LimitExec, MemSeqScanExec, NestedLoopJoinExec, PhysicalPlan, ProjectionExec, SortExec, ValuesExec,
+    self, CounterNode, CountingExec, DiskSeqScanExec, DistinctExec, Executor, FilterExec, HashAggregateExec, HashJoinExec,
+    IndexNestedLoopJoinExec, IndexScanExec, LimitExec, MemSeqScanExec, NestedLoopJoinExec, PhysicalPlan, ProjectionExec,
+    SeqScanNode, SortExec, StatsLookup, ValuesExec, explain_text,
 };
 use crate::rules;
+use crate::statistics::{StatsCollector, TableStats};
 use crate::storage::Storage;
 use crate::storage_mem::MemStorage;
 use crate::types::{Column, DataType, Schema, Tuple, Value};
@@ -80,8 +85,17 @@ use crate::types::{Column, DataType, Schema, Tuple, Value};
 /// テストなど、この教材で最も頻繁な使い方)にも`Disk`分の大きさを毎回
 /// スタックに載せることになる。
 enum Backend {
-    Memory { catalog: Catalog, storage: MemStorage },
-    Disk { storage: Box<Storage> },
+    Memory {
+        catalog: Catalog,
+        storage: MemStorage,
+        /// `ANALYZE`(第27章)が集めた統計情報。`Catalog`・`MemStorage`と同じく
+        /// プロセスのメモリ上だけに保持し、永続化しない
+        /// (`crate::catalog`がメモリオンリーである既存方針と一貫させる)。
+        stats: HashMap<TableId, TableStats>,
+    },
+    Disk {
+        storage: Box<Storage>,
+    },
 }
 
 /// minidbのデータベース1つを表す。
@@ -106,6 +120,7 @@ impl Database {
             backend: Backend::Memory {
                 catalog: Catalog::new(),
                 storage: MemStorage::new(),
+                stats: HashMap::new(),
             },
         }
     }
@@ -208,7 +223,8 @@ impl Database {
             BoundStatement::Insert(insert) => self.execute_insert(logical_plan::build_insert(insert)),
             BoundStatement::Update(update) => self.execute_update(logical_plan::build_update(update)),
             BoundStatement::Delete(delete) => self.execute_delete(logical_plan::build_delete(delete)),
-            BoundStatement::Explain(inner) => self.execute_explain(*inner),
+            BoundStatement::Explain { inner, analyze } => self.execute_explain(*inner, analyze),
+            BoundStatement::Analyze(analyze) => self.execute_analyze(analyze),
         }
     }
 
@@ -269,7 +285,7 @@ impl Database {
             .collect();
 
         match &mut self.backend {
-            Backend::Memory { catalog, storage } => {
+            Backend::Memory { catalog, storage, .. } => {
                 let id = catalog.create_table(&create.table.name, schema)?;
                 storage.create_table(id);
             }
@@ -337,9 +353,11 @@ impl Database {
     /// 状態が変わる余地はこの章には無いため、実際には後者が発火することはない。
     fn execute_drop_table(&mut self, drop: &DropTableStatement) -> DbResult<QueryResult> {
         match &mut self.backend {
-            Backend::Memory { catalog, storage } => {
+            Backend::Memory { catalog, storage, stats } => {
                 let id = catalog.drop_table(&drop.table.name)?;
                 storage.drop_table(id);
+                // 統計情報(第27章)も、もう存在しないテーブルの分を残さない。
+                stats.remove(&id);
             }
             Backend::Disk { storage } => {
                 storage.drop_table(&drop.table.name)?;
@@ -376,7 +394,7 @@ impl Database {
         let plan = rules::optimize(plan, &self.functions);
         let physical = physical_plan::optimize(plan, self.index_storage());
         let schema = physical.output_schema();
-        let mut executor = self.build_query_executor(&physical)?;
+        let mut executor = self.build_query_executor(&physical, None)?;
 
         let mut rows = Vec::new();
         while let Some(tuple) = executor.next()? {
@@ -400,7 +418,31 @@ impl Database {
     /// インターフェースだけを相手にする。`Insert`・`Update`・`Delete`は
     /// この関数を経由しない(`crate::physical_plan`冒頭の説明を参照)ため、
     /// ここに渡ってくることはない。
-    fn build_query_executor<'a>(&'a self, plan: &'a PhysicalPlan) -> DbResult<Box<dyn Executor + 'a>> {
+    ///
+    /// `counters`が`Some`(`EXPLAIN ANALYZE`、第27章)なら、組み立てた
+    /// `Executor`を[`CountingExec`]でラップしたうえで返す。`counters`の木は
+    /// `plan.children()`と同じ形(`CounterNode::build`が複製したもの)を
+    /// 持つため、子へ再帰するたびに`counters.map(|n| &n.children[i])`で
+    /// 対応する子のカウンタへ降りていける。`None`(通常の`SELECT`・
+    /// `ANALYZE`)なら計測のオーバーヘッドを一切かけない。
+    fn build_query_executor<'a>(
+        &'a self,
+        plan: &'a PhysicalPlan,
+        counters: Option<&CounterNode>,
+    ) -> DbResult<Box<dyn Executor + 'a>> {
+        let exec = self.build_query_executor_inner(plan, counters)?;
+        Ok(match counters {
+            Some(node) => Box::new(CountingExec::new(exec, node.count.clone())),
+            None => exec,
+        })
+    }
+
+    fn build_query_executor_inner<'a>(
+        &'a self,
+        plan: &'a PhysicalPlan,
+        counters: Option<&CounterNode>,
+    ) -> DbResult<Box<dyn Executor + 'a>> {
+        let child = |index: usize| counters.map(|n| &n.children[index]);
         match plan {
             PhysicalPlan::SeqScan(scan) => {
                 let exec: Box<dyn Executor + 'a> = match &self.backend {
@@ -429,18 +471,18 @@ impl Database {
                 Ok(Box::new(exec))
             }
             PhysicalPlan::Filter(filter) => {
-                let input = self.build_query_executor(&filter.input)?;
+                let input = self.build_query_executor(&filter.input, child(0))?;
                 Ok(Box::new(FilterExec::new(input, &filter.predicate, &self.functions)))
             }
             PhysicalPlan::NestedLoopJoin(join) => {
-                let left = self.build_query_executor(&join.left)?;
-                let right = self.build_query_executor(&join.right)?;
+                let left = self.build_query_executor(&join.left, child(0))?;
+                let right = self.build_query_executor(&join.right, child(1))?;
                 let exec = NestedLoopJoinExec::new(left, right, &join.condition, &self.functions)?;
                 Ok(Box::new(exec))
             }
             PhysicalPlan::HashJoin(join) => {
-                let left = self.build_query_executor(&join.left)?;
-                let right = self.build_query_executor(&join.right)?;
+                let left = self.build_query_executor(&join.left, child(0))?;
+                let right = self.build_query_executor(&join.right, child(1))?;
                 let exec = HashJoinExec::new(left, right, &join.keys, &self.functions)?;
                 Ok(Box::new(exec))
             }
@@ -450,7 +492,7 @@ impl Database {
                 let Backend::Disk { storage } = &self.backend else {
                     unreachable!("IndexNestedLoopJoinはBackend::Diskのときにしかoptimizeが選ばない")
                 };
-                let left = self.build_query_executor(&join.left)?;
+                let left = self.build_query_executor(&join.left, child(0))?;
                 let exec = IndexNestedLoopJoinExec::new(
                     left,
                     storage,
@@ -463,7 +505,7 @@ impl Database {
                 Ok(Box::new(exec))
             }
             PhysicalPlan::Aggregate(aggregate) => {
-                let input = self.build_query_executor(&aggregate.input)?;
+                let input = self.build_query_executor(&aggregate.input, child(0))?;
                 let exec = HashAggregateExec::new(
                     input,
                     &aggregate.group_by,
@@ -474,19 +516,19 @@ impl Database {
                 Ok(Box::new(exec))
             }
             PhysicalPlan::Projection(projection) => {
-                let input = self.build_query_executor(&projection.input)?;
+                let input = self.build_query_executor(&projection.input, child(0))?;
                 Ok(Box::new(ProjectionExec::new(input, &projection.projection, &self.functions)))
             }
             PhysicalPlan::Distinct(distinct) => {
-                let input = self.build_query_executor(&distinct.input)?;
+                let input = self.build_query_executor(&distinct.input, child(0))?;
                 Ok(Box::new(DistinctExec::new(input)))
             }
             PhysicalPlan::Sort(sort) => {
-                let input = self.build_query_executor(&sort.input)?;
+                let input = self.build_query_executor(&sort.input, child(0))?;
                 Ok(Box::new(SortExec::new(input, &sort.keys, &self.functions)?))
             }
             PhysicalPlan::Limit(limit) => {
-                let input = self.build_query_executor(&limit.input)?;
+                let input = self.build_query_executor(&limit.input, child(0))?;
                 Ok(Box::new(LimitExec::new(input, limit.limit, limit.offset)))
             }
             PhysicalPlan::Insert(_) | PhysicalPlan::Update(_) | PhysicalPlan::Delete(_) => {
@@ -495,8 +537,9 @@ impl Database {
         }
     }
 
-    /// `EXPLAIN`を実行する。対象の文を`LogicalPlan`・`PhysicalPlan`へ変換し、
-    /// その木を文字列化しただけの`QueryResult`を返す(実際には何も実行しない)。
+    /// `EXPLAIN [ANALYZE]`を実行する。対象の文を`LogicalPlan`・`PhysicalPlan`へ
+    /// 変換し、各演算子に推定行数(`rows=`)を添えた木を文字列化した
+    /// `QueryResult`を返す。
     ///
     /// `SELECT`は`execute_select`と同じく`rules::optimize`(第26章)を経由する。
     /// `EXPLAIN`が見せる計画は、実際に実行される計画そのものでなければならない
@@ -505,25 +548,83 @@ impl Database {
     ///
     /// `inner`は`Parser`(第19章)がすでに`SELECT`・`INSERT INTO`・`UPDATE`・
     /// `DELETE FROM`の4種類に絞っているため、`CreateTable`・`DropTable`・
-    /// `CreateIndex`・`DropIndex`(第24章)・入れ子の`Explain`はここに渡ってこない。
-    fn execute_explain(&self, inner: BoundStatement) -> DbResult<QueryResult> {
-        let logical = match inner {
-            BoundStatement::Select(select) => rules::optimize(logical_plan::build_select(*select), &self.functions),
-            BoundStatement::Insert(insert) => logical_plan::build_insert(insert),
-            BoundStatement::Update(update) => logical_plan::build_update(update),
-            BoundStatement::Delete(delete) => logical_plan::build_delete(delete),
+    /// `CreateIndex`・`DropIndex`(第24章)・`ANALYZE`(第27章)・入れ子の
+    /// `Explain`はここに渡ってこない。
+    ///
+    /// `analyze`が`true`(第27章、PostgreSQLの`EXPLAIN ANALYZE`に相当)なら、
+    /// 対象の文を実際に実行し、実測行数(`actual=`)も併記する。
+    ///
+    /// **`SELECT`と`INSERT`/`UPDATE`/`DELETE`とで、`actual=`を添えられる
+    /// 範囲が異なる**。`SELECT`は`Executor`の木をそのまま実行できる
+    /// (`crate::physical_plan`冒頭の説明)ため、[`CountingExec`]で全ノードを
+    /// ラップし、演算子ごとの実測行数を集められる。`INSERT`/`UPDATE`/`DELETE`
+    /// は`Executor`を経由しない一括処理(`run_insert`等)であり、演算子ごとの
+    /// 内訳を計測する手段が無い。そのためこの章では、`INSERT`/`UPDATE`/
+    /// `DELETE`の`EXPLAIN ANALYZE`は**根のノード1行にだけ**`actual=`
+    /// (実際に書き込まれた行数)を添え、`input`側(`Values`・`Scan`)の
+    /// サブツリーは推定行数のみを表示する。
+    ///
+    /// もう1つ明記しておく必要があるのは、`EXPLAIN ANALYZE INSERT`/`UPDATE`/
+    /// `DELETE`は**実際に書き込みを行う**という点である。PostgreSQLの
+    /// `EXPLAIN (ANALYZE, ...)`と異なり、この教材はトランザクション内で
+    /// ロールバックして計測だけを取り消す機能を持たない(第29章より前に
+    /// トランザクションを導入していない)ため、`EXPLAIN ANALYZE INSERT`を
+    /// 実行すればテーブルの行は実際に増える。
+    fn execute_explain(&mut self, inner: BoundStatement, analyze: bool) -> DbResult<QueryResult> {
+        match inner {
+            BoundStatement::Select(select) => {
+                let logical = rules::optimize(logical_plan::build_select(*select), &self.functions);
+                let physical = physical_plan::optimize(logical, self.index_storage());
+                if analyze {
+                    let counters = CounterNode::build(&physical);
+                    let mut executor = self.build_query_executor(&physical, Some(&counters))?;
+                    while executor.next()?.is_some() {}
+                    Ok(QueryResult::explain(explain_text(&physical, self, Some(&counters))))
+                } else {
+                    Ok(QueryResult::explain(explain_text(&physical, self, None)))
+                }
+            }
+            BoundStatement::Insert(insert) => {
+                let physical = physical_plan::optimize(logical_plan::build_insert(insert.clone()), self.index_storage());
+                let text = explain_text(&physical, self, None);
+                if analyze {
+                    let count = self.run_insert(logical_plan::build_insert(insert))?;
+                    Ok(QueryResult::explain(append_actual_to_root_line(&text, count)))
+                } else {
+                    Ok(QueryResult::explain(text))
+                }
+            }
+            BoundStatement::Update(update) => {
+                let physical = physical_plan::optimize(logical_plan::build_update(update.clone()), self.index_storage());
+                let text = explain_text(&physical, self, None);
+                if analyze {
+                    let count = self.run_update(logical_plan::build_update(update))?;
+                    Ok(QueryResult::explain(append_actual_to_root_line(&text, count)))
+                } else {
+                    Ok(QueryResult::explain(text))
+                }
+            }
+            BoundStatement::Delete(delete) => {
+                let physical = physical_plan::optimize(logical_plan::build_delete(delete.clone()), self.index_storage());
+                let text = explain_text(&physical, self, None);
+                if analyze {
+                    let count = self.run_delete(logical_plan::build_delete(delete))?;
+                    Ok(QueryResult::explain(append_actual_to_root_line(&text, count)))
+                } else {
+                    Ok(QueryResult::explain(text))
+                }
+            }
             BoundStatement::CreateTable(_)
             | BoundStatement::DropTable(_)
             | BoundStatement::CreateIndex(_)
             | BoundStatement::DropIndex(_)
-            | BoundStatement::Explain(_) => {
+            | BoundStatement::Explain { .. }
+            | BoundStatement::Analyze(_) => {
                 unreachable!(
                     "ParserがEXPLAINの対象をSELECT・INSERT INTO・UPDATE・DELETE FROMに制限している"
                 )
             }
-        };
-        let physical = physical_plan::optimize(logical, self.index_storage());
-        Ok(QueryResult::explain(physical.to_string()))
+        }
     }
 
     /// `physical_plan::optimize`にPoint/Range Index Scan・Index Nested Loop
@@ -555,6 +656,14 @@ impl Database {
     /// 自身が`table_info.clone()`という形で行っていたが、`Binder`が返す時点で
     /// 複製済みになったことで、その回避策はここでは要らなくなった。
     fn execute_insert(&mut self, plan: LogicalPlan) -> DbResult<QueryResult> {
+        let count = self.run_insert(plan)?;
+        Ok(QueryResult::command_with_count("INSERT", count))
+    }
+
+    /// `execute_insert`の中身のうち、実際に書き込んで影響行数を返す部分。
+    /// `EXPLAIN ANALYZE INSERT`(第27章、`execute_explain`)も、`QueryResult`
+    /// ではなく実測行数そのものを必要とするため、この部分だけを共有する。
+    fn run_insert(&mut self, plan: LogicalPlan) -> DbResult<usize> {
         let LogicalPlan::Insert(InsertNode { table_id, schema, columns, input, .. }) = plan else {
             unreachable!("logical_plan::build_insertは常にLogicalPlan::Insertを返す")
         };
@@ -562,17 +671,16 @@ impl Database {
             unreachable!("logical_plan::build_insertはInsertの子に常にValuesを積む")
         };
 
-        let count = match &mut self.backend {
+        match &mut self.backend {
             Backend::Memory { storage, .. } => {
                 let mem_table =
                     storage.table_mut(table_id).expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::insert(mem_table, &schema, &self.functions, columns.as_deref(), &values.rows)?
+                executor::insert(mem_table, &schema, &self.functions, columns.as_deref(), &values.rows)
             }
             Backend::Disk { storage } => {
-                executor::storage_insert(storage, table_id, &schema, &self.functions, columns.as_deref(), &values.rows)?
+                executor::storage_insert(storage, table_id, &schema, &self.functions, columns.as_deref(), &values.rows)
             }
-        };
-        Ok(QueryResult::command_with_count("INSERT", count))
+        }
     }
 
     /// `UPDATE`を実行する。`executor::update`(または`executor::storage_update`)
@@ -586,21 +694,26 @@ impl Database {
     /// まとめて行うため、ここでは`input`を実際にたどらず`table_id`・`schema`
     /// だけを取り出す(`logical_plan::build_update`のドキュメント参照)。
     fn execute_update(&mut self, plan: LogicalPlan) -> DbResult<QueryResult> {
+        let count = self.run_update(plan)?;
+        Ok(QueryResult::command_with_count("UPDATE", count))
+    }
+
+    /// `execute_update`と`EXPLAIN ANALYZE UPDATE`が共有する、実際に書き込む部分。
+    fn run_update(&mut self, plan: LogicalPlan) -> DbResult<usize> {
         let LogicalPlan::Update(UpdateNode { table_id, schema, assignments, predicate, .. }) = plan else {
             unreachable!("logical_plan::build_updateは常にLogicalPlan::Updateを返す")
         };
 
-        let count = match &mut self.backend {
+        match &mut self.backend {
             Backend::Memory { storage, .. } => {
                 let mem_table =
                     storage.table_mut(table_id).expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::update(mem_table, &schema, &self.functions, &assignments, predicate.as_ref())?
+                executor::update(mem_table, &schema, &self.functions, &assignments, predicate.as_ref())
             }
             Backend::Disk { storage } => {
-                executor::storage_update(storage, table_id, &schema, &self.functions, &assignments, predicate.as_ref())?
+                executor::storage_update(storage, table_id, &schema, &self.functions, &assignments, predicate.as_ref())
             }
-        };
-        Ok(QueryResult::command_with_count("UPDATE", count))
+        }
     }
 
     /// `DELETE FROM`を実行する。`executor::delete`(または`executor::storage_delete`)
@@ -608,21 +721,119 @@ impl Database {
     /// 型検査は`Binder`の`bind_delete`が済ませている。`DeleteNode::input`を
     /// 実際にたどらない理由は`execute_update`と同じ。
     fn execute_delete(&mut self, plan: LogicalPlan) -> DbResult<QueryResult> {
+        let count = self.run_delete(plan)?;
+        Ok(QueryResult::command_with_count("DELETE", count))
+    }
+
+    /// `execute_delete`と`EXPLAIN ANALYZE DELETE`が共有する、実際に書き込む部分。
+    fn run_delete(&mut self, plan: LogicalPlan) -> DbResult<usize> {
         let LogicalPlan::Delete(DeleteNode { table_id, schema, predicate, .. }) = plan else {
             unreachable!("logical_plan::build_deleteは常にLogicalPlan::Deleteを返す")
         };
 
-        let count = match &mut self.backend {
+        match &mut self.backend {
             Backend::Memory { storage, .. } => {
                 let mem_table =
                     storage.table_mut(table_id).expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::delete(mem_table, &schema, &self.functions, predicate.as_ref())?
+                executor::delete(mem_table, &schema, &self.functions, predicate.as_ref())
             }
             Backend::Disk { storage } => {
-                executor::storage_delete(storage, table_id, &schema, &self.functions, predicate.as_ref())?
+                executor::storage_delete(storage, table_id, &schema, &self.functions, predicate.as_ref())
             }
+        }
+    }
+
+    /// `ANALYZE [テーブル名]`を実行する(第27章)。
+    ///
+    /// 対象テーブルを`SeqScan`相当の全件走査(`build_query_executor`が
+    /// 組み立てる`Executor`、`Backend::Memory`・`Backend::Disk`のどちらでも
+    /// 同じ経路)で1回走査し、[`StatsCollector`]へ1行ずつ渡して統計を集める。
+    /// テーブル名が省略されていれば、カタログに登録されている全テーブルが
+    /// 対象になる。
+    fn execute_analyze(&mut self, analyze: AnalyzeStatement) -> DbResult<QueryResult> {
+        let targets: Vec<(TableId, String, Schema)> = match &analyze.table {
+            Some(ident) => {
+                let info = self.table_info(&ident.name).ok_or_else(|| DbError::TableNotFound(ident.name.clone()))?;
+                vec![(info.id, info.name.clone(), info.schema.clone())]
+            }
+            None => self.all_table_infos().map(|info| (info.id, info.name.clone(), info.schema.clone())).collect(),
         };
-        Ok(QueryResult::command_with_count("DELETE", count))
+
+        for (table_id, table_name, schema) in &targets {
+            let stats = self.collect_table_stats(*table_id, table_name, schema)?;
+            match &mut self.backend {
+                Backend::Memory { stats: table_stats, .. } => {
+                    table_stats.insert(*table_id, stats);
+                }
+                Backend::Disk { storage } => {
+                    storage.set_table_stats(*table_id, stats)?;
+                }
+            }
+        }
+
+        Ok(QueryResult::command_with_count("ANALYZE", targets.len()))
+    }
+
+    /// `table_id`を`SeqScan`で全件走査し、[`StatsCollector`]で統計を集める。
+    fn collect_table_stats(&self, table_id: TableId, table_name: &str, schema: &Schema) -> DbResult<TableStats> {
+        let plan = PhysicalPlan::SeqScan(SeqScanNode {
+            table_id,
+            table_name: table_name.to_string(),
+            schema: schema.clone(),
+        });
+        let mut executor = self.build_query_executor(&plan, None)?;
+        let mut collector = StatsCollector::new(schema);
+        while let Some(tuple) = executor.next()? {
+            collector.add_row(&tuple);
+        }
+        Ok(collector.finish())
+    }
+
+    /// テーブル名から`TableInfo`相当(`id`・`name`・`schema`)を引く。
+    /// `Backend::Memory`・`Backend::Disk`のどちらでも使えるよう、`catalog()`
+    /// のようにpanicするのではなく`Option`で返す(第27章、`ANALYZE`が最初の
+    /// 利用者)。
+    fn table_info(&self, name: &str) -> Option<TableInfo> {
+        match &self.backend {
+            Backend::Memory { catalog, .. } => catalog.table(name).cloned(),
+            Backend::Disk { storage } => storage.table(name).cloned(),
+        }
+    }
+
+    /// 登録されている全テーブルの`TableInfo`を返す(第27章、`ANALYZE`が
+    /// テーブル名を省略した場合に使う)。
+    fn all_table_infos(&self) -> Box<dyn Iterator<Item = TableInfo> + '_> {
+        match &self.backend {
+            Backend::Memory { catalog, .. } => Box::new(catalog.tables().cloned()),
+            Backend::Disk { storage } => Box::new(storage.tables().cloned()),
+        }
+    }
+}
+
+impl StatsLookup for Database {
+    /// `EXPLAIN`/`EXPLAIN ANALYZE`(第27章)が推定行数を計算するための
+    /// `table_stats`の実装。`Backend::Memory`はプロセスのメモリ上に持つ
+    /// `HashMap`をそのまま引き、`Backend::Disk`は`Storage`がCatalogページから
+    /// 復元した統計情報を引く。
+    fn table_stats(&self, table_id: TableId) -> Option<&TableStats> {
+        match &self.backend {
+            Backend::Memory { stats, .. } => stats.get(&table_id),
+            Backend::Disk { storage } => storage.table_stats(table_id),
+        }
+    }
+}
+
+/// `text`(`explain_text`が組み立てた複数行のEXPLAIN出力)の先頭行(根の
+/// ノード)にだけ` actual=<count>`を追記する(第27章)。
+///
+/// `INSERT`/`UPDATE`/`DELETE`の`EXPLAIN ANALYZE`(`Database::execute_explain`)が
+/// 使う。根のノードは常に1行目に現れる(`explain_text`・`write_tree`の
+/// 深さ0の行はインデント無しの1行になる)ため、改行までの部分文字列に
+/// 追記するだけでよい。
+fn append_actual_to_root_line(text: &str, count: usize) -> String {
+    match text.split_once('\n') {
+        Some((first_line, rest)) => format!("{first_line} actual={count}\n{rest}"),
+        None => format!("{text} actual={count}"),
     }
 }
 
@@ -1696,35 +1907,35 @@ mod tests {
     fn explain_select_shows_projection_over_filter_over_seq_scan() {
         let mut db = users_db();
         let lines = explain_lines(&mut db, "EXPLAIN SELECT name FROM users WHERE id = 42");
-        assert_eq!(lines, vec!["Projection(name)", "  └─ Filter(id = 42)", "    └─ SeqScan(users)"]);
+        assert_eq!(lines, vec!["Projection(name) rows=5", "  └─ Filter(id = 42) rows=5", "    └─ SeqScan(users) rows=1000"]);
     }
 
     #[test]
     fn explain_select_without_where_has_no_filter_node() {
         let mut db = users_db();
         let lines = explain_lines(&mut db, "EXPLAIN SELECT id FROM users");
-        assert_eq!(lines, vec!["Projection(id)", "  └─ SeqScan(users)"]);
+        assert_eq!(lines, vec!["Projection(id) rows=1000", "  └─ SeqScan(users) rows=1000"]);
     }
 
     #[test]
     fn explain_insert_shows_insert_over_values() {
         let mut db = users_db();
         let lines = explain_lines(&mut db, "EXPLAIN INSERT INTO users VALUES (1, 'Alice')");
-        assert_eq!(lines, vec!["Insert(users)", "  └─ Values(1 row)"]);
+        assert_eq!(lines, vec!["Insert(users) rows=1", "  └─ Values(1 row) rows=1"]);
     }
 
     #[test]
     fn explain_update_shows_update_over_seq_scan() {
         let mut db = users_db();
         let lines = explain_lines(&mut db, "EXPLAIN UPDATE users SET name = 'x' WHERE id = 1");
-        assert_eq!(lines, vec!["Update(users)", "  └─ SeqScan(users)"]);
+        assert_eq!(lines, vec!["Update(users) rows=1000", "  └─ SeqScan(users) rows=1000"]);
     }
 
     #[test]
     fn explain_delete_shows_delete_over_seq_scan() {
         let mut db = users_db();
         let lines = explain_lines(&mut db, "EXPLAIN DELETE FROM users WHERE id = 1");
-        assert_eq!(lines, vec!["Delete(users)", "  └─ SeqScan(users)"]);
+        assert_eq!(lines, vec!["Delete(users) rows=1000", "  └─ SeqScan(users) rows=1000"]);
     }
 
     #[test]
@@ -2035,13 +2246,13 @@ mod tests {
         assert_eq!(
             result.to_string(),
             "QUERY PLAN\n----------\n\
-             Limit(limit=5)\n  \
-             └─ Sort(dept ASC)\n    \
-             └─ Projection(dept, COUNT(*))\n      \
-             └─ Filter(COUNT(*) > 1)\n        \
-             └─ Aggregate(group_by=[dept], calls=[COUNT(*)])\n          \
-             └─ Filter(amount IS NOT NULL)\n            \
-             └─ SeqScan(orders)\n\
+             Limit(limit=5) rows=5\n  \
+             └─ Sort(dept ASC) rows=111\n    \
+             └─ Projection(dept, COUNT(*)) rows=111\n      \
+             └─ Filter(COUNT(*) > 1) rows=111\n        \
+             └─ Aggregate(group_by=[dept], calls=[COUNT(*)]) rows=333\n          \
+             └─ Filter(amount IS NOT NULL) rows=333\n            \
+             └─ SeqScan(orders) rows=1000\n\
              (7 rows)"
         );
     }
@@ -2112,10 +2323,10 @@ mod tests {
         assert_eq!(
             result.to_string(),
             "QUERY PLAN\n----------\n\
-             Projection(name)\n  \
-             └─ Sort(id ASC)\n    \
-             └─ Projection(name, id)\n      \
-             └─ SeqScan(t)\n\
+             Projection(name) rows=1000\n  \
+             └─ Sort(id ASC) rows=1000\n    \
+             └─ Projection(name, id) rows=1000\n      \
+             └─ SeqScan(t) rows=1000\n\
              (4 rows)"
         );
     }
@@ -2675,7 +2886,7 @@ mod tests {
         let plan = db.execute("EXPLAIN SELECT id, amount, name FROM orders WHERE id = 1").unwrap().to_string();
         assert_eq!(
             plan,
-            "QUERY PLAN\n----------\nProjection(id, amount, name)\n  └─ IndexScan(idx_id, id = 1)\n(2 rows)"
+            "QUERY PLAN\n----------\nProjection(id, amount, name) rows=5\n  └─ IndexScan(idx_id, id = 1) rows=5\n(2 rows)"
         );
 
         let result = db.execute("SELECT id, amount, name FROM orders WHERE id = 1").unwrap();
@@ -2700,7 +2911,7 @@ mod tests {
             .to_string();
         assert_eq!(
             plan,
-            "QUERY PLAN\n----------\nProjection(id, amount, name)\n  └─ Filter(name = 'Alice')\n    └─ IndexScan(idx_id, id = 1)\n(3 rows)"
+            "QUERY PLAN\n----------\nProjection(id, amount, name) rows=0\n  └─ Filter(name = 'Alice') rows=0\n    └─ IndexScan(idx_id, id = 1) rows=5\n(3 rows)"
         );
 
         let result = db.execute("SELECT id, amount, name FROM orders WHERE id = 1 AND name = 'Alice'").unwrap();
@@ -2724,7 +2935,7 @@ mod tests {
             .to_string();
         assert_eq!(
             plan,
-            "QUERY PLAN\n----------\nProjection(id)\n  └─ IndexScan(idx_amount, amount >= 100 AND amount <= 200)\n(2 rows)"
+            "QUERY PLAN\n----------\nProjection(id) rows=111\n  └─ IndexScan(idx_amount, amount >= 100 AND amount <= 200) rows=111\n(2 rows)"
         );
 
         let result = db.execute("SELECT id FROM orders WHERE amount >= 100 AND amount <= 200 ORDER BY id").unwrap();
@@ -2749,7 +2960,7 @@ mod tests {
         let plan = db.execute("EXPLAIN SELECT id FROM orders WHERE amount = 100").unwrap().to_string();
         assert_eq!(
             plan,
-            "QUERY PLAN\n----------\nProjection(id)\n  └─ Filter(amount = 100)\n    └─ SeqScan(orders)\n(3 rows)"
+            "QUERY PLAN\n----------\nProjection(id) rows=5\n  └─ Filter(amount = 100) rows=5\n    └─ SeqScan(orders) rows=1000\n(3 rows)"
         );
 
         remove_db_and_indexes(&path, &[]);
@@ -2881,7 +3092,7 @@ mod tests {
             .to_string();
         assert_eq!(
             plan,
-            "QUERY PLAN\n----------\nProjection(customers.name, orders.item)\n  └─ IndexNestedLoopJoin(INNER JOIN, id = customer_id)\n    └─ SeqScan(customers)\n    └─ IndexScan(idx_customer_id, customer_id = id)\n(4 rows)"
+            "QUERY PLAN\n----------\nProjection(customers.name, orders.item) rows=1000\n  └─ IndexNestedLoopJoin(INNER JOIN, id = customer_id) rows=1000\n    └─ SeqScan(customers) rows=1000\n    └─ IndexScan(idx_customer_id, customer_id = id) rows=1\n(4 rows)"
         );
 
         let result = db
@@ -3067,5 +3278,148 @@ mod tests {
         for m in [2_000usize, 8_000, 32_000] {
             measure_join_once(m, false, "dense");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // ANALYZE / EXPLAIN ANALYZE(第27章)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn analyze_changes_the_estimated_rows_shown_by_explain() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')").unwrap();
+
+        // ANALYZE前は、統計を持たないテーブルのデフォルト値(1000)が使われる。
+        let before = explain_lines(&mut db, "EXPLAIN SELECT id FROM users");
+        assert_eq!(before, vec!["Projection(id) rows=1000", "  └─ SeqScan(users) rows=1000"]);
+
+        db.execute("ANALYZE users").unwrap();
+
+        // ANALYZE後は、実測した行数(3)が使われる。
+        let after = explain_lines(&mut db, "EXPLAIN SELECT id FROM users");
+        assert_eq!(after, vec!["Projection(id) rows=3", "  └─ SeqScan(users) rows=3"]);
+    }
+
+    #[test]
+    fn analyze_without_a_table_name_analyzes_every_registered_table() {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE a (v BIGINT)").unwrap();
+        db.execute("CREATE TABLE b (v BIGINT)").unwrap();
+        db.execute("INSERT INTO a VALUES (1), (2)").unwrap();
+        db.execute("INSERT INTO b VALUES (1), (2), (3), (4), (5)").unwrap();
+
+        let result = db.execute("ANALYZE").unwrap();
+        assert_eq!(result.to_string(), "ANALYZE 2");
+
+        assert_eq!(explain_lines(&mut db, "EXPLAIN SELECT v FROM a"), vec!["Projection(v) rows=2", "  └─ SeqScan(a) rows=2"]);
+        assert_eq!(explain_lines(&mut db, "EXPLAIN SELECT v FROM b"), vec!["Projection(v) rows=5", "  └─ SeqScan(b) rows=5"]);
+    }
+
+    #[test]
+    fn analyze_rejects_an_unknown_table_name() {
+        let mut db = users_db();
+        let result = db.execute("ANALYZE does_not_exist");
+        assert!(matches!(result, Err(DbError::Bind { .. })));
+    }
+
+    #[test]
+    fn explain_analyze_select_shows_actual_row_counts_alongside_estimates() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')").unwrap();
+        db.execute("ANALYZE users").unwrap();
+
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE SELECT id FROM users WHERE id = 2");
+        // rows=は推定値(ANALYZE済みだがHistogramの範囲外に近い等値述語なので
+        // 概算になる)。actual=は実測値(1行だけ一致する)。
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("Projection(id) rows="));
+        assert!(lines[0].ends_with("actual=1"), "line={}", lines[0]);
+        assert!(lines[1].trim_start().starts_with("└─ Filter(id = 2) rows="));
+        assert!(lines[1].ends_with("actual=1"), "line={}", lines[1]);
+        assert!(lines[2].trim_start().starts_with("└─ SeqScan(users) rows="));
+        assert!(lines[2].ends_with("actual=3"), "line={}", lines[2]);
+    }
+
+    #[test]
+    fn explain_without_analyze_never_shows_actual() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        let lines = explain_lines(&mut db, "EXPLAIN SELECT id FROM users");
+        assert!(lines.iter().all(|line| !line.contains("actual=")));
+    }
+
+    #[test]
+    fn explain_analyze_insert_shows_actual_only_on_the_root_line() {
+        let mut db = users_db();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')");
+        assert_eq!(lines, vec!["Insert(users) rows=2 actual=2", "  └─ Values(2 rows) rows=2"]);
+
+        // EXPLAIN ANALYZE INSERTは実際に書き込みを行う(本文で明記する制約)。
+        let result = db.execute("SELECT id FROM users").unwrap();
+        assert_eq!(result.rows().len(), 2);
+    }
+
+    #[test]
+    fn explain_analyze_update_shows_the_actual_affected_row_count() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')").unwrap();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE UPDATE users SET name = 'x' WHERE id <= 2");
+        assert_eq!(lines[0], "Update(users) rows=1000 actual=2");
+
+        let result = db.execute("SELECT name FROM users WHERE id <= 2").unwrap();
+        for row in result.rows() {
+            assert_eq!(row.values()[0], Value::Text("x".to_string()));
+        }
+    }
+
+    #[test]
+    fn explain_analyze_delete_shows_the_actual_affected_row_count() {
+        let mut db = users_db();
+        db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')").unwrap();
+        let lines = explain_lines(&mut db, "EXPLAIN ANALYZE DELETE FROM users WHERE id <= 2");
+        assert_eq!(lines[0], "Delete(users) rows=1000 actual=2");
+
+        let result = db.execute("SELECT id FROM users").unwrap();
+        assert_eq!(result.rows().len(), 1);
+    }
+
+    #[test]
+    fn analyze_stats_survive_a_reopen_of_the_disk_backend() {
+        let path = temp_db_path("analyze-persists-across-reopen");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE orders (id BIGINT NOT NULL, amount BIGINT)").unwrap();
+            db.execute("INSERT INTO orders VALUES (1, 100), (2, 200), (3, 300), (4, 400)").unwrap();
+            db.execute("ANALYZE orders").unwrap();
+            db.flush().unwrap();
+
+            // 開いたままでも、統計はすでに実測値(4行)を反映している。
+            let lines = explain_lines(&mut db, "EXPLAIN SELECT id FROM orders");
+            assert_eq!(lines, vec!["Projection(id) rows=4", "  └─ SeqScan(orders) rows=4"]);
+        }
+
+        // ファイルを閉じて(スコープを抜けて`Storage`を破棄して)再度開く。
+        let mut reopened = Database::open(&path).unwrap();
+        let lines = explain_lines(&mut reopened, "EXPLAIN SELECT id FROM orders");
+        assert_eq!(lines, vec!["Projection(id) rows=4", "  └─ SeqScan(orders) rows=4"]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dropping_a_table_also_drops_its_statistics_on_disk() {
+        let path = temp_db_path("analyze-drop-table-clears-stats");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (v BIGINT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        db.execute("ANALYZE t").unwrap();
+        db.execute("DROP TABLE t").unwrap();
+        db.execute("CREATE TABLE t (v BIGINT)").unwrap();
+
+        // 同名で作り直した新しいテーブルは、前のテーブルの統計を引き継がない。
+        let lines = explain_lines(&mut db, "EXPLAIN SELECT v FROM t");
+        assert_eq!(lines, vec!["Projection(v) rows=1000", "  └─ SeqScan(t) rows=1000"]);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

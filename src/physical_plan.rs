@@ -67,21 +67,25 @@
 //! 一括反映)こそがこの章の設計判断であり、`INSERT`・`UPDATE`・`DELETE`を
 //! Volcanoの子として分解しなかった理由である。
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::ops::Bound;
+use std::rc::Rc;
 
-use crate::ast::{AggregateFunc, BinaryOperator, Expr, JoinKind};
+use crate::ast::{AggregateFunc, BinaryOperator, Expr, JoinKind, UnaryOperator};
 use crate::binder::{AggregateCall, BoundAssignment, BoundExpr, BoundSelectItem};
 use crate::btree::RangeScan;
 use crate::error::{DbError, DbResult};
+use crate::estimator;
 use crate::eval::{FunctionRegistry, eval_bound_expr, eval_expr};
 use crate::executor::predicate_matches;
 use crate::heap_file::Scan as HeapScan;
 use crate::ids::{RecordId, TableId};
 use crate::logical_plan::{self, LogicalPlan, SortKey};
+use crate::statistics::{ColumnStats, TableStats};
 use crate::storage::Storage;
 use crate::storage_mem::MemTable;
 use crate::tuple_codec::decode_tuple;
@@ -874,7 +878,10 @@ impl PhysicalPlan {
         }
     }
 
-    fn children(&self) -> Vec<&PhysicalPlan> {
+    /// この演算子の直接の子。第27章の`EXPLAIN`/`EXPLAIN ANALYZE`が、この木と
+    /// 同じ形を持つ推定行数・実測行数の木([`estimate_rows`]・`CounterNode`)を
+    /// 組み立てるために`pub(crate)`にしてある。
+    pub(crate) fn children(&self) -> Vec<&PhysicalPlan> {
         match self {
             PhysicalPlan::SeqScan(_) | PhysicalPlan::IndexScan(_) | PhysicalPlan::Values(_) => Vec::new(),
             PhysicalPlan::Filter(filter) => vec![&filter.input],
@@ -1040,6 +1047,339 @@ impl fmt::Display for PhysicalPlan {
     /// ここに現れるラベルが変わる。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.write_tree(f, 0)
+    }
+}
+
+// ==================================================================
+// Cardinality Estimation: EXPLAIN/EXPLAIN ANALYZEが表示する推定行数(第27章)
+// ==================================================================
+
+/// `table_id`から[`TableStats`](第27章)を引ける、統計情報の抽象。
+///
+/// `crate::binder::CatalogLookup`と同じ考え方で、`Database`が`Backend::Memory`
+/// (プロセスのメモリ上だけの`HashMap`)と`Backend::Disk`(`Storage`が
+/// Catalogページへ永続化したもの)のどちらを使っていても、`estimate_rows`
+/// 自身はどちらのバックエンドかを意識しない。
+pub trait StatsLookup {
+    /// `table_id`の統計情報を引く。`ANALYZE`を実行していなければ`None`。
+    fn table_stats(&self, table_id: TableId) -> Option<&TableStats>;
+}
+
+/// 統計情報を一切持たない`StatsLookup`。テストや、統計を無視したい場面で使う。
+pub struct NoStats;
+
+impl StatsLookup for NoStats {
+    fn table_stats(&self, _table_id: TableId) -> Option<&TableStats> {
+        None
+    }
+}
+
+/// `plan`の根が生成する行数を見積もる。
+///
+/// `SeqScan`/`IndexScan`は対象テーブルの[`TableStats::row_count`](統計が
+/// 無ければ[`estimator::DEFAULT_ROW_COUNT_ESTIMATE`])を返す。`Filter`は
+/// 子の推定行数に[`predicate_selectivity`]を掛ける。`Join`系は
+/// [`estimator::estimate_join_row_count`]、`Aggregate`は
+/// [`estimator::estimate_aggregate_row_count`]を使う。`Insert`・`Update`・
+/// `Delete`は`Executor`を経由しない(モジュール冒頭の説明を参照)ため、この章
+/// では対象の`input`の推定行数をそのまま返す(影響を受ける行数の見積もり)。
+pub fn estimate_rows(plan: &PhysicalPlan, stats: &dyn StatsLookup) -> u64 {
+    match plan {
+        PhysicalPlan::SeqScan(scan) => table_row_count(stats, scan.table_id),
+        PhysicalPlan::IndexScan(scan) => {
+            let total = table_row_count(stats, scan.table_id);
+            let column_stats = column_stats_of(stats, scan.table_id, &scan.column_name, &scan.schema);
+            let selectivity = match &scan.kind {
+                IndexScanKind::Point(value) => estimator::estimate_equality_selectivity(column_stats, value),
+                IndexScanKind::Range { lower, upper } => range_selectivity_of_bounds(column_stats, lower, upper),
+            };
+            ((total as f64) * selectivity).round().max(0.0) as u64
+        }
+        PhysicalPlan::Values(values) => values.rows.len() as u64,
+        PhysicalPlan::Filter(filter) => {
+            let input_rows = estimate_rows(&filter.input, stats);
+            let selectivity = predicate_selectivity(&filter.predicate, &filter.input, stats);
+            ((input_rows as f64) * selectivity).round().max(0.0) as u64
+        }
+        PhysicalPlan::NestedLoopJoin(join) => {
+            // `NestedLoopJoin`は任意の条件(等値とは限らない)を持つため、
+            // 結合キー列を特定できない。フォールバック(下記)にすべて委ねる。
+            let left_rows = estimate_rows(&join.left, stats);
+            let right_rows = estimate_rows(&join.right, stats);
+            fallback_join_row_count(left_rows, right_rows)
+        }
+        PhysicalPlan::HashJoin(join) => {
+            let left_rows = estimate_rows(&join.left, stats);
+            let right_rows = estimate_rows(&join.right, stats);
+            // `HashJoin`は等値条件の対の並び(`keys`)を持つため、先頭のキーの
+            // 実際のNDVを引ける(第22章、`split_equi_join_keys`)。複数キーの
+            // 場合でも先頭の1本だけを見るのは単純化だが、`AND`で連結された
+            // 複数の等値条件は同じかそれ以上に選択的になるはずなので、
+            // 先頭キーだけを見た見積もりは「選択されすぎない」側の安全な近似になる。
+            let key_ndv = join.keys.first().map(|(left_key, right_key)| {
+                let left_ndv = column_owner_stats(left_key, &join.left, stats).map(|c| c.distinct_count).filter(|&n| n > 0);
+                let right_ndv = column_owner_stats(right_key, &join.right, stats).map(|c| c.distinct_count).filter(|&n| n > 0);
+                (left_ndv, right_ndv)
+            });
+            match key_ndv {
+                Some((Some(left_ndv), Some(right_ndv))) => {
+                    estimator::estimate_join_row_count(left_rows, right_rows, left_ndv, right_ndv)
+                }
+                _ => fallback_join_row_count(left_rows, right_rows),
+            }
+        }
+        PhysicalPlan::IndexNestedLoopJoin(join) => {
+            let left_rows = estimate_rows(&join.left, stats);
+            let inner_rows = table_row_count(stats, join.table_id);
+            let column_stats = column_stats_of(stats, join.table_id, &join.column_name, &join.schema);
+            let inner_ndv = column_stats.map(|c| c.distinct_count).unwrap_or(inner_rows).max(1);
+            estimator::estimate_join_row_count(left_rows, inner_rows, left_rows.max(1), inner_ndv)
+        }
+        PhysicalPlan::Aggregate(aggregate) => {
+            let input_rows = estimate_rows(&aggregate.input, stats);
+            let group_ndvs: Vec<u64> = aggregate
+                .group_by
+                .iter()
+                .map(|expr| column_owner_stats(expr, &aggregate.input, stats).map(|c| c.distinct_count).unwrap_or(input_rows).max(1))
+                .collect();
+            estimator::estimate_aggregate_row_count(&group_ndvs, input_rows)
+        }
+        PhysicalPlan::Projection(projection) => estimate_rows(&projection.input, stats),
+        PhysicalPlan::Distinct(distinct) => estimate_rows(&distinct.input, stats),
+        PhysicalPlan::Sort(sort) => estimate_rows(&sort.input, stats),
+        PhysicalPlan::Limit(limit) => {
+            let input_rows = estimate_rows(&limit.input, stats);
+            match limit.limit {
+                Some(n) => input_rows.min(n as u64),
+                None => input_rows,
+            }
+        }
+        PhysicalPlan::Insert(insert) => estimate_rows(&insert.input, stats),
+        PhysicalPlan::Update(update) => estimate_rows(&update.input, stats),
+        PhysicalPlan::Delete(delete) => estimate_rows(&delete.input, stats),
+    }
+}
+
+fn table_row_count(stats: &dyn StatsLookup, table_id: TableId) -> u64 {
+    stats.table_stats(table_id).map(|s| s.row_count).unwrap_or(estimator::DEFAULT_ROW_COUNT_ESTIMATE)
+}
+
+/// `schema`上で`column_name`という名前を持つ列の[`ColumnStats`]を、
+/// `table_id`の統計情報から引く。
+fn column_stats_of<'a>(
+    stats: &'a dyn StatsLookup,
+    table_id: TableId,
+    column_name: &str,
+    schema: &Schema,
+) -> Option<&'a crate::statistics::ColumnStats> {
+    let index = schema.index_of(column_name)?;
+    stats.table_stats(table_id)?.columns.get(index)
+}
+
+/// [`IndexScanKind::Range`]の下限・上限の両方から選択率を見積もる。上限・
+/// 下限のうち指定されている側だけ[`estimator::estimate_range_selectivity`]を
+/// 呼び、両方指定されていれば独立性を仮定した積(`estimate_and_selectivity`)を
+/// 取る。
+fn range_selectivity_of_bounds(stats: Option<&ColumnStats>, lower: &Bound<Value>, upper: &Bound<Value>) -> f64 {
+    let lower_sel = match lower {
+        Bound::Included(v) => Some(estimator::estimate_range_selectivity(stats, estimator::RangeOp::Ge, v)),
+        Bound::Excluded(v) => Some(estimator::estimate_range_selectivity(stats, estimator::RangeOp::Gt, v)),
+        Bound::Unbounded => None,
+    };
+    let upper_sel = match upper {
+        Bound::Included(v) => Some(estimator::estimate_range_selectivity(stats, estimator::RangeOp::Le, v)),
+        Bound::Excluded(v) => Some(estimator::estimate_range_selectivity(stats, estimator::RangeOp::Lt, v)),
+        Bound::Unbounded => None,
+    };
+    match (lower_sel, upper_sel) {
+        (Some(a), Some(b)) => estimator::estimate_and_selectivity(a, b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => 1.0,
+    }
+}
+
+/// 結合キー列のNDVを特定できない場合(`NestedLoopJoin`の任意条件、または
+/// `HashJoin`でも列に統計情報が無い場合)の既定の見積もり。「値はすべて
+/// 一意」という最も楽観的な既定値(それぞれの出力行数そのもの)を
+/// [`estimator::estimate_join_row_count`]へ渡す。主キー・外部キー結合
+/// (外部キー側の値がすべて異なる典型的な結合)を想定した単純化である。
+fn fallback_join_row_count(left_rows: u64, right_rows: u64) -> u64 {
+    estimator::estimate_join_row_count(left_rows, right_rows, left_rows.max(1), right_rows.max(1))
+}
+
+/// `plan`の列`column_index`が、どのテーブルのどの列に由来するかを解決する。
+///
+/// `SeqScan`/`IndexScan`はその場で確定する。`Filter`・`Distinct`・`Sort`・
+/// `Limit`は列の意味を変えずに素通しするので、子へそのまま委ねる。`Join`は
+/// 左右どちらの出力かを列番号のオフセットで判定し、対応する側へ委ねる
+/// (`IndexNestedLoopJoin`の内側テーブルは独立した`PhysicalPlan`を持たない
+/// ため、その場で確定する)。`Projection`・`Aggregate`は列の意味が
+/// 再構成されるため`None`を返す(この章の推定はここでデフォルトの
+/// 選択率にフォールバックする)。
+fn resolve_column_owner(plan: &PhysicalPlan, column_index: usize) -> Option<(TableId, usize)> {
+    match plan {
+        PhysicalPlan::SeqScan(scan) => Some((scan.table_id, column_index)),
+        PhysicalPlan::IndexScan(scan) => Some((scan.table_id, column_index)),
+        PhysicalPlan::Filter(filter) => resolve_column_owner(&filter.input, column_index),
+        PhysicalPlan::Distinct(distinct) => resolve_column_owner(&distinct.input, column_index),
+        PhysicalPlan::Sort(sort) => resolve_column_owner(&sort.input, column_index),
+        PhysicalPlan::Limit(limit) => resolve_column_owner(&limit.input, column_index),
+        PhysicalPlan::NestedLoopJoin(join) => resolve_join_column(&join.left, &join.right, column_index),
+        PhysicalPlan::HashJoin(join) => resolve_join_column(&join.left, &join.right, column_index),
+        PhysicalPlan::IndexNestedLoopJoin(join) => {
+            let left_len = join.left.output_schema().len();
+            if column_index < left_len {
+                resolve_column_owner(&join.left, column_index)
+            } else {
+                Some((join.table_id, column_index - left_len))
+            }
+        }
+        PhysicalPlan::Values(_)
+        | PhysicalPlan::Aggregate(_)
+        | PhysicalPlan::Projection(_)
+        | PhysicalPlan::Insert(_)
+        | PhysicalPlan::Update(_)
+        | PhysicalPlan::Delete(_) => None,
+    }
+}
+
+fn resolve_join_column(left: &PhysicalPlan, right: &PhysicalPlan, column_index: usize) -> Option<(TableId, usize)> {
+    let left_len = left.output_schema().len();
+    if column_index < left_len {
+        resolve_column_owner(left, column_index)
+    } else {
+        resolve_column_owner(right, column_index - left_len)
+    }
+}
+
+/// [`BoundExpr::ColumnRef`]から、その列が由来するテーブルの[`ColumnStats`]を
+/// 引く。列参照でない式、または由来を解決できない式には`None`を返す。
+fn column_owner_stats<'a>(expr: &BoundExpr, plan: &PhysicalPlan, stats: &'a dyn StatsLookup) -> Option<&'a ColumnStats> {
+    let BoundExpr::ColumnRef { column_index, .. } = expr else { return None };
+    let (table_id, local_index) = resolve_column_owner(plan, *column_index)?;
+    stats.table_stats(table_id)?.columns.get(local_index)
+}
+
+/// `predicate`(`plan`を子に持つ`Filter`の述語)の選択率を見積もる。
+///
+/// 対応するのは、`col <op> 定数`(`=`・`<>`・`<`・`<=`・`>`・`>=`)の形の比較と、
+/// `AND`・`OR`・`NOT`による組み合わせだけである。列参照が定数と比較されて
+/// いない述語(`col1 = col2`、関数呼び出しを含む式など)は、この章の推定式が
+/// 対応する範囲の外にあるため、[`estimator::DEFAULT_INEQ_SEL`]にフォールバック
+/// する。
+pub fn predicate_selectivity(predicate: &BoundExpr, plan: &PhysicalPlan, stats: &dyn StatsLookup) -> f64 {
+    match predicate {
+        BoundExpr::Paren { expr, .. } => predicate_selectivity(expr, plan, stats),
+        BoundExpr::UnaryOp { op: UnaryOperator::Not, expr, .. } => {
+            estimator::estimate_not_selectivity(predicate_selectivity(expr, plan, stats))
+        }
+        BoundExpr::BinaryOp { op: BinaryOperator::And, lhs, rhs, .. } => {
+            estimator::estimate_and_selectivity(predicate_selectivity(lhs, plan, stats), predicate_selectivity(rhs, plan, stats))
+        }
+        BoundExpr::BinaryOp { op: BinaryOperator::Or, lhs, rhs, .. } => {
+            estimator::estimate_or_selectivity(predicate_selectivity(lhs, plan, stats), predicate_selectivity(rhs, plan, stats))
+        }
+        BoundExpr::BinaryOp { op, lhs, rhs, .. } => comparison_selectivity(*op, lhs, rhs, plan, stats),
+        _ => estimator::DEFAULT_INEQ_SEL,
+    }
+}
+
+/// `lhs <op> rhs`という1個の比較式の選択率を見積もる。`col = 定数`・
+/// `定数 = col`のどちらの並びでも同じ選択率になるよう、列参照がどちらの側に
+/// あるかを見て演算子の向きを揃える。
+fn comparison_selectivity(op: BinaryOperator, lhs: &BoundExpr, rhs: &BoundExpr, plan: &PhysicalPlan, stats: &dyn StatsLookup) -> f64 {
+    let (column_expr, op, value) = match (literal_value(rhs), literal_value(lhs)) {
+        (Some(value), _) => (lhs, op, value),
+        (None, Some(value)) => (rhs, flip_comparison(op), value),
+        (None, None) => return estimator::DEFAULT_INEQ_SEL,
+    };
+    let column_stats = column_owner_stats(column_expr, plan, stats);
+    match op {
+        BinaryOperator::Eq => estimator::estimate_equality_selectivity(column_stats, &value),
+        BinaryOperator::NotEq => estimator::estimate_not_selectivity(estimator::estimate_equality_selectivity(column_stats, &value)),
+        BinaryOperator::Lt => estimator::estimate_range_selectivity(column_stats, estimator::RangeOp::Lt, &value),
+        BinaryOperator::LtEq => estimator::estimate_range_selectivity(column_stats, estimator::RangeOp::Le, &value),
+        BinaryOperator::Gt => estimator::estimate_range_selectivity(column_stats, estimator::RangeOp::Gt, &value),
+        BinaryOperator::GtEq => estimator::estimate_range_selectivity(column_stats, estimator::RangeOp::Ge, &value),
+        _ => estimator::DEFAULT_INEQ_SEL,
+    }
+}
+
+// ==================================================================
+// EXPLAIN / EXPLAIN ANALYZE: 推定行数・実測行数を添えた木の表示(第27章)
+// ==================================================================
+
+/// [`CountingExec`]が実測した、`PhysicalPlan`の1ノードぶんの実行時カウンタ。
+/// `children`は対応する`PhysicalPlan::children()`と同じ並び順・同じ要素数を
+/// 持つ(`build_counter_tree`が`PhysicalPlan`の形をそのまま複製して作る)。
+pub struct CounterNode {
+    pub count: Rc<Cell<u64>>,
+    pub children: Vec<CounterNode>,
+}
+
+impl CounterNode {
+    /// `plan`と同じ形(子の数・並び順)を持つ、カウンタがすべて0の木を作る。
+    pub fn build(plan: &PhysicalPlan) -> CounterNode {
+        CounterNode {
+            count: Rc::new(Cell::new(0)),
+            children: plan.children().iter().map(|child| CounterNode::build(child)).collect(),
+        }
+    }
+}
+
+/// `plan`の`EXPLAIN`表示を組み立てる。`actual`が`Some`なら各行へ
+/// ` actual=<実測行数>`も添える(`EXPLAIN ANALYZE`)。`actual`が`None`なら
+/// 推定行数(` rows=<推定値>`)だけを添える(従来の`EXPLAIN`)。
+///
+/// 木の形・インデント・矢印記法は[`PhysicalPlan`]の`Display`実装
+/// (`write_tree`)と同じ規則に従う。`IndexNestedLoopJoin`の内側テーブルの
+/// 表示(木の子ではなく、深さを1段手動で掘った合成行)も同様に揃える。
+pub fn explain_text(plan: &PhysicalPlan, stats: &dyn StatsLookup, actual: Option<&CounterNode>) -> String {
+    let mut out = String::new();
+    write_explain_tree(plan, stats, actual, 0, &mut out);
+    out
+}
+
+fn write_explain_tree(plan: &PhysicalPlan, stats: &dyn StatsLookup, actual: Option<&CounterNode>, depth: usize, out: &mut String) {
+    let rows = estimate_rows(plan, stats);
+    if depth == 0 {
+        out.push_str(&plan.label());
+    } else {
+        out.push_str(&"  ".repeat(depth));
+        out.push_str("└─ ");
+        out.push_str(&plan.label());
+    }
+    out.push_str(&format!(" rows={rows}"));
+    if let Some(node) = actual {
+        out.push_str(&format!(" actual={}", node.count.get()));
+    }
+    out.push('\n');
+
+    for (i, child) in plan.children().iter().enumerate() {
+        let child_actual = actual.map(|node| &node.children[i]);
+        write_explain_tree(child, stats, child_actual, depth + 1, out);
+    }
+
+    if let PhysicalPlan::IndexNestedLoopJoin(join) = plan {
+        // `children()`には現れない、内側テーブルへの索引アクセス
+        // (`write_tree`と同じ合成行)。実測値を集める`CountingExec`の対象には
+        // していない(`IndexNestedLoopJoinExec`は外側の行ごとに内側を
+        // `lookup`するため、この1行だけの実測件数を他の演算子と同じ形では
+        // 数えられない)ので、推定行数だけを添える。
+        // 外側の行ごとに異なる値で`lookup`するため、特定の定数に対する選択率
+        // ではなく「平均的な等値検索は何行返すか」(`1 / NDV`)を見積もる。
+        let inner_rows = table_row_count(stats, join.table_id);
+        let column_stats = column_stats_of(stats, join.table_id, &join.column_name, &join.schema);
+        let ndv = column_stats.map(|c| c.distinct_count).filter(|&n| n > 0).unwrap_or(inner_rows).max(1);
+        let estimated = (inner_rows as f64 / ndv as f64).round().max(0.0) as u64;
+        let indent = "  ".repeat(depth + 1);
+        out.push_str(&format!(
+            "{indent}└─ IndexScan({}, {} = {}) rows={estimated}\n",
+            join.index_name,
+            join.column_name,
+            logical_plan::fmt_bound_expr(&join.outer_key)
+        ));
     }
 }
 
@@ -1925,6 +2265,41 @@ impl<'a> Executor for LimitExec<'a> {
             *remaining -= 1;
         }
         Ok(Some(tuple))
+    }
+}
+
+/// `EXPLAIN ANALYZE`(第27章)が実測行数を集めるための、`Executor`1個の
+/// ラッパー。`inner.next()`が`Some`を返すたびに`count`を1つ増やす。
+///
+/// カウンタを`Rc<Cell<u64>>`で持つのは、`Database::build_query_executor`が
+/// `PhysicalPlan`の木をたどりながら`Box<dyn Executor>`の木を組み立てたあと、
+/// 呼び出し側(`Database::execute_explain`)が`Executor`の木とは別に
+/// [`CounterNode`]の木を保持し続け、実行が終わってから(=`Box<dyn Executor>`の
+/// 所有権が尽きたあとで)各カウンタの値を読む必要があるためである。
+/// `&mut u64`のような通常の参照では、`Executor`の木を借用したまま結果を
+/// 読み出すことになり借用規則に反する。
+pub struct CountingExec<'a> {
+    inner: Box<dyn Executor + 'a>,
+    count: Rc<Cell<u64>>,
+}
+
+impl<'a> CountingExec<'a> {
+    pub fn new(inner: Box<dyn Executor + 'a>, count: Rc<Cell<u64>>) -> Self {
+        CountingExec { inner, count }
+    }
+}
+
+impl<'a> Executor for CountingExec<'a> {
+    fn output_schema(&self) -> &Schema {
+        self.inner.output_schema()
+    }
+
+    fn next(&mut self) -> DbResult<Option<Tuple>> {
+        let result = self.inner.next()?;
+        if result.is_some() {
+            self.count.set(self.count.get() + 1);
+        }
+        Ok(result)
     }
 }
 

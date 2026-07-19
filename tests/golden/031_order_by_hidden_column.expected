@@ -11,17 +11,17 @@ c
 
 QUERY PLAN
 ----------
-Projection(name)
-  └─ Sort(id ASC)
-    └─ Projection(name, id)
-      └─ SeqScan(t)
+Projection(name) rows=1000
+  └─ Sort(id ASC) rows=1000
+    └─ Projection(name, id) rows=1000
+      └─ SeqScan(t) rows=1000
 (4 rows)
 
 QUERY PLAN
 ----------
-Sort(id ASC)
-  └─ Projection(id)
-    └─ SeqScan(t)
+Sort(id ASC) rows=1000
+  └─ Projection(id) rows=1000
+    └─ SeqScan(t) rows=1000
 (3 rows)
 
 ERROR: 行1列38: 名前解決エラー: DISTINCTを伴うSELECTでは、ORDER BYはSELECTの対象式だけを参照できます

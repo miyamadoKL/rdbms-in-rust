@@ -51,9 +51,9 @@
 use std::collections::HashSet;
 
 use crate::ast::{
-    AggregateFunc, Assignment, BinaryOperator, CreateIndexStatement, CreateTableStatement, DeleteStatement,
-    DropIndexStatement, DropTableStatement, Expr, FromClause, Ident, InsertStatement, JoinKind, SelectItem,
-    SelectStatement, Statement, UnaryOperator, UpdateStatement,
+    AggregateFunc, AnalyzeStatement, Assignment, BinaryOperator, CreateIndexStatement, CreateTableStatement,
+    DeleteStatement, DropIndexStatement, DropTableStatement, Expr, FromClause, Ident, InsertStatement, JoinKind,
+    SelectItem, SelectStatement, Statement, UnaryOperator, UpdateStatement,
 };
 use crate::catalog::{Catalog, TableInfo};
 use crate::error::{DbError, DbResult};
@@ -127,11 +127,17 @@ pub enum BoundStatement {
     Insert(BoundInsert),
     Update(BoundUpdate),
     Delete(BoundDelete),
-    /// `EXPLAIN`。対象の文はParser(第19章)がすでに`SELECT`・`INSERT INTO`・
-    /// `UPDATE`・`DELETE FROM`の4種類に絞っているため、この束縛先も
-    /// `CreateTable`・`DropTable`・入れ子の`Explain`にはならない
-    /// (`Database::execute_explain`はその前提で網羅する)。
-    Explain(Box<BoundStatement>),
+    /// `EXPLAIN [ANALYZE]`。対象の文はParser(第19章)がすでに`SELECT`・
+    /// `INSERT INTO`・`UPDATE`・`DELETE FROM`の4種類に絞っているため、この
+    /// 束縛先も`CreateTable`・`DropTable`・入れ子の`Explain`にはならない
+    /// (`Database::execute_explain`はその前提で網羅する)。`analyze`は
+    /// `ExplainStatement::analyze`(第27章)をそのまま引き継ぐ。
+    Explain { inner: Box<BoundStatement>, analyze: bool },
+    /// `ANALYZE`(第27章)。`CreateTable`と同じく、ASTのバリアントをそのまま
+    /// 持ち回す(統計収集は既存のカタログエントリを書き換えるだけの操作であり、
+    /// 式の名前解決・型検査を必要としない)。テーブル名が指定されていれば、
+    /// その存在だけを`DropTable`と同じ理由でここで確認する。
+    Analyze(AnalyzeStatement),
 }
 
 /// 束縛済みの`CREATE INDEX`(第24章)。
@@ -482,9 +488,23 @@ impl<'a> Binder<'a> {
             Statement::Update(update) => self.bind_update(update).map(BoundStatement::Update),
             Statement::Delete(delete) => self.bind_delete(delete).map(BoundStatement::Delete),
             Statement::Explain(explain) => {
-                self.bind(*explain.statement).map(|inner| BoundStatement::Explain(Box::new(inner)))
+                let analyze = explain.analyze;
+                self.bind(*explain.statement).map(|inner| BoundStatement::Explain { inner: Box::new(inner), analyze })
             }
+            Statement::Analyze(analyze) => self.bind_analyze(analyze),
         }
+    }
+
+    /// `ANALYZE`のテーブル名を解決する(第27章)。テーブル名が省略されて
+    /// いれば(`table`が`None`)検査せずそのまま通す(`Database::execute_analyze`が
+    /// 登録済みの全テーブルを対象にする)。
+    fn bind_analyze(&self, analyze: AnalyzeStatement) -> DbResult<BoundStatement> {
+        if let Some(table) = &analyze.table {
+            self.catalog
+                .table(&table.name)
+                .ok_or_else(|| self.error_at(table.span, format!("テーブルが見つかりません: {}", table.name)))?;
+        }
+        Ok(BoundStatement::Analyze(analyze))
     }
 
     fn error_at(&self, span: Span, message: impl Into<String>) -> DbError {
@@ -1711,6 +1731,50 @@ mod tests {
         let catalog = users_catalog();
         let (line, column) = bind_err_position("DROP TABLE does_not_exist", &catalog);
         assert_eq!((line, column), (1, 12));
+    }
+
+    #[test]
+    fn analyze_with_a_known_table_passes_through_unchanged() {
+        let catalog = users_catalog();
+        let bound = bind("ANALYZE users", &catalog).unwrap();
+        let BoundStatement::Analyze(analyze) = bound else {
+            panic!("Analyzeを期待した");
+        };
+        assert_eq!(analyze.table.map(|t| t.name), Some("users".to_string()));
+    }
+
+    #[test]
+    fn analyze_without_a_table_name_passes_through_unchanged() {
+        let catalog = users_catalog();
+        let bound = bind("ANALYZE", &catalog).unwrap();
+        assert!(matches!(bound, BoundStatement::Analyze(_)));
+    }
+
+    #[test]
+    fn analyze_rejects_unknown_table_with_position() {
+        let catalog = users_catalog();
+        let (line, column) = bind_err_position("ANALYZE does_not_exist", &catalog);
+        assert_eq!((line, column), (1, 9));
+    }
+
+    #[test]
+    fn explain_analyze_keeps_the_analyze_flag_through_binding() {
+        let catalog = users_catalog();
+        let bound = bind("EXPLAIN ANALYZE SELECT id FROM users", &catalog).unwrap();
+        let BoundStatement::Explain { analyze, .. } = bound else {
+            panic!("Explainを期待した");
+        };
+        assert!(analyze);
+    }
+
+    #[test]
+    fn explain_without_analyze_keeps_the_flag_false_through_binding() {
+        let catalog = users_catalog();
+        let bound = bind("EXPLAIN SELECT id FROM users", &catalog).unwrap();
+        let BoundStatement::Explain { analyze, .. } = bound else {
+            panic!("Explainを期待した");
+        };
+        assert!(!analyze);
     }
 
     #[test]

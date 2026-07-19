@@ -207,6 +207,45 @@
 //! 持つのは索引の**メタデータ**(名前・テーブル・列・`unique`・キー型)だけで、
 //! B+Treeの`Root`の`PageId`はここには現れない(索引ごとのファイルの中で
 //! `BTree`自身が管理する)。
+//!
+//! # 第27章での変更: 統計情報をCatalogページへ追加する
+//!
+//! `ANALYZE`(第27章)が集めるテーブル・列ごとの統計情報
+//! (`crate::statistics::TableStats`)を、索引メタデータと同じ考え方で
+//! Catalogページの末尾に追記する。`ANALYZE`を実行していないテーブルは
+//! このセクションに現れない(統計を持たないテーブルは、`estimator`モジュールが
+//! デフォルトの選択率にフォールバックして扱う)。
+//!
+//! ```text
+//! stats_count: u32
+//! stats × stats_count:
+//!     table_id:      u64
+//!     row_count:     u64
+//!     column_count:  u16
+//!     columns × column_count:
+//!         null_count:     u64
+//!         distinct_count: u64
+//!         min:            Value  (`NULL`タグは「値が無い」ことを表す)
+//!         max:            Value
+//!         bucket_count:   u16
+//!         buckets × bucket_count:
+//!             lower:     Value
+//!             upper:     Value
+//!             row_count: u64
+//! ```
+//!
+//! `Value`は、既存のフィールドが使ってきた`data_type: u8`とは別に、値そのものを
+//! 復元できるよう`tag: u8`(0=NULL, 1=BOOLEAN, 2=BIGINT, 3=TEXT)に続けて
+//! 型ごとのペイロードを書く小さな自己記述形式でエンコードする
+//! (`encode_value`/`decode_value`)。`min`・`max`は`Option<Value>`だが、
+//! 列に非NULLの値が1件も無い場合(=`None`)しか`NULL`タグを取らない
+//! (`StatsCollector`はそもそも`NULL`値を`min`/`max`の対象に含めない)ため、
+//! 「値が無い」ことを表す専用のフラグバイトを別に持たせず、`Value::Null`の
+//! タグをそのまま「無し」の意味で流用する。
+//!
+//! 索引メタデータと同じ理由で、テーブルは`TableId`の昇順に書き出す。この
+//! セクションを追加したことに伴い、[`CATALOG_LAYOUT_VERSION`]を`1`から`2`へ
+//! 上げてある。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -222,8 +261,9 @@ use crate::ids::{PageId, RecordId, TableId};
 use crate::index::IndexInfo;
 use crate::page::{PAGE_PAYLOAD_SIZE, PageType};
 use crate::slotted_page::{SlotStatus, SlottedPage, SlottedPageRef, max_len_for_fresh_page};
+use crate::statistics::{Bucket, ColumnStats, TableStats};
 use crate::tuple_codec::decode_tuple;
-use crate::types::{Column, DataType, Schema, Tuple};
+use crate::types::{Column, DataType, Schema, Tuple, Value};
 
 /// Catalogページの定位置。ページ0はFile Header(第11章)が占有しているため、
 /// 空いている最初の番号を使う。
@@ -275,6 +315,9 @@ pub struct Storage {
     fsm: FreeSpaceMap,
     /// `CREATE INDEX`で登録された索引(第24章)。キーは索引名。
     indexes: HashMap<String, IndexEntry>,
+    /// `ANALYZE`で収集された統計情報(第27章)。キーは`TableId`。`ANALYZE`を
+    /// 一度も実行していないテーブルはここに現れない。
+    stats: HashMap<TableId, TableStats>,
 }
 
 impl Storage {
@@ -310,6 +353,7 @@ impl Storage {
             free_pages: Vec::new(),
             fsm: FreeSpaceMap::new(),
             indexes: HashMap::new(),
+            stats: HashMap::new(),
         };
         storage.persist_catalog()?;
         Ok(storage)
@@ -414,6 +458,7 @@ impl Storage {
             free_pages: decoded.free_pages,
             fsm,
             indexes,
+            stats: decoded.stats,
         })
     }
 
@@ -459,6 +504,37 @@ impl Storage {
     /// テーブル名から`TableInfo`を引く。見つからなければ`None`を返す。
     pub fn table(&self, name: &str) -> Option<&TableInfo> {
         self.tables.values().find(|t| t.info.name == name).map(|t| &t.info)
+    }
+
+    /// 登録されている全テーブルの`TableInfo`を返す(第27章、`ANALYZE`が
+    /// テーブル名を省略した場合に使う)。順序は保証しない。
+    pub fn tables(&self) -> impl Iterator<Item = &TableInfo> {
+        self.tables.values().map(|t| &t.info)
+    }
+
+    /// `table_id`の統計情報(第27章)を引く。`ANALYZE`を一度も実行していなければ
+    /// `None`を返す。
+    pub fn table_stats(&self, table_id: TableId) -> Option<&TableStats> {
+        self.stats.get(&table_id)
+    }
+
+    /// `ANALYZE`が集計した`stats`を`table_id`の統計情報として登録し、
+    /// Catalogページへ永続化する(第27章)。永続化に失敗した場合は登録を
+    /// 取り消す(`Self::create_table`と同じロールバックの方針)。
+    pub fn set_table_stats(&mut self, table_id: TableId, stats: TableStats) -> DbResult<()> {
+        let previous = self.stats.insert(table_id, stats);
+        if let Err(err) = self.persist_catalog() {
+            match previous {
+                Some(previous) => {
+                    self.stats.insert(table_id, previous);
+                }
+                None => {
+                    self.stats.remove(&table_id);
+                }
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// 新しいテーブルを登録する。
@@ -533,6 +609,8 @@ impl Storage {
             self.fsm.remove(page_id);
             self.free_pages.push(page_id);
         }
+        // 統計情報(第27章)も、もう存在しないテーブルの分をカタログに残さない。
+        self.stats.remove(&id);
 
         let index_names: Vec<String> =
             self.indexes.values().filter(|e| e.info.table_id == id).map(|e| e.info.name.clone()).collect();
@@ -1218,7 +1296,7 @@ impl Storage {
     /// `DbError::CatalogTooLarge`を返す(モジュール冒頭の説明を参照)。
     fn persist_catalog(&self) -> DbResult<()> {
         let index_infos: Vec<&IndexInfo> = self.indexes.values().map(|e| &e.info).collect();
-        let bytes = encode_catalog(self.next_table_id, &self.tables, &self.free_pages, &index_infos);
+        let bytes = encode_catalog(self.next_table_id, &self.tables, &self.free_pages, &index_infos, &self.stats);
         if bytes.len() > PAGE_PAYLOAD_SIZE {
             return Err(DbError::CatalogTooLarge(bytes.len(), PAGE_PAYLOAD_SIZE));
         }
@@ -1349,7 +1427,8 @@ const CATALOG_MAGIC: [u8; 8] = *b"MDBCTLG1";
 /// バイト列を新しいレイアウトとして読み違え、フィールドの境界がずれた
 /// まま「たまたま妥当に見える値」を受理してしまう危険がある
 /// (`is_constraint`フィールドを追加した際に実際に起きた不具合)。
-const CATALOG_LAYOUT_VERSION: u32 = 1;
+/// 第27章で統計情報セクションを追加した際、`1`から`2`へ上げた。
+const CATALOG_LAYOUT_VERSION: u32 = 2;
 
 /// `decode_catalog`が返す、Catalogページから復元した状態。
 struct DecodedCatalog {
@@ -1359,6 +1438,8 @@ struct DecodedCatalog {
     /// 索引メタデータ(第24章)。索引名の重複が無いことは`decode_catalog`が
     /// `Vec`へ積む時点で検査済み。
     indexes: Vec<IndexInfo>,
+    /// 統計情報(第27章)。`ANALYZE`を実行していないテーブルはここに現れない。
+    stats: HashMap<TableId, TableStats>,
 }
 
 /// 現在のテーブル定義・Free Page List・索引メタデータ(第24章)をバイト列へ
@@ -1374,6 +1455,7 @@ fn encode_catalog(
     tables: &HashMap<TableId, TableEntry>,
     free_pages: &[PageId],
     indexes: &[&IndexInfo],
+    stats: &HashMap<TableId, TableStats>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&CATALOG_MAGIC);
@@ -1430,7 +1512,64 @@ fn encode_catalog(
         out.push(u8::from(info.is_constraint));
     }
 
+    let mut sorted_stats: Vec<(&TableId, &TableStats)> = stats.iter().collect();
+    sorted_stats.sort_by_key(|(id, _)| id.0);
+    out.extend_from_slice(&(sorted_stats.len() as u32).to_le_bytes());
+    for (table_id, table_stats) in sorted_stats {
+        out.extend_from_slice(&table_id.0.to_le_bytes());
+        out.extend_from_slice(&table_stats.row_count.to_le_bytes());
+        out.extend_from_slice(&(table_stats.columns.len() as u16).to_le_bytes());
+        for column in &table_stats.columns {
+            out.extend_from_slice(&column.null_count.to_le_bytes());
+            out.extend_from_slice(&column.distinct_count.to_le_bytes());
+            encode_optional_value(&column.min, &mut out);
+            encode_optional_value(&column.max, &mut out);
+            out.extend_from_slice(&(column.histogram.len() as u16).to_le_bytes());
+            for bucket in &column.histogram {
+                encode_value(&bucket.lower, &mut out);
+                encode_value(&bucket.upper, &mut out);
+                out.extend_from_slice(&bucket.row_count.to_le_bytes());
+            }
+        }
+    }
+
     out
+}
+
+/// [`Value`]をタグ(0=NULL, 1=BOOLEAN, 2=BIGINT, 3=TEXT)+ペイロードへ
+/// エンコードする(第27章)。既存の`data_type_to_u8`(列の型だけを表す)とは
+/// 異なり、値そのものを復元できる自己記述形式にする必要がある
+/// (統計情報のMin/Max/Histogram境界は値そのものだから)。
+fn encode_value(value: &Value, out: &mut Vec<u8>) {
+    match value {
+        Value::Null => out.push(0),
+        Value::Boolean(b) => {
+            out.push(1);
+            out.push(u8::from(*b));
+        }
+        Value::BigInt(n) => {
+            out.push(2);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        Value::Text(s) => {
+            out.push(3);
+            let bytes = s.as_bytes();
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+    }
+}
+
+/// `Option<Value>`をエンコードする(第27章)。`StatsCollector`は`NULL`値を
+/// `min`/`max`の対象に含めないため、`None`(値が1件も無い)と`Value::Null`が
+/// 同時に起こることは無い。この不変条件により、`None`を`Value::Null`と
+/// 同じタグ(0)で表せば、専用の存在フラグを別に持つ必要が無い
+/// (モジュール冒頭のレイアウト解説を参照)。
+fn encode_optional_value(value: &Option<Value>, out: &mut Vec<u8>) {
+    match value {
+        Some(value) => encode_value(value, out),
+        None => encode_value(&Value::Null, out),
+    }
 }
 
 /// Catalogページの`payload`から`DecodedCatalog`を復元する。
@@ -1544,12 +1683,64 @@ fn decode_catalog(bytes: &[u8]) -> DbResult<DecodedCatalog> {
         indexes.push(IndexInfo { name, table_id, column_index, column_name, unique, primary_key, is_constraint, key_type });
     }
 
+    let stats_count = take_u32(&mut cursor, "stats_count")? as usize;
+    let mut stats = HashMap::new();
+    for _ in 0..stats_count {
+        let table_id = TableId(take_u64(&mut cursor, "統計のtable_id")?);
+        let row_count = take_u64(&mut cursor, "統計のrow_count")?;
+        let column_count = take_u16(&mut cursor, "統計のcolumn_count")? as usize;
+        let mut columns = Vec::new();
+        for _ in 0..column_count {
+            let null_count = take_u64(&mut cursor, "統計のnull_count")?;
+            let distinct_count = take_u64(&mut cursor, "統計のdistinct_count")?;
+            let min = decode_optional_value(&mut cursor)?;
+            let max = decode_optional_value(&mut cursor)?;
+            let bucket_count = take_u16(&mut cursor, "統計のbucket_count")? as usize;
+            let mut histogram = Vec::new();
+            for _ in 0..bucket_count {
+                let lower = decode_value(&mut cursor)?;
+                let upper = decode_value(&mut cursor)?;
+                let bucket_row_count = take_u64(&mut cursor, "統計のバケツのrow_count")?;
+                histogram.push(Bucket { lower, upper, row_count: bucket_row_count });
+            }
+            columns.push(ColumnStats { null_count, distinct_count, min, max, histogram });
+        }
+        if stats.insert(table_id, TableStats { row_count, columns }).is_some() {
+            return Err(DbError::CorruptCatalog(format!("TableId({})の統計情報が複数回出現しています", table_id.0)));
+        }
+    }
+
     Ok(DecodedCatalog {
         next_table_id,
         tables,
         free_pages,
         indexes,
+        stats,
     })
+}
+
+/// [`encode_value`]の対。
+fn decode_value(cursor: &mut &[u8]) -> DbResult<Value> {
+    let tag = take_u8(cursor, "value_tag")?;
+    match tag {
+        0 => Ok(Value::Null),
+        1 => Ok(Value::Boolean(take_bool(cursor, "value_bool")?)),
+        2 => Ok(Value::BigInt(i64::from_le_bytes(take(cursor, 8, "value_bigint")?.try_into().unwrap()))),
+        3 => {
+            let len = take_u32(cursor, "value_text_len")? as usize;
+            Ok(Value::Text(take_string(cursor, len, "value_text")?))
+        }
+        other => Err(DbError::CorruptCatalog(format!("未知のValueタグです: {other}"))),
+    }
+}
+
+/// [`encode_optional_value`]の対。タグ0(NULL)を`None`として復元する
+/// (モジュール冒頭のレイアウト解説を参照)。
+fn decode_optional_value(cursor: &mut &[u8]) -> DbResult<Option<Value>> {
+    match decode_value(cursor)? {
+        Value::Null => Ok(None),
+        other => Ok(Some(other)),
+    }
 }
 
 /// `*bytes`の先頭`n`バイトを切り出し、`*bytes`をその続きへ進める。
@@ -1947,7 +2138,7 @@ mod tests {
         Storage::create(&path).unwrap();
 
         let tables = single_table_entry(TableId(0), "a", Vec::new());
-        let bytes = encode_catalog(1, &tables, &[PageId(0)], &[]);
+        let bytes = encode_catalog(1, &tables, &[PageId(0)], &[], &HashMap::new());
         write_catalog_payload(&path, &bytes);
 
         let err = expect_err(Storage::open(&path));
@@ -1962,7 +2153,7 @@ mod tests {
         Storage::create(&path).unwrap();
 
         let tables = single_table_entry(TableId(0), "a", vec![PageId(999)]);
-        let bytes = encode_catalog(1, &tables, &[], &[]);
+        let bytes = encode_catalog(1, &tables, &[], &[], &HashMap::new());
         write_catalog_payload(&path, &bytes);
 
         let err = expect_err(Storage::open(&path));
@@ -1984,7 +2175,7 @@ mod tests {
             let bogus_data_page = pool.allocate_page(PageType::Catalog).unwrap();
 
             let tables = single_table_entry(TableId(0), "a", vec![bogus_data_page]);
-            let bytes = encode_catalog(1, &tables, &[], &[]);
+            let bytes = encode_catalog(1, &tables, &[], &[], &HashMap::new());
             let mut guard = pool.write_page(CATALOG_PAGE_ID).unwrap();
             let data = guard.data_mut();
             data[..bytes.len()].copy_from_slice(&bytes);
@@ -2025,7 +2216,7 @@ mod tests {
                 page_ids: vec![shared_page],
             },
         );
-        let bytes = encode_catalog(2, &tables, &[], &[]);
+        let bytes = encode_catalog(2, &tables, &[], &[], &HashMap::new());
         write_catalog_payload(&path, &bytes);
 
         let err = expect_err(Storage::open(&path));
@@ -2042,7 +2233,7 @@ mod tests {
         // TableId(0)が存在するのにnext_table_idも0のまま、というカタログ。
         // 次のcreate_tableがTableId(0)を再利用してしまう矛盾がある。
         let tables = single_table_entry(TableId(0), "a", Vec::new());
-        let bytes = encode_catalog(0, &tables, &[], &[]);
+        let bytes = encode_catalog(0, &tables, &[], &[], &HashMap::new());
         write_catalog_payload(&path, &bytes);
 
         let err = expect_err(Storage::open(&path));
@@ -2062,7 +2253,7 @@ mod tests {
         Storage::create(&path).unwrap();
 
         let tables: HashMap<TableId, TableEntry> = HashMap::new();
-        let bytes = encode_catalog(u64::MAX, &tables, &[], &[]);
+        let bytes = encode_catalog(u64::MAX, &tables, &[], &[], &HashMap::new());
         write_catalog_payload(&path, &bytes);
 
         let mut storage = Storage::open(&path).unwrap();
@@ -2137,7 +2328,7 @@ mod tests {
                 page_ids: Vec::new(),
             },
         );
-        let bytes = encode_catalog(2, &tables, &[], &[]);
+        let bytes = encode_catalog(2, &tables, &[], &[], &HashMap::new());
         write_catalog_payload(&path, &bytes);
 
         let err = expect_err(Storage::open(&path));
