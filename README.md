@@ -5,7 +5,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 
 ## 目次
 
-現在執筆済みなのは[はじめに](book/src/index.md)と第1〜25章のみで、第26章以降は準備中です。
+現在執筆済みなのは[はじめに](book/src/index.md)と第1〜29章のみで、第30章以降は準備中です。
 
 ### 第0部 設計と開発環境
 
@@ -46,10 +46,10 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 
 ### 第4部 Query Optimizer: よりよい実行計画を選ぶ
 
-- 第26章 ルールベース最適化
-- 第27章 統計情報とCardinality Estimation
-- 第28章 Cost Modelとアクセスパス選択
-- 第29章 Join OrderとPhysical Properties
+- [第26章 ルールベース最適化](book/src/ch26-rule-based-optimization.md)
+- [第27章 統計情報とCardinality Estimation](book/src/ch27-statistics.md)
+- [第28章 Cost Modelとアクセスパス選択](book/src/ch28-cost-model.md)
+- [第29章 Join OrderとPhysical Properties](book/src/ch29-join-order.md)
 
 ### 第5部 Transaction: ACIDと並行実行
 

@@ -2,19 +2,19 @@ CREATE TABLE
 
 QUERY PLAN
 ----------
-Limit(limit=5)
-  └─ Sort(dept ASC)
-    └─ Projection(dept, COUNT(*))
-      └─ Filter(COUNT(*) > 1)
-        └─ Aggregate(group_by=[dept], calls=[COUNT(*)])
-          └─ Filter(amount IS NOT NULL)
-            └─ SeqScan(orders)
+Limit(limit=5) rows=5 cost=91.03
+  └─ Sort(dept ASC) rows=332 cost=91.03
+    └─ Projection(dept, COUNT(*)) rows=332 cost=63.22
+      └─ Filter(COUNT(*) > 1) rows=332 cost=59.90
+        └─ Aggregate(group_by=[dept], calls=[COUNT(*)]) rows=995 cost=49.95
+          └─ Filter(amount IS NOT NULL) rows=995 cost=40.00
+            └─ SeqScan(orders) rows=1000 cost=30.00
 (7 rows)
 
 QUERY PLAN
 ----------
-Sort(dept ASC)
-  └─ Distinct
-    └─ Projection(dept)
-      └─ SeqScan(orders)
+Sort(dept ASC) rows=1000 cost=149.66
+  └─ Distinct rows=1000 cost=50.00
+    └─ Projection(dept) rows=1000 cost=40.00
+      └─ SeqScan(orders) rows=1000 cost=30.00
 (4 rows)

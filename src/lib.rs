@@ -46,21 +46,26 @@ pub mod btree_page;
 pub mod buffer_pool;
 pub mod catalog;
 pub mod constraints;
+pub mod cost_model;
 pub mod database;
 pub mod disk_manager;
 pub mod error;
+pub mod estimator;
 pub mod eval;
 pub mod executor;
 pub mod free_space_map;
 pub mod heap_file;
 pub mod ids;
 pub mod index;
+pub mod join_order;
 pub mod lexer;
 pub mod logical_plan;
 pub mod page;
 pub mod parser;
 pub mod physical_plan;
+pub mod rules;
 pub mod slotted_page;
+pub mod statistics;
 pub mod storage;
 pub mod storage_mem;
 pub mod tuple_codec;
@@ -85,9 +90,11 @@ pub use page::{
     FILE_HEADER_SIZE, FORMAT_VERSION, MAGIC, PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, PAGE_SIZE,
     FileHeader, Page, PageType,
 };
+pub use estimator::{DEFAULT_EQ_SEL, DEFAULT_INEQ_SEL, RangeOp};
 pub use parser::parse_statement;
 pub use physical_plan::{Executor, PhysicalPlan};
 pub use slotted_page::{SLOT_ENTRY_SIZE, SLOTTED_HEADER_SIZE, SlotStatus, SlottedPage, SlottedPageRef};
+pub use statistics::{Bucket, ColumnStats, HISTOGRAM_BUCKET_COUNT, StatsCollector, TableStats};
 pub use storage::Storage;
 pub use storage_mem::{MemStorage, MemTable};
 pub use tuple_codec::{decode_tuple, encode_tuple};

@@ -15,18 +15,18 @@ Bob | cherry
 
 QUERY PLAN
 ----------
-Projection(customers.name, orders.item)
-  └─ HashJoin(INNER JOIN, id = customer_id)
-    └─ SeqScan(customers)
-    └─ SeqScan(orders)
+Projection(customers.name, orders.item) rows=1000 cost=90.00
+  └─ HashJoin(INNER JOIN, id = customer_id) rows=1000 cost=80.00
+    └─ SeqScan(customers) rows=1000 cost=30.00
+    └─ SeqScan(orders) rows=1000 cost=30.00
 (4 rows)
 
 QUERY PLAN
 ----------
-Projection(customers.name)
-  └─ NestedLoopJoin(INNER JOIN, id <> customer_id)
-    └─ SeqScan(customers)
-    └─ SeqScan(orders)
+Projection(customers.name) rows=1000 cost=10070.00
+  └─ NestedLoopJoin(INNER JOIN, id <> customer_id) rows=1000 cost=10060.00
+    └─ SeqScan(customers) rows=1000 cost=30.00
+    └─ SeqScan(orders) rows=1000 cost=30.00
 (4 rows)
 
 ERROR: 行1列8: 名前解決エラー: 列'id'は複数のテーブルに存在するため曖昧です: customers, orders

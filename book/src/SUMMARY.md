@@ -39,10 +39,10 @@
 
 # 第4部 Query Optimizer: よりよい実行計画を選ぶ
 
-- [第26章 ルールベース最適化]()
-- [第27章 統計情報とCardinality Estimation]()
-- [第28章 Cost Modelとアクセスパス選択]()
-- [第29章 Join OrderとPhysical Properties]()
+- [第26章 ルールベース最適化](ch26-rule-based-optimization.md)
+- [第27章 統計情報とCardinality Estimation](ch27-statistics.md)
+- [第28章 Cost Modelとアクセスパス選択](ch28-cost-model.md)
+- [第29章 Join OrderとPhysical Properties](ch29-join-order.md)
 
 # 第5部 Transaction: ACIDと並行実行
 

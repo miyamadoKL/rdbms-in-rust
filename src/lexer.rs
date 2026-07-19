@@ -77,6 +77,8 @@ pub enum Keyword {
     On,
     /// `CREATE INDEX` / `DROP INDEX`(第24章)。
     Index,
+    /// `ANALYZE`文、`EXPLAIN ANALYZE`修飾(第27章)。
+    Analyze,
 }
 
 impl Keyword {
@@ -121,6 +123,7 @@ impl Keyword {
             "JOIN" => Keyword::Join,
             "ON" => Keyword::On,
             "INDEX" => Keyword::Index,
+            "ANALYZE" => Keyword::Analyze,
             _ => return None,
         };
         Some(keyword)

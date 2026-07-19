@@ -148,7 +148,7 @@ pub fn optimize(plan: LogicalPlan) -> PhysicalPlan {
 
 この章の時点で`optimize`が行っているのは、`Scan`を`SeqScan`という名前に変えるだけの、選びようのない変換です。
 それでも関数名を「変換する」ではなく`optimize`にしたのは、この関数が将来担う役割を先取りしているからです。
-第25章で`optimize`は、`id`列に索引があるかどうかや、統計情報から推定した一致行数(第27章)をもとに、`Scan`を`SeqScan`と`IndexScan`のどちらへ変換するかを本当に選ぶようになります。
+第25章で`optimize`は、`id`列に索引があるかどうかをもとに`Scan`を`SeqScan`と`IndexScan`のどちらへ変換するかを本当に選ぶようになり、第28章では統計情報から推定した一致行数にもとづくコスト比較へ育ちます。
 この章の実装は、その選択肢がまだ1つしか無い特殊ケースにすぎません。
 
 `PhysicalPlan`は`output_schema()`、`Display`実装のどちらも`LogicalPlan`と同じ考え方で持ちます。
