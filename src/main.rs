@@ -2,8 +2,11 @@
 //!
 //! # REPLモード(既定)
 //!
-//! 標準入力からSQLを1行ずつ読み、`Database::execute`に渡して結果を表示する。
-//! `\q`を入力すると終了する。
+//! 標準入力からSQLを1行ずつ読み、`crate::session::Session::execute`(第37章)に
+//! 渡して結果を表示する。`\q`を入力すると終了する。REPLは`Database`を直接
+//! 保持せず、`SharedDatabase`を1個包んだ`Session`を1個だけ作って使い回す
+//! (`minidb::session`モジュールのドキュメント「Embedded・REPL・Serverの統一」
+//! を参照)。これにより、REPLでも`PREPARE`・`EXECUTE`・`DEALLOCATE`が使える。
 //!
 //! 起動引数にファイルパスを渡すと、そのパスを`Database::open`(第16章)で開き、
 //! 永続モードで動く(`cargo run -- example.db`)。引数を渡さなければ、これまで
@@ -26,7 +29,7 @@ use std::env;
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
-use minidb::{Database, Server, SharedDatabase};
+use minidb::{Database, Server, SharedDatabase, Session};
 
 fn main() {
     let mut args = env::args();
@@ -72,7 +75,7 @@ fn run_server(mut args: env::Args) {
 /// REPLモードを処理する。`first_arg`は起動引数の先頭(`--serve`ではないと
 /// すでに確認済み)で、`Some`ならファイルパスとして永続モードを開く。
 fn run_repl(first_arg: Option<String>) {
-    let mut db = match first_arg {
+    let db = match first_arg {
         Some(path) => match Database::open(&path) {
             Ok(db) => db,
             Err(e) => {
@@ -82,6 +85,8 @@ fn run_repl(first_arg: Option<String>) {
         },
         None => Database::memory(),
     };
+    let shared = Arc::new(SharedDatabase::new(db));
+    let mut session = Session::new(Arc::clone(&shared));
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -102,14 +107,14 @@ fn run_repl(first_arg: Option<String>) {
             break;
         }
 
-        match db.execute(input) {
+        match session.execute(input) {
             Ok(result) => println!("{result}"),
             Err(e) => println!("エラー: {e}"),
         }
         prompt(&mut stdout);
     }
 
-    if let Err(e) = db.flush() {
+    if let Err(e) = shared.flush() {
         eprintln!("エラー: 終了時のflushに失敗しました: {e}");
     }
 }

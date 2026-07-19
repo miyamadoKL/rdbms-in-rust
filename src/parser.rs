@@ -23,9 +23,10 @@
 
 use crate::ast::{
     AggregateFunc, AnalyzeStatement, Assignment, BeginStatement, BinaryOperator, CheckpointStatement, ColumnDef,
-    CommitStatement, CreateIndexStatement, CreateTableStatement, DeleteStatement, DropIndexStatement,
-    DropTableStatement, ExplainStatement, Expr, FromClause, Ident, InsertStatement, IsolationLevel, JoinClause,
-    JoinKind, OrderByItem, RollbackStatement, SelectItem, SelectStatement, Statement, UnaryOperator, UpdateStatement,
+    CommitStatement, CreateIndexStatement, CreateTableStatement, DeallocateStatement, DeleteStatement,
+    DropIndexStatement, DropTableStatement, ExecuteStatement, ExplainStatement, Expr, FromClause, Ident,
+    InsertStatement, IsolationLevel, JoinClause, JoinKind, Literal, OrderByItem, PrepareStatement, RollbackStatement,
+    SelectItem, SelectStatement, Statement, UnaryOperator, UpdateStatement,
 };
 use crate::error::{DbError, DbResult};
 use crate::lexer::{self, Keyword, Span, Token, TokenKind};
@@ -168,9 +169,13 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Commit) => self.parse_commit_statement().map(Statement::Commit),
             TokenKind::Keyword(Keyword::Rollback) => self.parse_rollback_statement().map(Statement::Rollback),
             TokenKind::Keyword(Keyword::Checkpoint) => self.parse_checkpoint_statement().map(Statement::Checkpoint),
+            TokenKind::Keyword(Keyword::Prepare) => self.parse_prepare_statement().map(Statement::Prepare),
+            TokenKind::Keyword(Keyword::Execute) => self.parse_execute_statement().map(Statement::Execute),
+            TokenKind::Keyword(Keyword::Deallocate) => self.parse_deallocate_statement().map(Statement::Deallocate),
             _ => Err(self.unexpected(
                 "SELECT・CREATE TABLE・DROP TABLE・CREATE INDEX・DROP INDEX・INSERT INTO・UPDATE・\
-                 DELETE FROM・EXPLAIN・ANALYZE・BEGIN・COMMIT・ROLLBACK・CHECKPOINTのいずれか",
+                 DELETE FROM・EXPLAIN・ANALYZE・BEGIN・COMMIT・ROLLBACK・CHECKPOINT・PREPARE・EXECUTE・\
+                 DEALLOCATEのいずれか",
             )),
         }
     }
@@ -310,6 +315,99 @@ impl<'a> Parser<'a> {
     fn parse_checkpoint_statement(&mut self) -> DbResult<CheckpointStatement> {
         let span = self.expect_keyword(Keyword::Checkpoint, "CHECKPOINT")?;
         Ok(CheckpointStatement { span })
+    }
+
+    // ---- PREPARE / EXECUTE / DEALLOCATE(第37章) ----
+
+    /// `PREPARE name AS <statement>`を読む。`statement`の種類自体はここでは
+    /// 検査しない(`SELECT`・`INSERT INTO`・`UPDATE`・`DELETE FROM`以外を
+    /// 弾く検査は`Session::execute`が担う。`parse_statement`を再帰的に呼ぶだけ
+    /// なので、構文としては任意の文を`AS`の後ろに置けてしまうが、たとえば
+    /// `PREPARE p AS BEGIN`のような組み合わせは実行時にエラーになる)。
+    fn parse_prepare_statement(&mut self) -> DbResult<PrepareStatement> {
+        let start = self.expect_keyword(Keyword::Prepare, "PREPARE")?.start;
+        let name = self.expect_ident()?;
+        self.expect_keyword(Keyword::As, "AS")?;
+        let statement = self.parse_statement()?;
+        let end = statement.span().end;
+        Ok(PrepareStatement { name, statement: Box::new(statement), span: Span::new(start, end) })
+    }
+
+    /// `EXECUTE name [(値, ...)]`を読む。括弧を省略した場合は引数0個として
+    /// 解析する。
+    fn parse_execute_statement(&mut self) -> DbResult<ExecuteStatement> {
+        let start = self.expect_keyword(Keyword::Execute, "EXECUTE")?.start;
+        let name = self.expect_ident()?;
+        let mut end = name.span.end;
+
+        let mut args = Vec::new();
+        if *self.peek_kind() == TokenKind::LParen {
+            self.advance();
+            if *self.peek_kind() != TokenKind::RParen {
+                loop {
+                    args.push(self.parse_literal()?);
+                    if *self.peek_kind() == TokenKind::Comma {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            end = self.expect_punct(TokenKind::RParen, ")")?.end;
+        }
+
+        Ok(ExecuteStatement { name, args, span: Span::new(start, end) })
+    }
+
+    /// `EXECUTE`の引数1個を読む。リテラル(整数・文字列・真偽値・`NULL`)だけを
+    /// 受理し、列参照や式は受理しない(`ast::Literal`のドキュメント参照)。
+    /// 負の整数リテラル(`-1`)は`parse_prefix`と同じ理由で、`-`の直後の
+    /// 整数リテラルをここで直接読む。
+    fn parse_literal(&mut self) -> DbResult<Literal> {
+        match self.peek_kind().clone() {
+            TokenKind::IntLiteral(magnitude) => {
+                let token = self.advance();
+                let value = i64::try_from(magnitude).map_err(|_| {
+                    self.error_at(token.span, format!("整数リテラルの範囲を超えています: {magnitude}"))
+                })?;
+                Ok(Literal::Int { value, span: token.span })
+            }
+            TokenKind::Minus => {
+                let start = self.advance().span.start;
+                let TokenKind::IntLiteral(magnitude) = *self.peek_kind() else {
+                    return Err(self.unexpected("整数リテラル"));
+                };
+                let magnitude_token = self.advance();
+                let value = negate_u64_to_i64(magnitude).ok_or_else(|| {
+                    self.error_at(magnitude_token.span, format!("整数リテラルの範囲を超えています: -{magnitude}"))
+                })?;
+                Ok(Literal::Int { value, span: Span::new(start, magnitude_token.span.end) })
+            }
+            TokenKind::StringLiteral(value) => {
+                let span = self.advance().span;
+                Ok(Literal::Text { value, span })
+            }
+            TokenKind::Keyword(Keyword::True) => {
+                let span = self.advance().span;
+                Ok(Literal::Bool { value: true, span })
+            }
+            TokenKind::Keyword(Keyword::False) => {
+                let span = self.advance().span;
+                Ok(Literal::Bool { value: false, span })
+            }
+            TokenKind::Keyword(Keyword::Null) => {
+                let span = self.advance().span;
+                Ok(Literal::Null { span })
+            }
+            _ => Err(self.unexpected("リテラル(整数・文字列・真偽値・NULL)")),
+        }
+    }
+
+    fn parse_deallocate_statement(&mut self) -> DbResult<DeallocateStatement> {
+        let start = self.expect_keyword(Keyword::Deallocate, "DEALLOCATE")?.start;
+        let name = self.expect_ident()?;
+        let end = name.span.end;
+        Ok(DeallocateStatement { name, span: Span::new(start, end) })
     }
 
     // ---- SELECT ----
@@ -886,6 +984,10 @@ impl<'a> Parser<'a> {
                 let span = self.advance().span;
                 Ok(Expr::NullLiteral { span })
             }
+            TokenKind::Param(index) => {
+                let span = self.advance().span;
+                Ok(Expr::Param { index, span })
+            }
             TokenKind::Ident(name) => {
                 let start_span = self.advance().span;
                 if *self.peek_kind() == TokenKind::Dot {
@@ -1072,6 +1174,7 @@ mod tests {
             Expr::StringLiteral { value, .. } => Expr::StringLiteral { value, span: dummy },
             Expr::BoolLiteral { value, .. } => Expr::BoolLiteral { value, span: dummy },
             Expr::NullLiteral { .. } => Expr::NullLiteral { span: dummy },
+            Expr::Param { index, .. } => Expr::Param { index, span: dummy },
             Expr::ColumnRef { qualifier, name, .. } => Expr::ColumnRef {
                 qualifier: qualifier.map(|q| Ident { name: q.name, span: dummy }),
                 name,

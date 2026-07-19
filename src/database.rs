@@ -319,6 +319,17 @@ impl Database {
         }
     }
 
+    /// [`Database::bind`]の公開版(第37章)。
+    ///
+    /// `Session`が`PREPARE`を実行するときに使う。`Database::execute`は
+    /// 構文解析・束縛・実行をひと続きに行うが、`PREPARE`は束縛までを
+    /// 先に済ませて`BoundStatement`をSessionの名前空間に残す必要がある
+    /// (`crate::session`モジュールのドキュメント参照)ため、束縛だけを
+    /// 独立に呼べる入口が要る。
+    pub fn bind_statement(&self, statement: Statement, sql: &str) -> DbResult<BoundStatement> {
+        self.bind(statement, sql)
+    }
+
     /// SQL文字列を1本実行し、結果を返す。
     ///
     /// 構文解析(`parser::parse_statement`)→名前解決(`Binder::bind`)→計画
@@ -418,6 +429,22 @@ impl Database {
     /// この実装で表している部分である。
     fn execute_bound_statement(&mut self, statement: Statement, sql: &str) -> DbResult<QueryResult> {
         let bound = self.bind(statement, sql)?;
+        self.run_bound_statement(bound)
+    }
+
+    /// すでに束縛済みの文を、束縛をやり直さずに直接実行する(第37章)。
+    ///
+    /// `EXECUTE`(`Session::execute`)が、`PREPARE`時に確定した`BoundStatement`
+    /// へパラメータを差し込んだ結果を渡すために使う。`bind`を経由しない点を
+    /// 除けば[`Database::execute_bound_statement`]と全く同じロック・実行の
+    /// 規律(`lock_owner`・Autocommitのロック解放)に従う。
+    pub fn execute_bound_statement_prebound(&mut self, bound: BoundStatement) -> DbResult<QueryResult> {
+        self.run_bound_statement(bound)
+    }
+
+    /// [`Database::execute_bound_statement`]・[`Database::execute_bound_statement_prebound`]
+    /// が共有する、束縛済みの文を実際に実行する本体。
+    fn run_bound_statement(&mut self, bound: BoundStatement) -> DbResult<QueryResult> {
         let owner = self.lock_owner();
         let result = match bound {
             BoundStatement::Select(select) => self.execute_select(logical_plan::build_select(*select), owner),
@@ -605,6 +632,35 @@ impl Database {
     /// 自動的に行うスケジューラは無い(モジュール`crate::lock_manager`冒頭の
     /// 説明を参照)。
     pub fn execute_in_tx(&mut self, handle: &TxHandle, sql: &str) -> DbResult<QueryResult> {
+        self.run_in_tx(handle, |db| {
+            let statement = crate::parser::parse_statement(sql)?;
+            db.execute_bound_statement(statement, sql)
+        })
+    }
+
+    /// [`Database::execute_in_tx`]の、すでに束縛済みの文を渡す版(第37章)。
+    ///
+    /// `EXECUTE`(`Session::execute`)が、`PREPARE`時に確定した`BoundStatement`
+    /// へパラメータを差し込んだ結果を、`BEGIN`で開始済みのトランザクションの
+    /// 中で実行するために使う。構文解析・束縛のどちらもやり直さない点だけが
+    /// [`Database::execute_in_tx`]と異なり、ロック待ちでの再試行(`WouldBlock`)・
+    /// `Aborted`状態での拒否・`finish`によるAbort遷移は共通の`run_in_tx`が
+    /// 同じ規律で扱う。
+    pub fn execute_in_tx_bound(&mut self, handle: &TxHandle, bound: BoundStatement) -> DbResult<QueryResult> {
+        self.run_in_tx(handle, |db| db.run_bound_statement(bound))
+    }
+
+    /// `execute_in_tx`・`execute_in_tx_bound`が共有する、`harness_contexts`との
+    /// 出し入れ・`Aborted`検査・`finish`適用をまとめた本体。`run`には
+    /// 「構文解析(必要なら)して実行する」処理を渡す。`run`の実行前に`sql`の
+    /// 構文解析だけが失敗した場合でも、`finish`によるAbort遷移とcontextの
+    /// 復元を他の失敗と同じ経路で行う(第30章の元の`execute_in_tx`が
+    /// 持っていた挙動をそのまま引き継ぐ)。
+    fn run_in_tx(
+        &mut self,
+        handle: &TxHandle,
+        run: impl FnOnce(&mut Self) -> DbResult<QueryResult>,
+    ) -> DbResult<QueryResult> {
         let ctx = self
             .harness_contexts
             .remove(&handle.0)
@@ -620,13 +676,9 @@ impl Database {
         // 前提なので、差し替え前の`self.tx`は常に`None`のはずだが、`Option`の
         // まま保存して差し替え後に戻すことで、その前提が破られても値を失わない。
         let previous = self.tx.replace(ctx);
-        let statement = crate::parser::parse_statement(sql);
-        let result = match statement {
-            Ok(statement) => self.execute_bound_statement(statement, sql),
-            Err(err) => Err(err),
-        };
+        let result = run(self);
         let result = self.finish(result);
-        let ctx = self.tx.take().expect("execute_bound_statementはself.txを取り除かない");
+        let ctx = self.tx.take().expect("runはself.txを取り除かない");
         self.tx = previous;
         self.harness_contexts.insert(handle.0, ctx);
         result
@@ -1698,6 +1750,32 @@ impl SharedDatabase {
         }
     }
 
+    /// [`Database::bind_statement`]のブロッキング版(第37章)。`Session`が
+    /// `PREPARE`のときに使う。束縛はロックを待つ必要が無い(ロック取得は
+    /// 実行の時点で行う)ため、`execute_in_tx`のような再試行ループは持たない。
+    pub fn bind_statement(&self, statement: Statement, sql: &str) -> DbResult<BoundStatement> {
+        self.lock().bind_statement(statement, sql)
+    }
+
+    /// [`Database::execute_in_tx_bound`]のブロッキング版(第37章)。
+    /// `bound`を`&BoundStatement`で受け取り、`WouldBlock`で再試行するたびに
+    /// `clone`する([`Database::execute_in_tx_bound`]は所有権を取るが、この文は
+    /// 一切実行されていないため同じ`bound`をそのまま渡し直せる、`execute_in_tx`
+    /// が同じ`sql`をもう一度渡すのと同じ理由)。
+    pub fn execute_in_tx_bound(&self, handle: &TxHandle, bound: &BoundStatement) -> DbResult<QueryResult> {
+        let mut guard = self.lock();
+        loop {
+            let outcome = guard.execute_in_tx_bound(handle, bound.clone());
+            self.cvar.notify_all();
+            match outcome {
+                Err(DbError::WouldBlock) => {
+                    guard = self.cvar.wait(guard).unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// `handle`が指すトランザクションを確定する([`Database::commit_tx`]を
     /// 参照)。ロックを解放するため、成功・失敗によらず`notify_all`する。
     pub fn commit_tx(&self, handle: TxHandle) -> DbResult<()> {
@@ -1716,6 +1794,13 @@ impl SharedDatabase {
         drop(guard);
         self.cvar.notify_all();
         result
+    }
+
+    /// [`Database::flush`]のブロッキング版(第37章)。REPL(`src/main.rs`)が
+    /// `Session`経由で`Database`を直接持たなくなったため、終了時の
+    /// flushを`SharedDatabase`越しに呼べるようにする。
+    pub fn flush(&self) -> DbResult<()> {
+        self.lock().flush()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Database> {
@@ -1759,6 +1844,7 @@ fn append_actual_to_root_line(text: &str, count: usize) -> String {
 /// 種類の名前だけ、DML文は`"INSERT 2"`のように影響を受けた行数を添えた形式に
 /// なる(psqlの`INSERT 0 2`のような追加情報は持たない、この教材の簡略形式)。
 /// 行を1件も返さない`SELECT`と区別するためにフィールドを分けている。
+#[derive(Debug)]
 pub struct QueryResult {
     schema: Schema,
     rows: Vec<Tuple>,

@@ -4,6 +4,8 @@
 
 use thiserror::Error;
 
+use crate::types::DataType;
+
 /// minidb の操作全般で返されるエラー。
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -253,6 +255,56 @@ pub enum DbError {
     /// を参照)。
     #[error("デッドロックを検出しました。このトランザクションはVictimとして強制的にABORTされました")]
     DeadlockDetected,
+
+    /// `PREPARE`が、そのSessionにすでに登録済みの名前を指定したエラー(第37章)。
+    /// PostgreSQLに倣い、同じ名前への無言の上書きは許さず、先に`DEALLOCATE`
+    /// することを要求する。
+    #[error("プリペア済み文はすでに存在します: {0}")]
+    PreparedStatementAlreadyExists(String),
+
+    /// `EXECUTE`・`DEALLOCATE`が、そのSessionに登録されていない名前を指定した
+    /// エラー(第37章)。`PREPARE`していない名前、別のSessionで`PREPARE`した
+    /// 名前(Session単位の名前空間、本文「Prepared StatementはSessionの
+    /// ものである」を参照)、またはすでに`DEALLOCATE`済みの名前のいずれかが
+    /// 当てはまる。
+    #[error("プリペア済み文が見つかりません: {0}")]
+    PreparedStatementNotFound(String),
+
+    /// `PREPARE`の対象に、`SELECT`・`INSERT INTO`・`UPDATE`・`DELETE FROM`の
+    /// いずれでもない文を指定したエラー(第37章)。
+    #[error("PREPAREはSELECT・INSERT INTO・UPDATE・DELETE FROMのみ対象にできます")]
+    CannotPrepareStatement,
+
+    /// `EXECUTE`に渡した引数の個数が、`PREPARE`本体が使うプレースホルダの
+    /// 個数と一致しないエラー(第37章)。
+    #[error("EXECUTEの引数の個数が一致しません: {expected}個必要ですが{actual}個渡されました")]
+    ParamCountMismatch {
+        /// プリペア済み文が使うプレースホルダの個数(`$`の最大番号)。
+        expected: usize,
+        /// `EXECUTE`に渡された引数の個数。
+        actual: usize,
+    },
+    /// `EXECUTE`に渡した値の型が、`PREPARE`時に文脈から推論した
+    /// プレースホルダの型と一致しないエラー(第37章)。`NULL`はどの型の
+    /// プレースホルダに対しても許す(通常の列のNULL制約と同じ扱い)。
+    #[error("${index}の型が一致しません: {expected}が必要ですが{actual}が渡されました")]
+    ParamTypeMismatch {
+        /// プレースホルダの番号(`$1`なら`1`)。
+        index: u32,
+        /// `PREPARE`時に文脈から推論した型。
+        expected: DataType,
+        /// `EXECUTE`に渡された値の型。
+        actual: DataType,
+    },
+    /// `PREPARE`本体の中で、同じプレースホルダ(`$n`)が矛盾する型で使われて
+    /// いるエラー(第37章)。`WHERE a = $1 AND b = $1`で`a`と`b`の型が違う場合
+    /// などが該当する。
+    #[error("${index}の型が文中で矛盾しています: {first}と{second}")]
+    ParamTypeConflict {
+        index: u32,
+        first: DataType,
+        second: DataType,
+    },
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

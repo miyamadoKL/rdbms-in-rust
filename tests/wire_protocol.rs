@@ -186,6 +186,50 @@ fn concurrent_connections_can_insert_disjoint_rows_at_the_same_time() {
     }
 }
 
+/// `PREPARE`・`EXECUTE`・`DEALLOCATE`はSQL文字列としてそのまま送れる
+/// (第37章、Wire Protocolへの追加が不要な理由は`crate::session`モジュール
+/// 冒頭「Wire Protocolを拡張しない」を参照)。
+#[test]
+fn prepare_execute_deallocate_round_trip_over_tcp() {
+    let addr = spawn_server();
+    let mut stream = connect(addr);
+
+    send_sql(&mut stream, 1, "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)");
+    send_sql(&mut stream, 2, "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')");
+    assert_eq!(
+        send_sql(&mut stream, 3, "PREPARE by_id AS SELECT name FROM users WHERE id = $1"),
+        Response::Command("PREPARE".to_string())
+    );
+
+    match send_sql(&mut stream, 4, "EXECUTE by_id(2)") {
+        Response::Rows { rows, .. } => assert_eq!(rows[0].values()[0], minidb::Value::Text("Bob".to_string())),
+        other => panic!("SELECTの結果が行の並びではありません: {other:?}"),
+    }
+
+    assert_eq!(send_sql(&mut stream, 5, "DEALLOCATE by_id"), Response::Command("DEALLOCATE".to_string()));
+    match send_sql(&mut stream, 6, "EXECUTE by_id(1)") {
+        Response::Error(message) => assert!(message.contains("by_id"), "メッセージ: {message}"),
+        other => panic!("エラー応答を期待しましたが{other:?}でした"),
+    }
+}
+
+/// Prepared StatementはSessionごと、つまりTCP接続ごとに独立している
+/// (第37章、`crate::session`モジュール冒頭「Prepared StatementはSessionの
+/// ものである」を参照)。別の接続で`PREPARE`した名前は見えない。
+#[test]
+fn prepared_statements_do_not_leak_across_connections() {
+    let addr = spawn_server();
+    let mut owner = connect(addr);
+    send_sql(&mut owner, 1, "CREATE TABLE t (id BIGINT)");
+    send_sql(&mut owner, 2, "PREPARE p AS SELECT id FROM t");
+
+    let mut other = connect(addr);
+    match send_sql(&mut other, 1, "EXECUTE p()") {
+        Response::Error(message) => assert!(message.contains('p'), "メッセージ: {message}"),
+        other => panic!("エラー応答を期待しましたが{other:?}でした"),
+    }
+}
+
 /// フレーム長が上限を超えるリクエストを送ると、サーバーはペイロードを
 /// 読みにいかず接続を切る(`crate::protocol`モジュール冒頭を参照)。
 #[test]

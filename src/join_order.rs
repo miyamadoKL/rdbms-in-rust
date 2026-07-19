@@ -382,6 +382,7 @@ fn referenced_tables(expr: &BoundExpr, out: &mut Vec<usize>) {
         | BoundExpr::StringLiteral { .. }
         | BoundExpr::BoolLiteral { .. }
         | BoundExpr::NullLiteral { .. }
+        | BoundExpr::Param { .. }
         | BoundExpr::Aggregate { .. } => {}
     }
 }

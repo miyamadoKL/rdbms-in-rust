@@ -877,9 +877,11 @@ fn collect_column_side(expr: &BoundExpr, left_len: usize, side: &mut Option<Side
                 Some(existing) => *existing == this_side,
             }
         }
-        BoundExpr::IntLiteral { .. } | BoundExpr::StringLiteral { .. } | BoundExpr::BoolLiteral { .. } | BoundExpr::NullLiteral { .. } => {
-            true
-        }
+        BoundExpr::IntLiteral { .. }
+        | BoundExpr::StringLiteral { .. }
+        | BoundExpr::BoolLiteral { .. }
+        | BoundExpr::NullLiteral { .. }
+        | BoundExpr::Param { .. } => true,
         BoundExpr::UnaryOp { expr, .. } | BoundExpr::Paren { expr, .. } | BoundExpr::Cast { expr, .. } => {
             collect_column_side(expr, left_len, side)
         }
@@ -918,7 +920,8 @@ pub(crate) fn shift_column_index(expr: &BoundExpr, delta: usize) -> BoundExpr {
         BoundExpr::IntLiteral { .. }
         | BoundExpr::StringLiteral { .. }
         | BoundExpr::BoolLiteral { .. }
-        | BoundExpr::NullLiteral { .. } => expr.clone(),
+        | BoundExpr::NullLiteral { .. }
+        | BoundExpr::Param { .. } => expr.clone(),
         BoundExpr::UnaryOp { op, expr, data_type, span } => {
             BoundExpr::UnaryOp { op: *op, expr: Box::new(shift_column_index(expr, delta)), data_type: *data_type, span: *span }
         }
