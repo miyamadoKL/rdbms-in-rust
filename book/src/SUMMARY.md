@@ -46,7 +46,7 @@
 
 # 第5部 Transaction: ACIDと並行実行
 
-- [第30章 トランザクション境界とAtomicity]()
+- [第30章 トランザクション境界とAtomicity](ch30-transactions.md)
 - [第31章 Lock ManagerとStrict 2PL]()
 - [第32章 Isolation LevelとDeadlock]()
 - [第33章 Write-Ahead Logging]()

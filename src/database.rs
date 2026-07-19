@@ -51,13 +51,16 @@ use std::path::Path;
 
 use std::collections::HashMap;
 
-use crate::ast::{AnalyzeStatement, CreateTableStatement, DropIndexStatement, DropTableStatement, Statement};
+use crate::ast::{
+    AnalyzeStatement, BeginStatement, CommitStatement, CreateTableStatement, DropIndexStatement, DropTableStatement,
+    RollbackStatement, Statement,
+};
 use crate::binder::{Binder, BoundCreateIndex, BoundStatement};
 use crate::catalog::{Catalog, TableInfo};
 use crate::error::{DbError, DbResult};
 use crate::eval::FunctionRegistry;
 use crate::executor;
-use crate::ids::TableId;
+use crate::ids::{TableId, TransactionId};
 use crate::logical_plan::{self, DeleteNode, InsertNode, LogicalPlan, UpdateNode};
 use crate::physical_plan::{
     self, CounterNode, CountingExec, DiskSeqScanExec, DistinctExec, Executor, FilterExec, HashAggregateExec, HashJoinExec,
@@ -68,6 +71,7 @@ use crate::rules;
 use crate::statistics::{StatsCollector, TableStats};
 use crate::storage::Storage;
 use crate::storage_mem::MemStorage;
+use crate::transaction::{self, TransactionContext, TransactionState};
 use crate::types::{Column, DataType, Schema, Tuple, Value};
 
 /// テーブル定義と行を実際に保持する場所。
@@ -105,7 +109,33 @@ enum Backend {
 pub struct Database {
     functions: FunctionRegistry,
     backend: Backend,
+    /// `BEGIN`で開始した、明示的なトランザクション(第30章)。`None`は
+    /// Autocommit(明示的な`BEGIN`を伴わない文を、1文ごとに独立した
+    /// トランザクションとして扱うモード)を意味する。`Database`はこの1本しか
+    /// 持てない(`BEGIN`の入れ子を許さない設計、本文「BEGINの入れ子をどう
+    /// 扱うか」を参照)。第37章で複数セッションに分かれるまでは、1つの
+    /// `Database`が持てるActiveなトランザクションは高々1本である。
+    tx: Option<TransactionContext>,
+    /// 次に`BEGIN`(または`begin_tx`)が割り当てる`TransactionId`(第30章)。
+    /// `0`から単調増加させるだけの採番で、`Storage`側には永続化しない。
+    /// プロセスを再起動すれば`0`から採番し直すが、`TransactionId`はプロセス内
+    /// でのUndoの帳簿以上の役割を持たないため、再起動をまたいで一意である
+    /// 必要がない。`tx`と`harness_contexts`はどちらもこの採番を共有する。
+    next_txn_id: u64,
+    /// 決定的インターリーブテストハーネス専用の、複数トランザクションの
+    /// 対応表(第30章、後述の「決定的インターリーブテストハーネス専用の
+    /// 内部API」を参照)。通常のSQL経路(`execute`)はこのフィールドに一切
+    /// 触れない。
+    harness_contexts: HashMap<TransactionId, TransactionContext>,
 }
+
+/// [`Database::begin_tx`]が返す、1本のトランザクションを指す不透明な識別子。
+///
+/// 中身(`TransactionId`)はハーネスのコード自身も直接読む必要が無いため、
+/// フィールドは非公開にしてある。`Database::execute_in_tx`・`commit_tx`・
+/// `rollback_tx`へ渡す以外の使い道を持たない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxHandle(TransactionId);
 
 impl Database {
     /// インメモリのDatabaseを作る。組み込みのScalar Function(`abs`、`length`)は
@@ -122,6 +152,9 @@ impl Database {
                 storage: MemStorage::new(),
                 stats: HashMap::new(),
             },
+            tx: None,
+            next_txn_id: 0,
+            harness_contexts: HashMap::new(),
         }
     }
 
@@ -149,6 +182,9 @@ impl Database {
         Ok(Database {
             functions: FunctionRegistry::with_builtins(),
             backend: Backend::Disk { storage: Box::new(storage) },
+            tx: None,
+            next_txn_id: 0,
+            harness_contexts: HashMap::new(),
         })
     }
 
@@ -174,6 +210,21 @@ impl Database {
                 storage.sync()
             }
         }
+    }
+
+    /// 現在のトランザクション状態(第30章)。`None`はAutocommit、つまり
+    /// `BEGIN`していない状態を表す。
+    pub fn transaction_state(&self) -> Option<TransactionState> {
+        self.tx.as_ref().map(|tx| tx.state)
+    }
+
+    /// 通常のSQL経路(`execute`)が`BEGIN`で開始した、現在`Active`または
+    /// `Aborted`なトランザクションの`TransactionId`(第30章)。`None`は
+    /// Autocommitを表す。決定的インターリーブテストハーネス(`begin_tx`等)が
+    /// 作る`TransactionId`とは別の採番だが、`Database`の中では同じカウンタ
+    /// (`next_txn_id`)を共有する。
+    pub fn current_transaction_id(&self) -> Option<TransactionId> {
+        self.tx.as_ref().map(|tx| tx.id)
     }
 
     /// 現在のカタログへの参照。
@@ -211,8 +262,57 @@ impl Database {
     /// どちらもそのまま呼び出し元に伝わる。`LogicalPlan`への変換自体は失敗しない
     /// (`Binder`がすでに名前・型を確定させているため、`BoundStatement`から
     /// `LogicalPlan`への変換は形を組み替えるだけで、新たに検出すべき誤りが無い)。
+    /// 第30章から、この関数は`BEGIN`・`COMMIT`・`ROLLBACK`という3つの
+    /// トランザクション境界文をここで直接振り分ける。それ以外の文(`SELECT`
+    /// 以下、これまでどおりの9種類)は`execute_bound_statement`へ委ね、
+    /// 実行結果に応じて`finish`が「Active中の失敗はAbortedへ遷移させる」
+    /// (本文「Statement Error時のAbort」)を適用する。`BEGIN`・`COMMIT`・
+    /// `ROLLBACK`自身の失敗(たとえば`BEGIN`の入れ子)は`finish`を経由しない。
+    /// トランザクション制御文の成否とトランザクションの状態遷移は、
+    /// `execute_begin`・`execute_commit`・`execute_rollback`自身がすでに
+    /// 一貫した形で管理しているため、ここでさらに“失敗したら状態を変える”
+    /// という規則を重ねると、たとえば入れ子`BEGIN`のエラーが進行中の
+    /// トランザクションまで巻き込んでAbortedにしてしまう。
     pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
-        let statement = crate::parser::parse_statement(sql)?;
+        let statement = match crate::parser::parse_statement(sql) {
+            Ok(statement) => statement,
+            Err(err) => return self.finish(Err(err)),
+        };
+
+        match statement {
+            Statement::Begin(begin) => self.execute_begin(begin),
+            Statement::Commit(commit) => self.execute_commit(commit),
+            Statement::Rollback(rollback) => self.execute_rollback(rollback),
+            statement => {
+                if let Some(tx) = &self.tx
+                    && tx.state == TransactionState::Aborted
+                {
+                    return Err(DbError::TransactionAborted);
+                }
+                let result = self.execute_bound_statement(statement, sql);
+                self.finish(result)
+            }
+        }
+    }
+
+    /// `Active`なトランザクション中に実行した通常の文(`BEGIN`・`COMMIT`・
+    /// `ROLLBACK`以外)が失敗したら、トランザクションを`Aborted`へ遷移させる。
+    /// 以後は`ROLLBACK`だけを受け付ける(本文「Statement Error時のAbort」を
+    /// 参照)。Autocommit(`self.tx`が`None`)の場合は何もしない。
+    fn finish(&mut self, result: DbResult<QueryResult>) -> DbResult<QueryResult> {
+        if result.is_err()
+            && let Some(tx) = &mut self.tx
+            && tx.state == TransactionState::Active
+        {
+            tx.state = TransactionState::Aborted;
+        }
+        result
+    }
+
+    /// 構文解析済みの`Statement`(`BEGIN`・`COMMIT`・`ROLLBACK`以外)を束縛し、
+    /// 実行する。第16〜29章の`execute`本体そのものであり、この章が新設した
+    /// トランザクション境界の判定・遷移はすべて呼び出し元(`execute`)が担う。
+    fn execute_bound_statement(&mut self, statement: Statement, sql: &str) -> DbResult<QueryResult> {
         let bound = self.bind(statement, sql)?;
         match bound {
             BoundStatement::Select(select) => self.execute_select(logical_plan::build_select(*select)),
@@ -225,7 +325,165 @@ impl Database {
             BoundStatement::Delete(delete) => self.execute_delete(logical_plan::build_delete(delete)),
             BoundStatement::Explain { inner, analyze } => self.execute_explain(*inner, analyze),
             BoundStatement::Analyze(analyze) => self.execute_analyze(analyze),
+            BoundStatement::Begin(_) | BoundStatement::Commit(_) | BoundStatement::Rollback(_) => {
+                unreachable!("BEGIN・COMMIT・ROLLBACKはexecuteの先頭ですでに処理済み")
+            }
         }
+    }
+
+    /// `BEGIN`を実行する。すでに`Active`なトランザクションがあれば、その
+    /// 入れ子を許さずエラーにする(本文「BEGINの入れ子をどう扱うか」を参照)。
+    fn execute_begin(&mut self, _begin: BeginStatement) -> DbResult<QueryResult> {
+        if self.tx.is_some() {
+            return Err(DbError::TransactionAlreadyActive);
+        }
+        let id = TransactionId(self.next_txn_id);
+        self.next_txn_id += 1;
+        self.tx = Some(TransactionContext::new(id));
+        Ok(QueryResult::command("BEGIN"))
+    }
+
+    /// `COMMIT`を実行する。トランザクションが無ければ`DbError::NoActiveTransaction`、
+    /// `Aborted`状態であれば`DbError::TransactionAborted`を返す。PostgreSQLは
+    /// `Aborted`状態への`COMMIT`を暗黙の`ROLLBACK`として受理するが、この章では
+    /// 採らない(本文「Statement Error時のAbort」で理由を説明する)。積んだ
+    /// `undo_log`はここでは適用せず、ただ捨てる。`Active`の間に行った書き込みは
+    /// すでに`backend`に反映済みであり、`COMMIT`はその状態を追認するだけで
+    /// 良い。
+    fn execute_commit(&mut self, _commit: CommitStatement) -> DbResult<QueryResult> {
+        match &self.tx {
+            None => Err(DbError::NoActiveTransaction),
+            Some(tx) if tx.state == TransactionState::Aborted => Err(DbError::TransactionAborted),
+            Some(_) => {
+                self.tx = None;
+                Ok(QueryResult::command("COMMIT"))
+            }
+        }
+    }
+
+    /// `ROLLBACK`を実行する。`Active`・`Aborted`のどちらの状態でも受理し、
+    /// `BEGIN`以降に積んだ`undo_log`を逆順に適用してから`tx`を手放す
+    /// (`crate::transaction::apply_undo_memory`・`apply_undo_disk`)。
+    fn execute_rollback(&mut self, _rollback: RollbackStatement) -> DbResult<QueryResult> {
+        let Some(tx) = self.tx.take() else {
+            return Err(DbError::NoActiveTransaction);
+        };
+        match &mut self.backend {
+            Backend::Memory { storage, .. } => transaction::apply_undo_memory(storage, tx.undo_log),
+            Backend::Disk { storage } => transaction::apply_undo_disk(storage, tx.undo_log)?,
+        }
+        Ok(QueryResult::command("ROLLBACK"))
+    }
+
+    /// `undo`を、`Active`なトランザクションがあればその`undo_log`へ積む。
+    /// Autocommit(`self.tx`が`None`)であれば、この文の変更を取り消す先が
+    /// 無い(Statement Rollbackがすでに文単位のAll-or-Nothingを保証している
+    /// ため、そもそも積む必要が無い)ので、そのまま捨てる。
+    fn record_undo(&mut self, undo: Vec<transaction::UndoRecord>) {
+        if undo.is_empty() {
+            return;
+        }
+        if let Some(tx) = &mut self.tx {
+            tx.undo_log.extend(undo);
+        }
+    }
+
+    // ---- 決定的インターリーブテストハーネス専用の内部API(第30章) ----
+    //
+    // 通常のSQL経路(`execute`)は、`Database`が`Active`なトランザクションを
+    // 高々1本しか持てない設計である(`tx: Option<TransactionContext>`)。
+    // ところがトランザクションのインターリーブを検証するテストは、複数の
+    // 未コミットトランザクションを、1つの`Database`の上で交互に進める必要が
+    // ある。Buffer PoolとB+Treeがスレッドセーフになるのは第35章であり、実際に
+    // 複数スレッドを立てて競合させることはまだできないため、「単一スレッド上で、
+    // 複数のトランザクションの文を指定した順序で交互に実行する」という形で
+    // インターリーブを再現する。
+    //
+    // `harness_contexts`は、`begin_tx`が作った`TransactionContext`を
+    // `TransactionId`ごとに保持する対応表である。`execute_in_tx`は、対象の
+    // `TransactionContext`を対応表から取り出して一時的に`self.tx`へ差し替え、
+    // 通常のSQL経路と共有の`execute_bound_statement`・`finish`をそのまま呼んだ
+    // あと、変化した`TransactionContext`(`undo_log`が伸びている、または
+    // `Aborted`へ遷移している)を対応表へ戻す。実行ロジック自体
+    // (`INSERT`・`UPDATE`・`DELETE`・`SELECT`のBind・実行・Undo記録・Abort遷移)
+    // は通常のSQL経路と完全に共有され、ハーネスのために複製しない。
+    //
+    // このAPIはSQLの構文(`BEGIN`・`COMMIT`・`ROLLBACK`)を経由しない。
+    // `TxHandle`は`Database`の外からは中身の見えない不透明な識別子であり、
+    // SQL文字列として`BEGIN`を書く通常の経路とは独立している(モジュール冒頭の
+    // 「SQL/REPL経路は単一トランザクションのまま」という設計判断のとおり)。
+
+    /// 新しいトランザクションを開始し、以後`execute_in_tx`・`commit_tx`・
+    /// `rollback_tx`で参照する`TxHandle`を返す。通常のSQL経路の`self.tx`には
+    /// 触れないため、`execute`(`BEGIN`を含む)と`begin_tx`は互いに独立している。
+    pub fn begin_tx(&mut self) -> TxHandle {
+        let id = TransactionId(self.next_txn_id);
+        self.next_txn_id += 1;
+        self.harness_contexts.insert(id, TransactionContext::new(id));
+        TxHandle(id)
+    }
+
+    /// `handle`が指すトランザクションの中で、`sql`を1文実行する。
+    ///
+    /// `handle`が`Aborted`状態であれば、`ROLLBACK`と同じ文言でしか区別できない
+    /// `DbError::TransactionAborted`を返す(通常のSQL経路の`execute`が
+    /// `Aborted`中に他の文を拒否するのと同じ規則)。`handle`が指す
+    /// トランザクションがすでに`commit_tx`・`rollback_tx`で終わっている場合は
+    /// panicする(ハーネスの使い方の誤りであり、SQLの実行時エラーではない)。
+    pub fn execute_in_tx(&mut self, handle: &TxHandle, sql: &str) -> DbResult<QueryResult> {
+        let ctx = self
+            .harness_contexts
+            .remove(&handle.0)
+            .expect("TxHandleはすでにcommit_tx・rollback_tx済み、または他のDatabaseのものです");
+        if ctx.state == TransactionState::Aborted {
+            self.harness_contexts.insert(handle.0, ctx);
+            return Err(DbError::TransactionAborted);
+        }
+
+        // 通常のSQL経路が使う`self.tx`を、この文の間だけ`ctx`に差し替える。
+        // ハーネスのテストは`execute`(`db.execute("BEGIN")`等)を併用しない
+        // 前提なので、差し替え前の`self.tx`は常に`None`のはずだが、`Option`の
+        // まま保存して差し替え後に戻すことで、その前提が破られても値を失わない。
+        let previous = self.tx.replace(ctx);
+        let statement = crate::parser::parse_statement(sql);
+        let result = match statement {
+            Ok(statement) => self.execute_bound_statement(statement, sql),
+            Err(err) => Err(err),
+        };
+        let result = self.finish(result);
+        let ctx = self.tx.take().expect("execute_bound_statementはself.txを取り除かない");
+        self.tx = previous;
+        self.harness_contexts.insert(handle.0, ctx);
+        result
+    }
+
+    /// `handle`が指すトランザクションを確定する。`Aborted`状態であれば
+    /// `DbError::TransactionAborted`を返し、`ROLLBACK`しか受け付けない
+    /// (`execute_commit`と同じ規則)。
+    pub fn commit_tx(&mut self, handle: TxHandle) -> DbResult<()> {
+        let ctx = self
+            .harness_contexts
+            .remove(&handle.0)
+            .expect("TxHandleはすでにcommit_tx・rollback_tx済み、または他のDatabaseのものです");
+        if ctx.state == TransactionState::Aborted {
+            self.harness_contexts.insert(handle.0, ctx);
+            return Err(DbError::TransactionAborted);
+        }
+        Ok(())
+    }
+
+    /// `handle`が指すトランザクションが積んだ`undo_log`を逆順に適用し、
+    /// `BEGIN`(`begin_tx`)以降の変更を取り消す。
+    pub fn rollback_tx(&mut self, handle: TxHandle) -> DbResult<()> {
+        let ctx = self
+            .harness_contexts
+            .remove(&handle.0)
+            .expect("TxHandleはすでにcommit_tx・rollback_tx済み、または他のDatabaseのものです");
+        match &mut self.backend {
+            Backend::Memory { storage, .. } => transaction::apply_undo_memory(storage, ctx.undo_log),
+            Backend::Disk { storage } => transaction::apply_undo_disk(storage, ctx.undo_log)?,
+        }
+        Ok(())
     }
 
     /// `CREATE TABLE`を実行し、列定義を`Schema`へ変換したうえで`Catalog`に登録し、
@@ -566,10 +824,12 @@ impl Database {
     ///
     /// もう1つ明記しておく必要があるのは、`EXPLAIN ANALYZE INSERT`/`UPDATE`/
     /// `DELETE`は**実際に書き込みを行う**という点である。PostgreSQLの
-    /// `EXPLAIN (ANALYZE, ...)`と異なり、この教材はトランザクション内で
-    /// ロールバックして計測だけを取り消す機能を持たない(第29章より前に
-    /// トランザクションを導入していない)ため、`EXPLAIN ANALYZE INSERT`を
-    /// 実行すればテーブルの行は実際に増える。
+    /// `EXPLAIN (ANALYZE, ...)`は計測後に自動でロールバックするが、この教材は
+    /// そこまでしない。`run_insert`等を直接呼ぶため、`Active`なトランザクション
+    /// の中で実行すれば第30章のUndoにも通常どおり乗り(そのトランザクションを
+    /// `ROLLBACK`すれば計測ぶんの書き込みも一緒に消える)、Autocommitで
+    /// 実行すればそのまま確定する。どちらの場合も、`EXPLAIN ANALYZE INSERT`を
+    /// 実行した時点でテーブルの行は実際に増える。
     fn execute_explain(&mut self, inner: BoundStatement, analyze: bool) -> DbResult<QueryResult> {
         match inner {
             BoundStatement::Select(select) => {
@@ -619,7 +879,10 @@ impl Database {
             | BoundStatement::CreateIndex(_)
             | BoundStatement::DropIndex(_)
             | BoundStatement::Explain { .. }
-            | BoundStatement::Analyze(_) => {
+            | BoundStatement::Analyze(_)
+            | BoundStatement::Begin(_)
+            | BoundStatement::Commit(_)
+            | BoundStatement::Rollback(_) => {
                 unreachable!(
                     "ParserがEXPLAINの対象をSELECT・INSERT INTO・UPDATE・DELETE FROMに制限している"
                 )
@@ -671,16 +934,25 @@ impl Database {
             unreachable!("logical_plan::build_insertはInsertの子に常にValuesを積む")
         };
 
-        match &mut self.backend {
+        let mut undo = Vec::new();
+        let result = match &mut self.backend {
             Backend::Memory { storage, .. } => {
                 let mem_table =
                     storage.table_mut(table_id).expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::insert(mem_table, &schema, &self.functions, columns.as_deref(), &values.rows)
+                executor::insert(mem_table, table_id, &schema, &self.functions, columns.as_deref(), &values.rows, &mut undo)
             }
-            Backend::Disk { storage } => {
-                executor::storage_insert(storage, table_id, &schema, &self.functions, columns.as_deref(), &values.rows)
-            }
-        }
+            Backend::Disk { storage } => executor::storage_insert(
+                storage,
+                table_id,
+                &schema,
+                &self.functions,
+                columns.as_deref(),
+                &values.rows,
+                &mut undo,
+            ),
+        };
+        self.record_undo(undo);
+        result
     }
 
     /// `UPDATE`を実行する。`executor::update`(または`executor::storage_update`)
@@ -704,16 +976,25 @@ impl Database {
             unreachable!("logical_plan::build_updateは常にLogicalPlan::Updateを返す")
         };
 
-        match &mut self.backend {
+        let mut undo = Vec::new();
+        let result = match &mut self.backend {
             Backend::Memory { storage, .. } => {
                 let mem_table =
                     storage.table_mut(table_id).expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::update(mem_table, &schema, &self.functions, &assignments, predicate.as_ref())
+                executor::update(mem_table, table_id, &schema, &self.functions, &assignments, predicate.as_ref(), &mut undo)
             }
-            Backend::Disk { storage } => {
-                executor::storage_update(storage, table_id, &schema, &self.functions, &assignments, predicate.as_ref())
-            }
-        }
+            Backend::Disk { storage } => executor::storage_update(
+                storage,
+                table_id,
+                &schema,
+                &self.functions,
+                &assignments,
+                predicate.as_ref(),
+                &mut undo,
+            ),
+        };
+        self.record_undo(undo);
+        result
     }
 
     /// `DELETE FROM`を実行する。`executor::delete`(または`executor::storage_delete`)
@@ -731,16 +1012,19 @@ impl Database {
             unreachable!("logical_plan::build_deleteは常にLogicalPlan::Deleteを返す")
         };
 
-        match &mut self.backend {
+        let mut undo = Vec::new();
+        let result = match &mut self.backend {
             Backend::Memory { storage, .. } => {
                 let mem_table =
                     storage.table_mut(table_id).expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::delete(mem_table, &schema, &self.functions, predicate.as_ref())
+                executor::delete(mem_table, table_id, &schema, &self.functions, predicate.as_ref(), &mut undo)
             }
             Backend::Disk { storage } => {
-                executor::storage_delete(storage, table_id, &schema, &self.functions, predicate.as_ref())
+                executor::storage_delete(storage, table_id, &schema, &self.functions, predicate.as_ref(), &mut undo)
             }
-        }
+        };
+        self.record_undo(undo);
+        result
     }
 
     /// `ANALYZE [テーブル名]`を実行する(第27章)。
@@ -3992,5 +4276,246 @@ mod tests {
         // aとbは2行ずつ一致し(id同士)、cは無条件に2行とも掛かるので、
         // 2 (a=b一致) × 2 (c) = 4行になる。
         assert_eq!(result.rows().len(), 4, "rows={:?}", result.rows());
+    }
+
+    // ---- トランザクション境界とAtomicity(第30章) ----
+
+    fn accounts_db() -> Database {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)").unwrap();
+        db.execute("INSERT INTO accounts VALUES (1, 100), (2, 50)").unwrap();
+        db
+    }
+
+    fn balance(db: &mut Database, id: i64) -> i64 {
+        let result = db.execute(&format!("SELECT balance FROM accounts WHERE id = {id}")).unwrap();
+        match &result.rows()[0].values()[0] {
+            Value::BigInt(n) => *n,
+            other => panic!("BigIntを期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn begin_commit_keeps_the_changes() {
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        db.execute("UPDATE accounts SET balance = balance + 30 WHERE id = 2").unwrap();
+        db.execute("COMMIT").unwrap();
+
+        assert_eq!(balance(&mut db, 1), 70);
+        assert_eq!(balance(&mut db, 2), 80);
+        assert_eq!(db.transaction_state(), None);
+    }
+
+    #[test]
+    fn begin_rollback_discards_the_changes() {
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        db.execute("UPDATE accounts SET balance = balance + 30 WHERE id = 2").unwrap();
+        db.execute("ROLLBACK").unwrap();
+
+        assert_eq!(balance(&mut db, 1), 100);
+        assert_eq!(balance(&mut db, 2), 50);
+        assert_eq!(db.transaction_state(), None);
+    }
+
+    #[test]
+    fn begin_rollback_undoes_an_insert_and_a_delete_in_the_same_transaction() {
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO accounts VALUES (3, 10)").unwrap();
+        db.execute("DELETE FROM accounts WHERE id = 2").unwrap();
+        db.execute("ROLLBACK").unwrap();
+
+        let rows = db.execute("SELECT id FROM accounts ORDER BY id").unwrap();
+        let ids: Vec<i64> = rows
+            .rows()
+            .iter()
+            .map(|row| match &row.values()[0] {
+                Value::BigInt(n) => *n,
+                other => panic!("BigIntを期待したが{other:?}が返った"),
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn rollback_undoes_repeated_updates_to_the_same_row_in_reverse_order() {
+        // 同一行に対する複数回のUPDATEを、ROLLBACKが正しく逆順に取り消せるかを
+        // 確認する。UndoRecordは1回のUPDATEごとに1件積まれるので、3回の更新は
+        // 3件のUndoRecordになり、それをLIFOで戻すと元の値に一致するはずである。
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE accounts SET balance = 200 WHERE id = 1").unwrap();
+        db.execute("UPDATE accounts SET balance = 300 WHERE id = 1").unwrap();
+        db.execute("UPDATE accounts SET balance = 400 WHERE id = 1").unwrap();
+        assert_eq!(balance(&mut db, 1), 400);
+        db.execute("ROLLBACK").unwrap();
+
+        assert_eq!(balance(&mut db, 1), 100);
+    }
+
+    #[test]
+    fn rollback_undoes_repeated_updates_to_the_same_row_on_disk() {
+        // Memory版と同じ検証をDiskバックエンドで行う。`Storage::update`は
+        // ページ内に収まらない書き換えで`RecordId`を動かすことがあるため、
+        // `apply_undo_disk`のRecordId付け替え(remap)が正しく働くことも
+        // あわせて確認する。
+        let path = temp_db_path("rollback-repeated-update");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)").unwrap();
+        db.execute("INSERT INTO accounts VALUES (1, 100)").unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE accounts SET balance = 200 WHERE id = 1").unwrap();
+        db.execute("UPDATE accounts SET balance = 300 WHERE id = 1").unwrap();
+        db.execute("UPDATE accounts SET balance = 400 WHERE id = 1").unwrap();
+        db.execute("ROLLBACK").unwrap();
+
+        assert_eq!(balance(&mut db, 1), 100);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn autocommit_persists_each_statement_immediately() {
+        let mut db = accounts_db();
+        // BEGINを経由しない、これまでどおりの1文ずつの実行(Autocommit)。
+        db.execute("UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        assert_eq!(balance(&mut db, 1), 70);
+        assert_eq!(db.transaction_state(), None);
+    }
+
+    #[test]
+    fn nested_begin_is_rejected_and_the_outer_transaction_is_unaffected() {
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        assert!(matches!(db.execute("BEGIN"), Err(DbError::TransactionAlreadyActive)));
+
+        // 入れ子のBEGIN自体の失敗は、進行中のトランザクションを巻き込まない。
+        assert_eq!(db.transaction_state(), Some(TransactionState::Active));
+        db.execute("COMMIT").unwrap();
+        assert_eq!(balance(&mut db, 1), 70);
+    }
+
+    #[test]
+    fn commit_or_rollback_without_begin_is_rejected() {
+        let mut db = accounts_db();
+        assert!(matches!(db.execute("COMMIT"), Err(DbError::NoActiveTransaction)));
+        assert!(matches!(db.execute("ROLLBACK"), Err(DbError::NoActiveTransaction)));
+    }
+
+    #[test]
+    fn a_failing_statement_aborts_the_transaction_and_blocks_further_statements() {
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+
+        // id=2は既存のPRIMARY KEYと衝突するので失敗する。
+        assert!(matches!(
+            db.execute("INSERT INTO accounts VALUES (2, 999)"),
+            Err(DbError::PrimaryKeyViolation { .. })
+        ));
+        assert_eq!(db.transaction_state(), Some(TransactionState::Aborted));
+
+        // Aborted状態では、ROLLBACK以外のすべての文が拒否される。
+        assert!(matches!(db.execute("SELECT 1"), Err(DbError::TransactionAborted)));
+        assert!(matches!(db.execute("COMMIT"), Err(DbError::TransactionAborted)));
+
+        // ROLLBACKだけが受理され、Active中に成功していた1つ目のUPDATEも
+        // まとめて取り消される。
+        db.execute("ROLLBACK").unwrap();
+        assert_eq!(balance(&mut db, 1), 100);
+        assert_eq!(db.transaction_state(), None);
+    }
+
+    #[test]
+    fn statement_rollback_still_applies_inside_an_active_transaction() {
+        // 第20章のStatement Rollback(1文の中の部分失敗を巻き戻す)は、この章の
+        // トランザクション境界と両立する。複数行のINSERTが1行だけ失敗しても、
+        // その文自体は(Active中であっても)何も書き込まない。
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        assert!(matches!(
+            db.execute("INSERT INTO accounts VALUES (3, 10), (2, 20)"),
+            Err(DbError::PrimaryKeyViolation { .. })
+        ));
+        // 文自体は失敗したが、トランザクションはAbortedへ遷移する
+        // (「Statement Error時のAbort」、本文を参照)。
+        assert_eq!(db.transaction_state(), Some(TransactionState::Aborted));
+        db.execute("ROLLBACK").unwrap();
+
+        // id=3は1度も反映されていない。
+        let rows = db.execute("SELECT id FROM accounts WHERE id = 3").unwrap();
+        assert!(rows.rows().is_empty());
+    }
+
+    #[test]
+    fn begin_commit_and_rollback_work_on_the_disk_backend_too() {
+        let path = temp_db_path("tx-disk");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)").unwrap();
+        db.execute("INSERT INTO accounts VALUES (1, 100), (2, 50)").unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        db.execute("DELETE FROM accounts WHERE id = 2").unwrap();
+        db.execute("INSERT INTO accounts VALUES (3, 10)").unwrap();
+        db.execute("ROLLBACK").unwrap();
+
+        assert_eq!(balance(&mut db, 1), 100);
+        let rows = db.execute("SELECT id FROM accounts ORDER BY id").unwrap();
+        assert_eq!(rows.rows().len(), 2);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    // ---- 決定的インターリーブテストハーネス専用の内部API(第30章) ----
+
+    #[test]
+    fn begin_tx_execute_in_tx_and_commit_tx_leave_the_change_in_place() {
+        let mut db = accounts_db();
+        let tx = db.begin_tx();
+        db.execute_in_tx(&tx, "UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        db.commit_tx(tx).unwrap();
+
+        assert_eq!(balance(&mut db, 1), 70);
+    }
+
+    #[test]
+    fn rollback_tx_discards_the_change() {
+        let mut db = accounts_db();
+        let tx = db.begin_tx();
+        db.execute_in_tx(&tx, "UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        db.rollback_tx(tx).unwrap();
+
+        assert_eq!(balance(&mut db, 1), 100);
+    }
+
+    #[test]
+    fn two_handles_can_be_interleaved_on_one_database() {
+        // このAPIが「複数のトランザクションの文を受け付ける最小限の仕組み」
+        // として実際に機能することの確認。t1・t2という2つのTxHandleを、
+        // どちらもcommit/rollbackする前に交互に使う。
+        let mut db = accounts_db();
+        let t1 = db.begin_tx();
+        let t2 = db.begin_tx();
+
+        // t1・t2はそれぞれ別の行だけを触る(相対更新`balance - 30`が、
+        // もう一方のトランザクションのまだコミットしていない書き込みを
+        // 拾ってしまう心配が無いようにするため。並行制御の無さそのものは
+        // `tests/interleave.rs`で別途確認する)。
+        db.execute_in_tx(&t1, "UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        db.execute_in_tx(&t2, "UPDATE accounts SET balance = balance - 5 WHERE id = 2").unwrap();
+        db.execute_in_tx(&t1, "UPDATE accounts SET balance = balance + 1 WHERE id = 1").unwrap();
+
+        db.commit_tx(t1).unwrap();
+        db.rollback_tx(t2).unwrap();
+
+        // t1の2つの更新はコミット済み、t2の更新は取り消し済み。
+        assert_eq!(balance(&mut db, 1), 71);
+        assert_eq!(balance(&mut db, 2), 50);
     }
 }

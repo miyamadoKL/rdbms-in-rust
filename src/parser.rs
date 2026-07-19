@@ -14,6 +14,7 @@
 //! - `UPDATE <table> SET <col> = <式> [, ...] [WHERE <式>]`
 //! - `DELETE FROM <table> [WHERE <式>]`
 //! - `EXPLAIN <SELECT|INSERT INTO|UPDATE|DELETE FROM>`(第19章)
+//! - `BEGIN` / `COMMIT` / `ROLLBACK`(第30章)
 //! - 式: リテラル(整数・文字列・真偽値・`NULL`)、列参照、二項演算(`+ - * /`、
 //!   比較、`AND` `OR`)、単項演算(`-` `NOT`)、`IS [NOT] NULL`、関数呼び出し、
 //!   `CAST(expr AS type)`、括弧
@@ -21,10 +22,10 @@
 //! 優先順位は低い順に`OR` < `AND` < `NOT` < 比較 < `+` `-` < `*` `/` < 単項`-`。
 
 use crate::ast::{
-    AggregateFunc, AnalyzeStatement, Assignment, BinaryOperator, ColumnDef, CreateIndexStatement, CreateTableStatement,
-    DeleteStatement, DropIndexStatement, DropTableStatement, ExplainStatement, Expr, FromClause, Ident,
-    InsertStatement, JoinClause, JoinKind, OrderByItem, SelectItem, SelectStatement, Statement, UnaryOperator,
-    UpdateStatement,
+    AggregateFunc, AnalyzeStatement, Assignment, BeginStatement, BinaryOperator, ColumnDef, CommitStatement,
+    CreateIndexStatement, CreateTableStatement, DeleteStatement, DropIndexStatement, DropTableStatement,
+    ExplainStatement, Expr, FromClause, Ident, InsertStatement, JoinClause, JoinKind, OrderByItem, RollbackStatement,
+    SelectItem, SelectStatement, Statement, UnaryOperator, UpdateStatement,
 };
 use crate::error::{DbError, DbResult};
 use crate::lexer::{self, Keyword, Span, Token, TokenKind};
@@ -163,9 +164,12 @@ impl<'a> Parser<'a> {
             TokenKind::Keyword(Keyword::Analyze) => {
                 self.parse_analyze_statement().map(Statement::Analyze)
             }
+            TokenKind::Keyword(Keyword::Begin) => self.parse_begin_statement().map(Statement::Begin),
+            TokenKind::Keyword(Keyword::Commit) => self.parse_commit_statement().map(Statement::Commit),
+            TokenKind::Keyword(Keyword::Rollback) => self.parse_rollback_statement().map(Statement::Rollback),
             _ => Err(self.unexpected(
                 "SELECT・CREATE TABLE・DROP TABLE・CREATE INDEX・DROP INDEX・INSERT INTO・UPDATE・\
-                 DELETE FROM・EXPLAIN・ANALYZEのいずれか",
+                 DELETE FROM・EXPLAIN・ANALYZE・BEGIN・COMMIT・ROLLBACKのいずれか",
             )),
         }
     }
@@ -241,6 +245,25 @@ impl<'a> Parser<'a> {
         let end = table.as_ref().map(|t| t.span.end).unwrap_or(start + "ANALYZE".len());
 
         Ok(AnalyzeStatement { table, span: Span::new(start, end) })
+    }
+
+    // ---- BEGIN / COMMIT / ROLLBACK(第30章) ----
+
+    /// `BEGIN`単体を読む。`BEGIN TRANSACTION`・`BEGIN WORK`のような修飾語は、
+    /// このSQLサブセットでは受理しない(第30章の本文を参照)。
+    fn parse_begin_statement(&mut self) -> DbResult<BeginStatement> {
+        let span = self.expect_keyword(Keyword::Begin, "BEGIN")?;
+        Ok(BeginStatement { span })
+    }
+
+    fn parse_commit_statement(&mut self) -> DbResult<CommitStatement> {
+        let span = self.expect_keyword(Keyword::Commit, "COMMIT")?;
+        Ok(CommitStatement { span })
+    }
+
+    fn parse_rollback_statement(&mut self) -> DbResult<RollbackStatement> {
+        let span = self.expect_keyword(Keyword::Rollback, "ROLLBACK")?;
+        Ok(RollbackStatement { span })
     }
 
     // ---- SELECT ----

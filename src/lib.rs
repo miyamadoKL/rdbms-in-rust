@@ -38,6 +38,10 @@
 //! (`btree`、ページ内レイアウトを扱う`btree_page`)が加わる。この章の
 //! `BTree`はまだ`Storage`とは結線されておらず、`Storage`と同じ`BufferPool`の
 //! 上で動く独立したデータ構造として、Point Lookup・Insert・各種Splitを提供する。
+//! 第30章では、`BEGIN`・`COMMIT`・`ROLLBACK`によるトランザクション境界と、
+//! それを取り消すためのメモリ上のUndo Recordを扱う`transaction`が加わる。
+//! `database`は`Active`なトランザクションを高々1本持てるようになり、
+//! `INSERT`・`UPDATE`・`DELETE`は成功のたびに逆操作を記録する。
 
 pub mod ast;
 pub mod binder;
@@ -68,6 +72,7 @@ pub mod slotted_page;
 pub mod statistics;
 pub mod storage;
 pub mod storage_mem;
+pub mod transaction;
 pub mod tuple_codec;
 pub mod types;
 
@@ -76,7 +81,7 @@ pub use binder::{Binder, BoundExpr, BoundStatement, CatalogLookup};
 pub use btree::BTree;
 pub use buffer_pool::{BufferPool, BufferPoolStats, PageReadGuard, PageWriteGuard};
 pub use catalog::{Catalog, TableInfo};
-pub use database::{Database, QueryResult};
+pub use database::{Database, QueryResult, TxHandle};
 pub use disk_manager::DiskManager;
 pub use error::{DbError, DbResult};
 pub use eval::{FunctionRegistry, eval_expr};
@@ -97,6 +102,7 @@ pub use slotted_page::{SLOT_ENTRY_SIZE, SLOTTED_HEADER_SIZE, SlotStatus, Slotted
 pub use statistics::{Bucket, ColumnStats, HISTOGRAM_BUCKET_COUNT, StatsCollector, TableStats};
 pub use storage::Storage;
 pub use storage_mem::{MemStorage, MemTable};
+pub use transaction::TransactionState;
 pub use tuple_codec::{decode_tuple, encode_tuple};
 pub use types::{Column, DataType, Row, Schema, Tuple, Value};
 

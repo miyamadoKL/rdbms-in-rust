@@ -43,6 +43,12 @@ pub enum Statement {
     /// `ANALYZE [テーブル名]`文(第27章)。統計情報を収集する。テーブル名を
     /// 省略した場合はカタログに登録されている全テーブルが対象になる。
     Analyze(AnalyzeStatement),
+    /// `BEGIN`文(第30章)。明示的なトランザクションを開始する。
+    Begin(BeginStatement),
+    /// `COMMIT`文(第30章)。現在のトランザクションの変更を確定する。
+    Commit(CommitStatement),
+    /// `ROLLBACK`文(第30章)。現在のトランザクションの変更を取り消す。
+    Rollback(RollbackStatement),
 }
 
 impl Statement {
@@ -59,6 +65,9 @@ impl Statement {
             Statement::Delete(s) => s.span,
             Statement::Explain(s) => s.span,
             Statement::Analyze(s) => s.span,
+            Statement::Begin(s) => s.span,
+            Statement::Commit(s) => s.span,
+            Statement::Rollback(s) => s.span,
         }
     }
 }
@@ -327,6 +336,25 @@ pub struct ExplainStatement {
 pub struct AnalyzeStatement {
     /// 対象テーブル名。`None`ならカタログに登録されている全テーブルが対象。
     pub table: Option<Ident>,
+    pub span: Span,
+}
+
+/// `BEGIN`文(第30章)。`BEGIN TRANSACTION`のような修飾は持たず、`BEGIN`
+/// 単体だけを受理する(`docs-local/chatgpt_opinion.md`の原案どおり)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BeginStatement {
+    pub span: Span,
+}
+
+/// `COMMIT`文(第30章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitStatement {
+    pub span: Span,
+}
+
+/// `ROLLBACK`文(第30章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RollbackStatement {
     pub span: Span,
 }
 

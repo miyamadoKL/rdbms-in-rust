@@ -79,6 +79,12 @@ pub enum Keyword {
     Index,
     /// `ANALYZE`文、`EXPLAIN ANALYZE`修飾(第27章)。
     Analyze,
+    /// `BEGIN`文(第30章)。トランザクションを開始する。
+    Begin,
+    /// `COMMIT`文(第30章)。
+    Commit,
+    /// `ROLLBACK`文(第30章)。
+    Rollback,
 }
 
 impl Keyword {
@@ -124,6 +130,9 @@ impl Keyword {
             "ON" => Keyword::On,
             "INDEX" => Keyword::Index,
             "ANALYZE" => Keyword::Analyze,
+            "BEGIN" => Keyword::Begin,
+            "COMMIT" => Keyword::Commit,
+            "ROLLBACK" => Keyword::Rollback,
             _ => return None,
         };
         Some(keyword)

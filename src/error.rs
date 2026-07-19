@@ -213,6 +213,23 @@ pub enum DbError {
     /// このエラーの対象にはならない。
     #[error("索引'{0}'はPRIMARY KEY・UNIQUE制約が自動生成した索引のため、DROP INDEXでは削除できません")]
     CannotDropConstraintIndex(String),
+
+    /// すでに`Active`なトランザクションの中で`BEGIN`を実行したエラー(第30章)。
+    /// このSQLサブセットは`BEGIN`の入れ子を許さない(章の本文で理由を説明する)。
+    #[error("すでにトランザクションが開始されています(BEGINの入れ子は未対応です)")]
+    TransactionAlreadyActive,
+
+    /// トランザクションの外(Autocommitモード)で`COMMIT`または`ROLLBACK`を
+    /// 実行したエラー(第30章)。
+    #[error("有効なトランザクションがありません")]
+    NoActiveTransaction,
+
+    /// `Active`なトランザクションの中で実行した文がエラーになったあと、
+    /// `ROLLBACK`以外の文を実行しようとしたエラー(第30章)。PostgreSQLに
+    /// 倣い、一度失敗した文を含むトランザクションはロールバックするまで
+    /// 以後の文をすべて拒否する(章の本文「Statement Error時のAbort」を参照)。
+    #[error("現在のトランザクションはエラーのため中断されています。ROLLBACKだけ受け付けます")]
+    TransactionAborted,
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

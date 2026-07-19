@@ -51,9 +51,10 @@
 use std::collections::HashSet;
 
 use crate::ast::{
-    AggregateFunc, AnalyzeStatement, Assignment, BinaryOperator, CreateIndexStatement, CreateTableStatement,
-    DeleteStatement, DropIndexStatement, DropTableStatement, Expr, FromClause, Ident, InsertStatement, JoinKind,
-    SelectItem, SelectStatement, Statement, UnaryOperator, UpdateStatement,
+    AggregateFunc, AnalyzeStatement, Assignment, BeginStatement, BinaryOperator, CommitStatement, CreateIndexStatement,
+    CreateTableStatement, DeleteStatement, DropIndexStatement, DropTableStatement, Expr, FromClause, Ident,
+    InsertStatement, JoinKind, RollbackStatement, SelectItem, SelectStatement, Statement, UnaryOperator,
+    UpdateStatement,
 };
 use crate::catalog::{Catalog, TableInfo};
 use crate::error::{DbError, DbResult};
@@ -138,6 +139,13 @@ pub enum BoundStatement {
     /// 式の名前解決・型検査を必要としない)。テーブル名が指定されていれば、
     /// その存在だけを`DropTable`と同じ理由でここで確認する。
     Analyze(AnalyzeStatement),
+    /// `BEGIN`(第30章)。カタログと突き合わせる名前を持たないため、ASTの
+    /// バリアントをそのまま持ち回す(`Analyze`と同じ理由)。
+    Begin(BeginStatement),
+    /// `COMMIT`(第30章)。
+    Commit(CommitStatement),
+    /// `ROLLBACK`(第30章)。
+    Rollback(RollbackStatement),
 }
 
 /// 束縛済みの`CREATE INDEX`(第24章)。
@@ -492,6 +500,9 @@ impl<'a> Binder<'a> {
                 self.bind(*explain.statement).map(|inner| BoundStatement::Explain { inner: Box::new(inner), analyze })
             }
             Statement::Analyze(analyze) => self.bind_analyze(analyze),
+            Statement::Begin(begin) => Ok(BoundStatement::Begin(begin)),
+            Statement::Commit(commit) => Ok(BoundStatement::Commit(commit)),
+            Statement::Rollback(rollback) => Ok(BoundStatement::Rollback(rollback)),
         }
     }
 
