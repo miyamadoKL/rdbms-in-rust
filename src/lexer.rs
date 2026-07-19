@@ -79,6 +79,28 @@ pub enum Keyword {
     Index,
     /// `ANALYZE`文、`EXPLAIN ANALYZE`修飾(第27章)。
     Analyze,
+    /// `BEGIN`文(第30章)。トランザクションを開始する。
+    Begin,
+    /// `COMMIT`文(第30章)。
+    Commit,
+    /// `ROLLBACK`文(第30章)。
+    Rollback,
+    /// `BEGIN ISOLATION LEVEL ...`(第32章)の`ISOLATION`。
+    Isolation,
+    /// `BEGIN ISOLATION LEVEL ...`(第32章)の`LEVEL`。
+    Level,
+    /// `READ UNCOMMITTED` / `READ COMMITTED`(第32章)の`READ`。
+    Read,
+    /// `READ UNCOMMITTED`(第32章)の`UNCOMMITTED`。
+    Uncommitted,
+    /// `READ COMMITTED`(第32章)の`COMMITTED`。
+    Committed,
+    /// `REPEATABLE READ`(第32章)の`REPEATABLE`。
+    Repeatable,
+    /// `SERIALIZABLE`(第32章)。
+    Serializable,
+    /// `CHECKPOINT`文(第34章)。
+    Checkpoint,
 }
 
 impl Keyword {
@@ -124,6 +146,17 @@ impl Keyword {
             "ON" => Keyword::On,
             "INDEX" => Keyword::Index,
             "ANALYZE" => Keyword::Analyze,
+            "BEGIN" => Keyword::Begin,
+            "COMMIT" => Keyword::Commit,
+            "ROLLBACK" => Keyword::Rollback,
+            "ISOLATION" => Keyword::Isolation,
+            "LEVEL" => Keyword::Level,
+            "READ" => Keyword::Read,
+            "UNCOMMITTED" => Keyword::Uncommitted,
+            "COMMITTED" => Keyword::Committed,
+            "REPEATABLE" => Keyword::Repeatable,
+            "SERIALIZABLE" => Keyword::Serializable,
+            "CHECKPOINT" => Keyword::Checkpoint,
             _ => return None,
         };
         Some(keyword)

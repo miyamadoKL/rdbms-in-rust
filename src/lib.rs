@@ -38,6 +38,13 @@
 //! (`btree`、ページ内レイアウトを扱う`btree_page`)が加わる。この章の
 //! `BTree`はまだ`Storage`とは結線されておらず、`Storage`と同じ`BufferPool`の
 //! 上で動く独立したデータ構造として、Point Lookup・Insert・各種Splitを提供する。
+//! 第30章では、`BEGIN`・`COMMIT`・`ROLLBACK`によるトランザクション境界と、
+//! それを取り消すためのメモリ上のUndo Recordを扱う`transaction`が加わる。
+//! `database`は`Active`なトランザクションを高々1本持てるようになり、
+//! `INSERT`・`UPDATE`・`DELETE`は成功のたびに逆操作を記録する。第31章では、
+//! Shared/ExclusiveロックとWait Queueを管理する`lock_manager`が加わり、
+//! `database`の`SELECT`・`INSERT`・`UPDATE`・`DELETE`はStrict 2PLに従って
+//! ロックを獲得してから実行するようになる。
 
 pub mod ast;
 pub mod binder;
@@ -53,36 +60,41 @@ pub mod error;
 pub mod estimator;
 pub mod eval;
 pub mod executor;
+pub mod failpoint;
 pub mod free_space_map;
 pub mod heap_file;
 pub mod ids;
 pub mod index;
 pub mod join_order;
 pub mod lexer;
+pub mod lock_manager;
 pub mod logical_plan;
 pub mod page;
 pub mod parser;
 pub mod physical_plan;
+pub mod recovery;
 pub mod rules;
 pub mod slotted_page;
 pub mod statistics;
 pub mod storage;
 pub mod storage_mem;
+pub mod transaction;
 pub mod tuple_codec;
 pub mod types;
+pub mod wal;
 
-pub use ast::{Expr, Statement};
+pub use ast::{Expr, IsolationLevel, Statement};
 pub use binder::{Binder, BoundExpr, BoundStatement, CatalogLookup};
 pub use btree::BTree;
 pub use buffer_pool::{BufferPool, BufferPoolStats, PageReadGuard, PageWriteGuard};
 pub use catalog::{Catalog, TableInfo};
-pub use database::{Database, QueryResult};
+pub use database::{Database, QueryResult, SharedDatabase, TxHandle};
 pub use disk_manager::DiskManager;
 pub use error::{DbError, DbResult};
 pub use eval::{FunctionRegistry, eval_expr};
 pub use free_space_map::FreeSpaceMap;
 pub use heap_file::{HeapFile, Scan};
-pub use ids::{PageId, RecordId, SlotId, TableId, TransactionId};
+pub use ids::{Lsn, PageId, RecordId, SlotId, TableId, TransactionId};
 pub use index::IndexInfo;
 pub use lexer::{Keyword, Span, Token, TokenKind, tokenize};
 pub use logical_plan::LogicalPlan;
@@ -93,12 +105,15 @@ pub use page::{
 pub use estimator::{DEFAULT_EQ_SEL, DEFAULT_INEQ_SEL, RangeOp};
 pub use parser::parse_statement;
 pub use physical_plan::{Executor, PhysicalPlan};
+pub use recovery::RecoveryReport;
 pub use slotted_page::{SLOT_ENTRY_SIZE, SLOTTED_HEADER_SIZE, SlotStatus, SlottedPage, SlottedPageRef};
 pub use statistics::{Bucket, ColumnStats, HISTOGRAM_BUCKET_COUNT, StatsCollector, TableStats};
 pub use storage::Storage;
 pub use storage_mem::{MemStorage, MemTable};
+pub use transaction::TransactionState;
 pub use tuple_codec::{decode_tuple, encode_tuple};
 pub use types::{Column, DataType, Row, Schema, Tuple, Value};
+pub use wal::{LogRecord, LogRecordType, WalWriter};
 
 /// 簡易ログ出力マクロ(依存追加を避けるため `eprintln!` を薄くラップするだけ)。
 ///

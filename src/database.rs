@@ -46,18 +46,53 @@
 //! かで起動時に1回だけ決まり、実行中に差し替わることはないため、動的ディスパッチ
 //! や型引数を持ち込むほどの可変性が無い。`enum`の分岐のほうが、2つの実装を
 //! 並べて読み比べられる分、この章の分量では見通しがよい。
+//!
+//! # ロックの粒度(第31章)
+//!
+//! `SELECT`・`INSERT`・`UPDATE`・`DELETE`は、実行の前に
+//! [`crate::lock_manager::LockManager`]からロックを獲得する
+//! (`acquire_scan_locks`)。獲得するロックの**粒度**(テーブル単位か、行
+//! (`RecordId`)単位か)は`Backend`によって異なる。
+//!
+//! `Backend::Memory`は`RecordId`という概念を持たない(第30章の
+//! `crate::transaction`モジュールの説明のとおり、行は`Vec<Tuple>`の並びで
+//! しかない)ため、`LockKey::Table(table_id)`だけを使う。`SELECT`はテーブル
+//! 全体にSharedを、`INSERT`・`UPDATE`・`DELETE`はテーブル全体にExclusiveを
+//! 掛ける。この粒度はテーブルまるごとを1個の対象として扱うぶん粗いが、
+//! 正しさは疑いようがない。`INSERT`もテーブル全体のExclusiveを取るため、
+//! 他のトランザクションが同じテーブルにSharedを持っている間は新しい行を
+//! 差し込めず、結果としてPhantom(第30章の説明を参照)も起こらない。
+//!
+//! `Backend::Disk`は`RecordId`を持つため、`LockKey::Tuple(table_id, rid)`を
+//! 使う、より細かい粒度に切り替える。`SELECT`はその時点でテーブルに
+//! **存在する行**の`RecordId`をすべて列挙し、それぞれにSharedを掛ける
+//! (`WHERE`による絞り込みの前に、テーブル全体の現存する行を対象にする。
+//! この単純化については本文「タプルロックの対象をどこまで絞るか」を参照)。
+//! `UPDATE`・`DELETE`は`SELECT`より対象を絞り、`WHERE`に一致した行だけに
+//! Exclusiveを掛けてから書き換えに入る(`acquire_write_locks`、
+//! `crate::executor::storage_matching_rids`)。この絞り込みのおかげで、
+//! 異なる行を書き換える2つの`UPDATE`は互いにブロックし合わない
+//! (`tests/interleave_disk.rs`を参照)。**`INSERT`は何もロックしない。**
+//! 新しく挿入される行の`RecordId`は、挿入が終わるまで存在しないため、
+//! そもそもロックする対象が無い。この非対称性(既存の行は守られるが、まだ
+//! 存在しない行は誰も守らない)が、Tuple Lockの下でもPhantomが起き続ける
+//! 理由である(本文「Phantomはなぜ生き残るか」を参照)。
 
 use std::path::Path;
 
 use std::collections::HashMap;
 
-use crate::ast::{AnalyzeStatement, CreateTableStatement, DropIndexStatement, DropTableStatement, Statement};
-use crate::binder::{Binder, BoundCreateIndex, BoundStatement};
+use crate::ast::{
+    AnalyzeStatement, BeginStatement, CheckpointStatement, CommitStatement, CreateTableStatement, DropIndexStatement,
+    DropTableStatement, IsolationLevel, RollbackStatement, Statement,
+};
+use crate::binder::{Binder, BoundCreateIndex, BoundExpr, BoundStatement};
 use crate::catalog::{Catalog, TableInfo};
 use crate::error::{DbError, DbResult};
 use crate::eval::FunctionRegistry;
 use crate::executor;
-use crate::ids::TableId;
+use crate::ids::{Lsn, TableId, TransactionId};
+use crate::lock_manager::{LockKey, LockManager, LockMode, LockResult};
 use crate::logical_plan::{self, DeleteNode, InsertNode, LogicalPlan, UpdateNode};
 use crate::physical_plan::{
     self, CounterNode, CountingExec, DiskSeqScanExec, DistinctExec, Executor, FilterExec, HashAggregateExec, HashJoinExec,
@@ -68,7 +103,9 @@ use crate::rules;
 use crate::statistics::{StatsCollector, TableStats};
 use crate::storage::Storage;
 use crate::storage_mem::MemStorage;
+use crate::transaction::{self, TransactionContext, TransactionState};
 use crate::types::{Column, DataType, Schema, Tuple, Value};
+use crate::wal::WalCursor;
 
 /// テーブル定義と行を実際に保持する場所。
 ///
@@ -105,7 +142,42 @@ enum Backend {
 pub struct Database {
     functions: FunctionRegistry,
     backend: Backend,
+    /// `BEGIN`で開始した、明示的なトランザクション(第30章)。`None`は
+    /// Autocommit(明示的な`BEGIN`を伴わない文を、1文ごとに独立した
+    /// トランザクションとして扱うモード)を意味する。`Database`はこの1本しか
+    /// 持てない(`BEGIN`の入れ子を許さない設計、本文「BEGINの入れ子をどう
+    /// 扱うか」を参照)。第37章で複数セッションに分かれるまでは、1つの
+    /// `Database`が持てるActiveなトランザクションは高々1本である。
+    tx: Option<TransactionContext>,
+    /// 次に`BEGIN`(または`begin_tx`)が割り当てる`TransactionId`(第30章)。
+    /// `0`から単調増加させるだけの採番で、`Storage`側には永続化しない。
+    /// プロセスを再起動すれば`0`から採番し直すが、`TransactionId`はプロセス内
+    /// でのUndoの帳簿以上の役割を持たないため、再起動をまたいで一意である
+    /// 必要がない。`tx`と`harness_contexts`はどちらもこの採番を共有する。
+    next_txn_id: u64,
+    /// 決定的インターリーブテストハーネス専用の、複数トランザクションの
+    /// 対応表(第30章、後述の「決定的インターリーブテストハーネス専用の
+    /// 内部API」を参照)。通常のSQL経路(`execute`)はこのフィールドに一切
+    /// 触れない。
+    harness_contexts: HashMap<TransactionId, TransactionContext>,
+    /// SELECT・DMLが取得するShared/Exclusiveロックを管理する(第31章)。
+    /// 通常のSQL経路(`execute`・`tx`)とハーネス経路(`begin_tx`・
+    /// `harness_contexts`)は、この1個の`LockManager`を共有する。
+    /// `TransactionId`はどちらの経路でも同じ`next_txn_id`から採番されるため、
+    /// 両者が同時に同じ行・テーブルへ触れれば、この`lock_manager`を通じて
+    /// 正しく衝突する(ロックの粒度は`crate::database`モジュール冒頭の
+    /// 「ロックの粒度」節、統合の詳細は`execute_bound_statement`・
+    /// `acquire_scan_locks`を参照)。
+    lock_manager: LockManager<LockKey>,
 }
+
+/// [`Database::begin_tx`]が返す、1本のトランザクションを指す不透明な識別子。
+///
+/// 中身(`TransactionId`)はハーネスのコード自身も直接読む必要が無いため、
+/// フィールドは非公開にしてある。`Database::execute_in_tx`・`commit_tx`・
+/// `rollback_tx`へ渡す以外の使い道を持たない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxHandle(TransactionId);
 
 impl Database {
     /// インメモリのDatabaseを作る。組み込みのScalar Function(`abs`、`length`)は
@@ -122,6 +194,10 @@ impl Database {
                 storage: MemStorage::new(),
                 stats: HashMap::new(),
             },
+            tx: None,
+            next_txn_id: 0,
+            harness_contexts: HashMap::new(),
+            lock_manager: LockManager::new(),
         }
     }
 
@@ -149,6 +225,10 @@ impl Database {
         Ok(Database {
             functions: FunctionRegistry::with_builtins(),
             backend: Backend::Disk { storage: Box::new(storage) },
+            tx: None,
+            next_txn_id: 0,
+            harness_contexts: HashMap::new(),
+            lock_manager: LockManager::new(),
         })
     }
 
@@ -174,6 +254,42 @@ impl Database {
                 storage.sync()
             }
         }
+    }
+
+    /// これまでにWALへ書いた全レコードを、開発者が目視で確認できる文字列へ
+    /// 整形して返す(第33章)。Memoryバックエンドは常に空の`Vec`を返す
+    /// (WALを持たない)。`Storage::wal_dump`の薄い委譲であり、詳しくは
+    /// そちらのドキュメントを参照。
+    pub fn wal_dump(&self) -> Vec<String> {
+        match &self.backend {
+            Backend::Memory { .. } => Vec::new(),
+            Backend::Disk { storage } => storage.wal_dump(),
+        }
+    }
+
+    /// `Database::open`が起動時に実行したCrash Recovery(第34章)の要約。
+    /// Memoryバックエンド、または新規作成した(既存ファイルが無かった)
+    /// Diskバックエンドでは`None`。
+    pub fn last_recovery_report(&self) -> Option<crate::recovery::RecoveryReport> {
+        match &self.backend {
+            Backend::Memory { .. } => None,
+            Backend::Disk { storage } => storage.last_recovery_report(),
+        }
+    }
+
+    /// 現在のトランザクション状態(第30章)。`None`はAutocommit、つまり
+    /// `BEGIN`していない状態を表す。
+    pub fn transaction_state(&self) -> Option<TransactionState> {
+        self.tx.as_ref().map(|tx| tx.state)
+    }
+
+    /// 通常のSQL経路(`execute`)が`BEGIN`で開始した、現在`Active`または
+    /// `Aborted`なトランザクションの`TransactionId`(第30章)。`None`は
+    /// Autocommitを表す。決定的インターリーブテストハーネス(`begin_tx`等)が
+    /// 作る`TransactionId`とは別の採番だが、`Database`の中では同じカウンタ
+    /// (`next_txn_id`)を共有する。
+    pub fn current_transaction_id(&self) -> Option<TransactionId> {
+        self.tx.as_ref().map(|tx| tx.id)
     }
 
     /// 現在のカタログへの参照。
@@ -211,21 +327,343 @@ impl Database {
     /// どちらもそのまま呼び出し元に伝わる。`LogicalPlan`への変換自体は失敗しない
     /// (`Binder`がすでに名前・型を確定させているため、`BoundStatement`から
     /// `LogicalPlan`への変換は形を組み替えるだけで、新たに検出すべき誤りが無い)。
+    /// 第30章から、この関数は`BEGIN`・`COMMIT`・`ROLLBACK`という3つの
+    /// トランザクション境界文をここで直接振り分ける。それ以外の文(`SELECT`
+    /// 以下、これまでどおりの9種類)は`execute_bound_statement`へ委ね、
+    /// 実行結果に応じて`finish`が「Active中の失敗はAbortedへ遷移させる」
+    /// (本文「Statement Error時のAbort」)を適用する。`BEGIN`・`COMMIT`・
+    /// `ROLLBACK`自身の失敗(たとえば`BEGIN`の入れ子)は`finish`を経由しない。
+    /// トランザクション制御文の成否とトランザクションの状態遷移は、
+    /// `execute_begin`・`execute_commit`・`execute_rollback`自身がすでに
+    /// 一貫した形で管理しているため、ここでさらに“失敗したら状態を変える”
+    /// という規則を重ねると、たとえば入れ子`BEGIN`のエラーが進行中の
+    /// トランザクションまで巻き込んでAbortedにしてしまう。
     pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
-        let statement = crate::parser::parse_statement(sql)?;
+        let statement = match crate::parser::parse_statement(sql) {
+            Ok(statement) => statement,
+            Err(err) => return self.finish(Err(err)),
+        };
+
+        match statement {
+            Statement::Begin(begin) => self.execute_begin(begin),
+            Statement::Commit(commit) => self.execute_commit(commit),
+            Statement::Rollback(rollback) => self.execute_rollback(rollback),
+            Statement::Checkpoint(checkpoint) => self.execute_checkpoint(checkpoint),
+            statement => {
+                if let Some(tx) = &self.tx
+                    && tx.state == TransactionState::Aborted
+                {
+                    return Err(aborted_error(tx.victim_of_deadlock));
+                }
+                let result = self.execute_bound_statement(statement, sql);
+                self.finish(result)
+            }
+        }
+    }
+
+    /// `Active`なトランザクション中に実行した通常の文(`BEGIN`・`COMMIT`・
+    /// `ROLLBACK`以外)が失敗したら、トランザクションを`Aborted`へ遷移させる。
+    /// 以後は`ROLLBACK`だけを受け付ける(本文「Statement Error時のAbort」を
+    /// 参照)。Autocommit(`self.tx`が`None`)の場合は何もしない。
+    ///
+    /// 第31章から、`DbError::WouldBlock`(ロックを獲得できなかった)だけは
+    /// この遷移の対象外にする。この文は一切実行されていない(書き込みも
+    /// `undo_log`への記録も無い)ため、`Aborted`へ倒す理由が無い。呼び出し元は
+    /// あとで同じ文をもう一度試せる(本文「`WouldBlock`は失敗ではない」を参照)。
+    fn finish(&mut self, result: DbResult<QueryResult>) -> DbResult<QueryResult> {
+        if matches!(result, Err(DbError::WouldBlock)) {
+            return result;
+        }
+        if result.is_err()
+            && let Some(tx) = &mut self.tx
+            && tx.state == TransactionState::Active
+        {
+            tx.state = TransactionState::Aborted;
+        }
+        result
+    }
+
+    /// この文のロックを持つべきトランザクション(第31章)。`Active`な
+    /// トランザクション(`self.tx`、通常のSQL経路の`BEGIN`、またはハーネスの
+    /// `execute_in_tx`が差し替えた値)があればその`TransactionId`をそのまま
+    /// 使う。無ければ(Autocommit)、この1文だけのために新しい`TransactionId`を
+    /// 割り当てる。Autocommitで割り当てたIDは、この文の実行が終わったら
+    /// `execute_bound_statement`がその場で`lock_manager.release_all`する
+    /// (本文「Autocommit文のロックは文の間だけ」を参照)。
+    fn lock_owner(&mut self) -> TransactionId {
+        match &self.tx {
+            Some(tx) => tx.id,
+            None => {
+                let id = TransactionId(self.next_txn_id);
+                self.next_txn_id += 1;
+                id
+            }
+        }
+    }
+
+    /// 構文解析済みの`Statement`(`BEGIN`・`COMMIT`・`ROLLBACK`以外)を束縛し、
+    /// 実行する。第16〜29章の`execute`本体そのものであり、この章が新設した
+    /// トランザクション境界の判定・遷移はすべて呼び出し元(`execute`)が担う。
+    ///
+    /// 第31章から、実行の前に`lock_owner`でこの文のロック保持者を決める。
+    /// `SELECT`・`UPDATE`・`DELETE`はそれぞれの実行関数の中でこの
+    /// `TransactionId`を使ってロックを獲得する(`INSERT`がロックを取らない
+    /// 理由は`crate::database`モジュール冒頭「ロックの粒度」を参照)。
+    /// Autocommit(`self.tx`が`None`)であれば、文の実行が成功・失敗の
+    /// どちらであっても、終わった時点でこの文のために取ったロックをすべて
+    /// 手放す。`Active`なトランザクションの中であれば手放さず、
+    /// `COMMIT`・`ROLLBACK`(`execute_commit`・`execute_rollback`・
+    /// `commit_tx`・`rollback_tx`)まで持ち越す。これがStrict 2PLの
+    /// Growing Phase(獲得だけを行い、独立したShrinking Phaseを持たない)を
+    /// この実装で表している部分である。
+    fn execute_bound_statement(&mut self, statement: Statement, sql: &str) -> DbResult<QueryResult> {
         let bound = self.bind(statement, sql)?;
-        match bound {
-            BoundStatement::Select(select) => self.execute_select(logical_plan::build_select(*select)),
+        let owner = self.lock_owner();
+        let result = match bound {
+            BoundStatement::Select(select) => self.execute_select(logical_plan::build_select(*select), owner),
             BoundStatement::CreateTable(create) => self.execute_create_table(&create),
             BoundStatement::DropTable(drop) => self.execute_drop_table(&drop),
             BoundStatement::CreateIndex(create) => self.execute_create_index(create),
             BoundStatement::DropIndex(drop) => self.execute_drop_index(&drop),
-            BoundStatement::Insert(insert) => self.execute_insert(logical_plan::build_insert(insert)),
-            BoundStatement::Update(update) => self.execute_update(logical_plan::build_update(update)),
-            BoundStatement::Delete(delete) => self.execute_delete(logical_plan::build_delete(delete)),
-            BoundStatement::Explain { inner, analyze } => self.execute_explain(*inner, analyze),
+            BoundStatement::Insert(insert) => self.execute_insert(logical_plan::build_insert(insert), owner),
+            BoundStatement::Update(update) => self.execute_update(logical_plan::build_update(update), owner),
+            BoundStatement::Delete(delete) => self.execute_delete(logical_plan::build_delete(delete), owner),
+            BoundStatement::Explain { inner, analyze } => self.execute_explain(*inner, analyze, owner),
             BoundStatement::Analyze(analyze) => self.execute_analyze(analyze),
+            BoundStatement::Begin(_) | BoundStatement::Commit(_) | BoundStatement::Rollback(_) | BoundStatement::Checkpoint(_) => {
+                unreachable!("BEGIN・COMMIT・ROLLBACK・CHECKPOINTはexecuteの先頭ですでに処理済み")
+            }
+        };
+        if self.tx.is_none() {
+            self.lock_manager.release_all(owner);
         }
+        result
+    }
+
+    /// `BEGIN`を実行する。すでに`Active`なトランザクションがあれば、その
+    /// 入れ子を許さずエラーにする(本文「BEGINの入れ子をどう扱うか」を参照)。
+    ///
+    /// # 分離レベルの既定値(第32章)
+    ///
+    /// `BEGIN ISOLATION LEVEL ...`を省略した`BEGIN`単体は`RepeatableRead`を
+    /// 既定にする。PostgreSQLの既定(`Read Committed`)とは異なる選択だが、
+    /// このクレートは第31章の時点ですでにStrict 2PL(Shared LockもCOMMITまで
+    /// 保持する、`RepeatableRead`相当の規律)で動いていた。`Read Committed`を
+    /// 既定にすると、第31章までに書いた`BEGIN`を伴うテスト・本文の例すべてが
+    /// (読み取りロックを文の終わりで解放する挙動へ)無言で意味を変えてしまう。
+    /// 明示的に`BEGIN ISOLATION LEVEL ...`と書いた場合にだけ、その分離レベルの
+    /// 規律に従う。
+    fn execute_begin(&mut self, begin: BeginStatement) -> DbResult<QueryResult> {
+        if self.tx.is_some() {
+            return Err(DbError::TransactionAlreadyActive);
+        }
+        let id = TransactionId(self.next_txn_id);
+        self.next_txn_id += 1;
+        let level = begin.isolation_level.unwrap_or(IsolationLevel::RepeatableRead);
+        self.tx = Some(TransactionContext::new(id, level));
+        Ok(QueryResult::command("BEGIN"))
+    }
+
+    /// `COMMIT`を実行する。トランザクションが無ければ`DbError::NoActiveTransaction`、
+    /// `Aborted`状態であれば`DbError::TransactionAborted`を返す。PostgreSQLは
+    /// `Aborted`状態への`COMMIT`を暗黙の`ROLLBACK`として受理するが、この章では
+    /// 採らない(本文「Statement Error時のAbort」で理由を説明する)。積んだ
+    /// `undo_log`はここでは適用せず、ただ捨てる。`Active`の間に行った書き込みは
+    /// すでに`backend`に反映済みであり、`COMMIT`はその状態を追認するだけで
+    /// 良い。
+    fn execute_commit(&mut self, _commit: CommitStatement) -> DbResult<QueryResult> {
+        match &self.tx {
+            None => Err(DbError::NoActiveTransaction),
+            Some(tx) if tx.state == TransactionState::Aborted => Err(aborted_error(tx.victim_of_deadlock)),
+            Some(_) => {
+                let tx = self.tx.take().expect("直前のmatchでSomeを確認済み");
+                wal_commit_if_disk(&self.backend, tx.id, tx.wal_last_lsn)?;
+                self.lock_manager.release_all(tx.id);
+                Ok(QueryResult::command("COMMIT"))
+            }
+        }
+    }
+
+    /// `ROLLBACK`を実行する。`Active`・`Aborted`のどちらの状態でも受理し、
+    /// `BEGIN`以降に積んだ`undo_log`を逆順に適用してから`tx`を手放す
+    /// (`crate::transaction::apply_undo_memory`・`apply_undo_disk`)。
+    fn execute_rollback(&mut self, _rollback: RollbackStatement) -> DbResult<QueryResult> {
+        let Some(tx) = self.tx.take() else {
+            return Err(DbError::NoActiveTransaction);
+        };
+        match &mut self.backend {
+            Backend::Memory { storage, .. } => transaction::apply_undo_memory(storage, tx.undo_log),
+            Backend::Disk { storage } => wal_rollback_if_disk(storage, tx.id, tx.wal_last_lsn)?,
+        }
+        self.lock_manager.release_all(tx.id);
+        Ok(QueryResult::command("ROLLBACK"))
+    }
+
+    /// `CHECKPOINT`を実行する(第34章)。
+    ///
+    /// Memoryバックエンドはそもそも永続化しない(WALを持たない)ため何もしない。
+    /// Diskバックエンドは、現在Activeなトランザクションを全部、Active
+    /// Transaction一覧として`Storage::checkpoint`へ渡す。通常のSQL経路の
+    /// `self.tx`(高々1本)だけでなく、決定的インターリーブテストハーネス
+    /// (`harness_contexts`)が持つトランザクションも含める。`self.tx`と
+    /// `harness_contexts`は同じ`Database`が同時に持つ、対等なActive
+    /// トランザクションの集合であり(採番自体も共有している、`begin_tx`の
+    /// ドキュメントを参照)、`CHECKPOINT`の視点からハーネス経由かどうかを
+    /// 区別する理由が無い。これを省くと、`begin_tx`で開始したトランザクション
+    /// が`INSERT`したあと`CHECKPOINT`をまたいで再起動したとき、Analysisが
+    /// そのトランザクションの存在自体を知らないままRedoだけ行い、`Commit`
+    /// レコードの無い未確定の行がUndoされずに残ってしまう(この章のレビューで
+    /// 実際に指摘された不具合)。トランザクションの境界文ではないため、
+    /// `self.tx`・`harness_contexts`のどちらの状態も変えない。
+    fn execute_checkpoint(&mut self, _checkpoint: CheckpointStatement) -> DbResult<QueryResult> {
+        let mut active: Vec<(TransactionId, Option<Lsn>)> =
+            self.tx.as_ref().map(|tx| vec![(tx.id, tx.wal_last_lsn)]).unwrap_or_default();
+        active.extend(self.harness_contexts.values().map(|ctx| (ctx.id, ctx.wal_last_lsn)));
+        match &mut self.backend {
+            Backend::Memory { .. } => {}
+            Backend::Disk { storage } => {
+                storage.checkpoint(&active)?;
+            }
+        }
+        Ok(QueryResult::command("CHECKPOINT"))
+    }
+
+    /// `undo`を、`Active`なトランザクションがあればその`undo_log`へ積む。
+    /// Autocommit(`self.tx`が`None`)であれば、この文の変更を取り消す先が
+    /// 無い(Statement Rollbackがすでに文単位のAll-or-Nothingを保証している
+    /// ため、そもそも積む必要が無い)ので、そのまま捨てる。
+    fn record_undo(&mut self, undo: Vec<transaction::UndoRecord>) {
+        if undo.is_empty() {
+            return;
+        }
+        if let Some(tx) = &mut self.tx {
+            tx.undo_log.extend(undo);
+        }
+    }
+
+    // ---- 決定的インターリーブテストハーネス専用の内部API(第30章) ----
+    //
+    // 通常のSQL経路(`execute`)は、`Database`が`Active`なトランザクションを
+    // 高々1本しか持てない設計である(`tx: Option<TransactionContext>`)。
+    // ところがトランザクションのインターリーブを検証するテストは、複数の
+    // 未コミットトランザクションを、1つの`Database`の上で交互に進める必要が
+    // ある。Buffer PoolとB+Treeがスレッドセーフになるのは第35章であり、実際に
+    // 複数スレッドを立てて競合させることはまだできないため、「単一スレッド上で、
+    // 複数のトランザクションの文を指定した順序で交互に実行する」という形で
+    // インターリーブを再現する。
+    //
+    // `harness_contexts`は、`begin_tx`が作った`TransactionContext`を
+    // `TransactionId`ごとに保持する対応表である。`execute_in_tx`は、対象の
+    // `TransactionContext`を対応表から取り出して一時的に`self.tx`へ差し替え、
+    // 通常のSQL経路と共有の`execute_bound_statement`・`finish`をそのまま呼んだ
+    // あと、変化した`TransactionContext`(`undo_log`が伸びている、または
+    // `Aborted`へ遷移している)を対応表へ戻す。実行ロジック自体
+    // (`INSERT`・`UPDATE`・`DELETE`・`SELECT`のBind・実行・Undo記録・Abort遷移)
+    // は通常のSQL経路と完全に共有され、ハーネスのために複製しない。
+    //
+    // このAPIはSQLの構文(`BEGIN`・`COMMIT`・`ROLLBACK`)を経由しない。
+    // `TxHandle`は`Database`の外からは中身の見えない不透明な識別子であり、
+    // SQL文字列として`BEGIN`を書く通常の経路とは独立している(モジュール冒頭の
+    // 「SQL/REPL経路は単一トランザクションのまま」という設計判断のとおり)。
+
+    /// 新しいトランザクションを開始し、以後`execute_in_tx`・`commit_tx`・
+    /// `rollback_tx`で参照する`TxHandle`を返す。通常のSQL経路の`self.tx`には
+    /// 触れないため、`execute`(`BEGIN`を含む)と`begin_tx`は互いに独立している。
+    ///
+    /// 分離レベルは`RepeatableRead`が既定になる(`execute_begin`が`BEGIN`単体に
+    /// 対して選ぶ既定と同じ、理由も同じ)。他の分離レベルで開始したい場合は
+    /// [`Database::begin_tx_with_isolation`]を使う。
+    pub fn begin_tx(&mut self) -> TxHandle {
+        self.begin_tx_with_isolation(IsolationLevel::RepeatableRead)
+    }
+
+    /// [`Database::begin_tx`]と同じだが、分離レベルを明示的に指定できる
+    /// (第32章)。ハーネスのテストが`READ UNCOMMITTED`・`READ COMMITTED`・
+    /// `SERIALIZABLE`でのインターリーブを組み立てるときに使う。
+    pub fn begin_tx_with_isolation(&mut self, isolation_level: IsolationLevel) -> TxHandle {
+        let id = TransactionId(self.next_txn_id);
+        self.next_txn_id += 1;
+        self.harness_contexts.insert(id, TransactionContext::new(id, isolation_level));
+        TxHandle(id)
+    }
+
+    /// `handle`が指すトランザクションの中で、`sql`を1文実行する。
+    ///
+    /// `handle`が`Aborted`状態であれば、`ROLLBACK`と同じ文言でしか区別できない
+    /// `DbError::TransactionAborted`を返す(通常のSQL経路の`execute`が
+    /// `Aborted`中に他の文を拒否するのと同じ規則)。`handle`が指す
+    /// トランザクションがすでに`commit_tx`・`rollback_tx`で終わっている場合は
+    /// panicする(ハーネスの使い方の誤りであり、SQLの実行時エラーではない)。
+    ///
+    /// 第31章から、この文が必要とするロックのどれかを他の`handle`が
+    /// 両立しないモードで持っていれば、`Err(DbError::WouldBlock)`を返す。
+    /// この場合、`handle`のトランザクションは`Active`のまま変化せず
+    /// (`finish`がこのエラーだけ`Aborted`への遷移から除外する)、`sql`は
+    /// 一切実行されていない。呼び出し元(ハーネスを使うテストコード)は、
+    /// ロックを塞いでいる側の`commit_tx`・`rollback_tx`を呼んだあとで、
+    /// 同じ`sql`を引数にもう一度`execute_in_tx`を呼び直す。この再試行を
+    /// 自動的に行うスケジューラは無い(モジュール`crate::lock_manager`冒頭の
+    /// 説明を参照)。
+    pub fn execute_in_tx(&mut self, handle: &TxHandle, sql: &str) -> DbResult<QueryResult> {
+        let ctx = self
+            .harness_contexts
+            .remove(&handle.0)
+            .expect("TxHandleはすでにcommit_tx・rollback_tx済み、または他のDatabaseのものです");
+        if ctx.state == TransactionState::Aborted {
+            let err = aborted_error(ctx.victim_of_deadlock);
+            self.harness_contexts.insert(handle.0, ctx);
+            return Err(err);
+        }
+
+        // 通常のSQL経路が使う`self.tx`を、この文の間だけ`ctx`に差し替える。
+        // ハーネスのテストは`execute`(`db.execute("BEGIN")`等)を併用しない
+        // 前提なので、差し替え前の`self.tx`は常に`None`のはずだが、`Option`の
+        // まま保存して差し替え後に戻すことで、その前提が破られても値を失わない。
+        let previous = self.tx.replace(ctx);
+        let statement = crate::parser::parse_statement(sql);
+        let result = match statement {
+            Ok(statement) => self.execute_bound_statement(statement, sql),
+            Err(err) => Err(err),
+        };
+        let result = self.finish(result);
+        let ctx = self.tx.take().expect("execute_bound_statementはself.txを取り除かない");
+        self.tx = previous;
+        self.harness_contexts.insert(handle.0, ctx);
+        result
+    }
+
+    /// `handle`が指すトランザクションを確定する。`Aborted`状態であれば
+    /// `DbError::TransactionAborted`を返し、`ROLLBACK`しか受け付けない
+    /// (`execute_commit`と同じ規則)。
+    pub fn commit_tx(&mut self, handle: TxHandle) -> DbResult<()> {
+        let ctx = self
+            .harness_contexts
+            .remove(&handle.0)
+            .expect("TxHandleはすでにcommit_tx・rollback_tx済み、または他のDatabaseのものです");
+        if ctx.state == TransactionState::Aborted {
+            let err = aborted_error(ctx.victim_of_deadlock);
+            self.harness_contexts.insert(handle.0, ctx);
+            return Err(err);
+        }
+        wal_commit_if_disk(&self.backend, ctx.id, ctx.wal_last_lsn)?;
+        self.lock_manager.release_all(ctx.id);
+        Ok(())
+    }
+
+    /// `handle`が指すトランザクションが積んだ`undo_log`(Memoryバックエンド)
+    /// またはWALの`prev_lsn`連鎖(Diskバックエンド、第33章)を逆順に適用し、
+    /// `BEGIN`(`begin_tx`)以降の変更を取り消す。
+    pub fn rollback_tx(&mut self, handle: TxHandle) -> DbResult<()> {
+        let ctx = self
+            .harness_contexts
+            .remove(&handle.0)
+            .expect("TxHandleはすでにcommit_tx・rollback_tx済み、または他のDatabaseのものです");
+        match &mut self.backend {
+            Backend::Memory { storage, .. } => transaction::apply_undo_memory(storage, ctx.undo_log),
+            Backend::Disk { storage } => wal_rollback_if_disk(storage, ctx.id, ctx.wal_last_lsn)?,
+        }
+        self.lock_manager.release_all(ctx.id);
+        Ok(())
     }
 
     /// `CREATE TABLE`を実行し、列定義を`Schema`へ変換したうえで`Catalog`に登録し、
@@ -390,7 +828,17 @@ impl Database {
     /// 「最終的にクライアントへ返す結果の件数」に比例する。ストリーミング
     /// 実行が効くのは、あくまで計画の中間段階(`Filter`を通過する前の
     /// 候補行、`WHERE`に一致しなかった行)がメモリに残らないという点である。
-    fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {
+    ///
+    /// 第31章から、計画を組み立てたあと・実行するより前に、この`SELECT`が
+    /// 走査するテーブルすべてに対して`owner`名義でSharedロックを獲得する
+    /// (`acquire_scan_locks`)。獲得できなければ`Err(DbError::WouldBlock)`を
+    /// 返し、`Executor`は一切組み立てない(ロックを取れなかった`SELECT`は
+    /// 1行も読まない)。
+    fn execute_select(&mut self, plan: LogicalPlan, owner: TransactionId) -> DbResult<QueryResult> {
+        let mut scanned = Vec::new();
+        collect_scan_tables(&plan, &mut scanned);
+        self.acquire_scan_locks(owner, &scanned, LockMode::Shared)?;
+
         let plan = rules::optimize(plan, &self.functions);
         let physical = physical_plan::optimize(plan, self.index_storage(), self);
         let schema = physical.output_schema();
@@ -401,6 +849,290 @@ impl Database {
             rows.push(tuple);
         }
         Ok(QueryResult { schema, rows, command_tag: None })
+    }
+
+    /// `owner`の分離レベル(第32章)。通常のSQL経路の`self.tx`(`owner`と
+    /// `TransactionId`が一致すれば)、無ければハーネスの`harness_contexts`を
+    /// 見る。どちらにも無ければ`owner`はAutocommit用に`lock_owner`が
+    /// その場で割り当てた一時IDであり(`TransactionContext`自体が存在しない)、
+    /// `RepeatableRead`を返す。Autocommitの1文はそれ自体が完結したトランザク
+    /// ションであり、文の終わりに`execute_bound_statement`がロックを一括で
+    /// 手放す(`RepeatableRead`か`ReadCommitted`かで、文の**途中**の解放
+    /// タイミングに違いは出ない)。
+    fn isolation_level_of(&self, owner: TransactionId) -> IsolationLevel {
+        if let Some(tx) = &self.tx
+            && tx.id == owner
+        {
+            return tx.isolation_level;
+        }
+        if let Some(ctx) = self.harness_contexts.get(&owner) {
+            return ctx.isolation_level;
+        }
+        IsolationLevel::RepeatableRead
+    }
+
+    /// `owner`名義で`key`に`mode`のロックを1つ獲得する。`Blocked`になった場合は
+    /// [`Database::detect_deadlock`]でWait-for Graphを調べ、循環を検出できれば
+    /// Victimを強制的に`Aborted`へ倒してから再試行する(第32章、本文
+    /// 「デッドロックの検出と解決」を参照)。
+    ///
+    /// # 3つの結果
+    ///
+    /// 1. `Granted`(またはBlockedを検出・解決できて再試行が`Granted`): `Ok(())`。
+    /// 2. 循環が見つからない(単に他のトランザクションが保持中): `Err(WouldBlock)`。
+    /// 3. 循環が見つかり、`owner`自身がVictimに選ばれた: `Err(DeadlockDetected)`。
+    ///    この場合`owner`のトランザクションはすでに`Aborted`へ遷移済みである。
+    fn acquire_lock_or_detect_deadlock(&mut self, owner: TransactionId, key: LockKey, mode: LockMode) -> DbResult<()> {
+        if self.lock_manager.acquire(owner, key, mode) == LockResult::Granted {
+            return Ok(());
+        }
+        match self.detect_deadlock(owner)? {
+            None => Err(DbError::WouldBlock),
+            Some(victim) if victim == owner => Err(DbError::DeadlockDetected),
+            Some(_) => {
+                // 別のトランザクションをVictimとして倒したことで、`owner`が
+                // 待ち行列の中ですでに昇格しているかもしれない
+                // (`LockManager::release_all`の`promote_waiters`を参照)。
+                // 昇格していれば`acquire`は`Granted`をその場で返す。まだ
+                // 昇格していなければ(循環は解けたが、循環に含まれない
+                // 別のトランザクションがまだ`key`を保持している場合)、
+                // 通常の`WouldBlock`として呼び出し元に再試行を委ねる。
+                if self.lock_manager.acquire(owner, key, mode) == LockResult::Granted {
+                    Ok(())
+                } else {
+                    Err(DbError::WouldBlock)
+                }
+            }
+        }
+    }
+
+    /// `owner`が新しく作った待ち要求を起点に、Wait-for Graphへ循環が生じて
+    /// いないか調べる(第32章)。
+    ///
+    /// # Wait-for Graphの組み立てとVictim Selection
+    ///
+    /// `LockManager::wait_for_edges`が返す「誰が誰を待っているか」の辺から
+    /// 隣接表を作り、`owner`を起点にDFSで`owner`自身へ戻ってくる経路を探す。
+    /// 見つかった経路が閉路であり、この実装が検出する循環はすべて`owner`を
+    /// 含む(`owner`を経由しない、無関係な部分にある循環までは探索しない。
+    /// この単純化を選んだ理由は本文「検出のタイミング」を参照)。
+    ///
+    /// 循環が見つかったら、その中で最も**新しい**`TransactionId`(最若、
+    /// 最後に`BEGIN`したトランザクション)をVictimに選ぶ
+    /// (`crate::transaction`モジュールの`TransactionId`は単調増加で採番される、
+    /// 本文「Victim Selection: 最若TxIDを選ぶ」で理由を説明する)。選んだ
+    /// Victimは[`Database::abort_transaction`]で即座に強制Abortし、循環を
+    /// 物理的に断ち切ってから`Some(victim)`を返す。循環が見つからなければ
+    /// `None`を返す(呼び出し元は通常の`WouldBlock`を返す)。
+    fn detect_deadlock(&mut self, owner: TransactionId) -> DbResult<Option<TransactionId>> {
+        let edges = self.lock_manager.wait_for_edges();
+        let mut adjacency: HashMap<TransactionId, Vec<TransactionId>> = HashMap::new();
+        for (waiter, holder) in edges {
+            adjacency.entry(waiter).or_default().push(holder);
+        }
+        for neighbors in adjacency.values_mut() {
+            neighbors.sort_by_key(|t| t.0);
+            neighbors.dedup();
+        }
+
+        let Some(cycle) = find_cycle_containing(&adjacency, owner) else {
+            return Ok(None);
+        };
+        let victim = cycle.into_iter().max_by_key(|t| t.0).expect("循環は少なくとも1つの要素を持つ");
+        self.abort_transaction(victim)?;
+        Ok(Some(victim))
+    }
+
+    /// `victim`を強制的に`Aborted`へ倒す(第32章のVictim Selection、または
+    /// 将来の章がタイムアウト等の理由で呼ぶことを想定した共通経路)。
+    ///
+    /// `victim`のトランザクションコンテキストは、通常のSQL経路の`self.tx`
+    /// (`id`が一致する場合)か、ハーネスの`harness_contexts`のどちらかに
+    /// ある。見つけた側から`undo_log`を取り出して`ROLLBACK`と同じ逆順適用を
+    /// 行い、`state`を`Aborted`、`victim_of_deadlock`を`true`にする。
+    ///
+    /// `TransactionContext`自体は`self.tx`・`harness_contexts`のどちらの
+    /// スロットからも取り除かない(`Option`を`None`にしたり`HashMap`から
+    /// 取り除いたりしない)。呼び出し元がすでに`self.tx`や`harness_contexts`の
+    /// 該当エントリを前提にした後始末(`execute_in_tx`が`self.tx.take()`で
+    /// 対応表へ戻す、など)を書いているため、ここでスロットの形を変えると
+    /// その前提が壊れる。この関数は中身(`state`・`undo_log`)だけを書き換える。
+    fn abort_transaction(&mut self, victim: TransactionId) -> DbResult<()> {
+        // `undo_log`だけでなく`wal_last_lsn`も、ここで使ったら
+        // (`std::mem::take`で)消費してしまう。理由は本文
+        // 「二重巻き戻しを防ぐ」を参照: この関数はVictim Selectionの結果として
+        // 呼ばれるが、呼び出し元のトランザクションは、その後で改めて
+        // `rollback_tx`・`execute_rollback`(`ROLLBACK`はAborted状態でも
+        // 唯一受け付けられる文である)を呼ぶことを想定している。もし
+        // `wal_last_lsn`をここで消費せず残したままにすると、その後の
+        // `rollback_tx`がこの`Some(lsn)`をそのまま使って**同じWALレコードを
+        // 二重に**Undoしてしまう。1回目のUndoで書き戻した値を、その後
+        // 別のトランザクションが書き換えていたとしても、2回目のUndoは
+        // それを気にせず古いBefore Imageで踏みつぶす。`undo_log`
+        // (Memoryバックエンド)はすでに`mem::take`で空にしていたため
+        // この事故を免れていたが、`wal_last_lsn`(Diskバックエンド)は
+        // `Option<Lsn>`をコピーして使うだけだったため、この章の統合テストで
+        // 実スレッドが`DeadlockDetected`を受けたあと`rollback_tx`を呼ぶという
+        // (ごく自然な)後始末をするまで、この二重巻き戻しは表面化しなかった。
+        let (undo_log, wal_last_lsn) = if let Some(tx) = &mut self.tx
+            && tx.id == victim
+        {
+            (std::mem::take(&mut tx.undo_log), tx.wal_last_lsn.take())
+        } else if let Some(ctx) = self.harness_contexts.get_mut(&victim) {
+            (std::mem::take(&mut ctx.undo_log), ctx.wal_last_lsn.take())
+        } else {
+            return Ok(());
+        };
+
+        match &mut self.backend {
+            Backend::Memory { storage, .. } => transaction::apply_undo_memory(storage, undo_log),
+            Backend::Disk { storage } => wal_rollback_if_disk(storage, victim, wal_last_lsn)?,
+        }
+        self.lock_manager.release_all(victim);
+
+        if let Some(tx) = &mut self.tx
+            && tx.id == victim
+        {
+            tx.state = TransactionState::Aborted;
+            tx.victim_of_deadlock = true;
+        } else if let Some(ctx) = self.harness_contexts.get_mut(&victim) {
+            ctx.state = TransactionState::Aborted;
+            ctx.victim_of_deadlock = true;
+        }
+        Ok(())
+    }
+
+    /// `table_ids`が指すテーブルのうち、`SELECT`が実際にロックすべき対象の
+    /// 鍵を列挙する(第31・32章)。`Backend::Memory`は`LockKey::Table`を、
+    /// `Backend::Disk`はその時点でテーブルに**存在する**行の`LockKey::Tuple`を
+    /// 返す(絞り込みの単純化は本文「タプルロックの対象をどこまで絞るか」を
+    /// 参照)。`&self`だけで完結させているのは、`Backend::Disk`の`storage`への
+    /// 借用を先に終わらせ、続く`acquire_lock_or_detect_deadlock`(`&mut self`が
+    /// 要る)の呼び出しと衝突させないためである。
+    fn scan_lock_keys(&self, table_ids: &[TableId]) -> DbResult<Vec<LockKey>> {
+        match &self.backend {
+            Backend::Memory { .. } => Ok(table_ids.iter().map(|&id| LockKey::Table(id)).collect()),
+            Backend::Disk { storage } => {
+                let mut keys = Vec::new();
+                for &table_id in table_ids {
+                    for entry in storage.scan(table_id)? {
+                        let (rid, _) = entry?;
+                        keys.push(LockKey::Tuple(table_id, rid));
+                    }
+                }
+                Ok(keys)
+            }
+        }
+    }
+
+    /// `owner`名義で、`table_ids`が指すテーブルに対して`mode`のロックを
+    /// 獲得する(第31章)。`execute_select`(`SELECT`はテーブル全体を読みうる)と、
+    /// `run_insert`のMemory分岐(`INSERT`はテーブル全体にExclusiveを取る)が
+    /// 使う。`Backend`によってロックの粒度を切り替える理由は`crate::database`
+    /// モジュール冒頭「ロックの粒度」を参照。
+    ///
+    /// # 分離レベルによる読み取りロックの規律(第32章)
+    ///
+    /// `mode`が`Shared`(=読み取り)のときだけ、`owner`の分離レベルに応じて
+    /// 次のように振る舞いを変える。`mode`が`Exclusive`(書き込み)のときは
+    /// 分離レベルを見ない。書き込みロックの規律(Strict 2PL、COMMITまで保持)は
+    /// 4つの分離レベルすべてで共通であり、変えているのは常に「読み取りに
+    /// ロックをどこまで効かせるか」だけである(本文「分離レベルが変えるのは
+    /// 読み取りの規律だけ」を参照)。
+    ///
+    /// - `ReadUncommitted`: 読み取りロックを一切取らない(Dirty Readを許す)。
+    ///   `Ok(())`を即座に返し、`LockManager`にすら触れない。
+    /// - `ReadCommitted`: 通常どおり獲得したうえで、この関数を抜ける直前に
+    ///   [`LockManager::release_keys`]で**この文で新規に取得したShared
+    ///   ロックだけ**を即座に手放す(Non-repeatable Readを許す)。`owner`が
+    ///   この文より前から(たとえば先行する`UPDATE`によって)同じ鍵にすでに
+    ///   Exclusive・Sharedロックを持っていた場合、その鍵はここでは解放しない
+    ///   (`owner`が他に持っている書き込みロック等の鍵に触れないのはもちろん、
+    ///   **同じ鍵であっても**元から持っていたロックはCOMMIT・ABORTまで保持する。
+    ///   さもないと、`UPDATE`で確定前の変更をExclusiveロックで守っていたはず
+    ///   の行が、直後の`SELECT`が同じ行をなぞっただけで解放されてしまい、
+    ///   他のトランザクションがその未確定の行を書き換えられてしまう。この
+    ///   章のレビューで実際に指摘された不具合)。「新規に取得した」かどうかは
+    ///   [`LockManager::take_pending_shared_grants`]がその都度教えてくれる
+    ///   (この関数が自前で判定しない理由は同メソッドのドキュメントを参照。
+    ///   `WouldBlock`で一度待たされたあとの再試行でも正しく判定できることが
+    ///   この委譲の要点である)。
+    /// - `RepeatableRead`: 何もせず、獲得したロックをそのまま`COMMIT`まで
+    ///   保持させる(第31章から変わらない挙動)。
+    /// - `Serializable`(`Backend::Disk`のみ): 上の`RepeatableRead`と同じ
+    ///   Tuple Lockに加え、`LockKey::Table(table_id)`にも`Shared`を取る。この
+    ///   追加の1本が、Phantomを起こす`INSERT`(`run_insert`が同じ分離レベルで
+    ///   取る`LockKey::Table`への`Exclusive`)と衝突する(本文「Serializableは
+    ///   どうPhantomを防ぐか」を参照)。`Backend::Memory`は元から`LockKey::Table`
+    ///   だけを使うため、この追加は不要である。
+    fn acquire_scan_locks(&mut self, owner: TransactionId, table_ids: &[TableId], mode: LockMode) -> DbResult<()> {
+        let level = self.isolation_level_of(owner);
+        if level == IsolationLevel::ReadUncommitted && mode == LockMode::Shared {
+            return Ok(());
+        }
+
+        let mut keys = self.scan_lock_keys(table_ids)?;
+        if level == IsolationLevel::Serializable && mode == LockMode::Shared && matches!(&self.backend, Backend::Disk { .. })
+        {
+            keys.extend(table_ids.iter().map(|&id| LockKey::Table(id)));
+        }
+
+        for &key in &keys {
+            self.acquire_lock_or_detect_deadlock(owner, key, mode)?;
+        }
+
+        if level == IsolationLevel::ReadCommitted && mode == LockMode::Shared {
+            let newly_acquired = self.lock_manager.take_pending_shared_grants(owner);
+            self.lock_manager.release_keys(owner, &newly_acquired);
+        }
+        Ok(())
+    }
+
+    /// `table_id`のうち`predicate`に一致する行の鍵を列挙する(第31・32章、
+    /// `acquire_write_locks`が使う)。`scan_lock_keys`と同じ理由で`&self`だけで
+    /// 完結させている。
+    fn write_lock_keys(
+        &self,
+        table_id: TableId,
+        schema: &Schema,
+        predicate: Option<&BoundExpr>,
+    ) -> DbResult<Vec<LockKey>> {
+        match &self.backend {
+            Backend::Memory { .. } => Ok(vec![LockKey::Table(table_id)]),
+            Backend::Disk { storage } => {
+                let rids = executor::storage_matching_rids(storage, table_id, schema, &self.functions, predicate)?;
+                Ok(rids.into_iter().map(|rid| LockKey::Tuple(table_id, rid)).collect())
+            }
+        }
+    }
+
+    /// `owner`名義で、`table_id`のうち`predicate`に一致する行にExclusive
+    /// ロックを獲得する(第31章、`run_update`・`run_delete`が使う)。書き込み
+    /// ロックの規律は分離レベルに関係なく常にStrict 2PLであるため
+    /// (`acquire_scan_locks`のドキュメントを参照)、この関数は`isolation_level_of`
+    /// を見ない。
+    ///
+    /// `Backend::Memory`はテーブル全体のExclusiveを取る(`acquire_scan_locks`と
+    /// 同じ粒度)。`Backend::Disk`は`crate::executor::storage_matching_rids`で
+    /// `predicate`に一致した行の`RecordId`だけを先に確定させ、その行だけを
+    /// ロックする。この絞り込みのおかげで、`id`の異なる行を書き換える2つの
+    /// `UPDATE`は、`Backend::Disk`のもとでは互いにブロックし合わない
+    /// (`tests/interleave_disk.rs`の`different_rows_do_not_block_each_other_under_tuple_lock`
+    /// を参照)。`acquire_scan_locks`(`SELECT`が使う、絞り込み前の全行を
+    /// ロックする関数)より細かい粒度になっているのは、対象が`SELECT`より
+    /// 単純(常にただ1個のテーブル)だからである。
+    fn acquire_write_locks(
+        &mut self,
+        owner: TransactionId,
+        table_id: TableId,
+        schema: &Schema,
+        predicate: Option<&BoundExpr>,
+    ) -> DbResult<()> {
+        let keys = self.write_lock_keys(table_id, schema, predicate)?;
+        for key in keys {
+            self.acquire_lock_or_detect_deadlock(owner, key, LockMode::Exclusive)?;
+        }
+        Ok(())
     }
 
     /// `PhysicalPlan`の木を根から葉へたどり、対応する[`Executor`]を組み立てる。
@@ -566,11 +1298,23 @@ impl Database {
     ///
     /// もう1つ明記しておく必要があるのは、`EXPLAIN ANALYZE INSERT`/`UPDATE`/
     /// `DELETE`は**実際に書き込みを行う**という点である。PostgreSQLの
-    /// `EXPLAIN (ANALYZE, ...)`と異なり、この教材はトランザクション内で
-    /// ロールバックして計測だけを取り消す機能を持たない(第29章より前に
-    /// トランザクションを導入していない)ため、`EXPLAIN ANALYZE INSERT`を
-    /// 実行すればテーブルの行は実際に増える。
-    fn execute_explain(&mut self, inner: BoundStatement, analyze: bool) -> DbResult<QueryResult> {
+    /// `EXPLAIN (ANALYZE, ...)`は計測後に自動でロールバックするが、この教材は
+    /// そこまでしない。`run_insert`等を直接呼ぶため、`Active`なトランザクション
+    /// の中で実行すれば第30章のUndoにも通常どおり乗り(そのトランザクションを
+    /// `ROLLBACK`すれば計測ぶんの書き込みも一緒に消える)、Autocommitで
+    /// 実行すればそのまま確定する。どちらの場合も、`EXPLAIN ANALYZE INSERT`を
+    /// 実行した時点でテーブルの行は実際に増える。
+    ///
+    /// **この章のロックは、`EXPLAIN`の実行経路には組み込んでいない。**
+    /// `EXPLAIN`(非`ANALYZE`)は`SELECT`・`Executor`を実行せず計画を文字列化
+    /// するだけなので、そもそもロックを取る理由が無い。`EXPLAIN ANALYZE`は
+    /// 実際に`Executor`を実行する(`SELECT`の分岐)か`run_insert`等を呼ぶ
+    /// (`INSERT`/`UPDATE`/`DELETE`の分岐)ため本来はロックが必要だが、
+    /// `SELECT`の分岐は`execute_select`を経由せず独自に`Executor`を組み立てて
+    /// おり、ここに`acquire_scan_locks`を差し込むには`execute_select`と
+    /// ほぼ同じ配線をもう1箇所複製する必要がある。この章はその複製を見送り、
+    /// `EXPLAIN ANALYZE`をロックの対象外として残す(演習課題)。
+    fn execute_explain(&mut self, inner: BoundStatement, analyze: bool, owner: TransactionId) -> DbResult<QueryResult> {
         match inner {
             BoundStatement::Select(select) => {
                 let logical = rules::optimize(logical_plan::build_select(*select), &self.functions);
@@ -588,7 +1332,7 @@ impl Database {
                 let physical = physical_plan::optimize(logical_plan::build_insert(insert.clone()), self.index_storage(), self);
                 let text = explain_text(&physical, self, self.index_storage(), None);
                 if analyze {
-                    let count = self.run_insert(logical_plan::build_insert(insert))?;
+                    let count = self.run_insert(logical_plan::build_insert(insert), owner)?;
                     Ok(QueryResult::explain(append_actual_to_root_line(&text, count)))
                 } else {
                     Ok(QueryResult::explain(text))
@@ -598,7 +1342,7 @@ impl Database {
                 let physical = physical_plan::optimize(logical_plan::build_update(update.clone()), self.index_storage(), self);
                 let text = explain_text(&physical, self, self.index_storage(), None);
                 if analyze {
-                    let count = self.run_update(logical_plan::build_update(update))?;
+                    let count = self.run_update(logical_plan::build_update(update), owner)?;
                     Ok(QueryResult::explain(append_actual_to_root_line(&text, count)))
                 } else {
                     Ok(QueryResult::explain(text))
@@ -608,7 +1352,7 @@ impl Database {
                 let physical = physical_plan::optimize(logical_plan::build_delete(delete.clone()), self.index_storage(), self);
                 let text = explain_text(&physical, self, self.index_storage(), None);
                 if analyze {
-                    let count = self.run_delete(logical_plan::build_delete(delete))?;
+                    let count = self.run_delete(logical_plan::build_delete(delete), owner)?;
                     Ok(QueryResult::explain(append_actual_to_root_line(&text, count)))
                 } else {
                     Ok(QueryResult::explain(text))
@@ -619,7 +1363,11 @@ impl Database {
             | BoundStatement::CreateIndex(_)
             | BoundStatement::DropIndex(_)
             | BoundStatement::Explain { .. }
-            | BoundStatement::Analyze(_) => {
+            | BoundStatement::Analyze(_)
+            | BoundStatement::Begin(_)
+            | BoundStatement::Commit(_)
+            | BoundStatement::Rollback(_)
+            | BoundStatement::Checkpoint(_) => {
                 unreachable!(
                     "ParserがEXPLAINの対象をSELECT・INSERT INTO・UPDATE・DELETE FROMに制限している"
                 )
@@ -655,31 +1403,60 @@ impl Database {
     /// 借用ではなく複製として)持っている。第16章まではこの複製を`execute_insert`
     /// 自身が`table_info.clone()`という形で行っていたが、`Binder`が返す時点で
     /// 複製済みになったことで、その回避策はここでは要らなくなった。
-    fn execute_insert(&mut self, plan: LogicalPlan) -> DbResult<QueryResult> {
-        let count = self.run_insert(plan)?;
+    ///
+    /// **第31章から: `INSERT`のロックはバックエンドで非対称になる。**
+    /// `Backend::Memory`ではテーブル全体にExclusiveを取る(Table Lockしか
+    /// 粒度が無いため、`SELECT`・`UPDATE`・`DELETE`と同じ対象を奪い合う)。
+    /// `Backend::Disk`では**何もロックしない**。理由は`crate::database`
+    /// モジュール冒頭「ロックの粒度」を参照(挿入する行の`RecordId`は挿入が
+    /// 終わるまで存在せず、ロックする対象が無い)。
+    fn execute_insert(&mut self, plan: LogicalPlan, owner: TransactionId) -> DbResult<QueryResult> {
+        let count = self.run_insert(plan, owner)?;
         Ok(QueryResult::command_with_count("INSERT", count))
     }
 
     /// `execute_insert`の中身のうち、実際に書き込んで影響行数を返す部分。
     /// `EXPLAIN ANALYZE INSERT`(第27章、`execute_explain`)も、`QueryResult`
     /// ではなく実測行数そのものを必要とするため、この部分だけを共有する。
-    fn run_insert(&mut self, plan: LogicalPlan) -> DbResult<usize> {
+    fn run_insert(&mut self, plan: LogicalPlan, owner: TransactionId) -> DbResult<usize> {
         let LogicalPlan::Insert(InsertNode { table_id, schema, columns, input, .. }) = plan else {
             unreachable!("logical_plan::build_insertは常にLogicalPlan::Insertを返す")
         };
         let LogicalPlan::Values(values) = *input else {
             unreachable!("logical_plan::build_insertはInsertの子に常にValuesを積む")
         };
+        if matches!(&self.backend, Backend::Memory { .. }) {
+            self.acquire_scan_locks(owner, &[table_id], LockMode::Exclusive)?;
+        } else if self.isolation_level_of(owner) == IsolationLevel::Serializable {
+            // `Backend::Disk`の`INSERT`は通常どこもロックしない(モジュール
+            // 冒頭「ロックの粒度」を参照、新しい行の`RecordId`は挿入が終わる
+            // までロックする対象自体が無い)。`Serializable`のときだけ例外で、
+            // `acquire_scan_locks`が同じ分離レベルの`SELECT`に取らせる
+            // `LockKey::Table`のSharedと衝突させるため、`Exclusive`を先に
+            // 取る(本文「SerializableはどうPhantomを防ぐか」を参照)。
+            self.acquire_lock_or_detect_deadlock(owner, LockKey::Table(table_id), LockMode::Exclusive)?;
+        }
 
         match &mut self.backend {
             Backend::Memory { storage, .. } => {
+                let mut undo = Vec::new();
                 let mem_table =
                     storage.table_mut(table_id).expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::insert(mem_table, &schema, &self.functions, columns.as_deref(), &values.rows)
+                let result = executor::insert(
+                    mem_table,
+                    table_id,
+                    &schema,
+                    &self.functions,
+                    columns.as_deref(),
+                    &values.rows,
+                    &mut undo,
+                );
+                self.record_undo(undo);
+                result
             }
-            Backend::Disk { storage } => {
-                executor::storage_insert(storage, table_id, &schema, &self.functions, columns.as_deref(), &values.rows)
-            }
+            Backend::Disk { storage } => run_disk_dml(storage, &mut self.tx, &mut self.next_txn_id, |storage, wal| {
+                executor::storage_insert(storage, table_id, &schema, &self.functions, columns.as_deref(), &values.rows, wal)
+            }),
         }
     }
 
@@ -693,26 +1470,43 @@ impl Database {
     /// `predicate`を評価し、一致した行だけ書き換える」という1回の走査に
     /// まとめて行うため、ここでは`input`を実際にたどらず`table_id`・`schema`
     /// だけを取り出す(`logical_plan::build_update`のドキュメント参照)。
-    fn execute_update(&mut self, plan: LogicalPlan) -> DbResult<QueryResult> {
-        let count = self.run_update(plan)?;
+    fn execute_update(&mut self, plan: LogicalPlan, owner: TransactionId) -> DbResult<QueryResult> {
+        let count = self.run_update(plan, owner)?;
         Ok(QueryResult::command_with_count("UPDATE", count))
     }
 
     /// `execute_update`と`EXPLAIN ANALYZE UPDATE`が共有する、実際に書き込む部分。
-    fn run_update(&mut self, plan: LogicalPlan) -> DbResult<usize> {
+    ///
+    /// 第31章から、書き換えに入る前に`owner`名義で対象行へExclusiveロックを
+    /// 獲得する(`acquire_write_locks`)。獲得できなければ
+    /// `Err(DbError::WouldBlock)`を返し、`executor::update`・`storage_update`は
+    /// 一切呼ばない(ロックを取れなかった`UPDATE`は1行も書き換えない)。
+    fn run_update(&mut self, plan: LogicalPlan, owner: TransactionId) -> DbResult<usize> {
         let LogicalPlan::Update(UpdateNode { table_id, schema, assignments, predicate, .. }) = plan else {
             unreachable!("logical_plan::build_updateは常にLogicalPlan::Updateを返す")
         };
+        self.acquire_write_locks(owner, table_id, &schema, predicate.as_ref())?;
 
         match &mut self.backend {
             Backend::Memory { storage, .. } => {
+                let mut undo = Vec::new();
                 let mem_table =
                     storage.table_mut(table_id).expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::update(mem_table, &schema, &self.functions, &assignments, predicate.as_ref())
+                let result = executor::update(
+                    mem_table,
+                    table_id,
+                    &schema,
+                    &self.functions,
+                    &assignments,
+                    predicate.as_ref(),
+                    &mut undo,
+                );
+                self.record_undo(undo);
+                result
             }
-            Backend::Disk { storage } => {
-                executor::storage_update(storage, table_id, &schema, &self.functions, &assignments, predicate.as_ref())
-            }
+            Backend::Disk { storage } => run_disk_dml(storage, &mut self.tx, &mut self.next_txn_id, |storage, wal| {
+                executor::storage_update(storage, table_id, &schema, &self.functions, &assignments, predicate.as_ref(), wal)
+            }),
         }
     }
 
@@ -720,26 +1514,31 @@ impl Database {
     /// が、`WHERE`に一致した行の削除までを行う。テーブル名・`WHERE`の名前解決と
     /// 型検査は`Binder`の`bind_delete`が済ませている。`DeleteNode::input`を
     /// 実際にたどらない理由は`execute_update`と同じ。
-    fn execute_delete(&mut self, plan: LogicalPlan) -> DbResult<QueryResult> {
-        let count = self.run_delete(plan)?;
+    fn execute_delete(&mut self, plan: LogicalPlan, owner: TransactionId) -> DbResult<QueryResult> {
+        let count = self.run_delete(plan, owner)?;
         Ok(QueryResult::command_with_count("DELETE", count))
     }
 
     /// `execute_delete`と`EXPLAIN ANALYZE DELETE`が共有する、実際に書き込む部分。
-    fn run_delete(&mut self, plan: LogicalPlan) -> DbResult<usize> {
+    /// ロックの獲得は`run_update`と同じ(`acquire_write_locks`を呼ぶ)。
+    fn run_delete(&mut self, plan: LogicalPlan, owner: TransactionId) -> DbResult<usize> {
         let LogicalPlan::Delete(DeleteNode { table_id, schema, predicate, .. }) = plan else {
             unreachable!("logical_plan::build_deleteは常にLogicalPlan::Deleteを返す")
         };
+        self.acquire_write_locks(owner, table_id, &schema, predicate.as_ref())?;
 
         match &mut self.backend {
             Backend::Memory { storage, .. } => {
+                let mut undo = Vec::new();
                 let mem_table =
                     storage.table_mut(table_id).expect("catalogに登録されたテーブルはstorageにも必ず存在する");
-                executor::delete(mem_table, &schema, &self.functions, predicate.as_ref())
+                let result = executor::delete(mem_table, table_id, &schema, &self.functions, predicate.as_ref(), &mut undo);
+                self.record_undo(undo);
+                result
             }
-            Backend::Disk { storage } => {
-                executor::storage_delete(storage, table_id, &schema, &self.functions, predicate.as_ref())
-            }
+            Backend::Disk { storage } => run_disk_dml(storage, &mut self.tx, &mut self.next_txn_id, |storage, wal| {
+                executor::storage_delete(storage, table_id, &schema, &self.functions, predicate.as_ref(), wal)
+            }),
         }
     }
 
@@ -807,6 +1606,120 @@ impl Database {
             Backend::Memory { catalog, .. } => Box::new(catalog.tables().cloned()),
             Backend::Disk { storage } => Box::new(storage.tables().cloned()),
         }
+    }
+}
+
+/// 複数の実スレッドから同じ`Database`を安全に共有するための最小限のラッパー
+/// (第35章)。
+///
+/// `Database`自身のフィールド(`Catalog`・`Backend`・`LockManager`等)は
+/// スレッドセーフになっていない。このラッパーは`Mutex<Database>`1本で
+/// `Database`全体を丸ごと直列化し、「複数スレッドから同じ`Database`に
+/// 安全に触れる」という最小限の目標だけを満たす。SQL実行エンジンの内部
+/// (Catalog・Lock Manager・実行計画の組み立て)そのものを細粒度にロック
+/// フリー化し、セッションごとに独立させるのは第37章の仕事であり、この章の
+/// 範囲ではない。
+///
+/// 一方、`Mutex`の外にある**Buffer PoolとB+Treeは、この章で本物のLatchを
+/// 持つようになった**([`crate::buffer_pool`]・[`crate::btree`]を参照)ため、
+/// `Arc<BTree>`のように`Database`を経由せず直接複数スレッドから共有すれば、
+/// ページ単位の細かい並行性をそのまま使える。この2つの粒度(`Database`は
+/// トランザクション単位で粗く、Buffer Pool・B+Treeはページ単位で細かい)が
+/// 併存している状態が、この章の到達点である。
+///
+/// # `Blocked`を実スレッドの「待機」に変える
+///
+/// [`LockManager::acquire`]自体は第31章から変わっていない。`Blocked`だと
+/// 判断したら`DbError::WouldBlock`という**値**を返すだけで、呼び出し元の
+/// スレッドを止めはしない。決定的インターリーブテストハーネス(第30章)は、
+/// この値を受け取って「今は再試行しない」と判断する側に回ることで、
+/// 単一スレッドのままインターリーブを制御していた。
+///
+/// このラッパーは、その`WouldBlock`を受け取ったら`Condvar::wait`で
+/// スレッドを実際に眠らせ、他のどこかで`release_all`が呼ばれるたびに
+/// 起こして同じ文を再試行する。`LockManager`本体を書き換えず、その外側に
+/// 「値を受け取って待機に変える」薄い層を1枚重ねただけであり、決定的
+/// ハーネスを使う既存のテスト(第30〜34章)は一切変更していない。この
+/// 二層構成(下: 値を返すだけの`LockManager`、上: それを待機に変える
+/// このラッパー)を保つことで、同じ`LockManager`を単一スレッドの決定的
+/// テストと複数スレッドの実行時の両方で使い回せる。
+pub struct SharedDatabase {
+    db: std::sync::Mutex<Database>,
+    cvar: std::sync::Condvar,
+}
+
+impl SharedDatabase {
+    /// `db`を包んで、複数スレッドから共有できるようにする。
+    pub fn new(db: Database) -> Self {
+        SharedDatabase { db: std::sync::Mutex::new(db), cvar: std::sync::Condvar::new() }
+    }
+
+    /// 新しいトランザクションを開始する([`Database::begin_tx`]を参照)。
+    pub fn begin_tx(&self) -> TxHandle {
+        self.lock().begin_tx()
+    }
+
+    /// 分離レベルを指定して新しいトランザクションを開始する
+    /// ([`Database::begin_tx_with_isolation`]を参照)。
+    pub fn begin_tx_with_isolation(&self, isolation_level: IsolationLevel) -> TxHandle {
+        self.lock().begin_tx_with_isolation(isolation_level)
+    }
+
+    /// [`Database::execute_in_tx`]のブロッキング版。
+    ///
+    /// `DbError::WouldBlock`を受け取ったら、このスレッドを`Condvar`で
+    /// 眠らせ、起こされるたびに同じ`sql`をもう一度試す。他の結果
+    /// (`Ok`、`WouldBlock`以外の`Err`)はそのまま呼び出し元へ返す。
+    /// `DbError::DeadlockDetected`はここでは特別扱いしない。Victimに
+    /// 選ばれたトランザクションは`WouldBlock`を返さずこのエラーを返す
+    /// ([`Database::acquire_lock_or_detect_deadlock`]を参照)ため、この
+    /// メソッドはループを継続せずそのまま呼び出し元へ伝える。
+    ///
+    /// 試行のたびに(結果によらず)`Condvar::notify_all`を呼ぶ。この試行が
+    /// デッドロック解決のために別のトランザクションを強制Abortしていたら
+    /// (`Database::abort_transaction`、`lock_manager.release_all`)、その
+    /// Victim自身のスレッドが別に眠っているかもしれない。通知を怠ると、
+    /// そのスレッドは自分がAbort済みになったことに気付けないまま永久に
+    /// 眠り続ける。過剰な通知(何も変わっていない試行のあとの通知)は
+    /// 起こされたスレッドが条件を再確認して再び眠るだけで安全だが、通知の
+    /// 欠落は起こすべきスレッドを永久に眠らせたままにする。安全側に倒し、
+    /// 毎回無条件に通知する。
+    pub fn execute_in_tx(&self, handle: &TxHandle, sql: &str) -> DbResult<QueryResult> {
+        let mut guard = self.lock();
+        loop {
+            let outcome = guard.execute_in_tx(handle, sql);
+            self.cvar.notify_all();
+            match outcome {
+                Err(DbError::WouldBlock) => {
+                    guard = self.cvar.wait(guard).unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// `handle`が指すトランザクションを確定する([`Database::commit_tx`]を
+    /// 参照)。ロックを解放するため、成功・失敗によらず`notify_all`する。
+    pub fn commit_tx(&self, handle: TxHandle) -> DbResult<()> {
+        let mut guard = self.lock();
+        let result = guard.commit_tx(handle);
+        drop(guard);
+        self.cvar.notify_all();
+        result
+    }
+
+    /// `handle`が指すトランザクションを取り消す([`Database::rollback_tx`]を
+    /// 参照)。`commit_tx`と同じ理由で`notify_all`する。
+    pub fn rollback_tx(&self, handle: TxHandle) -> DbResult<()> {
+        let mut guard = self.lock();
+        let result = guard.rollback_tx(handle);
+        drop(guard);
+        self.cvar.notify_all();
+        result
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Database> {
+        self.db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -928,6 +1841,175 @@ impl std::fmt::Display for QueryResult {
 
         let row_word = if self.rows.len() == 1 { "row" } else { "rows" };
         write!(f, "({} {row_word})", self.rows.len())
+    }
+}
+
+/// `plan`が読みに行くテーブルの`TableId`を、木をたどって集める(第31章、
+/// `execute_select`がロックの対象を決めるために使う)。同じテーブルが
+/// (自己結合などで)複数回現れても構わない。`LockManager::acquire`は同じ
+/// `(txn, key)`への再要求を無害に素通りさせる(`crate::lock_manager`を参照)
+/// ため、ここで重複を取り除く必要は無い。
+/// `adjacency`(Wait-for Graphの隣接表)の中で、`start`を含む循環を1つ探す
+/// (第32章、`Database::detect_deadlock`が使う)。
+///
+/// `start`からDFSで辺をたどり、`start`へ戻ってくる経路が見つかれば、その
+/// 経路(`start`を含む、循環を構成するノードの列)を返す。`start`を経由しない
+/// 循環(たとえば`start`から到達できる先で、`start`とは無関係などうしが
+/// 待ち合っている場合)は探索しない。探索中に同じノードを2回訪れそうになったら
+/// (`start`自身への到達を除く)、そこで探索を打ち切る(無関係な循環に迷い込んで
+/// 無限に回り続けないための番人)。`adjacency`の各隣接リストは
+/// `detect_deadlock`が`TransactionId`の昇順にソート済みであり、複数の循環が
+/// 存在する場合でもこの関数は毎回同じ経路を決定的に返す。
+fn find_cycle_containing(
+    adjacency: &HashMap<TransactionId, Vec<TransactionId>>,
+    start: TransactionId,
+) -> Option<Vec<TransactionId>> {
+    fn dfs(
+        node: TransactionId,
+        start: TransactionId,
+        adjacency: &HashMap<TransactionId, Vec<TransactionId>>,
+        path: &mut Vec<TransactionId>,
+        on_path: &mut std::collections::HashSet<TransactionId>,
+    ) -> Option<Vec<TransactionId>> {
+        let neighbors = adjacency.get(&node)?;
+        for &next in neighbors {
+            if next == start {
+                return Some(path.clone());
+            }
+            if on_path.contains(&next) {
+                continue;
+            }
+            on_path.insert(next);
+            path.push(next);
+            if let Some(cycle) = dfs(next, start, adjacency, path, on_path) {
+                return Some(cycle);
+            }
+            path.pop();
+            on_path.remove(&next);
+        }
+        None
+    }
+
+    let mut path = vec![start];
+    let mut on_path = std::collections::HashSet::from([start]);
+    dfs(start, start, adjacency, &mut path, &mut on_path)
+}
+
+/// `Aborted`状態のトランザクションへ以後の操作を拒むときのエラーを選ぶ
+/// (第32章)。デッドロックのVictimとして強制的に`Aborted`へ倒された場合は
+/// `DbError::DeadlockDetected`を、それ以外(Statement Error時のAbort・
+/// 明示的な`ROLLBACK`後)は従来どおり`DbError::TransactionAborted`を返す。
+fn aborted_error(victim_of_deadlock: bool) -> DbError {
+    if victim_of_deadlock { DbError::DeadlockDetected } else { DbError::TransactionAborted }
+}
+
+/// Diskバックエンドの`INSERT`・`UPDATE`・`DELETE`を、WALのトランザクション
+/// 境界で挟んで実行する(第33章)。
+///
+/// `tx`が`Some`(`BEGIN`済みの明示的トランザクション)であれば、この関数は
+/// `Commit`・`Abort`のどちらも書かない(`COMMIT`・`ROLLBACK`自体のWAL処理は
+/// `Database::execute_commit`・`execute_rollback`が別途行う)。`Begin`は、
+/// 実際に1件でも書き込みが起きた時点で[`WalCursor`]が遅延して書く
+/// (`crate::wal::WalCursor`のドキュメントを参照)。
+///
+/// `tx`が`None`(Autocommit)であれば、この1文だけのための使い捨て
+/// トランザクションIDを`next_txn_id`から採番する。`f`が1件でも書き込んで
+/// いれば(`prev_lsn`が`None`のままでなければ)、成功時は`Commit`レコードを
+/// 書いてから[`crate::wal::WalWriter::sync`]で同期し、それが終わるまで
+/// `run_disk_dml`自体が返らない。これが「`COMMIT`応答前にログを同期する」と
+/// いう規律を、明示的な`BEGIN`を伴わない1文にも及ぼす部分である
+/// (本文「Autocommitの1文も、それ自体が耐久性を持つ」を参照)。失敗時は
+/// `Abort`レコードを書くだけで同期はしない(失敗した文の変更を耐久化する
+/// 意味が無いため)。
+fn run_disk_dml<F>(
+    storage: &mut Storage,
+    tx: &mut Option<TransactionContext>,
+    next_txn_id: &mut u64,
+    f: F,
+) -> DbResult<usize>
+where
+    F: FnOnce(&mut Storage, &mut WalCursor) -> DbResult<usize>,
+{
+    let wal = storage.wal().clone();
+    let autocommit = tx.is_none();
+    let txn_id = tx.as_ref().map(|ctx| ctx.id).unwrap_or_else(|| {
+        let id = TransactionId(*next_txn_id);
+        *next_txn_id += 1;
+        id
+    });
+
+    let mut local_prev_lsn: Option<Lsn> = None;
+    let prev_lsn: &mut Option<Lsn> = match tx.as_mut() {
+        Some(ctx) => &mut ctx.wal_last_lsn,
+        None => &mut local_prev_lsn,
+    };
+
+    let result = {
+        let mut cursor = WalCursor::new(&wal, txn_id, prev_lsn);
+        f(storage, &mut cursor)
+    };
+
+    if autocommit && let Some(last_lsn) = *prev_lsn {
+        let mut w = wal.lock().unwrap_or_else(|p| p.into_inner());
+        match &result {
+            Ok(_) => {
+                w.append_commit(txn_id, Some(last_lsn));
+                w.sync()?;
+            }
+            Err(_) => {
+                w.append_abort(txn_id, Some(last_lsn));
+            }
+        }
+    }
+    result
+}
+
+/// `tx.wal_last_lsn`が`Some`(=このトランザクションが1件でもWALへ書いて
+/// いた)なら、`Commit`レコードを書いて同期する(第33章、`execute_commit`・
+/// `commit_tx`が使う)。`None`(読み取りだけで終わったトランザクション)なら
+/// 何もしない。
+fn wal_commit_if_disk(backend: &Backend, tx_id: TransactionId, wal_last_lsn: Option<Lsn>) -> DbResult<()> {
+    let Backend::Disk { storage } = backend else { return Ok(()) };
+    let Some(last_lsn) = wal_last_lsn else { return Ok(()) };
+    let mut w = storage.wal().lock().unwrap_or_else(|p| p.into_inner());
+    w.append_commit(tx_id, Some(last_lsn));
+    w.sync()?;
+    Ok(())
+}
+
+/// `ROLLBACK`(および、Victim SelectionによるAbort)がDiskバックエンドの
+/// WALに対して行う後始末(第33章)。`wal_last_lsn`が指す連鎖を
+/// `crate::transaction::apply_wal_undo_disk`で逆順に適用してから、
+/// `Abort`レコードを書く(`Some`のときだけ。`None`なら何も書いていないので
+/// 取り消す変更も無い)。`Abort`は`COMMIT`と違って同期を待たない
+/// (本文「ROLLBACKの同期は待たない」を参照)。
+fn wal_rollback_if_disk(storage: &mut Storage, tx_id: TransactionId, wal_last_lsn: Option<Lsn>) -> DbResult<()> {
+    transaction::apply_wal_undo_disk(storage, wal_last_lsn)?;
+    if let Some(last_lsn) = wal_last_lsn {
+        let mut w = storage.wal().lock().unwrap_or_else(|p| p.into_inner());
+        w.append_abort(tx_id, Some(last_lsn));
+        w.flush()?;
+    }
+    Ok(())
+}
+
+fn collect_scan_tables(plan: &LogicalPlan, tables: &mut Vec<TableId>) {
+    match plan {
+        LogicalPlan::Scan(scan) => tables.push(scan.table_id),
+        LogicalPlan::Values(_) => {}
+        LogicalPlan::Filter(filter) => collect_scan_tables(&filter.input, tables),
+        LogicalPlan::Join(join) => {
+            collect_scan_tables(&join.left, tables);
+            collect_scan_tables(&join.right, tables);
+        }
+        LogicalPlan::Aggregate(aggregate) => collect_scan_tables(&aggregate.input, tables),
+        LogicalPlan::Projection(projection) => collect_scan_tables(&projection.input, tables),
+        LogicalPlan::Distinct(distinct) => collect_scan_tables(&distinct.input, tables),
+        LogicalPlan::Sort(sort) => collect_scan_tables(&sort.input, tables),
+        LogicalPlan::Limit(limit) => collect_scan_tables(&limit.input, tables),
+        LogicalPlan::Insert(_) | LogicalPlan::Update(_) | LogicalPlan::Delete(_) => {
+            unreachable!("logical_plan::build_selectが組み立てる木にInsert/Update/Deleteは現れない")
+        }
     }
 }
 
@@ -2634,8 +3716,10 @@ mod tests {
         // 第28章から、アクセスパスはコストで選ぶ(`choose_scan_plan`)ため、
         // 数行だけのテーブルではSeqScanのほうが安く済んでしまい索引が
         // 選ばれないことがある。この確認だけを目的に、行数を増やし
-        // `ANALYZE`して点検索を実際に選択的にしておく。
-        let rows: Vec<String> = (2..300).map(|i| format!("({i}, 'user{i}@example.com', 'User{i}')")).collect();
+        // `ANALYZE`して点検索を実際に選択的にしておく(第34章でPage LSNの分
+        // だけページの実効容量が減り、299行では境界的だったため1000行へ
+        // 引き上げてある)。
+        let rows: Vec<String> = (2..1000).map(|i| format!("({i}, 'user{i}@example.com', 'User{i}')")).collect();
         db.execute(&format!("INSERT INTO users VALUES {}", rows.join(", "))).unwrap();
         db.execute("ANALYZE users").unwrap();
 
@@ -2967,28 +4051,31 @@ mod tests {
         let mut db = orders_disk_db(&path);
         db.execute("CREATE INDEX idx_amount ON orders (amount)").unwrap();
 
-        // 5000行(バケツ10個、1バケツ=500行)を仕込む。うち500行だけ、
+        // 1400行(バケツ10個、1バケツ=140行)を仕込む。うち200行だけ、
         // ソート順で連続する1つのバケツにちょうど収まるよう`amount`を
-        // 1000(250行)と2000(250行)の2値だけに集中させ、残りの4500行は
-        // その外側([0,899]と[2001,4000])に均等に散らばせる。この結果、
+        // 1000(100行)と2000(100行)の2値だけに集中させ、残りの1200行は
+        // その外側([0,899]と[2001,3200])に均等に散らばせる。この結果、
         // 1つのバケツが`[1000, 2000]`という区間を持ちながら、実際の値は
-        // 区間の両端に偏り、中間(1400〜1600)には1行も無い。
+        // 区間の両端に偏り、中間(1400〜1600)には1行も無い。(第34章で
+        // Page LSNの分だけページの実効容量が減ったため、以前の5000行から
+        // 引き下げてある。Catalogページの`page_ids`(第15章)が収まる範囲に
+        // 収めるためで、バケツ構成の意図は変わらない。)
         let mut rows: Vec<String> = Vec::new();
-        for i in 0..2500i64 {
-            let amount = i * 900 / 2500; // [0, 899]
+        for i in 0..600i64 {
+            let amount = i * 900 / 600; // [0, 899]
             rows.push(format!("({i}, {amount}, 'name{i}')"));
         }
-        for i in 0..250i64 {
-            let id = 2500 + i;
+        for i in 0..100i64 {
+            let id = 600 + i;
             rows.push(format!("({id}, 1000, 'name{id}')"));
         }
-        for i in 0..250i64 {
-            let id = 2750 + i;
+        for i in 0..100i64 {
+            let id = 700 + i;
             rows.push(format!("({id}, 2000, 'name{id}')"));
         }
-        for i in 0..2000i64 {
-            let id = 3000 + i;
-            let amount = 2001 + i; // [2001, 4000]
+        for i in 0..600i64 {
+            let id = 800 + i;
+            let amount = 2001 + i; // [2001, 2600]
             rows.push(format!("({id}, {amount}, 'name{id}')"));
         }
         db.execute(&format!("INSERT INTO orders VALUES {}", rows.join(", "))).unwrap();
@@ -3068,7 +4155,13 @@ mod tests {
         // して選択率の推定を実際の分布に合わせる(統計が無ければ、
         // PostgreSQLの`selfuncs.c`にならった慣用のデフォルト定数
         // (`crate::estimator::DEFAULT_EQ_SEL`等)にフォールバックする、第27章)。
-        let n = 10_000i64;
+        // 第34章でPage LSNの分だけページの実効容量が減り、1万行では
+        // `ANALYZE`が集める統計情報を含めてCatalogページ(第15章、第27章)が
+        // 収まりきらなくなったため、1000行へ引き下げてある
+        // (`point_predicate_on_an_indexed_column_...`が1000行ですでに
+        // IndexScanを選ぶことを確認済みで、IndexScanが有利になる規模と
+        // いう以前の意図は変わらない)。
+        let n = 1_000i64;
         let rows: Vec<String> = (0..n).map(|i| format!("({i}, {}, 'name{i}')", i * 3)).collect();
         let insert_sql = format!("INSERT INTO orders VALUES {}", rows.join(", "));
 
@@ -3173,7 +4266,11 @@ mod tests {
         db.execute("CREATE INDEX idx_customer_id ON orders (customer_id)").unwrap();
 
         let n = 5i64;
-        let m = 5000i64;
+        // 第34章でPage LSNの分だけページの実効容量が減り、`ANALYZE`が集める
+        // 統計情報を含めてCatalogページが収まらなくなったため、5000から
+        // 1250へ引き下げてある(この規模でもIndex Nested Loop Joinが
+        // 選ばれることを確認済み。1000行以下ではHash Joinへ逆転する)。
+        let m = 1250i64;
         let modulus = n * 1000;
         let customers: Vec<String> = (0..n).map(|i| format!("({i}, 'name{i}')")).collect();
         db.execute(&format!("INSERT INTO customers VALUES {}", customers.join(", "))).unwrap();
@@ -3216,7 +4313,10 @@ mod tests {
         db.execute("CREATE INDEX idx_customer_id ON orders (customer_id)").unwrap();
 
         let n = 50i64;
-        let m = 2000i64;
+        // 第34章でPage LSNの分だけページの実効容量が減り、`ANALYZE`が集める
+        // 統計情報を含めてCatalogページが収まらなくなったため、2000から
+        // 1000へ引き下げてある(密な結合という以前の意図は変わらない)。
+        let m = 1000i64;
         let modulus = n; // 密な結合: customer_idの値域をcustomersの総数だけに絞る。
         let customers: Vec<String> = (0..n).map(|i| format!("({i}, 'name{i}')")).collect();
         db.execute(&format!("INSERT INTO customers VALUES {}", customers.join(", "))).unwrap();
@@ -3992,5 +5092,288 @@ mod tests {
         // aとbは2行ずつ一致し(id同士)、cは無条件に2行とも掛かるので、
         // 2 (a=b一致) × 2 (c) = 4行になる。
         assert_eq!(result.rows().len(), 4, "rows={:?}", result.rows());
+    }
+
+    // ---- トランザクション境界とAtomicity(第30章) ----
+
+    fn accounts_db() -> Database {
+        let mut db = Database::memory();
+        db.execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)").unwrap();
+        db.execute("INSERT INTO accounts VALUES (1, 100), (2, 50)").unwrap();
+        db
+    }
+
+    fn balance(db: &mut Database, id: i64) -> i64 {
+        let result = db.execute(&format!("SELECT balance FROM accounts WHERE id = {id}")).unwrap();
+        match &result.rows()[0].values()[0] {
+            Value::BigInt(n) => *n,
+            other => panic!("BigIntを期待したが{other:?}が返った"),
+        }
+    }
+
+    #[test]
+    fn begin_commit_keeps_the_changes() {
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        db.execute("UPDATE accounts SET balance = balance + 30 WHERE id = 2").unwrap();
+        db.execute("COMMIT").unwrap();
+
+        assert_eq!(balance(&mut db, 1), 70);
+        assert_eq!(balance(&mut db, 2), 80);
+        assert_eq!(db.transaction_state(), None);
+    }
+
+    /// `BEGIN`単体(`ISOLATION LEVEL`を省略)は`RepeatableRead`を既定にする
+    /// (第32章、`execute_begin`のドキュメント「分離レベルの既定値」を参照)。
+    /// 分離レベル自体は`Database`の外から直接観測できないため、`RepeatableRead`
+    /// の規律(Sharedロックも`COMMIT`まで保持する)が働いていることを、
+    /// Non-repeatable Readが起きないことで間接的に確認する。
+    #[test]
+    fn begin_without_isolation_level_defaults_to_repeatable_read() {
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        assert_eq!(balance(&mut db, 1), 100);
+
+        let t2 = db.begin_tx();
+        assert!(matches!(
+            db.execute_in_tx(&t2, "UPDATE accounts SET balance = 999 WHERE id = 1"),
+            Err(DbError::WouldBlock)
+        ));
+        db.execute("COMMIT").unwrap();
+    }
+
+    /// `BEGIN ISOLATION LEVEL READ UNCOMMITTED`をSQL経由で発行すると、
+    /// 読み取りロックを一切取らなくなる(第32章)。`db.execute`の通常のSQL経路
+    /// (`self.tx`)でも、ハーネス(`begin_tx_with_isolation`)と同じ分離レベルの
+    /// 規律が働くことを確認する。
+    #[test]
+    fn begin_isolation_level_read_uncommitted_over_sql_allows_dirty_read() {
+        let mut db = accounts_db();
+        let t1 = db.begin_tx();
+        db.execute_in_tx(&t1, "UPDATE accounts SET balance = 70 WHERE id = 1").unwrap();
+
+        db.execute("BEGIN ISOLATION LEVEL READ UNCOMMITTED").unwrap();
+        assert_eq!(balance(&mut db, 1), 70, "READ UNCOMMITTEDは未コミットの値を読める(Dirty Read)");
+        db.execute("COMMIT").unwrap();
+
+        db.rollback_tx(t1).unwrap();
+    }
+
+    #[test]
+    fn begin_rollback_discards_the_changes() {
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        db.execute("UPDATE accounts SET balance = balance + 30 WHERE id = 2").unwrap();
+        db.execute("ROLLBACK").unwrap();
+
+        assert_eq!(balance(&mut db, 1), 100);
+        assert_eq!(balance(&mut db, 2), 50);
+        assert_eq!(db.transaction_state(), None);
+    }
+
+    #[test]
+    fn begin_rollback_undoes_an_insert_and_a_delete_in_the_same_transaction() {
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO accounts VALUES (3, 10)").unwrap();
+        db.execute("DELETE FROM accounts WHERE id = 2").unwrap();
+        db.execute("ROLLBACK").unwrap();
+
+        let rows = db.execute("SELECT id FROM accounts ORDER BY id").unwrap();
+        let ids: Vec<i64> = rows
+            .rows()
+            .iter()
+            .map(|row| match &row.values()[0] {
+                Value::BigInt(n) => *n,
+                other => panic!("BigIntを期待したが{other:?}が返った"),
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn rollback_undoes_repeated_updates_to_the_same_row_in_reverse_order() {
+        // 同一行に対する複数回のUPDATEを、ROLLBACKが正しく逆順に取り消せるかを
+        // 確認する。UndoRecordは1回のUPDATEごとに1件積まれるので、3回の更新は
+        // 3件のUndoRecordになり、それをLIFOで戻すと元の値に一致するはずである。
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE accounts SET balance = 200 WHERE id = 1").unwrap();
+        db.execute("UPDATE accounts SET balance = 300 WHERE id = 1").unwrap();
+        db.execute("UPDATE accounts SET balance = 400 WHERE id = 1").unwrap();
+        assert_eq!(balance(&mut db, 1), 400);
+        db.execute("ROLLBACK").unwrap();
+
+        assert_eq!(balance(&mut db, 1), 100);
+    }
+
+    #[test]
+    fn rollback_undoes_repeated_updates_to_the_same_row_on_disk() {
+        // Memory版と同じ検証をDiskバックエンドで行う。`Storage::update`は
+        // ページ内に収まらない書き換えで`RecordId`を動かすことがあるため、
+        // `apply_undo_disk`のRecordId付け替え(remap)が正しく働くことも
+        // あわせて確認する。
+        let path = temp_db_path("rollback-repeated-update");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)").unwrap();
+        db.execute("INSERT INTO accounts VALUES (1, 100)").unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE accounts SET balance = 200 WHERE id = 1").unwrap();
+        db.execute("UPDATE accounts SET balance = 300 WHERE id = 1").unwrap();
+        db.execute("UPDATE accounts SET balance = 400 WHERE id = 1").unwrap();
+        db.execute("ROLLBACK").unwrap();
+
+        assert_eq!(balance(&mut db, 1), 100);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn autocommit_persists_each_statement_immediately() {
+        let mut db = accounts_db();
+        // BEGINを経由しない、これまでどおりの1文ずつの実行(Autocommit)。
+        db.execute("UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        assert_eq!(balance(&mut db, 1), 70);
+        assert_eq!(db.transaction_state(), None);
+    }
+
+    #[test]
+    fn nested_begin_is_rejected_and_the_outer_transaction_is_unaffected() {
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        assert!(matches!(db.execute("BEGIN"), Err(DbError::TransactionAlreadyActive)));
+
+        // 入れ子のBEGIN自体の失敗は、進行中のトランザクションを巻き込まない。
+        assert_eq!(db.transaction_state(), Some(TransactionState::Active));
+        db.execute("COMMIT").unwrap();
+        assert_eq!(balance(&mut db, 1), 70);
+    }
+
+    #[test]
+    fn commit_or_rollback_without_begin_is_rejected() {
+        let mut db = accounts_db();
+        assert!(matches!(db.execute("COMMIT"), Err(DbError::NoActiveTransaction)));
+        assert!(matches!(db.execute("ROLLBACK"), Err(DbError::NoActiveTransaction)));
+    }
+
+    #[test]
+    fn a_failing_statement_aborts_the_transaction_and_blocks_further_statements() {
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+
+        // id=2は既存のPRIMARY KEYと衝突するので失敗する。
+        assert!(matches!(
+            db.execute("INSERT INTO accounts VALUES (2, 999)"),
+            Err(DbError::PrimaryKeyViolation { .. })
+        ));
+        assert_eq!(db.transaction_state(), Some(TransactionState::Aborted));
+
+        // Aborted状態では、ROLLBACK以外のすべての文が拒否される。
+        assert!(matches!(db.execute("SELECT 1"), Err(DbError::TransactionAborted)));
+        assert!(matches!(db.execute("COMMIT"), Err(DbError::TransactionAborted)));
+
+        // ROLLBACKだけが受理され、Active中に成功していた1つ目のUPDATEも
+        // まとめて取り消される。
+        db.execute("ROLLBACK").unwrap();
+        assert_eq!(balance(&mut db, 1), 100);
+        assert_eq!(db.transaction_state(), None);
+    }
+
+    #[test]
+    fn statement_rollback_still_applies_inside_an_active_transaction() {
+        // 第20章のStatement Rollback(1文の中の部分失敗を巻き戻す)は、この章の
+        // トランザクション境界と両立する。複数行のINSERTが1行だけ失敗しても、
+        // その文自体は(Active中であっても)何も書き込まない。
+        let mut db = accounts_db();
+        db.execute("BEGIN").unwrap();
+        assert!(matches!(
+            db.execute("INSERT INTO accounts VALUES (3, 10), (2, 20)"),
+            Err(DbError::PrimaryKeyViolation { .. })
+        ));
+        // 文自体は失敗したが、トランザクションはAbortedへ遷移する
+        // (「Statement Error時のAbort」、本文を参照)。
+        assert_eq!(db.transaction_state(), Some(TransactionState::Aborted));
+        db.execute("ROLLBACK").unwrap();
+
+        // id=3は1度も反映されていない。
+        let rows = db.execute("SELECT id FROM accounts WHERE id = 3").unwrap();
+        assert!(rows.rows().is_empty());
+    }
+
+    #[test]
+    fn begin_commit_and_rollback_work_on_the_disk_backend_too() {
+        let path = temp_db_path("tx-disk");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)").unwrap();
+        db.execute("INSERT INTO accounts VALUES (1, 100), (2, 50)").unwrap();
+
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        db.execute("DELETE FROM accounts WHERE id = 2").unwrap();
+        db.execute("INSERT INTO accounts VALUES (3, 10)").unwrap();
+        db.execute("ROLLBACK").unwrap();
+
+        assert_eq!(balance(&mut db, 1), 100);
+        let rows = db.execute("SELECT id FROM accounts ORDER BY id").unwrap();
+        assert_eq!(rows.rows().len(), 2);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    // ---- 決定的インターリーブテストハーネス専用の内部API(第30章) ----
+
+    #[test]
+    fn begin_tx_execute_in_tx_and_commit_tx_leave_the_change_in_place() {
+        let mut db = accounts_db();
+        let tx = db.begin_tx();
+        db.execute_in_tx(&tx, "UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        db.commit_tx(tx).unwrap();
+
+        assert_eq!(balance(&mut db, 1), 70);
+    }
+
+    #[test]
+    fn rollback_tx_discards_the_change() {
+        let mut db = accounts_db();
+        let tx = db.begin_tx();
+        db.execute_in_tx(&tx, "UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        db.rollback_tx(tx).unwrap();
+
+        assert_eq!(balance(&mut db, 1), 100);
+    }
+
+    #[test]
+    fn two_handles_can_be_interleaved_on_one_database() {
+        // このAPIが「複数のトランザクションの文を受け付ける最小限の仕組み」
+        // として実際に機能することの確認。t1・t2という2つのTxHandleを、
+        // どちらもcommit/rollbackする前に交互に使う。
+        let mut db = accounts_db();
+        let t1 = db.begin_tx();
+        let t2 = db.begin_tx();
+
+        // t1・t2はそれぞれ別の行(id=1・id=2)だけを触るが、`accounts`は
+        // Memoryバックエンドなのでロックの粒度はテーブル単位である(第31章、
+        // `crate::database`モジュール冒頭「ロックの粒度」を参照)。t1が
+        // `accounts`のExclusiveロックを持っている間、t2の`UPDATE`は行が
+        // 違ってもブロックされる。
+        db.execute_in_tx(&t1, "UPDATE accounts SET balance = balance - 30 WHERE id = 1").unwrap();
+        assert!(matches!(
+            db.execute_in_tx(&t2, "UPDATE accounts SET balance = balance - 5 WHERE id = 2"),
+            Err(DbError::WouldBlock)
+        ));
+        db.execute_in_tx(&t1, "UPDATE accounts SET balance = balance + 1 WHERE id = 1").unwrap();
+        db.commit_tx(t1).unwrap();
+
+        // t1がコミットしてロックを手放したので、同じ文を再試行すれば通る。
+        db.execute_in_tx(&t2, "UPDATE accounts SET balance = balance - 5 WHERE id = 2").unwrap();
+        db.rollback_tx(t2).unwrap();
+
+        // t1の2つの更新はコミット済み、t2の更新は取り消し済み。
+        assert_eq!(balance(&mut db, 1), 71);
+        assert_eq!(balance(&mut db, 2), 50);
     }
 }

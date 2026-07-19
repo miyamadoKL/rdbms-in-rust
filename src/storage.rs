@@ -288,6 +288,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::btree::BTree;
 use crate::buffer_pool::BufferPool;
@@ -296,13 +297,14 @@ use crate::disk_manager::DiskManager;
 use crate::error::{DbError, DbResult};
 use crate::free_space_map::FreeSpaceMap;
 use crate::heap_file::Scan;
-use crate::ids::{PageId, RecordId, TableId};
+use crate::ids::{Lsn, PageId, RecordId, TableId, TransactionId};
 use crate::index::IndexInfo;
 use crate::page::{PAGE_PAYLOAD_SIZE, PageType};
 use crate::slotted_page::{SlotStatus, SlottedPage, SlottedPageRef, max_len_for_fresh_page};
 use crate::statistics::{Bucket, ColumnStats, HISTOGRAM_BUCKET_COUNT, MCV_MAX_ENTRIES, TableStats};
 use crate::tuple_codec::decode_tuple;
 use crate::types::{Column, DataType, Schema, Tuple, Value, compare_values};
+use crate::wal::WalWriter;
 
 /// Catalogページの定位置。ページ0はFile Header(第11章)が占有しているため、
 /// 空いている最初の番号を使う。
@@ -341,6 +343,25 @@ fn index_file_path(db_path: &Path, index_name: &str) -> PathBuf {
     PathBuf::from(os_string)
 }
 
+/// `rebuild_one_index_after_recovery`が索引を作り直す間だけ使う、一時ファイルの
+/// パス(第34章、`Storage::rebuild_all_indexes_after_recovery`を参照)。
+/// 索引の本体ファイルと同じディレクトリに置くことで、`std::fs::rename`が
+/// 同一ファイルシステム内のアトミックな置き換えになることを保証する。
+fn index_rebuild_temp_path(db_path: &Path, index_name: &str) -> PathBuf {
+    let mut os_string = index_file_path(db_path, index_name).into_os_string();
+    os_string.push(".rebuilding");
+    PathBuf::from(os_string)
+}
+
+/// `db_path`のWALファイル(第33章)のパスを組み立てる。索引ファイル
+/// ([`index_file_path`])と同じ命名の流儀で、本体のデータファイルとは
+/// 別のファイル`<db_path>.wal`に置く。
+fn wal_file_path(db_path: &Path) -> PathBuf {
+    let mut os_string = db_path.as_os_str().to_os_string();
+    os_string.push(".wal");
+    PathBuf::from(os_string)
+}
+
 /// テーブル定義とデータページの両方を1つのファイルへ永続化するストレージエンジン。
 pub struct Storage {
     /// このストレージ本体(テーブル定義・データページ)のファイルパス。
@@ -357,6 +378,17 @@ pub struct Storage {
     /// `ANALYZE`で収集された統計情報(第27章)。キーは`TableId`。`ANALYZE`を
     /// 一度も実行していないテーブルはここに現れない。
     stats: HashMap<TableId, TableStats>,
+    /// このテーブル本体用のWAL(第33章)。`<path>.wal`という専用ファイルを持ち、
+    /// `pool`(テーブル本体の`BufferPool`)に[`BufferPool::attach_wal`]で
+    /// 結線してある。`Database`は`Storage::wal`経由でこの`Arc`を共有し、
+    /// `BEGIN`・`COMMIT`・`ROLLBACK`のログレコードを直接書く
+    /// (`crate::database`、`crate::transaction::apply_wal_undo_disk`)。
+    /// 索引ごとの`BTree`は別々の`BufferPool`を持つが、そちらにはWALを結線
+    /// しない(モジュール冒頭「この章が対象にする範囲」を参照)。
+    wal: Arc<Mutex<WalWriter>>,
+    /// `Storage::open`が実行したCrash Recovery(第34章)の要約。
+    /// `Storage::create`(新規作成)では常に`None`(Recoveryを行わないため)。
+    last_recovery: Option<crate::recovery::RecoveryReport>,
 }
 
 impl Storage {
@@ -384,6 +416,9 @@ impl Storage {
             "新規ファイルで最初に確保されるページは常にCatalogページの定位置になる"
         );
 
+        let wal = Arc::new(Mutex::new(WalWriter::open(wal_file_path(&path_buf))?));
+        pool.attach_wal(wal.clone());
+
         let storage = Storage {
             path: path_buf,
             pool,
@@ -393,6 +428,8 @@ impl Storage {
             fsm: FreeSpaceMap::new(),
             indexes: HashMap::new(),
             stats: HashMap::new(),
+            wal,
+            last_recovery: None,
         };
         storage.persist_catalog()?;
         Ok(storage)
@@ -490,7 +527,10 @@ impl Storage {
             indexes.insert(info.name.clone(), IndexEntry { info, btree });
         }
 
-        Ok(Storage {
+        let wal = Arc::new(Mutex::new(WalWriter::open(wal_file_path(&path_buf))?));
+        pool.attach_wal(wal.clone());
+
+        let mut storage = Storage {
             path: path_buf,
             pool,
             next_table_id: decoded.next_table_id,
@@ -499,7 +539,23 @@ impl Storage {
             fsm,
             indexes,
             stats: decoded.stats,
-        })
+            wal,
+            last_recovery: None,
+        };
+        // Crash Recovery(第34章): WALのAnalysis→Redo→Undoを行い、前回の
+        // クラッシュが残した「Commit済みだがまだページに届いていない変更」を
+        // 再現し、「Commitされていない変更」を取り消す。新規作成
+        // (`Storage::create`)にはこの手順は無く、既存ファイルを開く
+        // このパスだけが通る(`crate::recovery`モジュールドキュメントを参照)。
+        let report = crate::recovery::recover(&mut storage)?;
+        storage.last_recovery = Some(report);
+        Ok(storage)
+    }
+
+    /// 直近の`Storage::open`が実行したCrash Recovery(第34章)の要約。
+    /// `Storage::create`で作ったばかりの(Recoveryを行っていない)場合は`None`。
+    pub fn last_recovery_report(&self) -> Option<crate::recovery::RecoveryReport> {
+        self.last_recovery
     }
 
     /// キャッシュされているdirtyなページをすべてディスクへ書き戻す。
@@ -539,6 +595,244 @@ impl Storage {
             entry.btree.sync()?;
         }
         Ok(())
+    }
+
+    /// このテーブル本体用のWAL(第33章)への共有ハンドル。
+    ///
+    /// `crate::database::Database`が`BEGIN`・`COMMIT`・`ROLLBACK`の
+    /// Begin・Commit・Abortレコードを直接書き、`crate::executor`の
+    /// `storage_insert`・`storage_update`・`storage_delete`がInsert・Update・
+    /// Deleteレコードを書く(`crate::wal::WalCursor`経由)ときに使う。
+    pub(crate) fn wal(&self) -> &Arc<Mutex<WalWriter>> {
+        &self.wal
+    }
+
+    /// `page_id`のPage LSN(第33章)を`lsn`まで引き上げる。
+    ///
+    /// `insert`・`update`・`delete`で書き込んだページの`PageId`に対して、
+    /// 対応するWALレコードを`append`した直後に呼ぶ薄い委譲であり、
+    /// `crate::buffer_pool::BufferPool::bump_page_lsn`を呼ぶだけである。
+    pub(crate) fn stamp_page_lsn(&self, page_id: PageId, lsn: Lsn) {
+        self.pool.bump_page_lsn(page_id, lsn);
+    }
+
+    /// `page_id`の現在のPage LSN(第34章)。`crate::recovery`のRedoが
+    /// 冪等性を判定するために使う(`crate::buffer_pool::BufferPool::page_lsn`
+    /// への薄い委譲)。
+    pub(crate) fn page_lsn(&self, page_id: PageId) -> DbResult<Lsn> {
+        self.pool.page_lsn(page_id)
+    }
+
+    /// これまでにWALへ書いた全レコードを、開発者が目視で確認できる文字列へ
+    /// 整形して返す(第33章、`crate::wal::WalWriter::dump`)。
+    pub fn wal_dump(&self) -> Vec<String> {
+        self.wal.lock().unwrap_or_else(|p| p.into_inner()).dump()
+    }
+
+    /// `table_id`のテーブルに`page_id`がまだ属していなければ追加する(第34章)。
+    ///
+    /// クラッシュ後の`crate::recovery::recover`のRedoが使う。あるページへの
+    /// 挿入を表すWALレコードは残っているのに、そのページを`table_id`の
+    /// `page_ids`へ登録するはずだった`persist_catalog`の呼び出し
+    /// (`Self::attach_page_to_table`)が(カタログページ自体がまだ
+    /// `BufferPool`のキャッシュにしか無く)ディスクへ届かないままクラッシュした
+    /// 場合、再起動直後のカタログはこのページの存在をまだ知らない。Redoが
+    /// 物理的な書き込みを再現しただけでは、この食い違いは直らない。呼び出し側
+    /// (`crate::recovery::recover`)は、Redoの全レコードを処理し終えた後に
+    /// 1回`persist_catalog`(`Self::persist_catalog_after_recovery`)を呼び、
+    /// この関数がその場で溜めた変更をまとめて永続化する。
+    pub(crate) fn attach_page_if_missing(&mut self, table_id: TableId, page_id: PageId) -> DbResult<()> {
+        let entry = self.table_entry_mut(table_id)?;
+        if !entry.page_ids.contains(&page_id) {
+            entry.page_ids.push(page_id);
+        }
+        Ok(())
+    }
+
+    fn table_entry_mut(&mut self, table_id: TableId) -> DbResult<&mut TableEntry> {
+        self.tables
+            .get_mut(&table_id)
+            .ok_or_else(|| DbError::TableNotFound(format!("TableId({})", table_id.0)))
+    }
+
+    /// Redoが`Self::attach_page_if_missing`で溜めた変更を、まとめて
+    /// カタログへ永続化する(第34章、`crate::recovery::recover`専用)。
+    pub(crate) fn persist_catalog_after_recovery(&self) -> DbResult<()> {
+        self.persist_catalog()
+    }
+
+    /// `table_id`の`rid`へ、Redo専用の低レベルな挿入を行う(第34章)。
+    ///
+    /// `Self::insert`(空きを探す・カタログを更新する通常の挿入)とは違い、
+    /// **WALレコードが記録した位置そのもの**(`rid`)へ書き込む。Redoが
+    /// 元のトランザクションと寸分違わぬ`RecordId`を再現できるのは、この
+    /// 位置ぴったりの書き込みのおかげである。本文「Redoは位置ぴったりに
+    /// 書き戻す」を参照。
+    ///
+    /// `rid.page_id`の現在のPage LSN(`lsn_before`)が`lsn`以上であれば、
+    /// この変更はすでにディスクに反映済みなので何もしない(冪等性)。
+    /// そうでなければ、`lsn_before`が`Lsn(0)`(このページはWALに追跡された
+    /// 変更をまだ一度も受けていない、`crate::page::Page::page_lsn`を参照)かどうかで
+    /// `SlottedPage::init`(まっさらな初期化)と`SlottedPage::open`(既存の
+    /// 構造の上に追記)を切り替える。この2択が事故なく機能するのは、Redoが
+    /// レコードをLSNの昇順で1ページずつ処理し、あるページに対して
+    /// スキップした(すでに反映済みの)レコードが常に「LSNが小さい側の
+    /// 連続した範囲」になるという、WALの追記専用という性質に支えられた
+    /// 前提があるからである(詳しくは本文を参照)。
+    pub(crate) fn redo_insert(&mut self, table_id: TableId, rid: RecordId, bytes: &[u8], lsn: Lsn) -> DbResult<()> {
+        let lsn_before = self.pool.page_lsn(rid.page_id)?;
+        if lsn_before >= lsn {
+            return Ok(());
+        }
+        {
+            let mut guard = self.pool.write_page(rid.page_id)?;
+            let mut page =
+                if lsn_before.0 == 0 { SlottedPage::init(guard.data_mut()) } else { SlottedPage::open(guard.data_mut())? };
+            let slot = page.insert(bytes);
+            debug_assert_eq!(
+                slot,
+                Some(rid.slot_id),
+                "Redoは元のRecordIdと同じスロットを再現できる前提(本文を参照)"
+            );
+            let free = page.free_space();
+            drop(guard);
+            self.fsm.update(rid.page_id, free);
+        }
+        self.pool.bump_page_lsn(rid.page_id, lsn);
+        self.attach_page_if_missing(table_id, rid.page_id)?;
+        Ok(())
+    }
+
+    /// `rid`のタプルを、Redo専用の低レベルな削除で取り消す(第34章)。
+    /// `Self::redo_insert`と同じPage LSNによる冪等性の判定を行う。対象の
+    /// ページはこの時点ですでに(以前の`redo_insert`または過去の永続化で)
+    /// 初期化済みのはずなので、`SlottedPage::open`だけを使う。
+    pub(crate) fn redo_delete(&mut self, rid: RecordId, lsn: Lsn) -> DbResult<()> {
+        let lsn_before = self.pool.page_lsn(rid.page_id)?;
+        if lsn_before >= lsn {
+            return Ok(());
+        }
+        {
+            let mut guard = self.pool.write_page(rid.page_id)?;
+            let mut page = SlottedPage::open(guard.data_mut())?;
+            page.delete(rid.slot_id);
+            let free = page.free_space();
+            drop(guard);
+            self.fsm.update(rid.page_id, free);
+        }
+        self.pool.bump_page_lsn(rid.page_id, lsn);
+        Ok(())
+    }
+
+    /// `rid`のタプルを`bytes`へ置き換える、Redo専用の低レベルな更新
+    /// (第34章、同じページ内で完結する`UPDATE`)。`Self::redo_insert`と同じ
+    /// Page LSNによる冪等性の判定を行う。
+    pub(crate) fn redo_update_in_place(&mut self, rid: RecordId, bytes: &[u8], lsn: Lsn) -> DbResult<()> {
+        let lsn_before = self.pool.page_lsn(rid.page_id)?;
+        if lsn_before >= lsn {
+            return Ok(());
+        }
+        {
+            let mut guard = self.pool.write_page(rid.page_id)?;
+            let mut page = SlottedPage::open(guard.data_mut())?;
+            page.update(rid.slot_id, bytes);
+            let free = page.free_space();
+            drop(guard);
+            self.fsm.update(rid.page_id, free);
+        }
+        self.pool.bump_page_lsn(rid.page_id, lsn);
+        Ok(())
+    }
+
+    /// 現在登録されている全索引を、`table_id`の現在のHeapの中身から作り直す
+    /// (第34章、`crate::recovery::recover`専用)。
+    ///
+    /// 第33章までの限界として、索引ごとの`BufferPool`にはWALを結線して
+    /// いない(モジュール冒頭を参照)。索引ページがクラッシュ後にどこまで
+    /// 反映されているかを保証する手段が無いため、この章はクラッシュ後の
+    /// 索引を個別に修復しようとせず、Heap(WALによって正しく復元済み)から
+    /// 全索引を丸ごと作り直す方式を選んだ。`Self::build_index`と同じ手順
+    /// (対象列がNULLでない行だけを挿入)で作り直す。`unique`索引で既存行に
+    /// 重複キーがあった場合(本来クラッシュ前に検査済みのはずだが、念のため)
+    /// は`DbError`をそのまま返す。
+    ///
+    /// # 索引ファイルの入れ替えは一時ファイル経由(第5部レビュー対応)
+    ///
+    /// 索引の作り直しは、既存の索引ファイルを直接削除して同じパスへ
+    /// 作り直すのではなく、同じディレクトリの**一時ファイル**へ新しい索引を
+    /// 書き、その一時ファイルを指す`BTree`を`self.indexes`へ組み込む。
+    /// 既存の索引ファイル自体(`index_file_path`が指すパス)は、この時点では
+    /// 一切変更しない。
+    ///
+    /// 戻り値の`Vec<(PathBuf, PathBuf)>`は、`(一時ファイル, 本来の索引
+    /// ファイル)`の組であり、呼び出し元(`crate::recovery::recover`)が
+    /// Redo・Undo・検証をすべて終えたあとの`Storage::flush`・`sync`と同じ
+    /// タイミングで`std::fs::rename`し、初めて既存の索引ファイルを置き換える。
+    /// これにより、Redo・Undoの途中で`recover`が失敗しても
+    /// (`crate::recovery`モジュールドキュメントの「Undo中のクラッシュへの
+    /// 耐性」)、索引ファイルのバイト列も他のファイルと同じく、`recover`を
+    /// 呼ぶ直前から一切変わらないままになる。
+    /// `self.indexes`が指す`BTree`自体はすでに一時ファイルを指しているため、
+    /// この後に続く`Undo`(`apply_wal_undo_disk`が呼ぶ`index_insert_row`・
+    /// `index_delete_row`)は、この一時ファイル上のインメモリな`BTree`を
+    /// そのまま正しく更新できる。
+    pub(crate) fn rebuild_all_indexes_after_recovery(&mut self) -> DbResult<Vec<(PathBuf, PathBuf)>> {
+        let index_names: Vec<String> = self.indexes.keys().cloned().collect();
+        let mut pending_renames = Vec::with_capacity(index_names.len());
+        for index_name in index_names {
+            pending_renames.push(self.rebuild_one_index_after_recovery(&index_name)?);
+        }
+        Ok(pending_renames)
+    }
+
+    fn rebuild_one_index_after_recovery(&mut self, index_name: &str) -> DbResult<(PathBuf, PathBuf)> {
+        let info = self.indexes.get(index_name).expect("index_namesはself.indexesのキーそのもの").info.clone();
+        let index_path = index_file_path(&self.path, index_name);
+        let temp_path = index_rebuild_temp_path(&self.path, index_name);
+        // 前回の`recover`がここまで進んで失敗した場合、この一時ファイルが
+        // 残っている可能性がある。中身は不完全かもしれないので、まっさらな
+        // 状態から作り直す(本来の索引ファイルには一度も触れていない)。
+        let _ = std::fs::remove_file(&temp_path);
+        let disk = DiskManager::open(&temp_path)?;
+        let btree = BTree::create(BufferPool::new(disk, DEFAULT_BUFFER_POOL_CAPACITY), info.key_type, info.unique)?;
+
+        let table_info = self.tables.get(&info.table_id).expect("索引の対象テーブルはDROP TABLEされていない前提").info.clone();
+        let mut pairs: Vec<(Value, RecordId)> = Vec::new();
+        for entry in self.scan(info.table_id)? {
+            let (rid, bytes) = entry?;
+            let tuple = decode_tuple(&table_info.schema, &bytes)?;
+            let value = tuple.get(info.column_index).expect("tupleはschemaと同じ列数を持つ").clone();
+            if !value.is_null() {
+                pairs.push((value, rid));
+            }
+        }
+        for (value, rid) in &pairs {
+            btree.insert(value, *rid)?;
+        }
+        self.indexes.get_mut(index_name).expect("index_namesはself.indexesのキーそのもの").btree = btree;
+        Ok((temp_path, index_path))
+    }
+
+    /// 手動`CHECKPOINT`(第34章)。全dirtyページ(データ・カタログ・索引)を
+    /// flush・syncした**あとで**、Checkpointレコード(現在アクティブな
+    /// トランザクションの一覧つき)をWALへ書き、そのLSNまで同期する。
+    ///
+    /// `active`は、この時点でActiveな全トランザクションの`(TransactionId,
+    /// wal_last_lsn)`。次回クラッシュ後のAnalysisは、この一覧をTransaction
+    /// Tableの初期状態として使うことで、Checkpointより前まで遡ってWALを
+    /// 走査せずに済む(本文「Analysisの開始点を短縮する」を参照)。
+    ///
+    /// flushを先に行うのは、Checkpoint以前の全ページのPage LSNが
+    /// Checkpointの時点で確実にこのLSN以上になっている、という前提を
+    /// Redoが使えるようにするためである。この前提が無いと、Analysisが
+    /// Checkpointより前を読まずに済ませてよい理由が崩れる。
+    pub fn checkpoint(&mut self, active: &[(TransactionId, Option<Lsn>)]) -> DbResult<Lsn> {
+        self.flush()?;
+        self.sync()?;
+        let mut w = self.wal.lock().unwrap_or_else(|p| p.into_inner());
+        let lsn = w.append_checkpoint(active);
+        w.sync()?;
+        Ok(lsn)
     }
 
     /// テーブル名から`TableInfo`を引く。見つからなければ`None`を返す。
@@ -808,7 +1102,7 @@ impl Storage {
 
         let index_path = index_file_path(&self.path, index_name);
         let disk = DiskManager::open(&index_path)?;
-        let mut btree = BTree::create(BufferPool::new(disk, DEFAULT_BUFFER_POOL_CAPACITY), key_type, unique)?;
+        let btree = BTree::create(BufferPool::new(disk, DEFAULT_BUFFER_POOL_CAPACITY), key_type, unique)?;
 
         // Index Build: 既存の全行を読み、対象列がNULLでない行だけを挿入する。
         let mut pairs: Vec<(crate::types::Value, RecordId)> = Vec::new();

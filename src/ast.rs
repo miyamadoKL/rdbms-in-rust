@@ -43,6 +43,15 @@ pub enum Statement {
     /// `ANALYZE [テーブル名]`文(第27章)。統計情報を収集する。テーブル名を
     /// 省略した場合はカタログに登録されている全テーブルが対象になる。
     Analyze(AnalyzeStatement),
+    /// `BEGIN`文(第30章)。明示的なトランザクションを開始する。
+    Begin(BeginStatement),
+    /// `COMMIT`文(第30章)。現在のトランザクションの変更を確定する。
+    Commit(CommitStatement),
+    /// `ROLLBACK`文(第30章)。現在のトランザクションの変更を取り消す。
+    Rollback(RollbackStatement),
+    /// `CHECKPOINT`文(第34章)。全dirtyページをflush・syncし、Checkpoint
+    /// レコードをWALへ書く。
+    Checkpoint(CheckpointStatement),
 }
 
 impl Statement {
@@ -59,6 +68,10 @@ impl Statement {
             Statement::Delete(s) => s.span,
             Statement::Explain(s) => s.span,
             Statement::Analyze(s) => s.span,
+            Statement::Begin(s) => s.span,
+            Statement::Commit(s) => s.span,
+            Statement::Rollback(s) => s.span,
+            Statement::Checkpoint(s) => s.span,
         }
     }
 }
@@ -327,6 +340,55 @@ pub struct ExplainStatement {
 pub struct AnalyzeStatement {
     /// 対象テーブル名。`None`ならカタログに登録されている全テーブルが対象。
     pub table: Option<Ident>,
+    pub span: Span,
+}
+
+/// `BEGIN`文(第30章)。`BEGIN TRANSACTION`のような修飾は持たず、`BEGIN`
+/// 単体、または`BEGIN ISOLATION LEVEL <level>`(第32章)だけを受理する
+/// (`docs-local/chatgpt_opinion.md`の原案が挙げる`BEGIN TRANSACTION`・
+/// `BEGIN WORK`のような修飾語は、この章でも引き続き受理しない)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BeginStatement {
+    /// 省略した場合は`None`になり、`Database::execute_begin`が既定の
+    /// 分離レベル(Repeatable Read、本文「分離レベルの既定値」を参照)を補う。
+    pub isolation_level: Option<IsolationLevel>,
+    pub span: Span,
+}
+
+/// `BEGIN ISOLATION LEVEL ...`(第32章)が指定できる4つの分離レベル。
+///
+/// SQL標準が定める順序どおりに並べてある(`Read Uncommitted`が最も緩く、
+/// `Serializable`が最も厳格)。この型はASTの一部であり、`Binder`を経由せず
+/// そのまま`crate::transaction::TransactionContext`へ渡る(`BeginStatement`
+/// 自体が`Binder`をほぼ素通りするのと同じ理由、本文を参照)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    /// `READ UNCOMMITTED`。読み取りロックを一切取らない。
+    ReadUncommitted,
+    /// `READ COMMITTED`。読み取りロックを文の終わりで解放する。
+    ReadCommitted,
+    /// `REPEATABLE READ`。読み取りロックもCOMMITまで保持する(第31章の
+    /// Strict 2PLがもともと持っていた挙動そのもの)。
+    RepeatableRead,
+    /// `SERIALIZABLE`。`RepeatableRead`に加え、Phantomも防ぐ。
+    Serializable,
+}
+
+/// `COMMIT`文(第30章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitStatement {
+    pub span: Span,
+}
+
+/// `ROLLBACK`文(第30章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RollbackStatement {
+    pub span: Span,
+}
+
+/// `CHECKPOINT`文(第34章)。修飾語を持たない単体の文。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckpointStatement {
     pub span: Span,
 }
 

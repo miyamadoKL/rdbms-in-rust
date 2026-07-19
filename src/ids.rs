@@ -14,7 +14,7 @@
 /// let table_id = TableId(1);
 /// load_page(table_id); // 型が違うためコンパイルエラー
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PageId(pub u64);
 
 /// カタログに登録されたテーブルを指す識別子。
@@ -24,6 +24,17 @@ pub struct TableId(pub u64);
 /// トランザクションを指す識別子。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransactionId(pub u64);
+
+/// WAL(第33章、`crate::wal`)のログレコードを指す、単調増加の番号
+/// (**Log Sequence Number**)。
+///
+/// `0`は「まだ何も書いていない」ことを表す番兵として予約し、実際に書いた
+/// レコードには`1`から順に割り当てる(`crate::wal::WalWriter`)。`Ord`を
+/// 導出しているのは、あるページの変更を表すログがどこまでディスクへ届いて
+/// いるか(`crate::buffer_pool`のPage LSN)を、ログの現在の書き込み位置と
+/// 比較するためである。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Lsn(pub u64);
 
 /// Slotted Page(第12章)内の1スロットを指す識別子。
 ///
@@ -38,7 +49,13 @@ pub struct SlotId(pub u16);
 /// `PageId`だけでは同じページ内の複数のタプルを区別できず、`SlotId`だけでは
 /// どのページのスロットを指しているのかが分からない。この2つの組がそろって
 /// 初めて、データベース全体でタプル1件の位置を一意に表せる。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `Ord`を導出しているのは、`(page_id, slot_id)`の辞書式順序が、
+/// `crate::btree::RangeScan`が重複キーの範囲を安定した全順序で走査するための
+/// 基準になるためである(`crate::btree`モジュールの`ScanPosition::After`を
+/// 参照)。この順序自体に業務上の意味は無く、単に「常に同じ結果になる、
+/// 何らかの全順序」であればよい。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RecordId {
     /// このタプルが格納されているページ。
     pub page_id: PageId,

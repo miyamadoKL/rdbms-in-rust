@@ -44,25 +44,61 @@
 //! 別の軽い`Mutex<Inner>`に出しておけば、走査はページ本体に一切触れずに
 //! 済み、この事故が起きない。
 //!
-//! # 単一スレッド前提の内部可変性
+//! # 第35章: フレーム本体を`RwLock`にし、Latchとして使う
 //!
-//! この章の`minidb`はまだシングルスレッドで動いている(並行アクセスは第35章の
-//! Latchまで登場しない)。それでも`&mut self`ではなく`&self`で読み書きできる
-//! ようにしているのは、第13章の`DiskManager`が`&self`を選んだ理由と同じで、
-//! `BufferPool`を`Arc`で複数の実行主体から共有できるようにしておくためである。
-//! フレームごとに別々の`Mutex`を持つ構成は、のちに複数スレッドが同時に
-//! 別々のページを読み書きできるようにするための布石でもある。ただし、
-//! `page_table`の更新とフレームへの書き込みを1つの操作として原子的に行う
-//! 保証はこの章にはまだなく、真の並行アクセスに対する安全性は第35章の
-//! Latchで扱う。
+//! 第34章まで、フレーム本体(`Frame`)は`Mutex`で守っていた。`Mutex`は
+//! Exclusiveの区別しか持たないため、同じページを読むだけの2つの
+//! [`PageReadGuard`]であっても、片方が生きている間はもう片方の`read_page`が
+//! ロック待ちで止まっていた(第14章の演習問題2、および本章の本文
+//! 「Read Latchの共存」を参照)。この章から`frames`の要素を`RwLock<Frame>`に
+//! 変え、`read_page`は`RwLock::read`、`write_page`と`evict`・`flush_frame`は
+//! `RwLock::write`を取るようにした。この`RwLock<Frame>`こそが、この章が導入
+//! する**Latch**の実体である。ページの中身を保護する主体は第14章から変わって
+//! いない。変わったのは、読み取り同士を同時に許すという一点だけである。
+//!
+//! # Latchの取得順序: Inner(メタデータ)を先に、Frame(ページ本体)をあとに
+//!
+//! `BufferPool`は2種類のロックを持つ。`page_table`・`pin_count`等をまとめた
+//! `Mutex<Inner>`(メタデータ)と、フレームごとの`RwLock<Frame>`(ページ本体、
+//! 上述のLatch)である。この2つを同時に取る箇所(`locate_or_load`・`evict`)は
+//! すべて「`Inner`を先にロックし、その`MutexGuard`を握ったままFrameのLatchを
+//! 取る」という順序で統一している。逆順(Frameを先に、Innerをあと)を許すと、
+//! スレッドAが`page_table`を調べる(Inner確保)ためにevictを試み、evict先の
+//! フレームがスレッドBの`PageReadGuard`によってLatch中で待たされている間に、
+//! スレッドBがそのGuardを`Drop`する段になって(Frameをまだ握ったまま)
+//! `unpin`のために`Inner`を取ろうとすると、AがInnerを握ったままB保有の
+//! Frameを待ち、BがFrameを握ったままAが握るInnerを待つ、という循環待ちが
+//! 起こりうる。
+//!
+//! 実際、[`PageReadGuard`]・[`PageWriteGuard`]の`Drop`は素朴に書くとこの逆順
+//! を踏む。`Drop`の中で`self.pool.unpin(...)`(Inner確保)を呼んだあと、
+//! Rustは構造体のフィールドを宣言順に自動でdropする。つまり素朴な実装では
+//! 「Inner確保 → (自動drop完了後に)Frame解放」という順序になり、`unpin`の
+//! 実行中は依然としてFrame Latchを握ったままInnerを取りに行くことになる。
+//! これは上で述べた逆順そのものであり、Buffer Poolを複数スレッドから使う
+//! 途端にデッドロックしうる。この章では`guard`フィールドを
+//! `std::mem::ManuallyDrop`で包み、`Drop::drop`の中で明示的に
+//! `ManuallyDrop::drop(&mut self.guard)`を呼んでFrame Latchを先に解放して
+//! から`unpin`(Inner確保)を呼ぶよう順序を固定した。「Frameを先に手放して
+//! からInnerに触る」は「Innerを先に、Frameをあとに」という規律に反して
+//! いるように見えるが、この2つは同時に保持されることが無くなった(Frameを
+//! 解放し終えてからInnerを取るだけ)という点で、規律が禁じる「逆順で同時に
+//! 保持する」状態そのものを作らない。
+//!
+//! この規律は、B+Tree(`crate::btree`、第35章)のLock Couplingが従う
+//! 「常に上から下、左から右」という取得順序とは別の軸の規律である。B+Treeの
+//! 規律はページとページの間の順序を、この規律はBuffer Pool内部のInnerと
+//! フレームという2種類のロックの間の順序を決める。
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::mem::ManuallyDrop;
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::disk_manager::DiskManager;
 use crate::error::{DbError, DbResult};
-use crate::ids::PageId;
+use crate::ids::{Lsn, PageId};
 use crate::page::{Page, PageType};
+use crate::wal::WalWriter;
 
 /// 1フレームが保持するページ本体。`None`は「まだどのページも読み込んでいない
 /// 空きフレーム」を表す。
@@ -82,6 +118,28 @@ struct FrameMeta {
     dirty: bool,
     /// Clock置換の参照ビット。
     referenced: bool,
+    /// **Page LSN**(第33章)。このページへの変更のうち、対応するWALレコードが
+    /// 存在する最新のものの`Lsn`。`Lsn(0)`は「WALに追跡された変更がまだ無い」
+    /// ことを表す番兵で、`crate::wal::Lsn`が実際に払い出す最小値(`Lsn(1)`)と
+    /// 衝突しない。dirtyなページをディスクへ書き戻す直前、この値までWALが
+    /// 同期済みであることを保証する(`BufferPool::flush_frame`・`evict`の
+    /// ドキュメントを参照)。
+    ///
+    /// # 第34章での変更: ページ自身へも永続化する
+    ///
+    /// 第33章までは、この値はこの`FrameMeta`(プロセスのメモリ上)にしか
+    /// 存在しなかった。この章から`crate::page::Page`自身も同じ`page_lsn`を
+    /// 持つようになり、ページをディスクへ書き戻す(`flush_frame`・`evict`)
+    /// 直前にこのメタデータの値を`Page::page_lsn`へ書き写してから
+    /// `DiskManager::write_page`を呼ぶ。ページを新しく読み込む
+    /// (`locate_or_load`)ときは、逆にディスクから読んだ`Page::page_lsn`を
+    /// この`FrameMeta::page_lsn`の初期値として引き継ぐ(`Lsn(0)`で固定的に
+    /// 初期化していた第33章までとの違い)。これにより、プロセスを再起動して
+    /// 読み直したページも、クラッシュ前にどこまでWALが反映されていたかを
+    /// 正しく覚えている状態から始まる。`crate::recovery::recover`のRedoが
+    /// 「このページのこの変更は、もうディスクに届いているか」を判定する
+    /// 材料は、まさにこの値である。
+    page_lsn: Lsn,
 }
 
 impl FrameMeta {
@@ -91,6 +149,7 @@ impl FrameMeta {
             pin_count: 0,
             dirty: false,
             referenced: false,
+            page_lsn: Lsn(0),
         }
     }
 }
@@ -106,6 +165,13 @@ struct Inner {
     clock_hand: usize,
     hits: u64,
     misses: u64,
+    /// WALファースト不変条件(第33章)を強制するために参照するWAL。
+    /// `crate::storage::Storage`が`create`・`open`のあとで
+    /// [`BufferPool::attach_wal`]を呼び、テーブル本体用の`BufferPool`にだけ
+    /// 結線する(索引ごとの`BufferPool`には結線しない、本文「この章が
+    /// 対象にする範囲」を参照)。`None`のままなら、このBufferPoolは
+    /// 第14章までと同じ、WALを一切意識しない書き戻しを行う。
+    wal: Option<Arc<Mutex<WalWriter>>>,
 }
 
 /// `read_page`・`write_page`のヒット/ミス回数。
@@ -121,7 +187,8 @@ pub struct BufferPoolStats {
 pub struct BufferPool {
     disk: DiskManager,
     /// フレームの配列。`new`で決めた容量のまま、以後は要素数を変えない。
-    frames: Vec<Mutex<Frame>>,
+    /// `RwLock`がこの章のLatchの実体である(モジュール冒頭を参照)。
+    frames: Vec<RwLock<Frame>>,
     inner: Mutex<Inner>,
 }
 
@@ -132,7 +199,7 @@ impl BufferPool {
     /// `capacity`は0より大きい必要がある(0だとどのページも読み込めない)。
     pub fn new(disk: DiskManager, capacity: usize) -> Self {
         assert!(capacity > 0, "capacityは1以上である必要があります");
-        let frames = (0..capacity).map(|_| Mutex::new(Frame { page: None })).collect();
+        let frames = (0..capacity).map(|_| RwLock::new(Frame { page: None })).collect();
         let meta = (0..capacity).map(|_| FrameMeta::empty()).collect();
         BufferPool {
             disk,
@@ -143,6 +210,7 @@ impl BufferPool {
                 clock_hand: 0,
                 hits: 0,
                 misses: 0,
+                wal: None,
             }),
         }
     }
@@ -150,6 +218,50 @@ impl BufferPool {
     /// このBufferPoolが保持できるフレーム数。
     pub fn capacity(&self) -> usize {
         self.frames.len()
+    }
+
+    /// このBufferPoolにWALを結線し、以後dirtyなページの書き戻し前に
+    /// WALファースト不変条件を強制するようにする(第33章)。
+    ///
+    /// `Storage::create`・`Storage::open`が、テーブル本体用の`BufferPool`に
+    /// 対してだけ1回呼ぶ。呼ばなければ、このBufferPoolは第14章までと同じ
+    /// 挙動のままになる(索引専用の`BufferPool`はこの章では呼ばない、
+    /// モジュール冒頭の`Inner::wal`のドキュメントを参照)。
+    pub fn attach_wal(&self, wal: Arc<Mutex<WalWriter>>) {
+        self.lock_inner().wal = Some(wal);
+    }
+
+    /// `id`のページが今このBufferPoolに読み込まれていれば、その**Page LSN**
+    /// (第33章)を`lsn`まで引き上げる(すでにより新しい`lsn`が記録されていれば
+    /// 何もしない)。
+    ///
+    /// `crate::storage::Storage`の`insert`・`update`・`delete`が、対応する
+    /// WALレコードを`append`した直後に呼ぶ。呼び出し時点でそのページは
+    /// 直前の書き込みによって必ずこのBufferPoolに読み込まれているはずなので、
+    /// 見つからない場合は何もしない(呼び出し側のバグを示す可能性はあるが、
+    /// このメソッド自身は`&self`しか取らない薄い更新であり、ここで
+    /// panicするほどの不変条件はまだ無い)。
+    pub fn bump_page_lsn(&self, id: PageId, lsn: Lsn) {
+        let mut inner = self.lock_inner();
+        if let Some(&frame_id) = inner.page_table.get(&id) {
+            let meta = &mut inner.meta[frame_id];
+            if lsn > meta.page_lsn {
+                meta.page_lsn = lsn;
+            }
+        }
+    }
+
+    /// `id`のページの現在のPage LSN(第34章)を返す。
+    ///
+    /// まだキャッシュされていなければ`DiskManager`から読み込む(その時点で
+    /// ディスクに永続化されている値を引き継ぐ、`locate_or_load`を参照)。
+    /// `crate::recovery::recover`のRedoが、あるログレコードをこのページへ
+    /// 再適用すべきかどうか(`このLsn < レコードのLsn`)を判定するために使う。
+    pub(crate) fn page_lsn(&self, id: PageId) -> DbResult<Lsn> {
+        let frame_id = self.locate_and_pin(id)?;
+        let lsn = self.lock_inner().meta[frame_id].page_lsn;
+        self.unpin(frame_id, false);
+        Ok(lsn)
     }
 
     /// このBufferPoolが管理する`DiskManager`の現在のページ数(Metaページを含む)。
@@ -171,9 +283,13 @@ impl BufferPool {
     /// すでにキャッシュされていればヒットとしてディスクI/Oなしで返す。
     /// されていなければ`DiskManager::read_page`で読み込み、空きフレームが
     /// なければClock置換でフレームを1つ確保してから読み込む。
+    ///
+    /// 取得するのはこのフレームのRead Latch(`RwLock::read`)であり、同じ
+    /// ページを指す他のスレッドの`PageReadGuard`と共存できる。`write_page`が
+    /// 握るWrite Latchとだけ両立しない(モジュール冒頭を参照)。
     pub fn read_page(&self, id: PageId) -> DbResult<PageReadGuard<'_>> {
         let frame_id = self.locate_and_pin(id)?;
-        let guard = self.lock_frame(frame_id);
+        let guard = ManuallyDrop::new(self.lock_frame_read(frame_id));
         Ok(PageReadGuard {
             pool: self,
             frame_id,
@@ -188,7 +304,7 @@ impl BufferPool {
     /// ときにdirty flagを立てる点だけが異なる(モジュール冒頭の説明を参照)。
     pub fn write_page(&self, id: PageId) -> DbResult<PageWriteGuard<'_>> {
         let frame_id = self.locate_and_pin(id)?;
-        let guard = self.lock_frame(frame_id);
+        let guard = ManuallyDrop::new(self.lock_frame_write(frame_id));
         Ok(PageWriteGuard {
             pool: self,
             frame_id,
@@ -256,9 +372,33 @@ impl BufferPool {
     /// `Inner`のロックとフレームのロックを同時に持たない(モジュール冒頭の
     /// 説明を参照)。呼び出し側がすでにこのフレームをpinしているGuardを
     /// 保持したまま呼ぶと、フレームのロック待ちで止まるので注意すること。
+    ///
+    /// # WALファースト不変条件の強制
+    ///
+    /// 実際にページを書き戻す(`self.disk.write_page`)前に、このフレームの
+    /// Page LSNを読み、WALが結線されていれば[`WalWriter::sync_up_to`]を呼ぶ。
+    /// これにより、このページに反映されている変更を表すWALレコードは、
+    /// ページ自身よりも必ず先にディスクへ同期される。WALのロックとフレームの
+    /// ロックはこの手順の中で同時に保持しない(WALの同期を終えてから
+    /// フレームをロックする)ため、`WalWriter`側の処理が長くかかっても
+    /// このBufferPoolの他の操作をブロックしない。
     fn flush_frame(&self, frame_id: usize) -> DbResult<()> {
-        let frame = self.lock_frame(frame_id);
-        if let Some(page) = frame.page.as_ref() {
+        let (page_lsn, wal) = {
+            let inner = self.lock_inner();
+            (inner.meta[frame_id].page_lsn, inner.wal.clone())
+        };
+        if let Some(wal) = wal {
+            wal.lock().unwrap_or_else(|p| p.into_inner()).sync_up_to(page_lsn)?;
+        }
+
+        let mut frame = self.lock_frame_write(frame_id);
+        if let Some(page) = frame.page.as_mut() {
+            // 第34章: このフレームのPage LSNをページ自身へ書き写してから
+            // ディスクへ書き戻す。こうしておかないと、次にこのページを読み込む
+            // (クラッシュ後の`Storage::open`も含む)側が、どこまでの変更が
+            // すでに反映済みかを知る手段を失う(`FrameMeta::page_lsn`の
+            // 「第34章での変更」を参照)。
+            page.page_lsn = page_lsn;
             self.disk.write_page(page)?;
         }
         drop(frame);
@@ -299,12 +439,17 @@ impl BufferPool {
         };
 
         let page = self.disk.read_page(id)?;
-        self.lock_frame(frame_id).page = Some(page);
+        // 第34章: ディスクに永続化されている`page_lsn`を、そのままこの
+        // フレームの初期値として引き継ぐ(モジュール冒頭`FrameMeta::page_lsn`の
+        // 「第34章での変更」を参照)。`Lsn(0)`固定で初期化していた第33章までとの違い。
+        let page_lsn = page.page_lsn;
+        self.lock_frame_write(frame_id).page = Some(page);
         inner.meta[frame_id] = FrameMeta {
             occupant: Some(id),
             pin_count: 0,
             dirty: false,
             referenced: false,
+            page_lsn,
         };
         inner.page_table.insert(id, frame_id);
         Ok(frame_id)
@@ -317,8 +462,11 @@ impl BufferPool {
     /// フレームを見つける、という古典的なClockアルゴリズムの動作を、この
     /// 上限が保証する。この範囲でevict候補が見つからなければ、全フレームが
     /// pin中だということなので`DbError::BufferPoolFull`を返す。
+    /// dirtyなフレームを書き戻す直前にWALファースト不変条件を強制する点は
+    /// [`BufferPool::flush_frame`]と同じである(`Inner::wal`のドキュメントを参照)。
     fn evict(&self, inner: &mut Inner) -> DbResult<usize> {
         let capacity = self.frames.len();
+        let wal = inner.wal.clone();
         for _ in 0..2 * capacity {
             let i = inner.clock_hand;
             inner.clock_hand = (inner.clock_hand + 1) % capacity;
@@ -333,13 +481,21 @@ impl BufferPool {
             }
 
             let evicted_id = meta.occupant.take().expect("occupantはSomeであることを確認済み");
-            if meta.dirty {
-                let frame = self.lock_frame(i);
-                if let Some(page) = frame.page.as_ref() {
+            let dirty = meta.dirty;
+            let page_lsn = meta.page_lsn;
+            if dirty {
+                if let Some(wal) = &wal {
+                    wal.lock().unwrap_or_else(|p| p.into_inner()).sync_up_to(page_lsn)?;
+                }
+                let mut frame = self.lock_frame_write(i);
+                if let Some(page) = frame.page.as_mut() {
+                    // `flush_frame`と同じ理由でPage LSNをページ自身へ書き写す
+                    // (第34章)。
+                    page.page_lsn = page_lsn;
                     self.disk.write_page(page)?;
                 }
             }
-            self.lock_frame(i).page = None;
+            self.lock_frame_write(i).page = None;
             inner.page_table.remove(&evicted_id);
             return Ok(i);
         }
@@ -348,10 +504,20 @@ impl BufferPool {
         ))
     }
 
-    /// `frame_id`のフレーム本体を1つロックする(メタデータではなくページ本体)。
-    fn lock_frame(&self, frame_id: usize) -> MutexGuard<'_, Frame> {
+    /// `frame_id`のフレーム本体にRead Latchをかける(メタデータではなく
+    /// ページ本体)。同じフレームの他の`PageReadGuard`とは共存できるが、
+    /// `lock_frame_write`とは両立しない。
+    fn lock_frame_read(&self, frame_id: usize) -> RwLockReadGuard<'_, Frame> {
         self.frames[frame_id]
-            .lock()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `frame_id`のフレーム本体にWrite Latchをかける。他のどの`PageReadGuard`
+    /// ・`PageWriteGuard`とも同時には持てない。
+    fn lock_frame_write(&self, frame_id: usize) -> RwLockWriteGuard<'_, Frame> {
+        self.frames[frame_id]
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
@@ -381,7 +547,10 @@ pub struct PageReadGuard<'a> {
     pool: &'a BufferPool,
     frame_id: usize,
     page_id: PageId,
-    guard: MutexGuard<'a, Frame>,
+    /// `ManuallyDrop`で包み、`Drop::drop`の中で明示的にFrame Latchを解放して
+    /// から`unpin`(Inner確保)を呼べるようにしている(モジュール冒頭の
+    /// 「Latchの取得順序」を参照)。
+    guard: ManuallyDrop<RwLockReadGuard<'a, Frame>>,
 }
 
 impl PageReadGuard<'_> {
@@ -410,6 +579,15 @@ impl PageReadGuard<'_> {
 
 impl Drop for PageReadGuard<'_> {
     fn drop(&mut self) {
+        // Frame Latchを先に解放してから`unpin`(Inner確保)を呼ぶ。逆順だと
+        // Inner確保中もFrame Latchを握り続けることになり、evictと循環待ちに
+        // なりうる(モジュール冒頭の「Latchの取得順序」を参照)。
+        // SAFETY: `guard`はこの後この構造体が読まれることはなく、二重dropも
+        // 起きない(構造体自体が`Drop::drop`を抜けたあとフィールドの自動drop
+        // 対象から外れるのが`ManuallyDrop`の意味である)。
+        unsafe {
+            ManuallyDrop::drop(&mut self.guard);
+        }
         self.pool.unpin(self.frame_id, false);
     }
 }
@@ -425,7 +603,8 @@ pub struct PageWriteGuard<'a> {
     pool: &'a BufferPool,
     frame_id: usize,
     page_id: PageId,
-    guard: MutexGuard<'a, Frame>,
+    /// `PageReadGuard`と同じ理由で`ManuallyDrop`に包む。
+    guard: ManuallyDrop<RwLockWriteGuard<'a, Frame>>,
 }
 
 impl PageWriteGuard<'_> {
@@ -449,6 +628,16 @@ impl PageWriteGuard<'_> {
         self.page_mut().payload_mut()
     }
 
+    /// このページの`PageType`を書き換える(第35章)。
+    ///
+    /// `BTree::grow_new_root`が、Rootの`PageId`を変えずに(古いRootページを
+    /// そのまま)Leaf PageからInternal Pageへ育てるために使う。通常の
+    /// ページはすべて`allocate_page`が決めた`PageType`のまま生涯変わらない
+    /// ため、この操作を使うのはその1箇所だけを想定している。
+    pub fn set_page_type(&mut self, page_type: PageType) {
+        self.page_mut().page_type = page_type;
+    }
+
     fn page(&self) -> &Page {
         self.guard
             .page
@@ -466,6 +655,10 @@ impl PageWriteGuard<'_> {
 
 impl Drop for PageWriteGuard<'_> {
     fn drop(&mut self) {
+        // SAFETY: `PageReadGuard::drop`と同じ理由。
+        unsafe {
+            ManuallyDrop::drop(&mut self.guard);
+        }
         self.pool.unpin(self.frame_id, true);
     }
 }
@@ -640,5 +833,88 @@ mod tests {
         drop(g2);
         drop(g3);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    fn wal_temp_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "minidb-buffer-pool-wal-test-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        path.push(unique);
+        path
+    }
+
+    /// WALファースト不変条件(第33章)の核心: `attach_wal`したBufferPoolが
+    /// dirtyなページを書き戻す(evictする、または`flush_page`を呼ぶ)前に、
+    /// そのページのPage LSNまでWALが必ず同期されている。
+    #[test]
+    fn flush_page_syncs_the_wal_up_to_the_pages_page_lsn_before_writing_it_back() {
+        let db_path = temp_path("wal-first-flush");
+        let wal_path = wal_temp_path("wal-first-flush");
+        let disk = disk_with_pages(&db_path, 1);
+        let pool = BufferPool::new(disk, 4);
+        let wal = Arc::new(Mutex::new(WalWriter::open(&wal_path).unwrap()));
+        pool.attach_wal(wal.clone());
+
+        let lsn = {
+            let mut w = wal.lock().unwrap();
+            w.append_begin(crate::ids::TransactionId(1))
+        };
+        {
+            let mut g = pool.write_page(PageId(1)).unwrap();
+            g.data_mut()[0..5].copy_from_slice(b"alice");
+        }
+        pool.bump_page_lsn(PageId(1), lsn);
+
+        // まだ`sync_up_to`を誰も呼んでいないので、WALはまだこのlsnまで
+        // 同期されていない。
+        assert!(wal.lock().unwrap().durable_lsn() < lsn);
+
+        pool.flush_page(PageId(1)).unwrap();
+
+        // `flush_page`がページを書き戻す前に、必ずこのlsnまでWALを
+        // 同期しているはず。
+        assert!(wal.lock().unwrap().durable_lsn() >= lsn);
+
+        std::fs::remove_file(&db_path).unwrap();
+        std::fs::remove_file(&wal_path).unwrap();
+    }
+
+    /// [`flush_page_syncs_the_wal_up_to_the_pages_page_lsn_before_writing_it_back`]
+    /// と同じ不変条件を、`flush_page`ではなくClock置換によるevict経路
+    /// (`BufferPool::evict`)でも確認する。
+    #[test]
+    fn eviction_syncs_the_wal_up_to_the_evicted_pages_page_lsn_before_writing_it_back() {
+        let db_path = temp_path("wal-first-evict");
+        let wal_path = wal_temp_path("wal-first-evict");
+        let disk = disk_with_pages(&db_path, 2);
+        let pool = BufferPool::new(disk, 1);
+        let wal = Arc::new(Mutex::new(WalWriter::open(&wal_path).unwrap()));
+        pool.attach_wal(wal.clone());
+
+        let lsn = {
+            let mut w = wal.lock().unwrap();
+            w.append_begin(crate::ids::TransactionId(1))
+        };
+        {
+            let mut g = pool.write_page(PageId(1)).unwrap();
+            g.data_mut()[0..5].copy_from_slice(b"alice");
+        }
+        pool.bump_page_lsn(PageId(1), lsn);
+        assert!(wal.lock().unwrap().durable_lsn() < lsn);
+
+        // 容量1のプールへpage 2を読み込むと、page 1がevictされ書き戻される。
+        {
+            let _g2 = pool.read_page(PageId(2)).unwrap();
+        }
+        assert!(wal.lock().unwrap().durable_lsn() >= lsn);
+
+        std::fs::remove_file(&db_path).unwrap();
+        std::fs::remove_file(&wal_path).unwrap();
     }
 }

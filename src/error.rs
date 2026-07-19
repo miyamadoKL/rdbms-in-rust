@@ -213,6 +213,46 @@ pub enum DbError {
     /// このエラーの対象にはならない。
     #[error("索引'{0}'はPRIMARY KEY・UNIQUE制約が自動生成した索引のため、DROP INDEXでは削除できません")]
     CannotDropConstraintIndex(String),
+
+    /// すでに`Active`なトランザクションの中で`BEGIN`を実行したエラー(第30章)。
+    /// このSQLサブセットは`BEGIN`の入れ子を許さない(章の本文で理由を説明する)。
+    #[error("すでにトランザクションが開始されています(BEGINの入れ子は未対応です)")]
+    TransactionAlreadyActive,
+
+    /// トランザクションの外(Autocommitモード)で`COMMIT`または`ROLLBACK`を
+    /// 実行したエラー(第30章)。
+    #[error("有効なトランザクションがありません")]
+    NoActiveTransaction,
+
+    /// `Active`なトランザクションの中で実行した文がエラーになったあと、
+    /// `ROLLBACK`以外の文を実行しようとしたエラー(第30章)。PostgreSQLに
+    /// 倣い、一度失敗した文を含むトランザクションはロールバックするまで
+    /// 以後の文をすべて拒否する(章の本文「Statement Error時のAbort」を参照)。
+    #[error("現在のトランザクションはエラーのため中断されています。ROLLBACKだけ受け付けます")]
+    TransactionAborted,
+
+    /// この文が必要とするロックのうち少なくとも1つを、他のトランザクションが
+    /// 両立しないモードで保持しているため、今すぐには獲得できなかったエラー
+    /// (第31章、`crate::lock_manager::LockResult::Blocked`)。この文は
+    /// 一切実行されていない(書き込みはおろか、`undo_log`への記録も無い)ため、
+    /// トランザクションは`Active`のまま変化しない
+    /// (`Database::finish`が`Aborted`への遷移をこのエラーだけ特別扱いする)。
+    /// 呼び出し元は、ロックを塞いでいる側のトランザクションが`COMMIT`・
+    /// `ROLLBACK`するのを待ってから、同じ文をもう一度実行し直すことを
+    /// 想定している。
+    #[error("ロックを獲得できませんでした(他のトランザクションが保持中です)")]
+    WouldBlock,
+
+    /// このトランザクションが、他のトランザクションと循環して互いのロックを
+    /// 待ち合う**デッドロック**の一部として検出され、Victim Selection(第32章)
+    /// によって強制的に`Aborted`へ倒されたエラー。`WouldBlock`と違い、この
+    /// トランザクションは(このエラーを受け取った文自身がVictimに選ばれた場合を
+    /// 除き)`ROLLBACK`(または`rollback_tx`)以外の操作をこれ以上受け付けない。
+    /// 呼び出し元は`WouldBlock`のように同じ文を再試行するのではなく、
+    /// トランザクション全体を最初からやり直す必要がある(本文「Victim Selection」
+    /// を参照)。
+    #[error("デッドロックを検出しました。このトランザクションはVictimとして強制的にABORTされました")]
+    DeadlockDetected,
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

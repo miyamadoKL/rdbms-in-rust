@@ -6,7 +6,7 @@
 //! (`u32`/`u64`の変換に`to_le_bytes`/`from_le_bytes`を使う)。
 
 use crate::error::{DbError, DbResult};
-use crate::ids::PageId;
+use crate::ids::{Lsn, PageId};
 
 /// 1ページのバイト数。
 ///
@@ -21,14 +21,21 @@ pub const MAGIC: [u8; 4] = *b"MDB1";
 
 /// オンディスク形式のバージョン。File HeaderやPage Headerのレイアウトを変更する
 /// たびに1ずつ増やす。
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// 第34章でPage Headerに`page_lsn`(8バイト)を追加したため、`1`から`2`へ
+/// 上げてある。この教材は章をまたいだファイル互換性を約束しない方針
+/// (`crate::storage`モジュール冒頭を参照)であり、古い章のファイルをこの章の
+/// コードで開こうとすると`format_version`の不一致で確実に`DbError::CorruptPage`
+/// になる。
+pub const FORMAT_VERSION: u32 = 2;
 
 /// File Headerのバイト数(`magic` 4 + `format_version` 4 + `page_size` 4 +
 /// `page_count` 8 + `checksum` 4)。
 pub const FILE_HEADER_SIZE: usize = 24;
 
-/// Page Headerのバイト数(`page_id` 8 + `page_type` 1 + 予約領域 3 + `checksum` 4)。
-pub const PAGE_HEADER_SIZE: usize = 16;
+/// Page Headerのバイト数(`page_id` 8 + `page_type` 1 + `page_lsn` 8 +
+/// 予約領域 3 + `checksum` 4、第34章)。
+pub const PAGE_HEADER_SIZE: usize = 24;
 
 /// 1ページのうち、Page Headerを除いた本体のバイト数。
 pub const PAGE_PAYLOAD_SIZE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
@@ -179,15 +186,30 @@ pub struct Page {
     pub page_id: PageId,
     /// このページの種類。
     pub page_type: PageType,
+    /// **Page LSN**(第34章)。このページに反映されている変更のうち、対応する
+    /// WALレコードが存在する最新のものの`Lsn`。`Lsn(0)`は「WALに追跡された
+    /// 変更がまだ一度もこのページへ反映されていない」ことを表す番兵で、
+    /// `crate::wal::WalWriter`が実際に払い出す最小値(`Lsn(1)`)と衝突しない。
+    ///
+    /// 第33章では同じ役割の値を`crate::buffer_pool::BufferPool`の
+    /// `FrameMeta`にだけ、プロセスのメモリ上で保持していた。この章から
+    /// ページ自身のバイト列に埋め込み、ディスクへ書き戻すたびに一緒に
+    /// 永続化する。クラッシュ後の`crate::recovery::recover`が「このページの
+    /// 変更のうち、どこまでがすでにディスクへ届いているか」をプロセスの
+    /// 再起動をまたいで知るには、この値がページ自身に残っている必要がある
+    /// (`crate::buffer_pool`モジュールドキュメントの「Page LSNの永続化」を参照)。
+    pub page_lsn: Lsn,
     payload: Vec<u8>,
 }
 
 impl Page {
-    /// `payload`を全て0で埋めた、新しい空のページを作る。
+    /// `payload`を全て0で埋めた、新しい空のページを作る。`page_lsn`は`Lsn(0)`
+    /// (第34章、「WALに追跡された変更がまだ無い」)から始まる。
     pub fn new(page_id: PageId, page_type: PageType) -> Self {
         Page {
             page_id,
             page_type,
+            page_lsn: Lsn(0),
             payload: vec![0u8; PAGE_PAYLOAD_SIZE],
         }
     }
@@ -205,18 +227,20 @@ impl Page {
     /// ページを`PAGE_SIZE`バイト固定長のバイト列へ変換する。
     ///
     /// レイアウトは先頭から`page_id`(8バイト、LE)、`page_type`(1バイト)、
-    /// 予約領域(3バイト、常に0)、`checksum`(4バイト、LE)、`payload`
-    /// (`PAGE_PAYLOAD_SIZE`バイト)の順。`checksum`は、`checksum`フィールド自身を
-    /// 0で埋めた状態のページ全体(ヘッダーと本体の両方)に対する`crc32`である。
+    /// `page_lsn`(8バイト、LE、第34章)、予約領域(3バイト、常に0)、
+    /// `checksum`(4バイト、LE)、`payload`(`PAGE_PAYLOAD_SIZE`バイト)の順。
+    /// `checksum`は、`checksum`フィールド自身を0で埋めた状態のページ全体
+    /// (ヘッダーと本体の両方)に対する`crc32`である。
     pub fn encode(&self) -> [u8; PAGE_SIZE] {
         let mut buf = [0u8; PAGE_SIZE];
         buf[0..8].copy_from_slice(&self.page_id.0.to_le_bytes());
         buf[8] = self.page_type.to_u8();
-        // buf[9..12]は予約領域で、初期化済みの0のままにする。
-        // buf[12..16]は次のcrc32計算までchecksum用に0を保つ。
+        buf[9..17].copy_from_slice(&self.page_lsn.0.to_le_bytes());
+        // buf[17..20]は予約領域で、初期化済みの0のままにする。
+        // buf[20..24]は次のcrc32計算までchecksum用に0を保つ。
         buf[PAGE_HEADER_SIZE..].copy_from_slice(&self.payload);
         let checksum = crc32(&buf);
-        buf[12..16].copy_from_slice(&checksum.to_le_bytes());
+        buf[20..24].copy_from_slice(&checksum.to_le_bytes());
         buf
     }
 
@@ -231,10 +255,10 @@ impl Page {
             )));
         }
 
-        let stored_checksum = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let stored_checksum = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
         let mut zeroed = [0u8; PAGE_SIZE];
         zeroed.copy_from_slice(bytes);
-        zeroed[12..16].fill(0);
+        zeroed[20..24].fill(0);
         let actual_checksum = crc32(&zeroed);
         if stored_checksum != actual_checksum {
             return Err(DbError::CorruptPage(format!(
@@ -244,11 +268,13 @@ impl Page {
 
         let page_id = PageId(u64::from_le_bytes(bytes[0..8].try_into().unwrap()));
         let page_type = PageType::from_u8(bytes[8])?;
+        let page_lsn = Lsn(u64::from_le_bytes(bytes[9..17].try_into().unwrap()));
         let payload = bytes[PAGE_HEADER_SIZE..].to_vec();
 
         Ok(Page {
             page_id,
             page_type,
+            page_lsn,
             payload,
         })
     }
@@ -261,7 +287,11 @@ impl Page {
 /// 高速化のためのテーブル参照は行わない。この章で扱うページ数では速度上の問題に
 /// ならない上、テーブル参照を導入すると、学ぶべき対象がCRC-32の計算そのものから
 /// テーブルの事前生成手順へずれてしまう。
-fn crc32(bytes: &[u8]) -> u32 {
+///
+/// `pub(crate)`にしてあるのは、第33章の`crate::wal`がログレコードのchecksumにも
+/// 同じアルゴリズムを使うためである(独自に再実装せず、ここで検証済みの実装を
+/// 再利用する)。
+pub(crate) fn crc32(bytes: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in bytes {
         crc ^= byte as u32;
@@ -371,9 +401,9 @@ mod tests {
         // page_typeを書き換えたのでchecksumも計算し直し、checksum不一致ではなく
         // page_typeの検証で失敗することを確認する。
         let mut zeroed = bytes;
-        zeroed[12..16].fill(0);
+        zeroed[20..24].fill(0);
         let checksum = crc32(&zeroed);
-        zeroed[12..16].copy_from_slice(&checksum.to_le_bytes());
+        zeroed[20..24].copy_from_slice(&checksum.to_le_bytes());
         bytes = zeroed;
         let err = Page::decode(&bytes).unwrap_err();
         assert!(matches!(err, DbError::CorruptPage(_)));

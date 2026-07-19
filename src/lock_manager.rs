@@ -1,0 +1,632 @@
+//! Lock ManagerとStrict 2PL(第31章)。
+//!
+//! この章の`Database`は、複数のトランザクションが同じ行・同じテーブルへ
+//! 同時にアクセスしようとしたとき、どちらか一方を**待たせる**という手段を
+//! 初めて持つ。それまで(第30章まで)は、`INSERT`・`UPDATE`・`DELETE`・
+//! `SELECT`はどのトランザクションの変更も即座に共有された`Backend`へ反映し、
+//! 他のトランザクションはそれを`COMMIT`より前から見ることができた
+//! (`tests/interleave.rs`が固定した、Lost Update・Dirty Read・
+//! Non-repeatable Read・Phantomという4つの異常)。
+//!
+//! この章のLock Managerは、行(またはテーブル)ごとに「今どのトランザクションが
+//! どんなロックを持っているか」を記録し、両立しないロックの要求を
+//! [`LockResult::Blocked`]として突き返す。この`Blocked`が、上の4つの異常のうち
+//! 3つ(Lost Update・Dirty Read・Non-repeatable Read)を実際に防ぐ土台になる
+//! (Phantomがなぜ防げないままなのかは、この章の本文と`src/database.rs`の
+//! ロック粒度の説明を参照)。
+//!
+//! # 実スレッドを待たせない
+//!
+//! 本物のLock Managerは、ロックを取れないトランザクションのスレッドを
+//! 実際にブロックし(`Mutex`の`lock()`が返ってこないのと同じ意味で)、ロックが
+//! 解放されたときにOSのスケジューラがそのスレッドを起こす。このクレートは
+//! 第35章までBuffer PoolとB+Treeがスレッドセーフでなく、複数スレッドから
+//! 同じ`Database`を触れない(第30章の決定的インターリーブテストハーネスの
+//! ドキュメントを参照)。そのため、この章の[`LockManager::acquire`]は
+//! ブロックする代わりに[`LockResult::Blocked`]という**値**を返すだけで、
+//! 即座に呼び出し元へ制御を返す。呼び出し元(`Database::execute_in_tx`)は、
+//! ロックを取れなかった文を実行せずに`Err`として返し、そのトランザクションを
+//! `Active`のまま保つ。ロックを取れなかった文をもう一度試すかどうか、いつ
+//! 試すかは、呼び出し側(ハーネスを使うテストコード)が決める。この章は
+//! 「取れなければ待ち行列に並べておく」ところまでで、待っているトランザクションを
+//! 自動的に起こして再実行するスケジューラは持たない。
+
+use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
+
+use crate::ids::{RecordId, TableId, TransactionId};
+
+/// SharedロックとExclusiveロックの2種類。
+///
+/// # 互換性行列
+///
+/// | 保持中\要求 | Shared | Exclusive |
+/// |---|---|---|
+/// | Shared | 両立する | 両立しない |
+/// | Exclusive | 両立しない | 両立しない |
+///
+/// Shared同士だけが両立する。1つのキーに対して複数のトランザクションが
+/// 同時に`Shared`を持てるが、`Exclusive`はどんな組み合わせであっても
+/// 他のロックと同居できない(自分自身がすでに持っている場合を除く。
+/// [`LockManager::acquire`]を参照)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    /// 読み取り用。複数のトランザクションが同じ対象に同時に持てる。
+    Shared,
+    /// 書き込み用。1つのトランザクションしか同時に持てない。
+    Exclusive,
+}
+
+impl LockMode {
+    /// `self`(保持中のモード)と`other`(要求されたモード)が両立するか。
+    fn compatible_with(self, other: LockMode) -> bool {
+        matches!((self, other), (LockMode::Shared, LockMode::Shared))
+    }
+}
+
+/// [`LockManager::acquire`]の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockResult {
+    /// ロックを獲得できた。呼び出し元はそのまま処理を続けてよい。
+    Granted,
+    /// 他のトランザクションが両立しないロックを持っているため、獲得できな
+    /// かった。要求は待ち行列の末尾(Lock Upgradeの場合は先頭、本文を参照)に
+    /// 積まれており、対象のロックが解放されるたびに[`LockManager::release_all`]
+    /// が再評価する。呼び出し元は今すぐこの要求を諦めるのではなく、あとで
+    /// もう一度同じ要求を試すことを想定している(モジュール冒頭の説明を参照)。
+    Blocked,
+}
+
+/// [`crate::database::Database`]がSELECT・DMLの対象を指すために使うロックの
+/// 単位。
+///
+/// `Table`はテーブル全体を1個のロック対象として扱う(この章の前半で作る、
+/// 最初の粒度)。`Tuple`はテーブルの1行(`RecordId`)を1個のロック対象として
+/// 扱う、より細かい粒度である。どちらの粒度を実際に使うかは`Database`の
+/// バックエンド(Memory・Disk)によって決まる。理由は
+/// [`crate::database`]モジュールの「ロックの粒度」節を参照。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LockKey {
+    /// テーブル全体。
+    Table(TableId),
+    /// 1行(`RecordId`はDiskバックエンドだけが持つ、第30章の`transaction`
+    /// モジュールを参照)。
+    Tuple(TableId, RecordId),
+}
+
+/// 待ち行列に積まれた1件の要求。
+struct Waiter {
+    txn: TransactionId,
+    mode: LockMode,
+    /// この要求が、すでに`Shared`を持っているトランザクションによる
+    /// `Exclusive`へのUpgrade要求かどうか。Upgrade要求は待ち行列の並び方が
+    /// 通常の新規要求と違う(`LockManager::acquire`のドキュメントを参照)。
+    is_upgrade: bool,
+}
+
+/// 1つのロック対象(`LockKey`1個)が持つ、保持者と待ち行列。
+#[derive(Default)]
+struct LockEntry {
+    holders: Vec<(TransactionId, LockMode)>,
+    waiters: VecDeque<Waiter>,
+}
+
+impl LockEntry {
+    /// 現在の保持者全員と`mode`が両立するか。保持者がいなければ常に`true`。
+    fn compatible_with_holders(&self, mode: LockMode) -> bool {
+        self.holders.iter().all(|(_, held)| held.compatible_with(mode))
+    }
+
+    fn holder_mode(&self, txn: TransactionId) -> Option<LockMode> {
+        self.holders.iter().find(|(t, _)| *t == txn).map(|(_, mode)| *mode)
+    }
+}
+
+/// キー`K`ごとに、Shared/ExclusiveロックとWait Queueを管理する。
+///
+/// `K`はロックの対象を指す型で、この章では[`LockKey`]を渡す
+/// (`Database`は`LockManager<LockKey>`を1個持つ)。`K`をジェネリクスに
+/// したのは、この章がまず`TableId`だけを`K`に据えてTable Lockの正しさを
+/// 単体で確認し(本文・`tests`内のユニットテストを参照)、そのあと`Database`へ
+/// 組み込む段になって`LockKey`(Table・Tupleの両方を表せる型)へ差し替える、
+/// という2段階の進め方を取るためである。ロックの管理ロジック自体はどちらの
+/// 段でも1文字も変わらない。
+pub struct LockManager<K: Eq + Hash + Clone> {
+    entries: HashMap<K, LockEntry>,
+    /// `txn`が`Shared`として新規に(=以前は持っていなかった状態から)獲得した
+    /// 鍵の列。`acquire`が即座に`Granted`を返した場合と、[`Self::
+    /// promote_waiters`]が待ち行列から昇格させた場合の両方をここに積む
+    /// (第32章、READ COMMITTEDの「文末解放」がこれを使う。詳しい理由は
+    /// [`Self::take_pending_shared_grants`]のドキュメントを参照)。
+    ///
+    /// `Shared`は`Database::acquire_scan_locks`(`SELECT`)からしか要求され
+    /// ないため、この記録は`SELECT`が新規に獲得したShared Lockだけを指す
+    /// (`Exclusive`の獲得・Upgradeはここに積まない)。
+    pending_shared_grants: HashMap<TransactionId, Vec<K>>,
+}
+
+impl<K: Eq + Hash + Clone> Default for LockManager<K> {
+    fn default() -> Self {
+        LockManager { entries: HashMap::new(), pending_shared_grants: HashMap::new() }
+    }
+}
+
+impl<K: Eq + Hash + Clone> LockManager<K> {
+    /// ロックを1つも持たない、空のLock Managerを作る。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `txn`が`key`に対して`mode`のロックを要求する。
+    ///
+    /// # 3つの分岐
+    ///
+    /// 1. **すでに十分なロックを持っている**: `txn`が`key`に対してすでに
+    ///    `mode`以上の強さのロックを持っていれば(`Exclusive`は`Shared`の
+    ///    要求も含めて何でも満たす)、そのまま`Granted`を返す。
+    /// 2. **Lock Upgrade**: `txn`がすでに`Shared`を持っていて、要求が
+    ///    `Exclusive`のとき。`txn`がそのキーの唯一の保持者であれば、他の
+    ///    誰とも衝突しないのでその場で`Shared`を`Exclusive`へ書き換えて
+    ///    `Granted`を返す。他にも`Shared`を持つトランザクションがいれば、
+    ///    Upgrade要求を待ち行列の**先頭**に積んで`Blocked`を返す。先頭に積む
+    ///    理由は、`txn`は「新規に割り込んできた要求」ではなく「すでに部分的な
+    ///    権利(Shared)を持っている既存の参加者」だからである。末尾に積むと、
+    ///    あとから来た無関係な新規Shared要求に何度も追い越され、Upgradeだけが
+    ///    いつまでも成立しない(Upgrade starvation)。
+    /// 3. **新規要求**: `txn`がまだこのキーに触れていない場合。待ち行列が
+    ///    空で、かつ現在の保持者全員と`mode`が両立すれば即座に`Granted`。
+    ///    そうでなければ待ち行列の**末尾**に積んで`Blocked`を返す
+    ///    (`Blocked`になった理由・待ち行列の並び順の意味は
+    ///    [`LockManager::release_all`]のFIFOに関する説明を参照)。
+    pub fn acquire(&mut self, txn: TransactionId, key: K, mode: LockMode) -> LockResult {
+        let entry = self.entries.entry(key.clone()).or_default();
+
+        if let Some(held) = entry.holder_mode(txn) {
+            if held == LockMode::Exclusive || held == mode {
+                return LockResult::Granted;
+            }
+            // held == Shared, mode == Exclusive: Lock Upgrade。
+            if entry.holders.len() == 1 {
+                entry.holders[0].1 = LockMode::Exclusive;
+                return LockResult::Granted;
+            }
+            if !entry.waiters.iter().any(|w| w.txn == txn) {
+                entry.waiters.push_front(Waiter { txn, mode, is_upgrade: true });
+            }
+            return LockResult::Blocked;
+        }
+
+        if entry.waiters.is_empty() && entry.compatible_with_holders(mode) {
+            entry.holders.push((txn, mode));
+            if mode == LockMode::Shared {
+                self.pending_shared_grants.entry(txn).or_default().push(key);
+            }
+            return LockResult::Granted;
+        }
+        if !entry.waiters.iter().any(|w| w.txn == txn) {
+            entry.waiters.push_back(Waiter { txn, mode, is_upgrade: false });
+        }
+        LockResult::Blocked
+    }
+
+    /// `txn`が保持している(待ち行列に積んだままの要求も含む)すべてのロックを
+    /// 手放す。Strict 2PLの一括解放(`COMMIT`・`ROLLBACK`)、およびAutocommit
+    /// 文が1文の終わりに呼ぶ(`crate::database`の該当節を参照)。
+    ///
+    /// 解放したキーごとに、待ち行列の先頭から
+    /// 昇格できるだけ昇格させる([`LockManager::promote_waiters`])。
+    pub fn release_all(&mut self, txn: TransactionId) {
+        let keys: Vec<K> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.holders.iter().any(|(t, _)| *t == txn) || entry.waiters.iter().any(|w| w.txn == txn)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        for key in keys {
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.holders.retain(|(t, _)| *t != txn);
+                entry.waiters.retain(|w| w.txn != txn);
+                self.promote_waiters(&key);
+            }
+        }
+        // `txn`自体がCOMMIT・ROLLBACK・強制Abortで終わる以上、
+        // `pending_shared_grants`に積んだままの記録(まだ`take_pending_shared_grants`
+        // で回収されていない、READ COMMITTEDの文末解放待ちの記録)はもう
+        // 意味を持たない。放置すると、二度と回収されないエントリが
+        // `HashMap`に残り続ける。
+        self.pending_shared_grants.remove(&txn);
+    }
+
+    /// `key`の待ち行列を先頭から見て、今の保持者集合と両立する限り昇格させる。
+    ///
+    /// # FIFOと後続のS要求がX待ちを追い越さない理由
+    ///
+    /// 待ち行列の先頭が`Shared`要求で、それが現在の保持者と両立すれば昇格し、
+    /// 次の要求へ進む。これを繰り返すと、先頭に連続して並んだ`Shared`要求は
+    /// まとめて昇格できる(`Shared`同士は何人いても両立するため)。ところが
+    /// 先頭が`Exclusive`要求(または成立しないUpgrade要求)だった場合はそこで
+    /// 止まる。たとえ2番目以降に、今なら通る`Shared`要求が控えていても、
+    /// **先へは進まない**。先頭の`Exclusive`要求を飛び越して後続の`Shared`
+    /// 要求を先に通してしまうと、`Exclusive`要求は後から来る`Shared`要求に
+    /// 際限なく追い越され続け、いつまでもロックを取れなくなる
+    /// (Starvation)。この関数が「先頭が両立しなければ即座に止める」という
+    /// 単純な規則を守っているのは、この追い越しを起こさないためである。
+    fn promote_waiters(&mut self, key: &K) {
+        let Some(entry) = self.entries.get_mut(key) else { return };
+        while let Some((is_upgrade, txn, mode)) = entry.waiters.front().map(|w| (w.is_upgrade, w.txn, w.mode)) {
+            if is_upgrade {
+                let is_sole_holder = entry.holders.len() == 1 && entry.holders[0].0 == txn;
+                if !is_sole_holder {
+                    break;
+                }
+                entry.waiters.pop_front();
+                entry.holders[0].1 = LockMode::Exclusive;
+                continue;
+            }
+            if !entry.compatible_with_holders(mode) {
+                break;
+            }
+            entry.waiters.pop_front();
+            entry.holders.push((txn, mode));
+            if mode == LockMode::Shared {
+                self.pending_shared_grants.entry(txn).or_default().push(key.clone());
+            }
+        }
+        if entry.holders.is_empty() && entry.waiters.is_empty() {
+            self.entries.remove(key);
+        }
+    }
+
+    /// `key`に対して`txn`が現在保持しているロックの強さ。テストと
+    /// デバッグ用の観測用途に限る(`Database`の通常の実行経路はこれを使わず、
+    /// `acquire`の戻り値だけで判断する)。
+    #[cfg(test)]
+    fn holder_mode(&self, txn: TransactionId, key: &K) -> Option<LockMode> {
+        self.entries.get(key).and_then(|entry| entry.holder_mode(txn))
+    }
+
+    /// `txn`が`Shared`として新規に獲得し、まだ回収していない鍵をすべて
+    /// 返し、その記録を空にする(第32章、READ COMMITTEDの文末解放)。
+    ///
+    /// # なぜ「獲得する前に`held_mode`を見る」方式ではないか(第5部レビュー
+    /// 2巡目対応)
+    ///
+    /// 最初の実装は、`acquire_scan_locks`が各鍵を獲得する**前**に
+    /// `held_mode`でその時点の保持状況を見て、「既に持っていなければ
+    /// 新規」と判定していた。この方式は、`SELECT`が`WouldBlock`で一度
+    /// 待たされたケースで壊れる。`SELECT`を先行トランザクションのCOMMIT後に
+    /// 再試行すると、その鍵はすでに待ち行列から昇格して`Some(Shared)`に
+    /// なっている。再試行の`acquire_scan_locks`はこの`Some`を見て「以前から
+    /// 持っていた」と誤判定し、`newly_acquired`に入れ損なう。結果、この文が
+    /// 実際に新規獲得したShared Lockが文末解放から漏れ、`READ COMMITTED`の
+    /// 規律(この文の読み取りロックは文末で手放す)が破れる。
+    ///
+    /// この方式は、「新規に獲得した」という事実を**獲得が実際に起きた
+    /// 瞬間**([`Self::acquire`]が即座に`Granted`を返す瞬間、または
+    /// [`Self::promote_waiters`]が待ち行列から昇格させる瞬間)に`LockManager`
+    /// 自身が記録することで、`WouldBlock`をまたいだ再試行の回数によらず
+    /// 正しく追跡する。獲得のタイミングと「誰かがそれを尋ねるタイミング」が
+    /// ずれても壊れないという点で、呼び出し側(`Database`)がその都度
+    /// `held_mode`を覗き見る方式より堅牢であり、ロックの獲得・解放という
+    /// この型自身の責務にも自然に収まる(モジュール冒頭のドキュメントを
+    /// 参照)。
+    pub(crate) fn take_pending_shared_grants(&mut self, txn: TransactionId) -> Vec<K> {
+        self.pending_shared_grants.remove(&txn).unwrap_or_default()
+    }
+
+    /// `txn`が保持している`keys`のロックだけを手放す(第32章、Read Committedの
+    /// 「読み取りロックを文の終わりで解放する」を実現する)。[`LockManager::release_all`]
+    /// と違い、`txn`が他に持っている(または待っている)ロックには一切触れない。
+    /// 呼び出し側(`Database::acquire_scan_locks`)は、この文のために新しく
+    /// 獲得した`Shared`ロックの鍵だけを`keys`に渡す。解放したキーごとに
+    /// [`LockManager::promote_waiters`]を呼び、空いたキーの待ち行列を再評価する。
+    pub(crate) fn release_keys(&mut self, txn: TransactionId, keys: &[K]) {
+        for key in keys {
+            if let Some(entry) = self.entries.get_mut(key) {
+                entry.holders.retain(|(t, _)| *t != txn);
+                self.promote_waiters(key);
+            }
+        }
+    }
+
+    /// `key`の待ち行列に並んでいる`TransactionId`を、先頭から順に返す。
+    /// テスト専用(FIFO順序の検証に使う)。
+    #[cfg(test)]
+    fn waiting_order(&self, key: &K) -> Vec<TransactionId> {
+        self.entries.get(key).map(|entry| entry.waiters.iter().map(|w| w.txn).collect()).unwrap_or_default()
+    }
+
+    /// 現在、待ち行列に1件以上並んでいる(=`Blocked`のまま止まっている)
+    /// トランザクションの集合。デッドロックの**観測**用。
+    #[cfg(test)]
+    fn blocked_transactions(&self) -> std::collections::HashSet<TransactionId> {
+        self.entries.values().flat_map(|entry| entry.waiters.iter().map(|w| w.txn)).collect()
+    }
+
+    /// **Wait-for Graph**の辺を`(待っている側, 待たれている側)`の組として
+    /// 列挙する(第32章、`Database::detect_deadlock`が使う)。
+    ///
+    /// この`LockManager`自身はデッドロックを検出しない(この型の責務は
+    /// あくまでロックの獲得・解放であり、複数のトランザクションをまたいだ
+    /// グラフ探索は1段上の`Database`に置く、という役割分担は第31章から変えて
+    /// いない)。この関数は、`Database`がWait-for Graphを組み立てるために
+    /// 必要な生データ(誰が誰を待っているか)を提供するだけである。
+    ///
+    /// 待ち行列の**順序**(FIFOの公平性)によるブロックも辺に含める。
+    /// [`LockManager::promote_waiters`]は待ち行列を必ず先頭から順に処理し、
+    /// 先頭が昇格できなければそこで止まる。したがって、ある待ち要求が
+    /// 昇格できるのは、その**手前に並ぶすべての要求が先に昇格し終わった**
+    /// ときに限られる。つまり待ち行列上の各要求は、実際にモードが衝突する
+    /// 保持者だけでなく、自分より前に並ぶ直前の要求にも依存している
+    /// (直前の要求がその時点でたまたま保持者と両立していても、まだ
+    /// 待ち行列に残っている限り、後続の要求はそれを追い越して先に
+    /// 昇格することはない)。この依存を辺として表現しないと、FIFOの
+    /// 順序だけで実在する循環待ちを見逃す(本文「Wait-for GraphとFIFOの
+    /// 待ち行列」を参照)。
+    ///
+    /// 返す辺は次の2種類を合わせたものである。
+    ///
+    /// 1. 要求されたモードと実際に保持されているモードが**両立しない**、
+    ///    本物のロック衝突。Upgrade要求(`is_upgrade`)は、自分以外の保持者
+    ///    全員と衝突するとみなす(唯一の保持者であれば`acquire`の時点で
+    ///    即座に`Granted`になっており、待ち行列に残ること自体がない)。
+    /// 2. 待ち行列上で自分の直前に並ぶ要求への辺(FIFOで追い越せない
+    ///    という依存)。
+    pub(crate) fn wait_for_edges(&self) -> Vec<(TransactionId, TransactionId)> {
+        let mut edges = Vec::new();
+        for entry in self.entries.values() {
+            for waiter in &entry.waiters {
+                for &(holder, held_mode) in &entry.holders {
+                    if holder == waiter.txn {
+                        continue;
+                    }
+                    let conflicts = if waiter.is_upgrade { true } else { !held_mode.compatible_with(waiter.mode) };
+                    if conflicts {
+                        edges.push((waiter.txn, holder));
+                    }
+                }
+            }
+            for pair in entry.waiters.iter().collect::<Vec<_>>().windows(2) {
+                let [predecessor, successor] = pair else { unreachable!("windows(2)は常に2要素を返す") };
+                edges.push((successor.txn, predecessor.txn));
+            }
+        }
+        edges
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const T1: TransactionId = TransactionId(1);
+    const T2: TransactionId = TransactionId(2);
+    const T3: TransactionId = TransactionId(3);
+
+    fn table(n: u64) -> LockKey {
+        LockKey::Table(TableId(n))
+    }
+
+    // ---- 互換性行列 ----
+
+    #[test]
+    fn shared_locks_are_compatible_with_each_other() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Shared), LockResult::Granted);
+        assert_eq!(lm.acquire(T2, table(1), LockMode::Shared), LockResult::Granted);
+    }
+
+    #[test]
+    fn exclusive_lock_conflicts_with_an_existing_shared_lock() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Shared), LockResult::Granted);
+        assert_eq!(lm.acquire(T2, table(1), LockMode::Exclusive), LockResult::Blocked);
+    }
+
+    #[test]
+    fn shared_lock_conflicts_with_an_existing_exclusive_lock() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Exclusive), LockResult::Granted);
+        assert_eq!(lm.acquire(T2, table(1), LockMode::Shared), LockResult::Blocked);
+    }
+
+    #[test]
+    fn exclusive_lock_conflicts_with_an_existing_exclusive_lock() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Exclusive), LockResult::Granted);
+        assert_eq!(lm.acquire(T2, table(1), LockMode::Exclusive), LockResult::Blocked);
+    }
+
+    #[test]
+    fn reacquiring_the_same_or_weaker_mode_is_a_no_op() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Exclusive), LockResult::Granted);
+        // すでにExclusiveを持っているので、Sharedの要求はそのまま素通りする。
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Shared), LockResult::Granted);
+        assert_eq!(lm.holder_mode(T1, &table(1)), Some(LockMode::Exclusive));
+    }
+
+    // ---- Lock Upgrade ----
+
+    #[test]
+    fn sole_shared_holder_upgrades_immediately() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Shared), LockResult::Granted);
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Exclusive), LockResult::Granted);
+        assert_eq!(lm.holder_mode(T1, &table(1)), Some(LockMode::Exclusive));
+    }
+
+    #[test]
+    fn upgrade_blocks_while_another_transaction_also_holds_shared() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Shared), LockResult::Granted);
+        assert_eq!(lm.acquire(T2, table(1), LockMode::Shared), LockResult::Granted);
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Exclusive), LockResult::Blocked);
+
+        // T2がSharedを手放すと、T1は唯一の保持者になりUpgradeが成立する。
+        lm.release_all(T2);
+        assert_eq!(lm.holder_mode(T1, &table(1)), Some(LockMode::Exclusive));
+    }
+
+    #[test]
+    fn upgrade_request_is_inserted_ahead_of_new_shared_requests() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Shared), LockResult::Granted);
+        assert_eq!(lm.acquire(T2, table(1), LockMode::Shared), LockResult::Granted);
+        // T1がUpgradeをブロックされたまま待つ。
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Exclusive), LockResult::Blocked);
+        // 後から来たT3の新規Shared要求は、末尾に積まれる。
+        assert_eq!(lm.acquire(T3, table(1), LockMode::Shared), LockResult::Blocked);
+        assert_eq!(lm.waiting_order(&table(1)), vec![T1, T3], "UpgradeのT1が新規要求のT3より先頭にいる");
+    }
+
+    // ---- Wait Queue: FIFOとStarvation回避 ----
+
+    #[test]
+    fn a_later_shared_request_does_not_overtake_an_earlier_exclusive_request() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Shared), LockResult::Granted);
+        // T2のExclusiveはT1のSharedとぶつかりBlocked。
+        assert_eq!(lm.acquire(T2, table(1), LockMode::Exclusive), LockResult::Blocked);
+        // T3の新規SharedはT1とは両立するはずだが、待ち行列の先頭(T2)を
+        // 追い越せないため、やはりBlockedになる。
+        assert_eq!(lm.acquire(T3, table(1), LockMode::Shared), LockResult::Blocked);
+        assert_eq!(lm.waiting_order(&table(1)), vec![T2, T3]);
+
+        // T1が手放すと、先頭のT2(Exclusive)だけが昇格し、T3はまだ待つ。
+        lm.release_all(T1);
+        assert_eq!(lm.holder_mode(T2, &table(1)), Some(LockMode::Exclusive));
+        assert_eq!(lm.waiting_order(&table(1)), vec![T3]);
+
+        // T2が手放して初めて、T3が通る。
+        lm.release_all(T2);
+        assert_eq!(lm.holder_mode(T3, &table(1)), Some(LockMode::Shared));
+    }
+
+    #[test]
+    fn consecutive_shared_waiters_are_promoted_together() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Exclusive), LockResult::Granted);
+        assert_eq!(lm.acquire(T2, table(1), LockMode::Shared), LockResult::Blocked);
+        assert_eq!(lm.acquire(T3, table(1), LockMode::Shared), LockResult::Blocked);
+
+        lm.release_all(T1);
+        assert_eq!(lm.holder_mode(T2, &table(1)), Some(LockMode::Shared));
+        assert_eq!(lm.holder_mode(T3, &table(1)), Some(LockMode::Shared));
+        assert!(lm.waiting_order(&table(1)).is_empty());
+    }
+
+    // ---- 一括解放 ----
+
+    #[test]
+    fn release_all_frees_every_key_a_transaction_holds() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Exclusive), LockResult::Granted);
+        assert_eq!(lm.acquire(T1, table(2), LockMode::Shared), LockResult::Granted);
+
+        lm.release_all(T1);
+
+        assert_eq!(lm.holder_mode(T1, &table(1)), None);
+        assert_eq!(lm.holder_mode(T1, &table(2)), None);
+        // 誰も持っていないキーは新規要求がそのまま通る。
+        assert_eq!(lm.acquire(T2, table(1), LockMode::Exclusive), LockResult::Granted);
+    }
+
+    #[test]
+    fn release_all_also_removes_pending_wait_entries() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Exclusive), LockResult::Granted);
+        assert_eq!(lm.acquire(T2, table(1), LockMode::Shared), LockResult::Blocked);
+
+        // T2は自分自身の要求(まだ成立していないもの)を取り下げる。
+        lm.release_all(T2);
+        assert!(lm.waiting_order(&table(1)).is_empty());
+
+        lm.release_all(T1);
+        assert_eq!(lm.holder_mode(T2, &table(1)), None, "取り下げた要求は昇格しない");
+    }
+
+    // ---- デッドロックの観測とWait-for Graph(検出・解決は1段上のDatabaseが行う) ----
+
+    /// この`LockManager`自身は、循環したまま両者ともブロックされ続ける状況を
+    /// 防げない。デッドロックの**検出**と**解決**(Wait-for Graphの構築、
+    /// Victim Selection、強制Abort)は第32章で`crate::database::Database`が
+    /// 1段上のレイヤとして持つ責務であり、`LockManager`はそのために必要な
+    /// 生データ(`wait_for_edges`)を提供するだけにとどめる(この型自身の責務を
+    /// 「ロックの獲得・解放」に絞る設計は第31章から変えていない)。
+    #[test]
+    fn mutual_wait_leaves_both_transactions_blocked_without_detection() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Exclusive), LockResult::Granted);
+        assert_eq!(lm.acquire(T2, table(2), LockMode::Exclusive), LockResult::Granted);
+
+        // T1はT2の持つtable(2)を、T2はT1の持つtable(1)を欲しがる。
+        assert_eq!(lm.acquire(T1, table(2), LockMode::Exclusive), LockResult::Blocked);
+        assert_eq!(lm.acquire(T2, table(1), LockMode::Exclusive), LockResult::Blocked);
+
+        // どちらも自動的には解決されない。2つとも待ち行列に残ったままである。
+        let blocked = lm.blocked_transactions();
+        assert!(blocked.contains(&T1));
+        assert!(blocked.contains(&T2));
+    }
+
+    /// `wait_for_edges`が、上と同じ状況からT1⇄T2の両方向の辺を返すことを
+    /// 確認する。`Database::detect_deadlock`はこの辺の集合からWait-for Graphの
+    /// 隣接表を組み立て、循環を探す(第32章)。
+    #[test]
+    fn wait_for_edges_reports_both_directions_of_a_mutual_wait() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Exclusive), LockResult::Granted);
+        assert_eq!(lm.acquire(T2, table(2), LockMode::Exclusive), LockResult::Granted);
+        assert_eq!(lm.acquire(T1, table(2), LockMode::Exclusive), LockResult::Blocked);
+        assert_eq!(lm.acquire(T2, table(1), LockMode::Exclusive), LockResult::Blocked);
+
+        let mut edges = lm.wait_for_edges();
+        edges.sort_by_key(|(waiter, holder)| (waiter.0, holder.0));
+        assert_eq!(edges, vec![(T1, T2), (T2, T1)]);
+    }
+
+    /// `wait_for_edges`は、モードの衝突による辺だけでなく、待ち行列上で
+    /// 自分の直前に並ぶ要求への辺(FIFOで追い越せないという依存)も返す。
+    ///
+    /// T1がAにSharedを持ち、T2がAにExclusiveを要求してBlocked(モード
+    /// 衝突の辺T2→T1)。T3がBのExclusiveを獲得したあと、AにSharedを要求
+    /// する。T1のSharedとは両立するが、待ち行列にはすでにT2がいるため
+    /// FIFOでT2の後ろに並ぶ(モードの衝突は無いので、この待ちを表す辺が
+    /// 無いと循環が見えなくなる)。最後にT1がBのExclusiveを要求すると、
+    /// T3の保持と衝突する(辺T1→T3)。この3本の辺が揃って初めて、
+    /// T1→T3→T2→T1という循環が閉じる(第32章のレビューで実際に指摘
+    /// された、この辺の欠落による見逃しを固定する)。
+    #[test]
+    fn wait_for_edges_includes_fifo_queue_position_dependency() {
+        let mut lm = LockManager::new();
+        let a = table(1);
+        let b = table(2);
+
+        assert_eq!(lm.acquire(T1, a, LockMode::Shared), LockResult::Granted);
+        assert_eq!(lm.acquire(T2, a, LockMode::Exclusive), LockResult::Blocked);
+        assert_eq!(lm.acquire(T3, b, LockMode::Exclusive), LockResult::Granted);
+        // T3のSharedはT1の保持と両立するが、待ち行列のT2を追い越せずBlocked。
+        assert_eq!(lm.acquire(T3, a, LockMode::Shared), LockResult::Blocked);
+        assert_eq!(lm.acquire(T1, b, LockMode::Exclusive), LockResult::Blocked);
+
+        let mut edges = lm.wait_for_edges();
+        edges.sort_by_key(|(waiter, holder)| (waiter.0, holder.0));
+        assert_eq!(edges, vec![(T1, T3), (T2, T1), (T3, T2)], "T1→T3→T2→T1の循環を閉じる3本の辺が揃っている");
+    }
+
+    /// 両立するShared同士は衝突ではないため、`wait_for_edges`は辺を作らない。
+    #[test]
+    fn wait_for_edges_ignores_compatible_shared_waiters() {
+        let mut lm = LockManager::new();
+        assert_eq!(lm.acquire(T1, table(1), LockMode::Shared), LockResult::Granted);
+        // T2のSharedはT1のSharedと両立するが、待ち行列が空でないと即座には
+        // 通らない規則(FIFO公平性)により、待ち行列が空でなければ末尾に積まれる。
+        // ここでは待ち行列が空なので即座にGrantedになり、辺は生まれない。
+        assert_eq!(lm.acquire(T2, table(1), LockMode::Shared), LockResult::Granted);
+        assert!(lm.wait_for_edges().is_empty());
+    }
+}
