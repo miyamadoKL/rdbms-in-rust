@@ -110,7 +110,6 @@ Lexerは元の文字列をそのまま渡すだけにしておき、畳み込む
 
 `Token`は種類(`TokenKind`)と、ソース中のバイト範囲(`Span`)の組です。
 この章では`src/lexer.rs`を新規に作成し、`Lexer`とその周辺の型をすべてここへ置きます。
-`src/lib.rs`には`pub mod lexer;`を追加します。
 
 ```rust
 /// ソースコード中のバイト範囲。`start`を含み`end`を含まない半開区間。
@@ -132,6 +131,12 @@ pub struct Token {
     pub kind: TokenKind,
     pub span: Span,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod lexer;
 ```
 
 `Span`が持つのは開始と終了のバイトオフセットだけで、行番号や列番号は持ちません。

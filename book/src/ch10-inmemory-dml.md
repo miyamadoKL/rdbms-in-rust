@@ -35,7 +35,6 @@ minidb> SELECT id FROM users;
 
 そこで、行の集まりは`storage_mem`という新しいモジュールに置きます。
 この章では`src/storage_mem.rs`を新規に作成します。
-`src/lib.rs`には`pub mod storage_mem;`を追加します。
 
 ```rust
 pub struct MemTable {
@@ -45,6 +44,12 @@ pub struct MemTable {
 pub struct MemStorage {
     tables: HashMap<TableId, MemTable>,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod storage_mem;
 ```
 
 `MemStorage`は`TableId`をキーにする対応表です。
@@ -195,7 +200,6 @@ while *self.peek_kind() == TokenKind::Comma {
 
 実行側の`executor::insert`は、Values演算子(各行の式を評価する部分)とInsert演算子(評価済みの行を書き込む部分)を1つの関数にまとめています。
 この章では`src/executor.rs`も新規に作成し、実行演算子の関数をまとめて置きます。
-`src/lib.rs`には`pub mod executor;`を追加します。
 
 ```rust
 pub fn insert(
@@ -219,6 +223,12 @@ pub fn insert(
     table.rows_mut().extend(planned);
     Ok(count)
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod executor;
 ```
 
 `VALUES`の各要素を評価するとき、`eval_expr`に渡す`Row`は常に`None`です。

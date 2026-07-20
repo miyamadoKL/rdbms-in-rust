@@ -115,7 +115,6 @@ Volcanoモデルの`next()`は、子の`next()`を1回呼んで1行受け取る�
 
 `LogicalPlan`とほぼ同じ形で、実行アルゴリズムを確定した木を`PhysicalPlan`という別の型として定義します。
 この章では新規モジュール`physical_plan`を作り、`src/physical_plan.rs`に置きます。
-`src/lib.rs`には`pub mod physical_plan;`を追加します。
 
 ```rust
 pub enum PhysicalPlan {
@@ -127,6 +126,12 @@ pub enum PhysicalPlan {
     Update(UpdateNode),
     Delete(DeleteNode),
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod physical_plan;
 ```
 
 `Scan`が`SeqScan`という具体的な名前に変わった以外、`LogicalPlan`とバリアントの構成は同じです。

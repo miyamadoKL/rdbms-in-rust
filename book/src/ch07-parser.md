@@ -40,7 +40,6 @@ minidb> SELECT 1 + 2 * 3
 
 構文解析器が組み立てるASTは、`Statement`(文)と`Expr`(式)という2種類のノードからなります。
 この章では`src/ast.rs`を新規に作成し、AST関連の型をまとめて置きます。
-`src/lib.rs`には`pub mod ast;`を追加します。
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +107,12 @@ pub enum Expr {
 }
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod ast;
+```
+
 `Expr::ColumnRef`は`id`のような識別子が式として出てきたことだけを表し、名前を文字列として持つだけです。
 この`id`が本当にどれかのテーブルの列なのか、それとも存在しない名前なのかは、ASTの時点では判定しません。
 `CreateTableStatement`の列定義も同様で、`BIGINT`という型名を`Ident`として、つまりただの文字列として保持する`ColumnDef`を、同じ`src/ast.rs`に次のように定義します。
@@ -169,7 +174,6 @@ Parserは「構文として正しい形をしているかどうか」だけを�
 
 `Parser`は、ソース文字列とToken列、現在の読み取り位置を持つ構造体です。
 この章では`src/parser.rs`を新規に作成し、構文解析器の実装をまとめて置きます。
-`src/lib.rs`には`pub mod parser;`を追加します。
 
 ```rust
 struct Parser<'a> {
@@ -177,6 +181,12 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod parser;
 ```
 
 現在のトークンを覗く`peek`、1個読み進める`advance`、期待するキーワードや記号でなければエラーを返す`expect_keyword`、`expect_punct`、`expect_ident`という基本操作を用意し、これらを組み合わせて先頭のキーワードで分岐する`parse_statement`を、同じ`src/parser.rs`に次のように定義します。

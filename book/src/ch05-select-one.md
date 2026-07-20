@@ -56,13 +56,7 @@ let value = minidb::???; // "SELECT 1"をどう渡せばいいのか、渡す先
 ### 仮の構文解析器
 
 `SELECT`に続く式だけを解析する仮実装を、新規作成する`src/toy_sql.rs`に置きます。
-`src/lib.rs`には次の行を追加します(公開APIとして外部に見せる必要はないので`pub`は付けません)。
-
-```rust
-mod toy_sql;
-```
-
-`src/toy_sql.rs`には、まず式を表す`ToyExpr`を定義します。
+まず、式を表す`ToyExpr`を定義します。
 
 ```rust
 /// この仮実装が扱える式。整数リテラル・真偽値リテラル・整数の加算のみを持つ。
@@ -79,6 +73,13 @@ pub enum ToyExpr {
 
 `ToyExpr`という名前にしたのは、これが本物のASTではないことを型名からも分かるようにするためです。
 第7章で本物のASTを設計するとき、この型は残さず削除します。
+
+あわせて`src/lib.rs`に次の行を加え、このモジュールをクレート内だけで使う非公開モジュールとして登録します。
+公開APIとして外部に見せる必要がないため、`pub`は付けません。
+
+```rust
+mod toy_sql;
+```
 
 評価は、同じ`src/toy_sql.rs`に定義する`eval`が受け持ちます。
 
@@ -197,14 +198,7 @@ fn parse_expr(src: &str) -> DbResult<ToyExpr> {
 ### `Database`と`QueryResult`
 
 `Database`は、SQL文字列を受け取って結果を返す入り口です。
-新規作成する`src/database.rs`に置きます。
-`src/lib.rs`には次の行を追加します。
-
-```rust
-pub mod database;
-```
-
-`src/database.rs`には、次の`Database`を定義します。
+新規作成する`src/database.rs`に、次の`Database`を定義します。
 
 ```rust
 /// minidbのデータベース1つを表す。
@@ -247,6 +241,12 @@ impl Database {
 `Database`自身はまだフィールドを1つも持ちません。
 テーブルを持たないデータベースなので、それで正しい状態です。
 テーブルを持つカタログは第9章で`Database`に追加します。
+
+あわせて`src/lib.rs`に次の行を加え、このモジュールを公開します。
+
+```rust
+pub mod database;
+```
 
 同じ`src/database.rs`に定義する`QueryResult`は、`Schema`と行の並びを持つだけの型です。
 

@@ -135,7 +135,7 @@ index_usage: RefCell<HashMap<String, u64>>,
 `&mut Storage`ではなく`&Storage`のまま増やせる必要があるのは、この値を増やす場所が`IndexScanExec`、`IndexNestedLoopJoinExec`(第25章)という、`Storage`を`&'a Storage`としてしか借用していない`Executor`の内部だからです。
 `RefCell`による内部可変性を使い、`src/physical_plan.rs`の2つの`Executor`で記録します。
 `IndexScanExec`ではPointまたはRangeの実行を開始する時に1回、`IndexNestedLoopJoinExec`では外側の行ごとに内側の`lookup`を呼ぶ直前に記録します。
-`src/physical_plan.rs`の`IndexScanExec`側では、次のように呼びます。
+`IndexScanExec`側では、次のように呼びます。
 
 ```rust
 storage.record_index_use(index_name);
@@ -383,7 +383,7 @@ fn run_bound_statement(&mut self, bound: BoundStatement, ctx: &ExecutionContext)
 
 Query Timingが累積の平均を返すのに対し、Slow Query Logは個々の遅い文を名指しします。
 サーバー起動時に`--slow-query-threshold-ms`を指定すると、その閾値を超えた文をSQL文、実行時間、行数つきでstderrへ記録します。
-この章はこの仕組みのために`src/slow_query_log.rs`を新規に作成し、`src/lib.rs`へ`pub mod slow_query_log;`を追加します。
+この章はこの仕組みのために`src/slow_query_log.rs`を新規に作成します。
 
 サーバー側の端末です。
 
@@ -423,6 +423,12 @@ fn log_to(out: &mut impl Write, threshold: Option<Duration>, sql: &str, elapsed:
     let outcome = if result.is_ok() { "ok" } else { "error" };
     let _ = writeln!(out, "[slow query] {:.3}ms rows={rows} outcome={outcome} sql={}", elapsed.as_secs_f64() * 1000.0, sql.trim());
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod slow_query_log;
 ```
 
 書き込み先を`impl Write`として受け取れるようにしてあるのは、実プロセスのstderrを奪い合わずにテストが出力内容を確認できるようにするためです。

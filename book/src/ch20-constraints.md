@@ -121,7 +121,7 @@ fn parse_column_def(&mut self) -> DbResult<ColumnDef> {
 どちらの順序で書くかは利用者の好みの問題であり、構文としてどちらか一方に決め打つ理由がありません。
 
 `src/types.rs`の`Column`(第4章)にも同じ2つのフラグを追加します。
-既存の呼び出し箇所(`Column::new(name, data_type, nullable)`という3引数の呼び出しが、このクレートだけで30箇所以上あります)を1つも壊さないよう、`src/types.rs`では`new`のシグネチャ自体は変えず、追加のフラグはビルダーメソッドで立てる形にしました。
+既存の呼び出し箇所(`Column::new(name, data_type, nullable)`という3引数の呼び出しが、このクレートだけで30箇所以上あります)を1つも壊さないよう、`new`のシグネチャ自体は変えず、追加のフラグはビルダーメソッドで立てる形にしました。
 
 ```rust
 pub struct Column {
@@ -194,7 +194,6 @@ if primary_key_count > 1 {
 索引が無い以上、この章の一意性検査は「これから書き込もうとしている値を、テーブルの全行と1つずつ比較する」という線形走査で実装するしかありません。
 
 この走査を、新規作成する`src/constraints.rs`に`check_uniqueness`という関数としてまとめます。
-`src/lib.rs`にも`pub mod constraints;`を追加し、`constraints`モジュールとして公開します。
 
 ```rust
 pub fn check_uniqueness<'a>(
@@ -228,6 +227,12 @@ pub fn check_uniqueness<'a>(
     }
     Ok(())
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod constraints;
 ```
 
 `schema.unique_constrained_columns()`は、`PRIMARY KEY`または`UNIQUE`が指定された列だけを、Schema上の索引とセットで返す`Schema`の新しいメソッドです。

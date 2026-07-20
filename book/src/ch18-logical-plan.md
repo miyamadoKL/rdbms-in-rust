@@ -76,7 +76,6 @@ Projection(name)
 
 演算子は7種類にとどめます。
 新規ファイル`src/logical_plan.rs`を作り、`LogicalPlan`を次のように定義します。
-`src/lib.rs`に`pub mod logical_plan;`を追加します。
 
 ```rust
 pub enum LogicalPlan {
@@ -88,6 +87,12 @@ pub enum LogicalPlan {
     Update(UpdateNode),
     Delete(DeleteNode),
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod logical_plan;
 ```
 
 `Scan`、`Values`、`Filter`、`Projection`は`SELECT`が使い、`Insert`、`Update`、`Delete`はそれぞれの文が使います。
@@ -457,7 +462,7 @@ fn execute_insert(&mut self, plan: LogicalPlan) -> DbResult<QueryResult> {
 ## テストで確認する
 
 `src/logical_plan.rs`には、各文種が正しい形の木になることを確認するテストを追加しました。
-木の形の検証は、`src/logical_plan.rs`のテストモジュールで、`to_string()`した結果を期待する文字列と比較する、ゴールデンテストに近いやり方です。
+木の形の検証は、そのテストモジュールで、`to_string()`した結果を期待する文字列と比較する、ゴールデンテストに近いやり方です。
 
 ```rust
 #[test]

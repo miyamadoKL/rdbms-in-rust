@@ -66,8 +66,7 @@ dense     m= 32000  matches= 32000  IndexNestedLoopJoin=786.240948ms  HashJoin=4
 ## 統計収集: 行数、NULL数、NDV、Min/Max、MCV、Histogram
 
 統計情報の型は、新規作成する`src/statistics.rs`に置きます。
-あわせて、`src/lib.rs`に`pub mod statistics;`を追加します。
-`src/statistics.rs`に置くこの型は、テーブルの行数と、列ごとの5種類の値を集めます。
+この型は、テーブルの行数と、列ごとの5種類の値を集めます。
 
 ```rust
 pub struct TableStats {
@@ -83,6 +82,12 @@ pub struct ColumnStats {
     pub mcv: Vec<(Value, u64)>,
     pub histogram: Vec<Bucket>,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod statistics;
 ```
 
 `mcv`(MCV、Most Common Values)は、出現回数の多い値を個別に(値そのものと実際の頻度の組で)保持するリストです。
@@ -472,7 +477,6 @@ fn encode_value(value: &Value, out: &mut Vec<u8>) {
 `ANALYZE`を一度も実行していないテーブルは、統計を持ちません。
 この場合の推定は、選択率の慣用定数にフォールバックします。
 この定数は、新規作成する`src/estimator.rs`に置きます。
-あわせて、`src/lib.rs`に`pub mod estimator;`を追加します。
 
 ```rust
 /// 等値述語のデフォルト選択率(統計が無い場合)。出典は本文を参照。
@@ -480,6 +484,12 @@ pub const DEFAULT_EQ_SEL: f64 = 0.005;
 
 /// 不等号述語のデフォルト選択率(統計が無い場合)。出典は本文を参照。
 pub const DEFAULT_INEQ_SEL: f64 = 1.0 / 3.0;
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod estimator;
 ```
 
 この2つの値は、PostgreSQLの`selfuncs.c`が同じ役割で使っている定数(`DEFAULT_EQ_SEL`と`DEFAULT_INEQ_SEL`)から取っています。

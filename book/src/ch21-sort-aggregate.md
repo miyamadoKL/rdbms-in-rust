@@ -655,7 +655,7 @@ fn next(&mut self) -> DbResult<Option<Tuple>> {
 ## テストで確認する
 
 各演算子の単体テストは`src/physical_plan.rs`の`#[cfg(test)]`モジュールに置き、`orders`(`dept TEXT`、`amount BIGINT`、どちらも`NULL`を許す)という専用のテーブル定義を使っています。
-第19章までの`users`テーブルは`id`が`NOT NULL`のため、`SUM`、`MIN`、`MAX`の`NULL`規則を確かめるテストが書けず、`src/physical_plan.rs`に次のテストを追加しています。
+第19章までの`users`テーブルは`id`が`NOT NULL`のため、`SUM`、`MIN`、`MAX`の`NULL`規則を確かめるテストが書けず、次のテストを追加しています。
 
 ```rust
 #[test]
@@ -672,7 +672,7 @@ fn sum_of_empty_group_is_null_but_count_is_zero() {
 `Sort`の安定性、`NULL`の順序、`Distinct`が子を最小限しか引かないこと、`Limit`が要求件数を返した後は子を1回も引かないことは、それぞれ`CountingExecutor`(第19章で導入した、`next()`の呼び出し回数を数えるテスト専用の葉演算子)を使って確認しています。
 
 `src/binder.rs`の`#[cfg(test)]`モジュールに置く`Binder`のテストは、`WHERE`、`GROUP BY`の中の集約関数、入れ子の集約関数、`GROUP BY`に無い列の射影、`DISTINCT`と隠し列の組み合わせといった、この章で新しく導入した検査それぞれについて、期待どおり`DbError::Bind`になることを確認します。
-`ORDER BY`が隠し列を追加する側のテストは、逆にエラーにならないことと、`hidden_column_count`が期待どおりの値になることを、`src/binder.rs`に次のように確認します。
+`ORDER BY`が隠し列を追加する側のテストは、逆にエラーにならないことと、`hidden_column_count`が期待どおりの値になることを、次のように確認します。
 
 ```rust
 #[test]

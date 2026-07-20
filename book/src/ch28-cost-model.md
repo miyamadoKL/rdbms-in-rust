@@ -43,8 +43,7 @@ Projection(customers.name, orders.item) rows=5000
 候補プランを`SeqScan`、`IndexScan`、`HashJoin`、`IndexNestedLoopJoin`という具体的な演算子の木として組み立てたあと、その木がどれだけの「仕事」をするかを、3種類の重みの合成として見積もります。
 
 このコストモデルは、新規作成する`src/cost_model.rs`に置きます。
-`src/lib.rs`には`pub mod cost_model;`を追加します。
-`src/cost_model.rs`に、まず3つの重みを次のように定義します。
+まず3つの重みを次のように定義します。
 
 ```rust
 /// 1ページぶんのSequential I/O(順読み)のコスト。PostgreSQLの
@@ -68,6 +67,12 @@ pub const RANDOM_PAGE_COST: f64 = 4.0;
 /// 採用する。I/Oの重み(1.0・4.0)に比べて2桁小さく、「I/Oに比べれば
 /// CPU処理は軽い」という一般的な前提を反映している。
 pub const CPU_TUPLE_COST: f64 = 0.01;
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod cost_model;
 ```
 
 出典はPostgreSQLの`postgresql.conf.sample`が定めるデフォルト値です。`seq_page_cost`を1として、`random_page_cost`はその4倍、`cpu_tuple_cost`は2桁小さいという比率そのものに意味があります。ページを1枚読むだけの`SeqScan`と、`Storage::get`を1行ごとに呼ぶ`IndexScan`(第25章)とでは、同じ1行を取り出すのにまったく違う量の仕事を払うということを、この3つの定数が表現しています。
@@ -210,7 +215,7 @@ pub fn sort_cost(rows: u64) -> Cost {
 コストの計算式が揃ったところで、`physical_plan::optimize`の中身を書き換えます。第25章までの`optimize`は`storage`と`predicate`から1つの`AccessPath`をルールで決め打っていましたが、この章はまず候補をすべて`PhysicalPlan`として組み立ててから、コストで比較します。
 
 ここからは`src/physical_plan.rs`への追記です。
-まず、`src/physical_plan.rs`に、複数の候補から最小コストのものを選ぶ`cheapest`を追加します。
+まず、複数の候補から最小コストのものを選ぶ`cheapest`を追加します。
 
 ```rust
 /// 複数の候補`PhysicalPlan`から、[`crate::cost_model::plan_cost`]が最小になる

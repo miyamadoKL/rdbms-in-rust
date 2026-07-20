@@ -82,7 +82,6 @@ Projection(name)
 
 書き換えの種類は複数あり、この先の章でも増えていく見込みです(第27章以降、統計情報を使う書き換えが加わります)。
 この章では`src/rules.rs`をモジュールとして新規作成し、個々の書き換えを`Rule`という1つのインターフェースの実装として登録できるようにしました。
-`src/lib.rs`にも`pub mod rules;`を追加します。
 
 ```rust
 pub trait Rule {
@@ -91,6 +90,12 @@ pub trait Rule {
     // ...(applyのドキュメントコメントは省略)
     fn apply(&self, plan: LogicalPlan, functions: &FunctionRegistry) -> (LogicalPlan, bool);
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod rules;
 ```
 
 `apply`は`plan`を受け取り、書き換え後の`plan`と「実際に何か変えたか」を表す`bool`を返します。

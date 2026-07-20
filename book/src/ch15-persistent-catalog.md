@@ -49,18 +49,18 @@ File Headerは、ファイルの先頭という**固定位置**(ページ0)に�
 このページを、以降**Catalogページ**と呼びます。
 
 この章から、テーブル定義そのものを1つのファイルへ永続化するストレージエンジンを新しいモジュール`storage`として作ります。
-`src/storage.rs`を新規に作成し、`src/lib.rs`へ次の宣言を加えます。
-
-```rust
-pub mod storage;
-```
-
-以降のコードは、特に断らない限りこの`src/storage.rs`に置きます。
+以降のコードは、特に断らない限り、新規作成する`src/storage.rs`に置きます。
 
 ```rust
 /// Catalogページの定位置。ページ0はFile Header(第11章)が占有しているため、
 /// 空いている最初の番号を使う。
 const CATALOG_PAGE_ID: PageId = PageId(1);
+```
+
+あわせて`src/lib.rs`へ次の宣言を加え、このモジュールを公開します。
+
+```rust
+pub mod storage;
 ```
 
 Catalogページは、第11章の`PageType`に新しく加えた種類のページとして扱います。
@@ -273,13 +273,7 @@ for &page_id in &self.page_ids {
 この章の**Free Space Map**は、「このページには残りおよそ何バイトの空きがあるか」という整数1つだけをメモリ上に持ち、`BufferPool`にもディスクにも触れずに候補を絞り込めるようにします。
 
 この`FreeSpaceMap`は新しいモジュール`free_space_map`として独立させます。
-`src/free_space_map.rs`を新規に作成し、`src/lib.rs`へ次の宣言を加えます。
-
-```rust
-pub mod free_space_map;
-```
-
-以降のコードはこの`src/free_space_map.rs`に置きます。
+以降のコードは、新規作成する`src/free_space_map.rs`に置きます。
 
 ```rust
 pub fn find_candidate(&self, candidates: &[PageId], needed: usize) -> Option<PageId> {
@@ -288,6 +282,12 @@ pub fn find_candidate(&self, candidates: &[PageId], needed: usize) -> Option<Pag
         .copied()
         .find(|page_id| self.free_bytes.get(page_id).is_some_and(|&free| free as usize >= needed))
 }
+```
+
+あわせて`src/lib.rs`へ次の宣言を加え、このモジュールを公開します。
+
+```rust
+pub mod free_space_map;
 ```
 
 ここで正直に書いておくべきことがあります。

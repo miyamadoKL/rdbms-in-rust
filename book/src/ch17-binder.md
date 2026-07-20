@@ -56,7 +56,6 @@ ColumnRef {
 `name`は文字列でしかなく、それが`users`の列を指すのか、単なる書き誤りなのかは、この型からは何も分かりません。
 これに対応する`Binder`側の型が`BoundExpr::ColumnRef`です。
 新規ファイル`src/binder.rs`を作り、次のように定義します。
-`src/lib.rs`に`pub mod binder;`を追加します。
 
 ```rust
 ColumnRef {
@@ -66,6 +65,12 @@ ColumnRef {
     data_type: DataType,
     span: Span,
 },
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod binder;
 ```
 
 `table_ordinal`と`column_index`は、`FROM`に並ぶテーブルの何番目の、`Schema`の何番目の列かという、解決済みの座標です。

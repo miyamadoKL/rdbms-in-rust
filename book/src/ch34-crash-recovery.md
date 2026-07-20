@@ -129,13 +129,7 @@ Redoが冪等に振る舞える根拠は、突き詰めればこの1つの永続
 WALの記録を先頭から順に見ていき、トランザクションごとに「最後に書いたレコードのLSN」と「`Commit`か`Abort`をすでに見たかどうか」を追跡するだけです。
 
 この章はAnalysis、Redo、Undoをまとめて、新規モジュール`src/recovery.rs`として実装します。
-`src/lib.rs`には、次の宣言を追加しています。
-
-```rust
-pub mod recovery;
-```
-
-`src/recovery.rs`の中身は、次のように`TxState`を組み立てるところから始まります。
+その中身は、次のように`TxState`を組み立てるところから始まります。
 
 ```rust
     for record in scanned {
@@ -158,6 +152,12 @@ pub mod recovery;
             LogRecordType::Checkpoint => {}
         }
     }
+```
+
+あわせて`src/lib.rs`に次の宣言を加え、このモジュールを公開します。
+
+```rust
+pub mod recovery;
 ```
 
 走査を終えた時点で、`resolved`が`false`のまま残っているトランザクションが**loser**です。
@@ -409,13 +409,8 @@ SQLの`CHECKPOINT`文は、現在Activeなトランザクションをすべて�
 `recover`は`Storage::open`という1回の関数呼び出しの**内部**で最初から最後まで進むため、その内側で止める仕掛けが要ります。
 
 この章は、実プロセスを本当には止めない、テスト専用のcrash point注入機構を自作しました。
-`src/failpoint.rs`を新しいモジュールとして作成し、`src/lib.rs`には次の宣言を追加しています。
-
-```rust
-pub mod failpoint;
-```
-
-`src/failpoint.rs`の中身は、次のとおりです。
+`src/failpoint.rs`を新しいモジュールとして作成します。
+その中身は、次のとおりです。
 
 ```rust
 pub fn arm(name: &'static str, count: usize) {
@@ -441,6 +436,12 @@ pub(crate) fn hit(name: &'static str) -> DbResult<()> {
         Ok(())
     })
 }
+```
+
+あわせて`src/lib.rs`に次の宣言を加え、このモジュールを公開します。
+
+```rust
+pub mod failpoint;
 ```
 
 `arm(名前, 回数)`で「この名前のfailpointが何回目に呼ばれたら失敗させるか」を予約し、`recover`の内部が要所(Redoの1レコードごと、Undoの1トランザクションごと)で`hit`を呼びます。

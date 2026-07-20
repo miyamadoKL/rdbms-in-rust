@@ -72,8 +72,7 @@ B+Treeはキーを挿入するたびに、次の3つの性質を保ち続けま�
 
 Leaf PageとInternal Pageの探索は、キーを`Value`へ戻さずバイト列のまま大小比較できるほうが単純です。
 そこでこの章のキーは、**順序を保存するバイト列**へエンコードします。
-この章では新しく`src/btree.rs`を作り、`src/lib.rs`に`pub mod btree;`を追加します。
-`encode_key`は`src/btree.rs`に置きます。
+この章では新しく`src/btree.rs`を作り、次の`encode_key`を定義します。
 
 ```rust
 fn encode_key(value: &Value) -> DbResult<Vec<u8>> {
@@ -88,6 +87,12 @@ fn encode_key(value: &Value) -> DbResult<Vec<u8>> {
 fn encode_bigint(n: i64) -> [u8; 8] {
     ((n as u64) ^ 0x8000_0000_0000_0000).to_be_bytes()
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod btree;
 ```
 
 `BOOLEAN`は`0`または`1`の1バイト、`TEXT`はUTF-8バイト列をそのまま使います。
@@ -195,8 +200,7 @@ pub enum PageType {
 ```
 
 書き込み側の`write_entries`は、`entries`が収まりきらなければ`payload`を一切変更せず`false`を返します。
-この章では新しく`src/btree_page.rs`を作り、`src/lib.rs`に`pub mod btree_page;`を追加します。
-`write_entries`は`src/btree_page.rs`に置きます。
+この章では新しく`src/btree_page.rs`を作り、次の`write_entries`を定義します。
 
 ```rust
 pub fn write_entries(&mut self, entries: &[(Vec<u8>, RecordId)]) -> bool {
@@ -226,6 +230,12 @@ pub fn write_entries(&mut self, entries: &[(Vec<u8>, RecordId)]) -> bool {
     }
     true
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod btree_page;
 ```
 
 必要バイト数を先に計算してから書き込むという順序が、`HeapFile::insert`(第13章)が`max_len_for_fresh_page`で事前にサイズを見積もっていたのと同じ理由で重要です。

@@ -53,7 +53,6 @@ OSのレベルでは`pthread_cancel`のような強制終了の仕組みが存�
 ## CancellationTokenと同期ポイント
 
 意思表示そのものは、新しいモジュール`cancellation`(`src/cancellation.rs`)に置く`CancellationToken`という小さな型が運びます。
-`src/lib.rs`には`pub mod cancellation;`を追加します。
 
 ```rust
 #[derive(Clone)]
@@ -62,6 +61,12 @@ pub struct CancellationToken {
     deadline: Option<Instant>,
     checkpoints: Arc<AtomicUsize>,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod cancellation;
 ```
 
 `cancelled`が明示的なキャンセル要求、`deadline`がタイムアウトの締切です(締切は次の節で使います)。
@@ -211,7 +216,6 @@ PostgreSQLは実際にこれを、実行中の接続とは別のTCP接続、共�
 
 キャンセルが効くようになっても、接続を受け付けるたびにスレッドを立て続ける限り、同時に処理できる接続数はクライアントの都合次第のままです。
 この章は新しいモジュール`thread_pool`(`src/thread_pool.rs`)に置く`WorkerPool`という、固定サイズのワーカースレッドの集合へ置き換えます。
-`src/lib.rs`には`pub mod thread_pool;`を追加します。
 
 ```rust
 pub struct WorkerPool {
@@ -220,6 +224,12 @@ pub struct WorkerPool {
     sender: Option<SyncSender<TcpStream>>,
     workers: Vec<JoinHandle<()>>,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod thread_pool;
 ```
 
 `std::sync::mpsc::sync_channel(queue_capacity)`が、この章のキューです。

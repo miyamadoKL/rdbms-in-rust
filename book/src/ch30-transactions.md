@@ -135,8 +135,7 @@ pub struct Database {
 `tx`が`Some`になっている間だけ、複数の文が1つのトランザクションにまとまります。
 
 `tx`の型`TransactionContext`は、新しいモジュール`transaction`に置きます。
-`src/transaction.rs`を新規作成し、`src/lib.rs`に`pub mod transaction;`を追加します。
-この`src/transaction.rs`に、次の`TransactionState`と`TransactionContext`を定義します。
+`src/transaction.rs`を新規作成し、次の`TransactionState`と`TransactionContext`を定義します。
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +156,12 @@ pub(crate) struct TransactionContext {
     pub state: TransactionState,
     pub undo_log: Vec<UndoRecord>,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod transaction;
 ```
 
 `TransactionId`は第13章のNewtype群(`src/ids.rs`)にすでに定義があり、この章で初めて使われます。

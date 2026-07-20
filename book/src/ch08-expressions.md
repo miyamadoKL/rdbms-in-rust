@@ -80,7 +80,6 @@ Rustの`&&`は左辺が`false`のとき右辺を評価しない短絡評価を�
 
 この章の`eval`モジュールでは、`Value`とは別に`Tri`という3値の列挙型を評価の内部でだけ使います。
 この章では`src/eval.rs`を新規に作成し、評価器の実装をまとめて置きます。
-`src/lib.rs`には`pub mod eval;`を追加します。
 
 ```rust
 enum Tri {
@@ -88,6 +87,12 @@ enum Tri {
     False,
     Unknown,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod eval;
 ```
 
 `Value`に3つめのバリアントを増やすのではなく、論理演算の間だけ使う専用の型を用意しているのは、`Value::Boolean`/`Value::Null`という対外的な表現と、論理演算の内部計算を分離するためです。

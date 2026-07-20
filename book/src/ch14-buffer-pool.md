@@ -35,7 +35,7 @@ struct Inner {
 
 `read_page`と`write_page`がこのカウンタを1ずつ増やすだけの変更です。
 これを使って、同じページを50回参照するテストを書いてみます。
-この章で新規作成する`src/buffer_pool.rs`に、`lib.rs`へ`pub mod buffer_pool;`を追加したうえで、`#[cfg(test)] mod tests`としてこのテストを置きます。
+このテストは、この章で新規作成する`src/buffer_pool.rs`の`#[cfg(test)] mod tests`に置きます。
 
 ```rust
 #[test]
@@ -52,6 +52,12 @@ fn referencing_the_same_page_repeatedly_without_a_pool_costs_disk_io_every_time(
 
     std::fs::remove_file(&path).unwrap();
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod buffer_pool;
 ```
 
 同じ1ページを50回読んだだけなのに、`io_count`は50になります。

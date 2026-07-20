@@ -67,14 +67,8 @@ NULLが「無型の値」であることと、「NULLを許すかどうか」が
 ## 最小実装
 
 これから定義する型は、新規作成する`src/types.rs`にまとめます。
-`src/lib.rs`には次の行を追加します。
-
-```rust
-pub mod types;
-```
-
 このSQLサブセットが対応する型は、`BOOLEAN`、`BIGINT`、`TEXT`の3種類だけです[^double]。
-まず`src/types.rs`に、次の`DataType`を定義します。
+まず、次の`DataType`を定義します。
 
 ```rust
 /// 列が取りうるデータ型。
@@ -92,6 +86,12 @@ pub enum DataType {
 ```
 
 [^double]: `DOUBLE`は式評価と型変換の基礎が固まった段階で追加します(第1章の対応SQLサブセットを参照)。
+
+あわせて`src/lib.rs`に次の行を加え、このモジュールを公開します。
+
+```rust
+pub mod types;
+```
 
 次に`Value`です。
 同じ`src/types.rs`に、`DataType`の各バリアントに対応する値を1つずつ持たせ、さらに`Null`を独立したバリアントとして加えた`Value`を定義します。

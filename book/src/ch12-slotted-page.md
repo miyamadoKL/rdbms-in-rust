@@ -84,12 +84,17 @@ Slot Directoryは先頭から後ろへ、Tuple Dataは末尾から前へ向か�
 スロット番号さえ分かれば、この掛け算1つでSlot Directory内の位置を直接求められ、先頭から順に走査する必要はありません。
 
 ここから先のコードは、この章で新しく作る`src/slotted_page.rs`に置いていきます。
-`src/lib.rs`には`pub mod slotted_page;`を追加します。
-まず、`src/slotted_page.rs`にこの2つの定数を定義します。
+まず、この2つの定数を定義します。
 
 ```rust
 pub const SLOTTED_HEADER_SIZE: usize = 4;
 pub const SLOT_ENTRY_SIZE: usize = 8;
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod slotted_page;
 ```
 
 Slot DirectoryとTuple Dataは、互いに向かい合って伸びる分だけ、いずれ衝突する可能性があります。
@@ -413,13 +418,18 @@ NULLビットマップは、列数を8列単位へ切り上げたバイト数を
 列`i`が`NULL`なら、`i / 8`バイト目の`i % 8`ビット目が1になります。
 
 ここから先のコードは、この章で新しく作る`src/tuple_codec.rs`に置いていきます。
-`src/lib.rs`には`pub mod tuple_codec;`を追加します。
-まず、`src/tuple_codec.rs`にこの関数を定義します。
+まず、この関数を定義します。
 
 ```rust
 fn null_bitmap_len(column_count: usize) -> usize {
     column_count.div_ceil(8)
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod tuple_codec;
 ```
 
 `NULL`は`Value::Null`という1種類の値であり、`DataType`を持ちません。

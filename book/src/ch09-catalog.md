@@ -46,7 +46,6 @@ PostgreSQLの`pg_class`やMySQLの`information_schema`は、テーブルだけ�
 インデックスや制約、統計情報は、それぞれの機能が実装として固まった章で`Catalog`に載せていく計画で、最初から全部を見込んだ大きな構造体を先に設計することはしません。
 必要になった機能の分だけ持ち場を広げていく、というこれまでの章と同じ育て方をここでも採ります。
 この章では`src/catalog.rs`を新規に作成し、`Catalog`と`TableInfo`をここへ置きます。
-`src/lib.rs`には`pub mod catalog;`を追加します。
 
 ```rust
 pub struct TableInfo {
@@ -54,6 +53,12 @@ pub struct TableInfo {
     pub name: String,
     pub schema: Schema,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod catalog;
 ```
 
 `name`と`schema`だけで足りそうなところに`id: TableId`を加えているのは、名前とは独立した識別子を持たせるためです。

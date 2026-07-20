@@ -47,8 +47,7 @@ offset 0                 PAGE_SIZE               2*PAGE_SIZE
 正常なファイルのバイト数は、常に`page_count * PAGE_SIZE`と一致します。
 
 この構造を、`DiskManager`という1つの構造体にまとめます。
-新しく`src/disk_manager.rs`を作り、`src/lib.rs`に`pub mod disk_manager;`を追加します。
-まずは`Inner`という補助的な構造体を、この`src/disk_manager.rs`に定義します。
+新しく`src/disk_manager.rs`を作り、まずは`Inner`という補助的な構造体を定義します。
 
 ```rust
 struct Inner {
@@ -64,6 +63,12 @@ struct Inner {
     /// たびにアクセスすると、この値がアクセス回数に比例して増え続けることを示す。
     io_count: u64,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod disk_manager;
 ```
 
 `Inner`をまとめて保持する`DiskManager`自体は、同じ`src/disk_manager.rs`で次のような形をしています。
@@ -320,8 +325,7 @@ fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
 
 `DiskManager`はページ1枚を読み書きできますが、「`users`というテーブルはどのページに入っているか」を知りません。
 この対応関係を管理するのがHeap Fileです。
-新しく`src/heap_file.rs`を作り、`src/lib.rs`に`pub mod heap_file;`を追加します。
-`HeapFile`本体は、この`src/heap_file.rs`に次のように定義します。
+新しく`src/heap_file.rs`を作り、`HeapFile`本体を次のように定義します。
 
 ```rust
 pub struct HeapFile {
@@ -330,6 +334,12 @@ pub struct HeapFile {
     /// ファイル中のページ番号順)。
     page_ids: Vec<PageId>,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod heap_file;
 ```
 
 この章の`HeapFile`は、1つの`DiskManager`(1つのファイル)を丸ごと1個のテーブルとして占有します。

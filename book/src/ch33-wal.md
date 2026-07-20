@@ -68,8 +68,7 @@ WALは、データファイルとは別のファイル(`<db_path>.wal`)に、追
 - **Before Image**、**After Image**：書き換え前、書き換え後のタプルのバイト列
 
 WALを扱うコードは、この章で新規作成する`src/wal.rs`にまとめます。
-`src/lib.rs`には`pub mod wal;`という1行を追加し、このモジュールを公開します。
-まずは、`src/wal.rs`に次の`LogRecord`を定義します。
+まずは、次の`LogRecord`を定義します。
 
 ```rust
 pub struct LogRecord {
@@ -83,6 +82,12 @@ pub struct LogRecord {
     pub before_image: Option<Vec<u8>>,
     pub after_image: Option<Vec<u8>>,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod wal;
 ```
 
 `old_rid`だけは`対象`の説明に出てきませんでした。

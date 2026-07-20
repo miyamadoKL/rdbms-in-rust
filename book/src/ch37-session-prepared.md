@@ -49,7 +49,6 @@ SELECT name FROM users WHERE name = 'x' OR '1'='1'
 
 `Session`は、Embedded、REPL、Serverの3つの利用箇所すべてが使う、接続ひとつぶんの状態です。
 この章から`src/session.rs`を新規作成し、`Session`とその周辺の型をそこへ実装していきます。
-`src/lib.rs`には`pub mod session;`を追加します。
 
 ```rust
 pub struct Session {
@@ -57,6 +56,12 @@ pub struct Session {
     tx: Option<TxHandle>,
     prepared: HashMap<String, PreparedStatement>,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod session;
 ```
 
 `Arc<SharedDatabase>`を1個持つだけの薄い型なので、3つの利用箇所は同じコードをそのまま使い回せます。
