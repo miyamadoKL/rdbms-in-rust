@@ -619,6 +619,7 @@ pub(crate) fn fmt_bound_expr(expr: &BoundExpr) -> String {
         }
         BoundExpr::Paren { expr, .. } => format!("({})", fmt_bound_expr(expr)),
         BoundExpr::Cast { expr, data_type, .. } => format!("CAST({} AS {data_type})", fmt_bound_expr(expr)),
+        BoundExpr::Param { index, .. } => format!("${index}"),
     }
 }
 

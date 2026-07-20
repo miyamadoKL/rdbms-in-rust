@@ -4,6 +4,8 @@
 
 use thiserror::Error;
 
+use crate::types::DataType;
+
 /// minidb の操作全般で返されるエラー。
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -253,6 +255,101 @@ pub enum DbError {
     /// を参照)。
     #[error("デッドロックを検出しました。このトランザクションはVictimとして強制的にABORTされました")]
     DeadlockDetected,
+
+    /// `PREPARE`が、そのSessionにすでに登録済みの名前を指定したエラー(第37章)。
+    /// PostgreSQLに倣い、同じ名前への無言の上書きは許さず、先に`DEALLOCATE`
+    /// することを要求する。
+    #[error("プリペア済み文はすでに存在します: {0}")]
+    PreparedStatementAlreadyExists(String),
+
+    /// `EXECUTE`・`DEALLOCATE`が、そのSessionに登録されていない名前を指定した
+    /// エラー(第37章)。`PREPARE`していない名前、別のSessionで`PREPARE`した
+    /// 名前(Session単位の名前空間、本文「Prepared StatementはSessionの
+    /// ものである」を参照)、またはすでに`DEALLOCATE`済みの名前のいずれかが
+    /// 当てはまる。
+    #[error("プリペア済み文が見つかりません: {0}")]
+    PreparedStatementNotFound(String),
+
+    /// `PREPARE`の対象に、`SELECT`・`INSERT INTO`・`UPDATE`・`DELETE FROM`の
+    /// いずれでもない文を指定したエラー(第37章)。
+    #[error("PREPAREはSELECT・INSERT INTO・UPDATE・DELETE FROMのみ対象にできます")]
+    CannotPrepareStatement,
+
+    /// `EXECUTE`に渡した引数の個数が、`PREPARE`本体が使うプレースホルダの
+    /// 個数と一致しないエラー(第37章)。
+    #[error("EXECUTEの引数の個数が一致しません: {expected}個必要ですが{actual}個渡されました")]
+    ParamCountMismatch {
+        /// プリペア済み文が使うプレースホルダの個数(`$`の最大番号)。
+        expected: usize,
+        /// `EXECUTE`に渡された引数の個数。
+        actual: usize,
+    },
+    /// `EXECUTE`に渡した値の型が、`PREPARE`時に文脈から推論した
+    /// プレースホルダの型と一致しないエラー(第37章)。`NULL`はどの型の
+    /// プレースホルダに対しても許す(通常の列のNULL制約と同じ扱い)。
+    #[error("${index}の型が一致しません: {expected}が必要ですが{actual}が渡されました")]
+    ParamTypeMismatch {
+        /// プレースホルダの番号(`$1`なら`1`)。
+        index: u32,
+        /// `PREPARE`時に文脈から推論した型。
+        expected: DataType,
+        /// `EXECUTE`に渡された値の型。
+        actual: DataType,
+    },
+    /// `PREPARE`本体の中で、同じプレースホルダ(`$n`)が矛盾する型で使われて
+    /// いるエラー(第37章)。`WHERE a = $1 AND b = $1`で`a`と`b`の型が違う場合
+    /// などが該当する。
+    #[error("${index}の型が文中で矛盾しています: {first}と{second}")]
+    ParamTypeConflict {
+        index: u32,
+        first: DataType,
+        second: DataType,
+    },
+
+    /// `PREPARE`本体のプレースホルダ番号(`$n`)が、実装が許容する上限
+    /// (`crate::session::MAX_PARAM_INDEX`)を超えているエラー(第6部レビュー
+    /// 対応)。字句解析器自体は`$n`を`u32`の範囲でしか制限しないため、
+    /// `$4294967295`のような入力自体は短くても、番号をそのまま
+    /// `Vec::resize`の引数に使うと桁外れの確保を試みてしまう。この上限は
+    /// `resize`する前に検査する。
+    #[error("プレースホルダの番号が上限を超えています: ${index}(上限は${max}です)")]
+    ParamIndexTooLarge {
+        /// SQL文中に現れた`$n`の番号。
+        index: u32,
+        /// 許容する上限(`crate::session::MAX_PARAM_INDEX`)。
+        max: u32,
+    },
+
+    /// 実行中の文が、`crate::cancellation::CancellationToken::cancel`による
+    /// 明示的なキャンセル要求を受けて打ち切られたエラー(第38章)。クライアントの
+    /// 切断検知(`crate::server`)、または`crate::session::Session::cancellation_handle`
+    /// 経由の明示的な要求のどちらでも、この同じエラーになる。
+    #[error("クエリがキャンセルされました")]
+    QueryCancelled,
+
+    /// 実行中の文が、設定された制限時間を超えたため打ち切られたエラー(第38章)。
+    /// `crate::cancellation::CancellationToken`が持つ締切を、同期ポイントの
+    /// `check`が超過と判定した場合に返る。
+    #[error("クエリの実行時間が上限を超えました")]
+    QueryTimeout,
+
+    /// `Sort`・Hash JoinのBuild側・Hash Aggregateが子から集める行数が、
+    /// 設定された上限(`crate::cancellation::ExecutionContext::max_operator_rows`)を
+    /// 超えたエラー(第38章)。
+    #[error("{operator}の収集行数が上限を超えました(上限{limit}行)")]
+    MemoryLimitExceeded {
+        /// 上限を超えた演算子の名前(`"Sort"`・`"Hash Join"`・`"Hash Aggregate"`)。
+        operator: &'static str,
+        /// 設定されていた上限行数。
+        limit: usize,
+    },
+
+    /// `SHOW STATS FROM <table>`(第39章)が、`ANALYZE`を一度も実行していない
+    /// テーブルを指定したエラー。列ごとの統計は`ANALYZE`(第27章)が集める
+    /// ものであり、集めたことのない統計を空の表として黙って返すより、
+    /// 「まだ何も集めていない」ことを明示するほうが利用者の勘違いを防げる。
+    #[error("テーブル{0}はまだANALYZEが実行されていません")]
+    TableNotAnalyzed(String),
 }
 
 /// minidb の操作全般で使う `Result` エイリアス。

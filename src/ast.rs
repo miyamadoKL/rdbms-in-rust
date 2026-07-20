@@ -52,6 +52,31 @@ pub enum Statement {
     /// `CHECKPOINT`文(第34章)。全dirtyページをflush・syncし、Checkpoint
     /// レコードをWALへ書く。
     Checkpoint(CheckpointStatement),
+    /// `PREPARE name AS <statement>`文(第37章)。`name`のもとに`statement`を
+    /// Session単位で登録する。
+    Prepare(PrepareStatement),
+    /// `EXECUTE name [(値, ...)]`文(第37章)。`PREPARE`済みの文へ値を
+    /// 束縛して実行する。
+    Execute(ExecuteStatement),
+    /// `DEALLOCATE name`文(第37章)。`PREPARE`済みの文をSessionの名前空間
+    /// から取り除く。
+    Deallocate(DeallocateStatement),
+    /// `SHOW TABLES`文(第39章)。カタログに登録されている全テーブルの名前・
+    /// 行数概算・ページ数を列挙する。
+    ShowTables(ShowTablesStatement),
+    /// `DESCRIBE <table>`文(第39章)。指定したテーブルの列構成・制約・
+    /// 索引を列挙する。
+    Describe(DescribeStatement),
+    /// `SHOW INDEXES [FROM <table>]`文(第39章)。索引の一覧を列挙する。
+    /// `table`を省略すると全テーブルの索引が対象になる。
+    ShowIndexes(ShowIndexesStatement),
+    /// `SHOW STATS [FROM <table>]`文(第39章)。`table`を指定すると
+    /// `ANALYZE`(第27章)が集めた列ごとの統計を、省略すると
+    /// Buffer Pool・索引利用回数・Query Timingのエンジン全体の統計を返す。
+    ShowStats(ShowStatsStatement),
+    /// `VACUUM [<table>]`文(第39章)。`table`を省略するとカタログに
+    /// 登録されている全テーブルが対象になる。
+    Vacuum(VacuumStatement),
 }
 
 impl Statement {
@@ -72,6 +97,14 @@ impl Statement {
             Statement::Commit(s) => s.span,
             Statement::Rollback(s) => s.span,
             Statement::Checkpoint(s) => s.span,
+            Statement::Prepare(s) => s.span,
+            Statement::Execute(s) => s.span,
+            Statement::Deallocate(s) => s.span,
+            Statement::ShowTables(s) => s.span,
+            Statement::Describe(s) => s.span,
+            Statement::ShowIndexes(s) => s.span,
+            Statement::ShowStats(s) => s.span,
+            Statement::Vacuum(s) => s.span,
         }
     }
 }
@@ -392,6 +425,60 @@ pub struct CheckpointStatement {
     pub span: Span,
 }
 
+/// `PREPARE name AS <statement>`文(第37章)。
+///
+/// `statement`には`SELECT`・`INSERT INTO`・`UPDATE`・`DELETE FROM`のいずれかを
+/// 置ける(`Session::execute`が受理する範囲を検査する。`CREATE TABLE`等の
+/// スキーマ操作や、`BEGIN`等のトランザクション境界文、`PREPARE`自身の入れ子は
+/// 対象外にする理由は本文を参照)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrepareStatement {
+    pub name: Ident,
+    pub statement: Box<Statement>,
+    pub span: Span,
+}
+
+/// `EXECUTE name [(値, ...)]`文(第37章)。
+///
+/// `args`に置けるのはリテラルだけである(`Literal`)。`EXECUTE`の引数は
+/// `PREPARE`済みの文へ渡す**値**であり、列参照や式評価を必要としない
+/// (本文「PrepareとExecuteの境界」を参照)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecuteStatement {
+    pub name: Ident,
+    pub args: Vec<Literal>,
+    pub span: Span,
+}
+
+/// `DEALLOCATE name`文(第37章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeallocateStatement {
+    pub name: Ident,
+    pub span: Span,
+}
+
+/// `EXECUTE`の引数1個。`Expr`のリテラルバリアントだけを持つ小さな型であり、
+/// 式評価を経ずに直接`crate::types::Value`へ変換できる(`Session`の
+/// `literal_to_value`を参照)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Literal {
+    Int { value: i64, span: Span },
+    Text { value: String, span: Span },
+    Bool { value: bool, span: Span },
+    Null { span: Span },
+}
+
+impl Literal {
+    pub fn span(&self) -> Span {
+        match self {
+            Literal::Int { span, .. }
+            | Literal::Text { span, .. }
+            | Literal::Bool { span, .. }
+            | Literal::Null { span } => *span,
+        }
+    }
+}
+
 /// 二項演算子。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOperator {
@@ -438,6 +525,14 @@ pub enum Expr {
         span: Span,
     },
     NullLiteral {
+        span: Span,
+    },
+    /// `$1`のようなParameter Binding用のプレースホルダ(第37章)。`index`は
+    /// `1`始まりの番号(`$1`なら`1`)。`PREPARE`本体の式木にだけ現れ、
+    /// `EXECUTE`が渡す値へ束縛される(`crate::binder::BoundExpr::Param`、
+    /// `Session`の`substitute_params`を参照)。
+    Param {
+        index: u32,
         span: Span,
     },
     /// 列参照。`users.id`のような修飾名も、`qualifier`に`users`を持つことで
@@ -505,6 +600,7 @@ impl Expr {
             | Expr::StringLiteral { span, .. }
             | Expr::BoolLiteral { span, .. }
             | Expr::NullLiteral { span }
+            | Expr::Param { span, .. }
             | Expr::ColumnRef { span, .. }
             | Expr::UnaryOp { span, .. }
             | Expr::BinaryOp { span, .. }
@@ -515,4 +611,44 @@ impl Expr {
             | Expr::Cast { span, .. } => *span,
         }
     }
+}
+
+// ---- SHOW / DESCRIBE / VACUUM(第39章) ----
+
+/// `SHOW TABLES`文(第39章)。修飾語を持たない単体の文。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowTablesStatement {
+    pub span: Span,
+}
+
+/// `DESCRIBE <table>`文(第39章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DescribeStatement {
+    pub table: Ident,
+    pub span: Span,
+}
+
+/// `SHOW INDEXES [FROM <table>]`文(第39章)。`table`を省略すると
+/// カタログに登録されている全テーブルの索引が対象になる。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowIndexesStatement {
+    pub table: Option<Ident>,
+    pub span: Span,
+}
+
+/// `SHOW STATS [FROM <table>]`文(第39章)。`table`を指定すると
+/// `ANALYZE`が集めた列ごとの統計、省略するとエンジン全体の統計を返す
+/// (`crate::database::Database::execute_show_stats`を参照)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowStatsStatement {
+    pub table: Option<Ident>,
+    pub span: Span,
+}
+
+/// `VACUUM [<table>]`文(第39章)。`table`を省略するとカタログに
+/// 登録されている全テーブルが対象になる。
+#[derive(Debug, Clone, PartialEq)]
+pub struct VacuumStatement {
+    pub table: Option<Ident>,
+    pub span: Span,
 }

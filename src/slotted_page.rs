@@ -120,6 +120,16 @@ impl<'a> SlottedPage<'a> {
         tuple_data_start as usize - self.directory_end(slot_count)
     }
 
+    /// Occupiedなスロットが1つも無いかどうか(第39章、`VACUUM`)。
+    ///
+    /// スロット数が0のページ(一度も使われていないページ)だけでなく、
+    /// 全スロットがTombstone化されたページも`true`を返す。`VACUUM`は
+    /// この判定でページ全体をFree Page Listへ返せるかどうかを決める。
+    pub fn is_empty(&self) -> bool {
+        let (slot_count, _) = self.header();
+        (0..slot_count).all(|i| !matches!(self.slot_entry(SlotId(i)), Some((_, _, STATUS_OCCUPIED))))
+    }
+
     /// 指定したスロットの状態を返す。スロットが存在しなければ`None`。
     pub fn status(&self, slot: SlotId) -> Option<SlotStatus> {
         let (_, _, status) = self.slot_entry(slot)?;
@@ -807,6 +817,23 @@ mod tests {
         assert_eq!(page.get(s3), Some(&b"carol"[..]));
         assert_eq!(page.get(s2), None);
         assert_eq!(page.status(s2), Some(SlotStatus::Tombstone));
+    }
+
+    #[test]
+    fn is_empty_is_true_only_when_no_slot_is_occupied() {
+        let mut payload = fresh_payload();
+        let mut page = SlottedPage::init(&mut payload);
+        assert!(page.is_empty(), "スロットが1つも無いページは空");
+
+        let s1 = page.insert(b"alice").unwrap();
+        let s2 = page.insert(b"bob").unwrap();
+        assert!(!page.is_empty());
+
+        page.delete(s1);
+        assert!(!page.is_empty(), "s2がまだOccupiedなので空ではない");
+
+        page.delete(s2);
+        assert!(page.is_empty(), "全スロットがTombstone化されれば空");
     }
 
     #[test]

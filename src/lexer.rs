@@ -101,6 +101,24 @@ pub enum Keyword {
     Serializable,
     /// `CHECKPOINT`文(第34章)。
     Checkpoint,
+    /// `PREPARE`文(第37章)。
+    Prepare,
+    /// `EXECUTE`文(第37章)。
+    Execute,
+    /// `DEALLOCATE`文(第37章)。
+    Deallocate,
+    /// `SHOW TABLES` / `SHOW INDEXES` / `SHOW STATS`(第39章)の`SHOW`。
+    Show,
+    /// `DESCRIBE <table>`(第39章)。
+    Describe,
+    /// `VACUUM [<table>]`(第39章)。
+    Vacuum,
+    /// `SHOW TABLES`(第39章)の`TABLES`。
+    Tables,
+    /// `SHOW INDEXES [FROM <table>]`(第39章)の`INDEXES`。
+    Indexes,
+    /// `SHOW STATS [FROM <table>]`(第39章)の`STATS`。
+    Stats,
 }
 
 impl Keyword {
@@ -157,6 +175,15 @@ impl Keyword {
             "REPEATABLE" => Keyword::Repeatable,
             "SERIALIZABLE" => Keyword::Serializable,
             "CHECKPOINT" => Keyword::Checkpoint,
+            "PREPARE" => Keyword::Prepare,
+            "EXECUTE" => Keyword::Execute,
+            "DEALLOCATE" => Keyword::Deallocate,
+            "SHOW" => Keyword::Show,
+            "DESCRIBE" => Keyword::Describe,
+            "VACUUM" => Keyword::Vacuum,
+            "TABLES" => Keyword::Tables,
+            "INDEXES" => Keyword::Indexes,
+            "STATS" => Keyword::Stats,
             _ => return None,
         };
         Some(keyword)
@@ -209,6 +236,9 @@ pub enum TokenKind {
     Semicolon,
     /// `.`。`users.id`のような修飾列参照を書くための区切り(第17章)。
     Dot,
+    /// `$1`のようなParameter Binding用のプレースホルダ(第37章)。
+    /// 保持するのは`$`に続く1始まりの番号そのもの(`$1`なら`1`)。
+    Param(u32),
     /// 入力の終端を表す番兵トークン。
     Eof,
 }
@@ -321,6 +351,8 @@ impl<'a> Lexer<'a> {
                 self.lex_string()?
             } else if is_ident_start(ch) {
                 self.lex_ident_or_keyword()
+            } else if ch == '$' {
+                self.lex_param()?
             } else {
                 self.lex_operator_or_punct()?
             };
@@ -489,6 +521,45 @@ impl<'a> Lexer<'a> {
             Some(keyword) => TokenKind::Keyword(keyword),
             None => TokenKind::Ident(text.to_string()),
         }
+    }
+
+    /// `$`に続く数字列を読み、`TokenKind::Param`にする(第37章、`PREPARE`が
+    /// 受け付けるPlaceholder)。`$`の直後に数字が1個も無ければ字句エラーにする。
+    /// 番号は`u32`で持てば十分な範囲(このSQLサブセットが受け付けるParameter数)
+    /// であり、`u32`の範囲を超える番号は字句エラーとして拒否する。
+    fn lex_param(&mut self) -> DbResult<TokenKind> {
+        let start_line = self.line;
+        let start_column = self.column;
+        self.bump(); // '$'
+
+        let Some(digits_start) = self.peek_offset() else {
+            return Err(DbError::Lex {
+                message: "'$'の直後に番号がありません".to_string(),
+                line: start_line,
+                column: start_column,
+            });
+        };
+        if !self.peek_char().is_some_and(|c| c.is_ascii_digit()) {
+            return Err(DbError::Lex {
+                message: "'$'の直後に番号がありません".to_string(),
+                line: start_line,
+                column: start_column,
+            });
+        }
+        while let Some(c) = self.peek_char() {
+            if c.is_ascii_digit() {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        let digits_end = self.peek_offset().unwrap_or(self.source.len());
+        let text = &self.source[digits_start..digits_end];
+        text.parse::<u32>().map(TokenKind::Param).map_err(|_| DbError::Lex {
+            message: format!("Parameterの番号の範囲を超えています: ${text}"),
+            line: start_line,
+            column: start_column,
+        })
     }
 
     /// 演算子・括弧・カンマ・セミコロンを1個読む。

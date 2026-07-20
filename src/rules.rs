@@ -157,7 +157,11 @@ fn is_constant(expr: &BoundExpr) -> bool {
         | BoundExpr::StringLiteral { .. }
         | BoundExpr::BoolLiteral { .. }
         | BoundExpr::NullLiteral { .. } => true,
-        BoundExpr::ColumnRef { .. } | BoundExpr::Aggregate { .. } => false,
+        // `Param`(第37章)は`EXECUTE`のたびに異なる値へ束縛されうるため、
+        // `ColumnRef`と同じく定数畳み込みの対象にしない(`Session`が渡す
+        // `BoundStatement`は、この最適化を通す前にすでにすべての`Param`を
+        // リテラルへ置き換え済みなので、実際にはここへ到達しない)。
+        BoundExpr::ColumnRef { .. } | BoundExpr::Aggregate { .. } | BoundExpr::Param { .. } => false,
         BoundExpr::UnaryOp { expr, .. } | BoundExpr::Paren { expr, .. } | BoundExpr::Cast { expr, .. } => {
             is_constant(expr)
         }
@@ -186,7 +190,8 @@ fn fold_expr(expr: BoundExpr, functions: &FunctionRegistry) -> (BoundExpr, bool)
         | BoundExpr::StringLiteral { .. }
         | BoundExpr::BoolLiteral { .. }
         | BoundExpr::NullLiteral { .. }
-        | BoundExpr::ColumnRef { .. } => (expr, false),
+        | BoundExpr::ColumnRef { .. }
+        | BoundExpr::Param { .. } => (expr, false),
         BoundExpr::UnaryOp { op, expr, data_type, span } => {
             let (expr, changed) = fold_expr(*expr, functions);
             try_fold(BoundExpr::UnaryOp { op, expr: Box::new(expr), data_type, span }, functions, changed)
@@ -758,7 +763,11 @@ fn collect_columns(expr: &BoundExpr, out: &mut BTreeSet<usize>) {
         BoundExpr::ColumnRef { column_index, .. } => {
             out.insert(*column_index);
         }
-        BoundExpr::IntLiteral { .. } | BoundExpr::StringLiteral { .. } | BoundExpr::BoolLiteral { .. } | BoundExpr::NullLiteral { .. } => {}
+        BoundExpr::IntLiteral { .. }
+        | BoundExpr::StringLiteral { .. }
+        | BoundExpr::BoolLiteral { .. }
+        | BoundExpr::NullLiteral { .. }
+        | BoundExpr::Param { .. } => {}
         BoundExpr::UnaryOp { expr, .. } | BoundExpr::Paren { expr, .. } | BoundExpr::Cast { expr, .. } => collect_columns(expr, out),
         BoundExpr::BinaryOp { lhs, rhs, .. } => {
             collect_columns(lhs, out);
@@ -789,7 +798,8 @@ fn remap_expr(expr: BoundExpr, map: &BTreeMap<usize, usize>) -> BoundExpr {
         literal @ (BoundExpr::IntLiteral { .. }
         | BoundExpr::StringLiteral { .. }
         | BoundExpr::BoolLiteral { .. }
-        | BoundExpr::NullLiteral { .. }) => literal,
+        | BoundExpr::NullLiteral { .. }
+        | BoundExpr::Param { .. }) => literal,
         BoundExpr::UnaryOp { op, expr, data_type, span } => {
             BoundExpr::UnaryOp { op, expr: Box::new(remap_expr(*expr, map)), data_type, span }
         }

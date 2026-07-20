@@ -2,8 +2,18 @@
 name = "minidb"
 version = "0.1.0"
 edition = "2024"
+default-run = "minidb"
+
+[[bin]]
+name = "minidb"
+path = "src/main.rs"
+
+[[bin]]
+name = "minidb-client"
+path = "src/bin/minidb_client.rs"
 
 [dependencies]
+ctrlc = "3.4.7"
 thiserror = "2.0.18"
 
 [dev-dependencies]

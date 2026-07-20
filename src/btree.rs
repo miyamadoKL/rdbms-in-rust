@@ -983,12 +983,66 @@ impl BTree {
 /// `Bound`)を`LeafPageRef::find`で**その時点の中身に対して**もう一度探し直す。
 /// 葉が途中で育っていても、探しているのは実在する値そのものなので、
 /// 「今の中身のどこにあるか」を正しく再特定できる。
+///
+/// # Leaf間をまたぐ探索条件を弱めてはならない(第6部レビュー対応)
+///
+/// `RangeScan::next()`が、今の葉を読み尽くして`next_leaf`(第24章)へ
+/// 移るとき、次の葉で使う`ScanPosition`をどう決めるかは、並行`insert`の
+/// もとで正しさを左右する。かつてはここで無条件に
+/// `ScanPosition::Start(Bound::Unbounded)`へ差し替えており(「下限はもう
+/// 満たしたので、次の葉の先頭を無条件に返してよい」という考え方)、これが
+/// 実際にバグを生んでいた。
+///
+/// 具体的には、`BTree::lookup(K)`(`range(Included(K), Included(K))`の
+/// 薄いラッパー)が葉Aを読んでKと一致するエントリが無いと判定し、次の葉B
+/// (Aの`next_leaf`)へ移ったとする。Aを読んだ時点とBを読む時点の間に、
+/// **別のスレッドがBへキーK未満の新しいエントリを`insert`していると**、
+/// 差し替えた`Start(Bound::Unbounded)`はBの物理的な先頭エントリを
+/// 無条件に返し、`exceeds_upper`(上限Kを超えているかどうか)だけで
+/// 判定していたため、そのK未満のエントリが「Kと一致した」かのように
+/// 返ってしまう。`BTree::insert`のunique検査(`self.unique &&
+/// !self.lookup(key)?.is_empty()`)はこの`lookup`の結果件数しか見ないため、
+/// 実際には存在しないキーKに対して`DbError::BTreeUniqueViolation`を
+/// 誤って返す(この章の統合テスト
+/// `tests/concurrent_threads.rs::concurrent_inserts_from_multiple_threads_are_all_findable`
+/// が、互いに素なキーだけを挿入しているにもかかわらずこのエラーで
+/// 失敗する形で顕在化した)。
+///
+/// ## 修正: `Start`はそのまま引き継ぎ、`After`は`Start(Included(key))`へ変換する
+///
+/// `position`が`Start(bound)`のときは、この葉で`bound`を満たす行が
+/// 1件も見つからなかっただけなので、同じ`bound`をそのまま次の葉でも使う。
+/// `locate_within_leaf`は`bound`が何であれ、渡された葉の**その時点の
+/// 中身**に対して下限条件を毎回正しく適用し直す関数なので、これだけで
+/// unique検査の誤検出は直る。「本当に`Unbounded`から始まった走査
+/// (`range(Unbounded, ..)`)」は`position`が最初から`Start(Bound::Unbounded)`
+/// のままなので、この修正による挙動の変化は無い。
+///
+/// `position`が`After(key, rid)`のときは、そのまま次の葉へ引き継いでは
+/// **ならない**(これは最初に試みて実際に壊れた設計であり、次の段落で
+/// 説明する)。代わりに`Start(Bound::Included(key))`へ変換する。`After`の
+/// `rid`による大小比較(`min_rid_index_after`)は、同じキーが**1つの葉の
+/// 中で**物理的に挿入順(`RecordId`順とは限らない)に並んでいることに
+/// 対する、その葉だけの重複解消手段である。葉をまたいだ`RecordId`の
+/// 大小には何の意味も無い(次の葉のエントリは、この葉のどの`RecordId`とも
+/// 無関係に採番されている)。もし`After(key, rid)`をそのまま次の葉へ
+/// 引き継ぐと、次の葉に残っている同じキーの続きが、たまたま`rid`より
+/// 小さい`RecordId`を持つというだけの理由で「まだ返していないのに
+/// 見つからなかった」ことにされ、走査から丸ごと欠落する(この章の統合
+/// テスト`range_scan_resumes_correctly_after_delete_when_duplicates_span_multiple_leaves_inserted_in_descending_record_id_order`
+/// が、`Start`だけを直した最初の修正案では実際にこの形で壊れることを
+/// 検出した)。`Start(Bound::Included(key))`へ変換すれば、次の葉に残る
+/// 同じキーの行は(`RecordId`によらず)すべて対象になり、一度も返して
+/// いないので正しく返せる。
 enum ScanPosition {
-    /// この葉ではまだ1件も返していない。`range`が受け取った元の下限
-    /// (最初の葉のとき)、または`Bound::Unbounded`(`next_leaf`をたどって
-    /// 移ってきた、2番目以降の葉のとき)を持つ。
+    /// この葉ではまだ1件も返していない。`range`が受け取った元の下限、
+    /// または`next_leaf`をたどって新しい葉へ移ったときの引き継ぎ条件
+    /// (このenumのドキュメント「Leaf間をまたぐ探索条件を弱めてはならない」
+    /// を参照)。
     Start(Bound<Vec<u8>>),
-    /// 直前に返した`(key, rid)`。次はこれより後ろから探す。
+    /// 直前に返した`(key, rid)`。**同じ葉の中で**次はこれより後ろから探す。
+    /// 葉をまたぐときはこの`rid`を持ち越さず、`Start(Included(key))`へ
+    /// 変換する(このenumのドキュメントを参照)。
     After(Vec<u8>, RecordId),
 }
 
@@ -1235,7 +1289,29 @@ impl Iterator for RangeScan<'_> {
             if next_leaf == NO_NEXT_LEAF {
                 return None;
             }
-            self.current = Some((next_leaf, ScanPosition::Start(Bound::Unbounded)));
+            // この葉で見つからなかった探索条件を、次の葉へ引き継ぐ。
+            // `ScanPosition::Start(Bound::Unbounded)`に一律差し替えてはならない
+            // (第6部レビュー対応で発見・修正した並行性バグ、モジュール
+            // ドキュメント「Leaf間をまたぐ探索条件を弱めてはならない」を参照)。
+            //
+            // `Start(bound)`のときは、この葉で`bound`を満たす行が1件も
+            // 見つからなかっただけなので、同じ`bound`をそのまま次の葉でも使う。
+            //
+            // `After(key, rid)`のときは、そのまま引き継いではならない。
+            // `rid`による大小比較は、同じキーが1つの葉の中で物理的に
+            // 挿入順(`RecordId`順とは限らない)で並んでいることに対する
+            // **葉の中だけの**重複解消手段であり、葉をまたいだ`RecordId`の
+            // 大小には何の意味も無い(次の葉のエントリは、この葉のどの
+            // `RecordId`とも独立している)。そのため次の葉では
+            // `Start(Bound::Included(key))`に変換し、「このキー以上の行を
+            // (`RecordId`によらず)すべて対象にする」条件へ戻す。次の葉に
+            // 同じキーの続きがまだ残っていれば、それらは一度も返していない
+            // ので正しく返せる。
+            let carried = match position {
+                ScanPosition::Start(bound) => ScanPosition::Start(bound),
+                ScanPosition::After(key, _rid) => ScanPosition::Start(Bound::Included(key)),
+            };
+            self.current = Some((next_leaf, carried));
         }
     }
 }
@@ -2378,6 +2454,104 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// 第6部レビュー対応の再現条件: `RangeScan`が`next_leaf`(第24章)を
+    /// たどって隣のLeaf Pageへ移るとき、元の下限を`Bound::Unbounded`へ
+    /// 弱めていた旧実装のバグを、実スレッドを使わずに決定的に再現する
+    /// (`ScanPosition`のドキュメント「Leaf間をまたぐ探索条件を弱めては
+    /// ならない」を参照)。
+    ///
+    /// 手順:
+    /// 1. 10刻みのキーを十分な件数挿入し、Leaf Split(実際のSplitに由来する
+    ///    正しいLeaf間リンクと親の区切りキー)を1回起こす。
+    /// 2. 左側の葉(A)の最大キーと、右側の葉(B、Aの`next_leaf`)の
+    ///    元の最小キーの**間**にある、実在しないキー`k`を選ぶ(`k`は
+    ///    どちらの葉にも存在しない)。
+    /// 3. `insert`の通常の経路(内部ノードの区切りキーに従ったルーティング)
+    ///    を経由せず、Bのページへ直接、`k`より小さいキーを1件書き込む。
+    ///    これは、Aを読み終えてBを読むまでの間に**別のスレッドがBへ
+    ///    `k`未満のキーを`insert`した**、という並行実行の一瞬を
+    ///    シミュレートしている(通常の`insert`は区切りキーに従って
+    ///    必ずAへルーティングするため、この状態は単一スレッドの逐次呼び出し
+    ///    だけでは再現できない)。
+    /// 4. `btree.lookup(k)`が、Bへ紛れ込んだこの小さいキーを`k`と取り違えて
+    ///    「見つかった」と報告しないこと(空の`Vec`を返すこと)を確認する。
+    #[test]
+    fn range_scan_does_not_mistake_a_smaller_key_racily_inserted_into_the_next_leaf_for_the_target() {
+        let path = temp_path("range-scan-next-leaf-lower-bound-race");
+        let btree = open_btree(&path, DataType::BigInt);
+
+        // 10刻みのキーを、最初のLeaf Splitが起きた直後で挿入をやめる。10刻みに
+        // しているのは、隣接する2つの実在キーの間に「存在しないキー」の
+        // 隙間を作るため。挿入を続けずにここで止めるのは、この後Bへ直接
+        // 1件書き込む余地(Bがまだpayload一杯になっていないこと)を残す
+        // ためである(昇順キーの挿入は常に木の一番右のLeafへ追記されるため、
+        // 最初のSplitで生まれたBは、挿入を続けるとその後もどんどん育って
+        // しまい、すぐに一杯になる)。
+        let mut i = 0i64;
+        loop {
+            btree.insert(&Value::BigInt(i * 10), rid(1, 0)).unwrap();
+            i += 1;
+            if btree.height().unwrap() >= 2 {
+                break;
+            }
+            assert!(i < 100_000, "十分な件数を挿入してもLeaf Splitが一度も起きないのはおかしい");
+        }
+
+        // 最も左のLeaf(A)と、そのnext_leaf(B)を取る。
+        let (leaf_a_id, leaf_a_max, leaf_b_id, leaf_b_original_min) = {
+            let guard = btree.leftmost_leaf().unwrap();
+            let view = LeafPageRef::open(guard.data()).unwrap();
+            let entries = view.entries();
+            let next = view.next_leaf();
+            assert_ne!(next, NO_NEXT_LEAF, "Leaf Splitが起きた直後なので次のLeafへのリンクがあるはず");
+            let a_id = guard.page_id();
+            let a_max = entries.last().unwrap().0.clone();
+            drop(guard);
+            let next_guard = btree.pool.read_page(next).unwrap();
+            let b_entries = LeafPageRef::open(next_guard.data()).unwrap().entries();
+            let (b_min, _) = b_entries.first().expect("Splitで生まれたBは1件以上のエントリを持つはず");
+            (a_id, a_max, next, b_min.clone())
+        };
+
+        // `k`は、Aの最大キーとBの(元の)最小キーの間にある、実在しない
+        // キー(10刻みなので必ず隙間がある)。
+        let a_max_value = decode_key(DataType::BigInt, &leaf_a_max).unwrap();
+        let b_min_value = decode_key(DataType::BigInt, &leaf_b_original_min).unwrap();
+        let (Value::BigInt(a_max_i), Value::BigInt(b_min_i)) = (a_max_value, b_min_value) else {
+            unreachable!("BigIntのBTreeなので必ずBigIntが返る");
+        };
+        assert_eq!(b_min_i, a_max_i + 10, "10刻みで挿入しているので隣接Leaf境界の差は10のはず");
+        let k = a_max_i + 5;
+        let racy_key = a_max_i + 1; // kより小さく、Aの最大キーより大きい値
+
+        // 「Aを読み終えてBを読むまでの間に、別のスレッドがBへk未満のキーを
+        // insertした」状態を、Bのページへ直接書き込むことで再現する
+        // (通常のinsert APIでは区切りキーによって必ずAへルーティングされる
+        // ため、この状態には到達できない)。
+        {
+            let mut guard = btree.pool.write_page(leaf_b_id).unwrap();
+            let mut entries = LeafPageRef::open(guard.data()).unwrap().entries();
+            let racy_bytes = encode_key(&Value::BigInt(racy_key)).unwrap();
+            let racy_rid = rid(9, 9);
+            let pos = leaf_insert_position(&entries, &racy_bytes);
+            entries.insert(pos, (racy_bytes, racy_rid));
+            let fits = LeafPage::open(guard.data_mut()).unwrap().write_entries(&entries);
+            assert!(fits, "1件追加するだけなので収まるはず");
+        }
+        let _ = leaf_a_id; // Aのpage_id自体は再現条件の説明にのみ使う
+
+        // `k`はどの葉にも実在しないので、`lookup`は空を返すべきである。
+        // 修正前の実装は、Bへ紛れ込んだ`racy_key`(kより小さい)を
+        // 「上限kを超えていない」というだけの理由で誤って返していた。
+        let found = btree.lookup(&Value::BigInt(k)).unwrap();
+        assert!(found.is_empty(), "実在しないキーkが、Bに紛れ込んだ{racy_key}と取り違えられて見つかってしまっている: {found:?}");
+
+        // 実在するキー(racy_key自身)は、通常どおり見つかる。
+        assert_eq!(btree.lookup(&Value::BigInt(racy_key)).unwrap(), vec![rid(9, 9)]);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
     // ---- 第24章: Delete(Lazy Delete) ----
 
     #[test]
@@ -2518,6 +2692,73 @@ mod tests {
         let expected_via_model: Vec<(i64, RecordId)> = model.iter().map(|(&k, &v)| (k, v)).collect();
         assert_eq!(all_via_range, expected_via_model);
 
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Property-based Testの拡張(第40章): 上の2つのモデルテストは
+    /// 「全部insertしてから全部delete」「全部insertしてから範囲検索」と
+    /// フェーズが分かれている。木の中身が挿入と削除の混在で常に変化し続ける
+    /// 状態は再現していない。このテストは`insert`・`delete`・`range`を1ステップ
+    /// ごとにランダムへ混ぜ、**すべてのステップの直後**に`BTreeMap`と一致する
+    /// ことを確認する(最後にまとめて確認するのではない)。分割・併合・借用の
+    /// 実装が、ある特定の混在パターンの直後だけ壊れるという種類のバグは、
+    /// フェーズを分けたテストでは踏めないが、この形なら踏める。
+    #[test]
+    fn random_interleaved_insert_delete_range_matches_a_btreemap_model() {
+        let path = temp_path("interleaved-model");
+        let btree = open_btree(&path, DataType::BigInt);
+        let mut rng = Xorshift64(0x1357_9bdf_2468_ace0);
+        let mut model: BTreeMap<i64, RecordId> = BTreeMap::new();
+        let key_space = 400i64;
+
+        for step in 0..3_000usize {
+            match rng.next() % 10 {
+                // 60%: insert。すでにあるキーへの再挿入は許さない設計
+                // (`insert`が重複キーを拒否する)ため、モデルに無いキーへ倒す。
+                0..=5 => {
+                    let key = (rng.next() % key_space as u64) as i64;
+                    if model.contains_key(&key) {
+                        continue;
+                    }
+                    let record = rid((step as u64 % 1000) + 1, (step % 100) as u16);
+                    btree.insert(&Value::BigInt(key), record).unwrap();
+                    model.insert(key, record);
+                    assert_eq!(btree.lookup(&Value::BigInt(key)).unwrap(), vec![record], "step={step} key={key}");
+                }
+                // 30%: delete。モデルにあるキーの中からランダムに選ぶ。
+                6..=8 => {
+                    if model.is_empty() {
+                        continue;
+                    }
+                    let idx = (rng.next() as usize) % model.len();
+                    let key = *model.keys().nth(idx).unwrap();
+                    let record = model[&key];
+                    assert!(btree.delete(&Value::BigInt(key), record).unwrap(), "step={step} key={key}");
+                    model.remove(&key);
+                    assert_eq!(btree.lookup(&Value::BigInt(key)).unwrap(), Vec::new(), "step={step} key={key}");
+                }
+                // 10%: 範囲検索。範囲の境界もランダムに選ぶ。
+                _ => {
+                    let lo = (rng.next() % key_space as u64) as i64;
+                    let hi = (rng.next() % key_space as u64) as i64;
+                    let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+                    let found = collect_range(&btree, Bound::Included(&Value::BigInt(lo)), Bound::Included(&Value::BigInt(hi)));
+                    let expected: Vec<(i64, RecordId)> = model.range(lo..=hi).map(|(&k, &v)| (k, v)).collect();
+                    assert_eq!(found, expected, "step={step} range={lo}..={hi}");
+                }
+            }
+
+            // 変更を伴うステップ(insert・delete)ごとに全キーを突き合わせるのは
+            // コストが高いので、100ステップに1回だけ全件一致を確認する。
+            // 個々のキーの整合は、上ですでにステップごとに確認済みである。
+            if step % 100 == 0 {
+                let all_via_range = collect_range(&btree, Bound::Unbounded, Bound::Unbounded);
+                let expected_via_model: Vec<(i64, RecordId)> = model.iter().map(|(&k, &v)| (k, v)).collect();
+                assert_eq!(all_via_range, expected_via_model, "step={step}");
+            }
+        }
+
+        assert!(model.len() > key_space as usize / 4, "3,000ステップも回せば十分な件数が残っているはず(テストの前提が崩れている)");
         std::fs::remove_file(&path).unwrap();
     }
 

@@ -64,6 +64,13 @@ pub fn eval_expr(expr: &Expr, functions: &FunctionRegistry, row: Option<&Row>) -
             "集約関数(COUNT/SUM/MIN/MAX)は複数行にまたがる文脈(SELECTの対象式・HAVING・ORDER BY)でのみ使えます"
                 .to_string(),
         )),
+        // `Expr::Param`(第37章)は`EXECUTE`が値を差し込む前のプレースホルダで
+        // あり、`Session::substitute_params`が`Database::execute`へ渡す前に
+        // 必ずリテラルへ置き換える(`crate::session`モジュールのドキュメント
+        // 参照)。この関数まで`Param`が残っているのは呼び出し側の誤りである。
+        Expr::Param { index, .. } => {
+            Err(DbError::Eval(format!("プレースホルダ${index}が値に束縛されないまま評価されました")))
+        }
     }
 }
 
@@ -124,6 +131,14 @@ pub fn eval_bound_expr(expr: &BoundExpr, functions: &FunctionRegistry, row: Opti
             Err(DbError::Eval(
                 "集約関数はAggregate演算子でのみ計算されます(Binderが値へ書き換え忘れています)".to_string(),
             ))
+        }
+        // `BoundExpr::Param`(第37章)も`Expr::Param`と同じ理由でここに残っては
+        // いけない値である。`Session::substitute_params`が、`EXECUTE`のたびに
+        // `PREPARE`時の`BoundStatement`を複製してすべての`Param`をリテラルへ
+        // 置き換えてから`Database`へ渡す(`crate::session`モジュールの
+        // ドキュメント参照)。
+        BoundExpr::Param { index, .. } => {
+            Err(DbError::Eval(format!("プレースホルダ${index}が値に束縛されないまま評価されました")))
         }
     }
 }

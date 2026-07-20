@@ -55,8 +55,8 @@
 
 # 第6部 Server、運用、品質保証
 
-- [第36章 Wire ProtocolとClient/Server]()
-- [第37章 SessionとPrepared Statement]()
-- [第38章 実行制御]()
-- [第39章 System Catalogとメンテナンス]()
-- [第40章 テスト、Fuzzing、Benchmark、リリース]()
+- [第36章 Wire ProtocolとClient/Server](ch36-wire-protocol.md)
+- [第37章 SessionとPrepared Statement](ch37-session-prepared.md)
+- [第38章 実行制御](ch38-execution-control.md)
+- [第39章 System Catalogとメンテナンス](ch39-system-catalog.md)
+- [第40章 テスト、Fuzzing、Benchmark、リリース](ch40-testing-release.md)

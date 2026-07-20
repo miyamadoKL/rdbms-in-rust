@@ -52,9 +52,10 @@ use std::collections::HashSet;
 
 use crate::ast::{
     AggregateFunc, AnalyzeStatement, Assignment, BeginStatement, BinaryOperator, CheckpointStatement, CommitStatement,
-    CreateIndexStatement, CreateTableStatement, DeleteStatement, DropIndexStatement, DropTableStatement, Expr,
-    FromClause, Ident, InsertStatement, JoinKind, RollbackStatement, SelectItem, SelectStatement, Statement,
-    UnaryOperator, UpdateStatement,
+    CreateIndexStatement, CreateTableStatement, DeleteStatement, DescribeStatement, DropIndexStatement,
+    DropTableStatement, Expr, FromClause, Ident, InsertStatement, JoinKind, RollbackStatement, SelectItem,
+    SelectStatement, ShowIndexesStatement, ShowStatsStatement, ShowTablesStatement, Statement, UnaryOperator,
+    UpdateStatement, VacuumStatement,
 };
 use crate::catalog::{Catalog, TableInfo};
 use crate::error::{DbError, DbResult};
@@ -149,6 +150,19 @@ pub enum BoundStatement {
     /// `CHECKPOINT`(第34章)。`Begin`・`Commit`・`Rollback`と同じ理由で、
     /// ASTのバリアントをそのまま持ち回す。
     Checkpoint(CheckpointStatement),
+    /// `SHOW TABLES`(第39章)。対象を持たないため、ASTのバリアントをそのまま
+    /// 持ち回す。
+    ShowTables(ShowTablesStatement),
+    /// `DESCRIBE <table>`(第39章)。`Analyze`と同じく、テーブル名の存在を
+    /// ここで確認する。
+    Describe(DescribeStatement),
+    /// `SHOW INDEXES [FROM <table>]`(第39章)。
+    ShowIndexes(ShowIndexesStatement),
+    /// `SHOW STATS [FROM <table>]`(第39章)。
+    ShowStats(ShowStatsStatement),
+    /// `VACUUM [<table>]`(第39章)。`Analyze`と同じ理由でASTのバリアントを
+    /// そのまま持ち回す。
+    Vacuum(VacuumStatement),
 }
 
 /// 束縛済みの`CREATE INDEX`(第24章)。
@@ -384,6 +398,18 @@ pub enum BoundExpr {
         data_type: DataType,
         span: Span,
     },
+    /// `$1`のようなParameter Binding用のプレースホルダ(第37章)。`index`は
+    /// `1`始まりの番号。`data_type`は、囲む式(比較の相手、算術演算子、
+    /// `CAST`、関数の仮引数など)から`bind_expr`が推論できた場合だけ`Some`に
+    /// なる。推論できなかった場合(`$1`同士の比較など)は`None`のままにし、
+    /// `EXECUTE`の値がどんな型であっても受理する(本文「プレースホルダの型を
+    /// いつ決めるか」を参照)。実際の値への置き換えは`Binder`の仕事ではなく、
+    /// `Session::substitute_params`(第37章)が`EXECUTE`のたびに行う。
+    Param {
+        index: u32,
+        data_type: Option<DataType>,
+        span: Span,
+    },
 }
 
 impl BoundExpr {
@@ -405,6 +431,7 @@ impl BoundExpr {
             | BoundExpr::Cast { data_type, .. } => Some(*data_type),
             BoundExpr::IsNull { .. } => Some(DataType::Boolean),
             BoundExpr::Paren { expr, .. } => expr.data_type(),
+            BoundExpr::Param { data_type, .. } => *data_type,
         }
     }
 
@@ -422,8 +449,22 @@ impl BoundExpr {
             | BoundExpr::FunctionCall { span, .. }
             | BoundExpr::Aggregate { span, .. }
             | BoundExpr::Paren { span, .. }
-            | BoundExpr::Cast { span, .. } => *span,
+            | BoundExpr::Cast { span, .. }
+            | BoundExpr::Param { span, .. } => *span,
         }
+    }
+}
+
+/// `expr`が型未確定の`BoundExpr::Param`であれば、その`data_type`を`hint`で
+/// 埋める。`expr`がParamでない場合、または`hint`が`None`の場合は変更しない
+/// (`Binder::bind_expr`が二項演算・単項演算・`CAST`・関数呼び出しの各箇所で、
+/// 文脈から決まる期待型を`hint`として渡す)。
+fn coerce_param_type(expr: BoundExpr, hint: Option<DataType>) -> BoundExpr {
+    match (expr, hint) {
+        (BoundExpr::Param { index, data_type: None, span }, Some(hint)) => {
+            BoundExpr::Param { index, data_type: Some(hint), span }
+        }
+        (expr, _) => expr,
     }
 }
 
@@ -507,6 +548,29 @@ impl<'a> Binder<'a> {
             Statement::Commit(commit) => Ok(BoundStatement::Commit(commit)),
             Statement::Rollback(rollback) => Ok(BoundStatement::Rollback(rollback)),
             Statement::Checkpoint(checkpoint) => Ok(BoundStatement::Checkpoint(checkpoint)),
+            Statement::ShowTables(show) => Ok(BoundStatement::ShowTables(show)),
+            Statement::Describe(describe) => self.bind_describe(describe),
+            Statement::ShowIndexes(show) => self.bind_show_indexes(show),
+            Statement::ShowStats(show) => self.bind_show_stats(show),
+            Statement::Vacuum(vacuum) => self.bind_vacuum(vacuum),
+            // `PREPARE`・`EXECUTE`・`DEALLOCATE`(第37章)は`Session`が
+            // `Database::execute`より前に横取りする文であり、ここまで
+            // 到達しない(`crate::session`モジュールのドキュメント参照)。
+            // `Database::execute("PREPARE ...")`のようにSessionを経由せず
+            // 直接呼んだ場合だけこの分岐に入るため、位置情報つきの
+            // `DbError::Bind`として案内する。
+            Statement::Prepare(s) => Err(self.error_at(
+                s.span,
+                "PREPAREはSessionを経由してください(Database::executeでは使えません)".to_string(),
+            )),
+            Statement::Execute(s) => Err(self.error_at(
+                s.span,
+                "EXECUTEはSessionを経由してください(Database::executeでは使えません)".to_string(),
+            )),
+            Statement::Deallocate(s) => Err(self.error_at(
+                s.span,
+                "DEALLOCATEはSessionを経由してください(Database::executeでは使えません)".to_string(),
+            )),
         }
     }
 
@@ -520,6 +584,47 @@ impl<'a> Binder<'a> {
                 .ok_or_else(|| self.error_at(table.span, format!("テーブルが見つかりません: {}", table.name)))?;
         }
         Ok(BoundStatement::Analyze(analyze))
+    }
+
+    /// `DESCRIBE <table>`のテーブル名を解決する(第39章)。`table`は`ANALYZE`と
+    /// 違って省略できないため、必ずここで存在を確認する。
+    fn bind_describe(&self, describe: DescribeStatement) -> DbResult<BoundStatement> {
+        self.catalog
+            .table(&describe.table.name)
+            .ok_or_else(|| self.error_at(describe.table.span, format!("テーブルが見つかりません: {}", describe.table.name)))?;
+        Ok(BoundStatement::Describe(describe))
+    }
+
+    /// `SHOW INDEXES [FROM <table>]`のテーブル名を解決する(第39章)。
+    /// `bind_analyze`と同じく、省略されていれば検査せずそのまま通す。
+    fn bind_show_indexes(&self, show: ShowIndexesStatement) -> DbResult<BoundStatement> {
+        if let Some(table) = &show.table {
+            self.catalog
+                .table(&table.name)
+                .ok_or_else(|| self.error_at(table.span, format!("テーブルが見つかりません: {}", table.name)))?;
+        }
+        Ok(BoundStatement::ShowIndexes(show))
+    }
+
+    /// `SHOW STATS [FROM <table>]`のテーブル名を解決する(第39章)。
+    fn bind_show_stats(&self, show: ShowStatsStatement) -> DbResult<BoundStatement> {
+        if let Some(table) = &show.table {
+            self.catalog
+                .table(&table.name)
+                .ok_or_else(|| self.error_at(table.span, format!("テーブルが見つかりません: {}", table.name)))?;
+        }
+        Ok(BoundStatement::ShowStats(show))
+    }
+
+    /// `VACUUM [<table>]`のテーブル名を解決する(第39章)。`bind_analyze`と
+    /// 同じ形。
+    fn bind_vacuum(&self, vacuum: VacuumStatement) -> DbResult<BoundStatement> {
+        if let Some(table) = &vacuum.table {
+            self.catalog
+                .table(&table.name)
+                .ok_or_else(|| self.error_at(table.span, format!("テーブルが見つかりません: {}", table.name)))?;
+        }
+        Ok(BoundStatement::Vacuum(vacuum))
     }
 
     fn error_at(&self, span: Span, message: impl Into<String>) -> DbError {
@@ -824,7 +929,8 @@ impl<'a> Binder<'a> {
             BoundExpr::IntLiteral { .. }
             | BoundExpr::StringLiteral { .. }
             | BoundExpr::BoolLiteral { .. }
-            | BoundExpr::NullLiteral { .. } => Ok(expr),
+            | BoundExpr::NullLiteral { .. }
+            | BoundExpr::Param { .. } => Ok(expr),
             BoundExpr::UnaryOp { op, expr, data_type, span } => {
                 let expr = self.rewrite_for_aggregate(*expr, aggregate)?;
                 Ok(BoundExpr::UnaryOp { op, expr: Box::new(expr), data_type, span })
@@ -1037,7 +1143,11 @@ impl<'a> Binder<'a> {
                 format!("列'{}'が見つかりません", assignment.column.name),
             )
         })?;
-        let value = self.bind_expr(&assignment.value, tables)?;
+        // `SET col = $1`のように、右辺が型未確定の`$n`であれば`col`自身の型を
+        // ヒントにする(`UPDATE`は代入先の列がすでに型を持っているため、
+        // `CAST`を書かせなくても文脈から一意に決まる)。
+        let target_type = tables[0].schema.columns()[column_index].data_type;
+        let value = coerce_param_type(self.bind_expr(&assignment.value, tables)?, Some(target_type));
         Ok(BoundAssignment { column_index, value })
     }
 
@@ -1091,6 +1201,7 @@ impl<'a> Binder<'a> {
             }
             Expr::BoolLiteral { value, span } => Ok(BoundExpr::BoolLiteral { value: *value, span: *span }),
             Expr::NullLiteral { span } => Ok(BoundExpr::NullLiteral { span: *span }),
+            Expr::Param { index, span } => Ok(BoundExpr::Param { index: *index, data_type: None, span: *span }),
             Expr::ColumnRef { qualifier, name, span } => {
                 self.resolve_column(qualifier.as_ref(), name, *span, tables)
             }
@@ -1099,13 +1210,40 @@ impl<'a> Binder<'a> {
                 Ok(BoundExpr::Paren { expr: Box::new(inner), span: *span })
             }
             Expr::UnaryOp { op, expr, span } => {
-                let operand = self.bind_expr(expr, tables)?;
+                // 単項演算子が要求する型は演算子自身から一意に決まる(`NOT`は
+                // BOOLEAN、単項`-`はBIGINT)ため、被演算子が型未確定の
+                // `$n`であればその型をここで確定させる(`coerce_param_type`)。
+                let hint = match op {
+                    UnaryOperator::Negate => Some(DataType::BigInt),
+                    UnaryOperator::Not => Some(DataType::Boolean),
+                };
+                let operand = coerce_param_type(self.bind_expr(expr, tables)?, hint);
                 let data_type = self.check_unary_type(*op, &operand, *span)?;
                 Ok(BoundExpr::UnaryOp { op: *op, expr: Box::new(operand), data_type, span: *span })
             }
             Expr::BinaryOp { op, lhs, rhs, span } => {
                 let bound_lhs = self.bind_expr(lhs, tables)?;
                 let bound_rhs = self.bind_expr(rhs, tables)?;
+                // 算術演算子(BIGINT同士)・論理演算子(BOOLEAN同士)は、演算子
+                // 自身から被演算子の期待型が一意に決まる。比較演算子は
+                // 両辺が同じ型でありさえすればよいので、もう一方の辺の型を
+                // ヒントにする(両辺とも`$n`なら、この式だけでは型を決められず
+                // `None`のまま残る。本文「プレースホルダの型をいつ決めるか」を
+                // 参照)。
+                let hint = match op {
+                    BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply | BinaryOperator::Divide => {
+                        Some(DataType::BigInt)
+                    }
+                    BinaryOperator::And | BinaryOperator::Or => Some(DataType::Boolean),
+                    BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq => bound_lhs.data_type().or_else(|| bound_rhs.data_type()),
+                };
+                let bound_lhs = coerce_param_type(bound_lhs, hint);
+                let bound_rhs = coerce_param_type(bound_rhs, hint);
                 let data_type = self.check_binary_type(*op, &bound_lhs, &bound_rhs, *span)?;
                 Ok(BoundExpr::BinaryOp {
                     op: *op,
@@ -1122,10 +1260,14 @@ impl<'a> Binder<'a> {
                 Ok(BoundExpr::IsNull { expr: Box::new(bound), negated: *negated, span: *span })
             }
             Expr::Cast { expr, type_name, span } => {
-                let bound = self.bind_expr(expr, tables)?;
                 let data_type = DataType::from_sql_name(&type_name.name).ok_or_else(|| {
                     self.error_at(type_name.span, format!("未知の型名です: {}", type_name.name))
                 })?;
+                // `CAST($1 AS BIGINT)`のように、型未確定の`$n`に明示的な型を
+                // 与える書き方を認める(PostgreSQLの`$1::int`に相当する、この
+                // サブセットでの書き方。本文「プレースホルダの型をいつ決めるか」
+                // を参照)。
+                let bound = coerce_param_type(self.bind_expr(expr, tables)?, Some(data_type));
                 Ok(BoundExpr::Cast { expr: Box::new(bound), data_type, span: *span })
             }
             Expr::FunctionCall { name, args, span } => {
@@ -1143,7 +1285,9 @@ impl<'a> Binder<'a> {
                 }
                 let mut bound_args = Vec::with_capacity(args.len());
                 for (arg, expected) in args.iter().zip(arg_types) {
-                    let bound_arg = self.bind_expr(arg, tables)?;
+                    // 関数の仮引数の型は`FunctionRegistry`の署名で決まっているので、
+                    // 型未確定の`$n`が渡されればその型として確定させる。
+                    let bound_arg = coerce_param_type(self.bind_expr(arg, tables)?, Some(*expected));
                     if let Some(actual) = bound_arg.data_type()
                         && actual != *expected
                     {
@@ -1429,6 +1573,7 @@ fn bound_contains_aggregate(expr: &BoundExpr) -> bool {
         | BoundExpr::StringLiteral { .. }
         | BoundExpr::BoolLiteral { .. }
         | BoundExpr::NullLiteral { .. }
+        | BoundExpr::Param { .. }
         | BoundExpr::ColumnRef { .. } => false,
         BoundExpr::UnaryOp { expr, .. } => bound_contains_aggregate(expr),
         BoundExpr::BinaryOp { lhs, rhs, .. } => bound_contains_aggregate(lhs) || bound_contains_aggregate(rhs),
@@ -1453,6 +1598,7 @@ fn ast_expr_contains_aggregate(expr: &Expr) -> bool {
         | Expr::StringLiteral { .. }
         | Expr::BoolLiteral { .. }
         | Expr::NullLiteral { .. }
+        | Expr::Param { .. }
         | Expr::ColumnRef { .. } => false,
         Expr::UnaryOp { expr, .. } => ast_expr_contains_aggregate(expr),
         Expr::BinaryOp { lhs, rhs, .. } => ast_expr_contains_aggregate(lhs) || ast_expr_contains_aggregate(rhs),
