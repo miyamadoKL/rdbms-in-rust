@@ -37,3 +37,39 @@ pub fn temp_db_path(name: &str) -> std::path::PathBuf {
     path.push(unique);
     path
 }
+
+/// テスト専用の決定的な疑似乱数生成器(xorshift64)。`src/btree.rs`・
+/// `src/slotted_page.rs`のテストモジュールが使っているものと同じ実装であり、
+/// 依存クレートを増やさずシードを固定して再現できることを理由に、この章
+/// (第40章)で追加するFuzzing・Property-based Test・Crash Injection Loop・
+/// 決定的ランダムインターリーブの4つのテストファイルが共通で使うぶんを
+/// ここへ集約した。
+#[allow(dead_code)]
+pub struct Xorshift64(pub u64);
+
+#[allow(dead_code)]
+impl Xorshift64 {
+    pub fn new(seed: u64) -> Self {
+        // 種が0だとxorshiftは0を返し続けて壊れるため、0除けの奇数へ倒す。
+        Xorshift64(seed | 1)
+    }
+
+    pub fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    /// `[0, bound)`の範囲の値を返す。`bound == 0`は呼び出し禁止。
+    pub fn range(&mut self, bound: usize) -> usize {
+        (self.next() as usize) % bound
+    }
+
+    /// `true`/`false`を確率`num/den`で返す。
+    pub fn chance(&mut self, num: u64, den: u64) -> bool {
+        self.next() % den < num
+    }
+}

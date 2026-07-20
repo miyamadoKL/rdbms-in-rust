@@ -2521,6 +2521,73 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// Property-based Testの拡張(第40章): 上の2つのモデルテストは
+    /// 「全部insertしてから全部delete」「全部insertしてから範囲検索」と
+    /// フェーズが分かれている。木の中身が挿入と削除の混在で常に変化し続ける
+    /// 状態は再現していない。このテストは`insert`・`delete`・`range`を1ステップ
+    /// ごとにランダムへ混ぜ、**すべてのステップの直後**に`BTreeMap`と一致する
+    /// ことを確認する(最後にまとめて確認するのではない)。分割・併合・借用の
+    /// 実装が、ある特定の混在パターンの直後だけ壊れるという種類のバグは、
+    /// フェーズを分けたテストでは踏めないが、この形なら踏める。
+    #[test]
+    fn random_interleaved_insert_delete_range_matches_a_btreemap_model() {
+        let path = temp_path("interleaved-model");
+        let btree = open_btree(&path, DataType::BigInt);
+        let mut rng = Xorshift64(0x1357_9bdf_2468_ace0);
+        let mut model: BTreeMap<i64, RecordId> = BTreeMap::new();
+        let key_space = 400i64;
+
+        for step in 0..3_000usize {
+            match rng.next() % 10 {
+                // 60%: insert。すでにあるキーへの再挿入は許さない設計
+                // (`insert`が重複キーを拒否する)ため、モデルに無いキーへ倒す。
+                0..=5 => {
+                    let key = (rng.next() % key_space as u64) as i64;
+                    if model.contains_key(&key) {
+                        continue;
+                    }
+                    let record = rid((step as u64 % 1000) + 1, (step % 100) as u16);
+                    btree.insert(&Value::BigInt(key), record).unwrap();
+                    model.insert(key, record);
+                    assert_eq!(btree.lookup(&Value::BigInt(key)).unwrap(), vec![record], "step={step} key={key}");
+                }
+                // 30%: delete。モデルにあるキーの中からランダムに選ぶ。
+                6..=8 => {
+                    if model.is_empty() {
+                        continue;
+                    }
+                    let idx = (rng.next() as usize) % model.len();
+                    let key = *model.keys().nth(idx).unwrap();
+                    let record = model[&key];
+                    assert!(btree.delete(&Value::BigInt(key), record).unwrap(), "step={step} key={key}");
+                    model.remove(&key);
+                    assert_eq!(btree.lookup(&Value::BigInt(key)).unwrap(), Vec::new(), "step={step} key={key}");
+                }
+                // 10%: 範囲検索。範囲の境界もランダムに選ぶ。
+                _ => {
+                    let lo = (rng.next() % key_space as u64) as i64;
+                    let hi = (rng.next() % key_space as u64) as i64;
+                    let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+                    let found = collect_range(&btree, Bound::Included(&Value::BigInt(lo)), Bound::Included(&Value::BigInt(hi)));
+                    let expected: Vec<(i64, RecordId)> = model.range(lo..=hi).map(|(&k, &v)| (k, v)).collect();
+                    assert_eq!(found, expected, "step={step} range={lo}..={hi}");
+                }
+            }
+
+            // 変更を伴うステップ(insert・delete)ごとに全キーを突き合わせるのは
+            // コストが高いので、100ステップに1回だけ全件一致を確認する。
+            // 個々のキーの整合は、上ですでにステップごとに確認済みである。
+            if step % 100 == 0 {
+                let all_via_range = collect_range(&btree, Bound::Unbounded, Bound::Unbounded);
+                let expected_via_model: Vec<(i64, RecordId)> = model.iter().map(|(&k, &v)| (k, v)).collect();
+                assert_eq!(all_via_range, expected_via_model, "step={step}");
+            }
+        }
+
+        assert!(model.len() > key_space as usize / 4, "3,000ステップも回せば十分な件数が残っているはず(テストの前提が崩れている)");
+        std::fs::remove_file(&path).unwrap();
+    }
+
     #[test]
     fn delete_rejects_null_and_wrong_type() {
         let path = temp_path("delete-validation");

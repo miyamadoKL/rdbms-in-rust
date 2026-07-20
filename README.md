@@ -5,7 +5,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 
 ## 目次
 
-現在執筆済みなのは[はじめに](book/src/index.md)と第1〜39章のみで、第40章以降は準備中です。
+[はじめに](book/src/index.md)から全40章まで、すべて執筆済みです。
 
 ### 第0部 設計と開発環境
 
@@ -66,7 +66,7 @@ Rustで一から関係データベース管理システム(RDBMS)を作りなが
 - [第37章 SessionとPrepared Statement](book/src/ch37-session-prepared.md)
 - [第38章 実行制御](book/src/ch38-execution-control.md)
 - [第39章 System Catalogとメンテナンス](book/src/ch39-system-catalog.md)
-- 第40章 テスト、Fuzzing、Benchmark、リリース
+- [第40章 テスト、Fuzzing、Benchmark、リリース](book/src/ch40-testing-release.md)
 
 ## 読み方とビルド方法
 
