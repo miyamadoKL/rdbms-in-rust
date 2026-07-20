@@ -479,9 +479,9 @@ REPL(`src/main.rs`)は`Session::execute`をそのまま呼ぶだけの薄いル�
 ## この章の限界
 
 `PREPARE`が1回だけ束縛して使い回すのは`BoundStatement`だけです。
-論理計画の構築、`rules::optimize`、`physical_plan::optimize`は`EXECUTE`のたびに(`Database::execute_select`が呼ばれるたびに)実行されます。
+論理計画の構築、`rules::optimize`(定数式の畳み込みを含む)、`physical_plan::optimize`は`EXECUTE`のたびに(`Database::execute_select`が呼ばれるたびに)実行され、その結果(畳み込んだ定数式を含む)はどこにも保存されません。
 したがって`PREPARE`した後に`ANALYZE`で統計情報が更新されれば、次の`EXECUTE`はその新しい統計を使って計画を組み直します。
-`EXECUTE`をまたいで古いまま引き継がれるのは、あくまで`rules::optimize`が畳み込む定数式や、束縛時点で確定した型、列インデックスといった`BoundStatement`の構造だけです。
+`EXECUTE`をまたいで再利用されるのは、あくまで束縛時点で確定した型、列インデックス、テーブル識別子といった`BoundStatement`の構造だけです。
 PostgreSQLが"generic plan"と"custom plan"を使い分けて対処する種類の問題(統計に応じて計画の形そのものを変える)を、この章では扱いません。
 
 `EXECUTE`の引数として書けるのはリテラルだけで、式は書けません。

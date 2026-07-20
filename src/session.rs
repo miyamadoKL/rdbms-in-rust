@@ -90,15 +90,16 @@
 //! 実行時エラーへ倒れる余地を最初から許容した設計であることを意味する。
 //!
 //! この章の限界として、`PREPARE`が1回だけ束縛して使い回すのは
-//! `BoundStatement`だけである。論理計画の構築・`rules::optimize`・
-//! `physical_plan::optimize`は`Database::execute_select`が呼ばれるたび、
-//! つまり`EXECUTE`のたびに実行される。したがって`PREPARE`した後に
+//! `BoundStatement`だけである。論理計画の構築・`rules::optimize`(定数式の
+//! 畳み込みを含む)・`physical_plan::optimize`は`Database::execute_select`が
+//! 呼ばれるたび、つまり`EXECUTE`のたびに実行され、その結果(畳み込んだ
+//! 定数式を含む)はどこにも保存されない。したがって`PREPARE`した後に
 //! `ANALYZE`で統計情報が更新されれば、次の`EXECUTE`はその新しい統計を
-//! 使って計画を組み直す。`EXECUTE`をまたいで古いまま引き継がれるのは、
-//! あくまで`rules::optimize`が畳み込む定数式や、束縛時点で確定した型・
-//! 列インデックスといった`BoundStatement`の構造だけであり、PostgreSQLが
-//! "generic plan"と"custom plan"を使い分けて対処する種類の問題(統計に
-//! 応じて計画の形そのものを変える)を、この章では扱わない。
+//! 使って計画を組み直す。`EXECUTE`をまたいで再利用されるのは、あくまで
+//! 束縛時点で確定した型・列インデックス・テーブル識別子といった
+//! `BoundStatement`の構造だけであり、PostgreSQLが"generic plan"と
+//! "custom plan"を使い分けて対処する種類の問題(統計に応じて計画の形
+//! そのものを変える)を、この章では扱わない。
 //!
 //! # Wire Protocolを拡張しない
 //!
@@ -116,8 +117,8 @@
 //! 埋める設計は発展編Eに譲る。
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::{Arc, Mutex};
 
 use crate::ast::{
     DeallocateStatement, ExecuteStatement, Expr, Literal, PrepareStatement, Statement,
@@ -130,33 +131,76 @@ use crate::error::{DbError, DbResult};
 use crate::lexer::Span;
 use crate::types::{DataType, Value};
 
-/// 接続(TCP接続、またはEmbedded/REPLの1プロセス)が持つ状態をまとめたもの。
-/// モジュール冒頭のドキュメントを参照。
+/// [`Session::cancellation_handle`]と実行中の文とで共有する、キャンセル要求
+/// フラグとチェックポイントカウンタの組(第6部レビュー2巡目対応)。
 ///
-/// # 第38章: 文1本ごとのキャンセル
+/// # 「リセット方式」から「使い捨てトークン方式」への変更
 ///
-/// [`Session`]は接続1本につき1個の`cancel_flag`(`Arc<AtomicBool>`)を持つ。
-/// [`Session::execute`]・[`Session::execute_prepared`]は、文を1本実行するたびに
-/// この`cancel_flag`を`false`へ戻してから、それを元にした
-/// [`crate::cancellation::CancellationToken`]([`SharedDatabase::make_execution_context`]、
-/// 設定済みのタイムアウトがあればその締切も併せ持つ)を作り、その文の実行に
-/// 使う。[`Session::cancellation_handle`]は同じ`cancel_flag`を`clone`して返す
-/// ([`CancellationToken`]自体を返さないのは、締切がまだ確定していない
-/// [`Session::execute`]呼び出し前の時点でも、呼び出し元が先にハンドルを
-/// 取得できるようにするため)。呼び出し元(`crate::server`のクライアント切断
-/// 検知、またはテストコード)がこのハンドルの`cancel`を呼べば、`self`を
-/// `&mut`で借用している`execute`呼び出しとは別のスレッドから、実行中の文を
-/// 打ち切れる(本文・テストを参照)。
-pub struct Session {
-    shared: Arc<SharedDatabase>,
-    tx: Option<TxHandle>,
-    prepared: HashMap<String, PreparedStatement>,
+/// かつては`Session`が`cancel_flag`・`checkpoints`を接続1本につき1個だけ
+/// 持ち、文を1本実行するたびにこれを`false`・`0`へ**リセット**していた。
+/// この方式には、`Session::cancellation_handle`を呼んでから
+/// [`Session::execute`]を呼ぶまでの間([`crate::server::handle_connection`]が
+/// 切断監視スレッドを立ててから実際に`execute`を呼ぶまでの窓、レビューでの
+/// 再現条件では単に`handle.cancel()`の直後に`execute`を呼ぶだけの窓)に
+/// 届いた`cancel`要求を、次の`execute`が呼ぶリセットがそのまま消してしまう
+/// という欠陥があった。`execute`の一番最初でリセットしても、リセットという
+/// 操作そのものが「その直前に届いた合図を確認せずに消す」性質を持つ限り、
+/// この窓は原理的に閉じられない。
+///
+/// この章では、`Session`が`cancel_flag`・`checkpoints`を直接持ち回すのを
+/// やめ、両方をひとまとめにした[`ExecutionSlot`]を`Arc`で参照する形にし、
+/// **文ごとに使い捨てる**。[`Session::cancellation_handle`]と
+/// [`Session::new_execution_context`]は、どちらも`current_slot`(`Mutex`で
+/// 保護する)から**同じ時点の同じ`Arc<ExecutionSlot>`**を取り出す。
+/// `new_execution_context`は取り出すと同時に、次の文のために真新しい
+/// (`cancelled = false`の)[`ExecutionSlot`]を`current_slot`へ差し込む。
+///
+/// この設計だと、`cancellation_handle`を呼んでから`execute`を呼ぶまでの
+/// 窓に`cancel`が呼ばれても、`cancellation_handle`が返したトークンと
+/// これから始まる`execute`が使う`ExecutionContext`は**同じ`Arc<AtomicBool>`
+/// を指している**ため、消えようがない。`execute`は「リセットする」のでは
+/// なく「今`current_slot`に**すでにある**ものをそのまま使う」だけであり、
+/// そこに書き込まれた`cancel`要求は、書き込まれたのが`execute`の前でも
+/// 最中でも、そのまま観測される。一方、ある文の実行が終わったあとに
+/// 呼ばれる次の`execute`は、その文が使い終えた古い[`ExecutionSlot`]では
+/// なく、その文の開始時にすでに差し込まれた**別の**真新しい
+/// [`ExecutionSlot`]を取り出すため、古い`cancel`要求が次の文へ漏れ出す
+/// こともない。
+struct ExecutionSlot {
     cancel_flag: Arc<AtomicBool>,
     /// [`CancellationToken::checkpoints`]をこの接続の外(`cancellation_handle`)と
     /// 内(実行中の文が使うトークン)で共有するための`Arc`。テストが「実行中の
     /// 文が同期ポイントを確かに何度も通過した」ことを外から観測するために使う
     /// (`crate::cancellation`モジュール冒頭を参照、本番のコードは読まない)。
-    checkpoints: Arc<std::sync::atomic::AtomicUsize>,
+    checkpoints: Arc<AtomicUsize>,
+}
+
+impl ExecutionSlot {
+    /// キャンセルされておらず、チェックポイントが0の、真新しいスロットを作る。
+    fn fresh() -> Arc<Self> {
+        Arc::new(ExecutionSlot { cancel_flag: Arc::new(AtomicBool::new(false)), checkpoints: Arc::new(AtomicUsize::new(0)) })
+    }
+}
+
+/// 接続(TCP接続、またはEmbedded/REPLの1プロセス)が持つ状態をまとめたもの。
+/// モジュール冒頭のドキュメントを参照。
+///
+/// # 第38章: 文1本ごとのキャンセル
+///
+/// [`Session`]は接続1本につき、今使う(または次に使う)[`ExecutionSlot`]を
+/// 指す`current_slot`を持つ。[`Session::cancellation_handle`]・
+/// [`Session::new_execution_context`]がこれをどう使い分けるかは
+/// [`ExecutionSlot`]のドキュメント(「リセット方式」から「使い捨てトークン
+/// 方式」への変更、第6部レビュー2巡目対応)を参照。呼び出し元
+/// (`crate::server`のクライアント切断検知、またはテストコード)が
+/// `cancellation_handle`の返す`CancellationToken`の`cancel`を呼べば、`self`を
+/// `&mut`で借用している`execute`呼び出しとは別のスレッドから、実行中(または
+/// 次に実行する)文を打ち切れる(本文・テストを参照)。
+pub struct Session {
+    shared: Arc<SharedDatabase>,
+    tx: Option<TxHandle>,
+    prepared: HashMap<String, PreparedStatement>,
+    current_slot: Mutex<Arc<ExecutionSlot>>,
 }
 
 /// `PREPARE`が登録する1件。`bound`は`PREPARE`の時点で束縛済みの文、
@@ -176,8 +220,7 @@ impl Session {
             shared,
             tx: None,
             prepared: HashMap::new(),
-            cancel_flag: Arc::new(AtomicBool::new(false)),
-            checkpoints: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            current_slot: Mutex::new(ExecutionSlot::fresh()),
         }
     }
 
@@ -186,42 +229,49 @@ impl Session {
     /// 呼ぶより前に取得しておき、別スレッドへ持って行って`cancel`を呼べる
     /// (型冒頭「第38章: 文1本ごとのキャンセル」を参照)。
     ///
-    /// 1回`cancel`されたハンドルは、以後この`Session`が実行するすべての文を
-    /// キャンセルし続ける(`cancel_flag`は文をまたいで同じ`Arc`のままで、
-    /// `execute`は次の文の開始時に`false`へ戻す。すでに`cancel`済みの
-    /// ハンドルを使い回すことは想定していない)。
+    /// 今`current_slot`に入っている[`ExecutionSlot`]をそのまま`clone`して
+    /// 返す。この呼び出しの直後に`execute`が呼ばれれば
+    /// ([`crate::server::handle_connection`]の通常の使い方どおり)、
+    /// `execute`も同じ`current_slot`から同じ`Arc<ExecutionSlot>`を取り出す
+    /// ため、このハンドルの`cancel`は必ずその文(または、まだ`execute`が
+    /// 呼ばれていなければ次の文)に効く([`ExecutionSlot`]のドキュメント
+    /// 「リセット方式」から「使い捨てトークン方式」への変更、を参照)。
+    /// `execute`が2回呼ばれるまでの間にもう一度`cancellation_handle`を
+    /// 呼ばずに使い回すと、1回目の文が終わった時点でその文専用の
+    /// [`ExecutionSlot`]は使い捨てられているため、以後このハンドルの
+    /// `cancel`は何にも効かなくなる(すでに`cancel`済みのハンドルを
+    /// 使い回すことも同様に想定していない)。
     pub fn cancellation_handle(&self) -> CancellationToken {
-        CancellationToken::with_checkpoints(Arc::clone(&self.cancel_flag), None, Arc::clone(&self.checkpoints))
+        let slot = Arc::clone(&self.current_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        CancellationToken::with_checkpoints(Arc::clone(&slot.cancel_flag), None, Arc::clone(&slot.checkpoints))
     }
 
-    /// この文専用の[`crate::cancellation::ExecutionContext`]を作る。呼ぶたびに
-    /// `cancel_flag`・`checkpoints`を初期状態へ戻すため、前の文の状態が次の文へ
-    /// 漏れることは無い。
+    /// この文専用の[`crate::cancellation::ExecutionContext`]を作る。
     ///
-    /// # 第6部レビュー対応: なぜ構文解析より前に呼ぶのか
+    /// `current_slot`から**今そこにある**[`ExecutionSlot`]をそのまま取り出し、
+    /// 代わりに真新しい[`ExecutionSlot`]を差し込む。取り出す・差し込むは
+    /// 同じ`Mutex`ロックの中で行うため、[`Session::cancellation_handle`]が
+    /// 同じ瞬間に読んでも、両者は必ず同じ`Arc<ExecutionSlot>`を見るか、
+    /// はっきり前後どちらかの`ExecutionSlot`を見るかのどちらかであり、
+    /// 中途半端な状態を観測することは無い(詳しい理由は[`ExecutionSlot`]の
+    /// ドキュメントを参照)。
     ///
     /// [`Session::execute`]・[`Session::execute_prepared`]は、この関数を
     /// 構文解析や`PREPARE`済み文の検索より**前**、関数の最初の行で呼ぶ。
-    /// かつては束縛が終わったあとに呼んでいたが、それだと次の問題が起きて
-    /// いた。`crate::server::handle_connection`は`Session::execute`を呼ぶより
-    /// **前**に切断監視スレッド([`Session::cancellation_handle`]が返す
-    /// トークンを共有)を立てる。監視スレッドが構文解析・束縛の**途中**で
-    /// 切断を検知して`cancel`を呼んでも、束縛後に`cancel_flag`を`false`へ
-    /// 戻していたのでは、その要求をそのままリセットで消してしまう。
-    /// 構文解析より前でリセットしておけば、以後(構文解析・束縛・実行の
-    /// どの段階でも)届いた`cancel`はこの[`ExecutionContext`]が正しく
-    /// 観測できる。構文解析・束縛の直後に明示的な`ctx.cancel.check()`も
-    /// 挟んである([`Session::execute`]・[`Session::execute_prepared_with_context`]
-    /// を参照)ため、束縛だけで完結し実行時に一度も`check`されない
+    /// 構文解析・束縛の直後に明示的な`ctx.cancel.check()`も挟んである
+    /// ([`Session::execute`]・[`Session::execute_prepared_with_context`]を
+    /// 参照)ため、束縛だけで完結し実行時に一度も`check`されない
     /// (`Filter`のstreamingループを一度も回らない等の)文でも、束縛中に
     /// 届いたキャンセル要求を確実に検知できる。
     ///
-    /// この設計変更は、締切の起点(「`Session::execute`が呼ばれた瞬間」)を
-    /// 文字どおり実装に一致させる副次効果も持つ(第37章・第38章の本文を参照)。
+    /// 締切の起点(「`Session::execute`が呼ばれた瞬間」)を実装に一致させる
+    /// 副次効果も持つ(第37章・第38章の本文を参照)。
     fn new_execution_context(&self) -> crate::cancellation::ExecutionContext {
-        self.cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-        self.checkpoints.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.shared.make_execution_context(Arc::clone(&self.cancel_flag), Arc::clone(&self.checkpoints))
+        let slot = {
+            let mut guard = self.current_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::replace(&mut *guard, ExecutionSlot::fresh())
+        };
+        self.shared.make_execution_context(Arc::clone(&slot.cancel_flag), Arc::clone(&slot.checkpoints))
     }
 
     /// `sql`を1文実行し、結果を返す。
@@ -235,8 +285,8 @@ impl Session {
     /// そちらのドキュメントを参照。`BEGIN`・`COMMIT`・`ROLLBACK`・
     /// `CHECKPOINT`・`PREPARE`・`DEALLOCATE`はこの`ctx`を使わずに終わる
     /// (これらはキャンセル・タイムアウトの対象外、本文の限界節を参照)が、
-    /// `cancel_flag`のリセット自体はどの文でも行う必要があるため、分岐の
-    /// 外側で無条件に作る。
+    /// `current_slot`の使い捨て自体はどの文でも行う必要があるため、分岐の
+    /// 外側で無条件に行う。
     pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
         let ctx = self.new_execution_context();
         let statement = crate::parser::parse_statement(sql)?;
@@ -1012,6 +1062,49 @@ mod tests {
 
         let result = worker.join().expect("ワーカースレッドがpanicした");
         assert!(matches!(result, Err(DbError::QueryCancelled)), "{result:?}");
+    }
+
+    /// 第6部レビュー2巡目対応の再現条件: `cancellation_handle`を取得して
+    /// `cancel`を呼んだ**直後**(同一スレッド、`execute`はまだ一度も
+    /// 呼んでいない)に`execute`を呼ぶと、その文がキャンセルされる。
+    ///
+    /// リセット方式(旧実装)では、`execute`の最初の行が`cancel_flag`を
+    /// `false`へ戻すため、この`cancel`は必ず消えてしまい、`execute`は
+    /// キャンセルされずに正常終了していた(単一スレッドの逐次呼び出しだけで
+    /// 再現でき、実スレッドも`sleep`も要らない)。使い捨てトークン方式
+    /// (`ExecutionSlot`のドキュメント参照)では、`cancellation_handle`が
+    /// 取り出す`Arc<ExecutionSlot>`と、直後の`execute`が使う
+    /// `Arc<ExecutionSlot>`が同じ`current_slot`から取り出された同一の
+    /// オブジェクトになるため、`execute`が「リセットする」動作そのものを
+    /// 持たず、この`cancel`を取りこぼしようがない。
+    #[test]
+    fn cancel_called_before_execute_starts_still_cancels_that_execute_call() {
+        let mut session = new_session();
+        seed_table(&mut session, "t", 5);
+
+        let handle = session.cancellation_handle();
+        handle.cancel();
+
+        let result = session.execute("SELECT * FROM t");
+        assert!(matches!(result, Err(DbError::QueryCancelled)), "{result:?}");
+    }
+
+    /// 上のテストの対になる確認: `cancel`されたのは**その1文だけ**であり、
+    /// 後続の文は通常どおり実行できる(`ExecutionSlot`が使い捨てである
+    /// ことの確認。「1回cancelしたら以後ずっとキャンセルされ続ける」
+    /// わけではない)。
+    #[test]
+    fn cancel_does_not_leak_into_the_statement_after_the_cancelled_one() {
+        let mut session = new_session();
+        seed_table(&mut session, "t", 5);
+
+        let handle = session.cancellation_handle();
+        handle.cancel();
+        let cancelled = session.execute("SELECT * FROM t");
+        assert!(matches!(cancelled, Err(DbError::QueryCancelled)), "{cancelled:?}");
+
+        let result = session.execute("SELECT * FROM t").unwrap();
+        assert_eq!(result.rows().len(), 5, "cancelは直後の1文だけに効き、次の文には漏れないはず");
     }
 
     #[test]

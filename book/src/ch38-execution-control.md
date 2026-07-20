@@ -191,12 +191,15 @@ fn watch_for_disconnect(stream: TcpStream, done: &AtomicBool, cancel: &Cancellat
 
 ```rust
 pub fn cancellation_handle(&self) -> CancellationToken {
-    CancellationToken::with_checkpoints(Arc::clone(&self.cancel_flag), None, Arc::clone(&self.checkpoints))
+    let slot = Arc::clone(&self.current_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    CancellationToken::with_checkpoints(Arc::clone(&slot.cancel_flag), None, Arc::clone(&slot.checkpoints))
 }
 ```
 
 `&self`だけで呼べるので、`session.execute(...)`(`&mut self`を要求し、実行が終わるまで戻ってこない)を別スレッドへ渡す前に取得しておけます。
 埋め込み用途のコードやテストは、この`CancellationToken`を持ったまま別スレッドから`cancel()`を呼ぶだけで、実行中の文を打ち切れます。
+
+`current_slot`(`Mutex<Arc<ExecutionSlot>>`)が何かは、次の`new_execution_context`と合わせて説明します。
 
 明示的なキャンセル要求を、この章のWire Protocol(第36章)へ専用のメッセージ種別として追加する案も検討しました。
 PostgreSQLは実際にこれを、実行中の接続とは別のTCP接続、共有のシークレットキーという形で実現しています(同じ接続の中では、応答を待っている間はリクエストを送れないため、"今すぐ止めて"を送る経路そのものが無いのです)。
@@ -300,20 +303,35 @@ pub struct ResourceLimits {
 
 ```rust
 fn new_execution_context(&self) -> crate::cancellation::ExecutionContext {
-    self.cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-    self.checkpoints.store(0, std::sync::atomic::Ordering::Relaxed);
-    self.shared.make_execution_context(Arc::clone(&self.cancel_flag), Arc::clone(&self.checkpoints))
+    let slot = {
+        let mut guard = self.current_slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::replace(&mut *guard, ExecutionSlot::fresh())
+    };
+    self.shared.make_execution_context(Arc::clone(&slot.cancel_flag), Arc::clone(&slot.checkpoints))
 }
 ```
 
-`cancel_flag`を`false`へ戻すのは、前の文へのキャンセル要求が次の文へ漏れないようにするためです。
+`cancel_flag`と`checkpoints`をひとまとめにした`ExecutionSlot`を、`current_slot`という`Mutex`ごしに文ごと**使い捨てる**設計です。
+最初は、この2つを接続1本につき1組だけ持ち、文を1本実行するたびに`false`と`0`へ**リセット**する設計でした。
+ところがこのリセット方式には見落としがありました。
+`crate::server::handle_connection`は、`Session::cancellation_handle`で切断監視スレッドを立ててから`Session::execute`を呼びます。
+監視スレッドが、`cancellation_handle`を呼んだ**あと**、`execute`が実際にリセットを行う**前**に`cancel`を呼ぶと、そのすぐ後で`execute`が行うリセットが、届いたばかりの`cancel`要求をそのまま消してしまいます。
+`execute`の一番最初でリセットしても、「リセット」という操作自体が「直前に届いた合図を確認せずに消す」性質を持つ以上、この窓は原理的に閉じられません。
+`cancellation_handle().cancel()`の直後に(実スレッドを使わず、同じスレッドの中で)`execute("SELECT 1")`を呼ぶだけの単純な直接検証で、実際にキャンセルされずに正常結果が返ることを確認しました。
+
+そこでこの章は、`cancel_flag`と`checkpoints`を接続で使い回す代わりに、`ExecutionSlot`という小さな構造体へまとめ、`current_slot`(`Mutex<Arc<ExecutionSlot>>`)から**文ごとに使い捨てる**設計に直しました。
+`cancellation_handle`と`new_execution_context`は、どちらも同じ`current_slot`から、その時点の`Arc<ExecutionSlot>`を取り出します。
+`new_execution_context`は取り出すと同時に、次の文のために真新しい(`cancelled = false`の)`ExecutionSlot`を`current_slot`へ差し込みます(`std::mem::replace`)。
+これで、`cancellation_handle`を呼んでから`execute`を呼ぶまでの間に`cancel`が呼ばれても、両者は**同じ`Arc<AtomicBool>`を指している**ため、消えようがありません。
+`execute`は「リセットする」のではなく「`current_slot`に今ある`ExecutionSlot`をそのまま使う」だけであり、そこに書き込まれた`cancel`要求は、書き込まれたのが`execute`の前でも最中でも観測されます。
+一方、ある文の実行が終わったあとに呼ばれる次の`execute`は、その文の開始時にすでに差し込まれた**別の**真新しい`ExecutionSlot`を取り出すため、古い`cancel`要求が次の文へ漏れ出すこともありません。
 `deadline`は締切そのものなので毎回作り直す必要があり、`CancellationToken::new`(または`with_checkpoints`)を呼ぶたびに`Instant::now() + timeout`として計算し直します。
 
 **時刻をどこで計測するか**は、この章がもう1つ決めた設計判断です。
 締切は「`Session::execute`が呼ばれた瞬間」から数えます。
 そのため`new_execution_context`は、構文解析より前、`Session::execute`の最初の行で呼びます。
 構文解析、束縛、計画の最適化(第26〜29章)はどれもこの締切の対象に含まれることになります(`PREPARE`済みの文を`EXECUTE`する場合も、再利用できるのは束縛結果の`BoundStatement`だけで、計画の構築も最適化もやはり`EXECUTE`のたびに行われます。第37章「この章の限界」を参照)。
-これらは通常すでに済んでいることが多い高速な処理であり、実行時間そのものと比べれば無視できる差ですが、「文の実行を頼んでから、実際に打ち切られるまで」という利用者から見える時間で締切を統一するという判断そのものは、この章を通じて変えていません。
+これらは通常は短時間で完了する処理であり、実行時間そのものと比べれば無視できる差ですが、「文の実行を頼んでから、実際に打ち切られるまで」という利用者から見える時間で締切を統一するという判断そのものは、この章を通じて変えていません。
 
 `statement_timeout`をサーバーの起動引数として指定できるようにしてあります(`--statement-timeout-ms`)。
 `SET`文のような実行時のSQL構文は追加しませんでした。
@@ -451,6 +469,10 @@ impl Read for ShutdownAwareReader<'_> {
         loop {
             match self.stream.read(buf) {
                 Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    #[cfg(test)]
+                    if let Some(tx) = &self.stall_notify {
+                        let _ = tx.send(());
+                    }
                     if self.shutdown.load(Ordering::Acquire) {
                         return Err(std::io::Error::other(
                             "シャットダウン要求によりフレームの読み取りを中断しました",
@@ -464,6 +486,11 @@ impl Read for ShutdownAwareReader<'_> {
     }
 }
 ```
+
+`stall_notify`は`#[cfg(test)]`だけでコンパイルされるテスト専用フィールドです。
+「クライアントが部分フレームを送ったまま止まった状態から、`Server::run`がちゃんと戻ってくる」ことを検証するテストは、`ShutdownAwareReader`がタイムアウトを経由する(=フレームの続きを待つ状態へ実際に入る)前にシャットダウンを要求してしまうと、部分フレームの読み取り自体を検証しないまま成功してしまいます。
+`sleep`による時間待ちでは、実行環境の速度でこの窓の大小が変わるため確実に埋められません。
+そこでタイムアウトを経由するたびにこのチャネルへ通知を送り、テスト側はこの通知を受け取ってからシャットダウンを要求することで、「部分フレームの続きを待つ状態に入ったこと」を確実に確認してから検証します。
 
 `read_exact`は内部でこの`read`を繰り返し呼びます。
 `POLL_INTERVAL`ごとにタイムアウトへ達するたびシャットダウンフラグを確認し、立っていなければ同じ`read`を再試行するので、ヘッダーの途中でもペイロードの途中でも、相手がどちらで止まっていても次の`POLL_INTERVAL`以内にシャットダウンへ気付けます。
@@ -510,6 +537,8 @@ if let Err(e) = ctrlc::set_handler(move || shutdown.trigger()) {
 `src/session.rs`の単体テストは、`Session::cancellation_handle`と`ResourceLimits`を次の観点で確認します。
 
 - 別スレッドから取得した`cancellation_handle`を`cancel`すると、実行中の長いクエリが`DbError::QueryCancelled`で打ち切られる
+- `cancellation_handle`を取得して`cancel`した**直後**(実スレッドを使わず、同じスレッドの中で)`execute`を呼んでも、その文が`DbError::QueryCancelled`になる(`ExecutionSlot`のドキュメント「リセット方式から使い捨てトークン方式への変更」の再現条件)。この`cancel`が直後の1文だけに効き、次の文には漏れないことも確認する
+- 別のセッションが`SharedDatabase`内部の`Mutex`を長時間握っている間に、`bind_statement`でブロックされている文を`cancel`しても、束縛後の初期化で消えずに`DbError::QueryCancelled`になる
 - `statement_timeout`を短く設定すると、締切に対して十分長くかかるクエリが`DbError::QueryTimeout`で打ち切られる
 - `max_operator_rows`を小さく設定すると、`Sort`、`Hash Join`のBuild側、`Hash Aggregate`がそれぞれ`DbError::MemoryLimitExceeded`で打ち切られ、上限内の行数では正常に完走する
 

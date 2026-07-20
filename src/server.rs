@@ -286,7 +286,13 @@ fn handle_connection(mut stream: TcpStream, shared: Arc<SharedDatabase>, shutdow
         // 期限に達しても、`ShutdownAwareReader`がシャットダウンフラグを
         // 確認したうえで同じ`read`を再試行するため、フレーム境界がずれる
         // 心配は無い(モジュール冒頭「Graceful Shutdown」を参照)。
-        let request = match Request::read(&mut ShutdownAwareReader { stream: &mut stream, shutdown: &shutdown }) {
+        let mut reader = ShutdownAwareReader {
+            stream: &mut stream,
+            shutdown: &shutdown,
+            #[cfg(test)]
+            stall_notify: None,
+        };
+        let request = match Request::read(&mut reader) {
             Ok(request) => request,
             Err(ProtocolError::Io(err)) if err.kind() == ErrorKind::UnexpectedEof => {
                 // クライアントが次のフレームを送る前にソケットを閉じた
@@ -313,6 +319,7 @@ fn handle_connection(mut stream: TcpStream, shared: Arc<SharedDatabase>, shutdow
     // される(`crate::session::Session`の`Drop`実装、モジュール冒頭を参照)。
 }
 
+#[derive(Debug)]
 enum WaitOutcome {
     /// 次のフレームの先頭バイトがすでに届いている。`stream`の読み取り
     /// タイムアウトは`POLL_INTERVAL`のままにしてある(モジュール冒頭
@@ -370,6 +377,21 @@ fn wait_for_request_or_shutdown(stream: &mut TcpStream, shutdown: &AtomicBool) -
 struct ShutdownAwareReader<'a> {
     stream: &'a mut TcpStream,
     shutdown: &'a AtomicBool,
+    /// テスト専用の同期フック(第6部レビュー3巡目対応)。`read`が
+    /// `WouldBlock`・`TimedOut`を受け取り、フレームの続きを待つ状態へ
+    /// 実際に入るたびに、このチャネルへ通知を送る(送信に失敗しても
+    /// 無視する。受信側がすでに`drop`されていても構わない)。本番の
+    /// `handle_connection`は`None`を渡す。
+    ///
+    /// この通知が要る理由: 部分フレームを送ったあとシャットダウンを要求する
+    /// テストは、「ワーカーが実際にこの続きを待つ状態へ入った」ことを
+    /// 確認してからでないと、シャットダウン要求のほうが先に(=
+    /// `ShutdownAwareReader`がまだ一度もタイムアウトを経由していない段階で)
+    /// 届いてしまい、部分フレームの読み取り自体を一切検証しないまま成功
+    /// してしまう(`sleep`による時間待ちでは、実行環境の速度によってこの窓の
+    /// 大小が変わるため確実に埋められない)。
+    #[cfg(test)]
+    stall_notify: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl Read for ShutdownAwareReader<'_> {
@@ -377,6 +399,10 @@ impl Read for ShutdownAwareReader<'_> {
         loop {
             match self.stream.read(buf) {
                 Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    #[cfg(test)]
+                    if let Some(tx) = &self.stall_notify {
+                        let _ = tx.send(());
+                    }
                     if self.shutdown.load(Ordering::Acquire) {
                         return Err(std::io::Error::other(
                             "シャットダウン要求によりフレームの読み取りを中断しました",
@@ -580,58 +606,102 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    /// `run`をバックグラウンドスレッドで動かし、その結果を`mpsc`チャネルへ
-    /// 送る。`JoinHandle::join`は無期限にブロックしうるため、テストからは
-    /// `channel`の`recv_timeout`で「`POLL_INTERVAL`の数サイクル以内に確実に
-    /// 戻ってくる」ことを検証する(戻ってこなければ`recv_timeout`が
-    /// `Err`になり、テストがハングする代わりに失敗する)。
-    fn run_in_background(server: Server) -> std::sync::mpsc::Receiver<std::io::Result<()>> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        thread::spawn(move || {
-            let _ = tx.send(server.run());
-        });
-        rx
+    /// `handle_connection`のうち、部分フレームのシャットダウン応答性に
+    /// 関わる部分(`wait_for_request_or_shutdown`・`ShutdownAwareReader`・
+    /// `Request::read`)だけを、`Server`・`WorkerPool`を経由せず直接
+    /// 駆動する(第6部レビュー3巡目対応)。
+    ///
+    /// `Server::run`のaccept・`WorkerPool`のディスパッチを経由しないのは、
+    /// [`ShutdownAwareReader::stall_notify`](テスト専用フック、`ShutdownAwareReader`
+    /// のドキュメント参照)をこのテストの`mpsc::Sender`に直接差し込むためである。
+    /// `handle_connection`経由だと、`stall_notify`は常に`None`が渡る
+    /// (本番のコードパスであり、フックを外から注入する経路が無い)ため、
+    /// 「ワーカーが部分フレームの続きを実際に待つ状態へ入った」ことを
+    /// テストの外から同期できない。
+    ///
+    /// 戻り値は、`wait_for_request_or_shutdown`の結果と、その後
+    /// `Request::read`(`ShutdownAwareReader`経由)を試みた結果。
+    fn drive_partial_frame_read(
+        mut stream: TcpStream,
+        shutdown: Arc<AtomicBool>,
+        stall_notify: std::sync::mpsc::Sender<()>,
+    ) -> Result<WaitOutcome, ProtocolError> {
+        match wait_for_request_or_shutdown(&mut stream, &shutdown) {
+            WaitOutcome::Ready => {}
+            other => return Ok(other),
+        }
+        let mut reader = ShutdownAwareReader { stream: &mut stream, shutdown: &shutdown, stall_notify: Some(stall_notify) };
+        Request::read(&mut reader)?;
+        Ok(WaitOutcome::Ready)
     }
 
     /// 第6部レビュー対応: フレームのヘッダー9バイトのうち3バイトだけ送って
-    /// 接続を開いたまま止め、その状態からシャットダウンを要求する。
+    /// 接続を開いたまま止め、ワーカーが実際にその続きを待つ状態(タイムアウト
+    /// 経由の再試行)へ入ったことを確認してから、シャットダウンを要求する。
     ///
-    /// 修正前は、最初の1バイトが届いた時点で`wait_for_request_or_shutdown`が
-    /// 読み取りタイムアウトを`None`(無期限)へ戻していたため、`Request::read`の
-    /// `read_exact`が残り6バイトを待ったまま戻らず、`Server::run`が
-    /// `WorkerPool::join`から永久に戻れなかった。
+    /// 修正前(第6部レビュー1巡目)は、最初の1バイトが届いた時点で
+    /// `wait_for_request_or_shutdown`が読み取りタイムアウトを`None`
+    /// (無期限)へ戻していたため、`Request::read`の`read_exact`が残り6バイトを
+    /// 待ったまま戻らず、`Server::run`が`WorkerPool::join`から永久に戻れ
+    /// なかった。
+    ///
+    /// 第6部レビュー2巡目で指摘された不足: この同期が無い版は、書き込み直後に
+    /// シャットダウンを要求していた。ワーカーがまだ`ShutdownAwareReader`の
+    /// タイムアウトを一度も経由していない(=部分フレームの読み取りを検証
+    /// できていない)段階でも、accept側が先にシャットダウンを観測すれば
+    /// テストは検証せずに成功しうる状態だった。
     #[test]
     fn shutdown_completes_while_a_connection_is_stalled_mid_header() {
-        let shared = Arc::new(SharedDatabase::new(Database::memory()));
-        let server = Server::bind_with_config("127.0.0.1:0", shared, ServerConfig::default()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let shutdown = server.shutdown_handle();
-        let rx = run_in_background(server);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (stall_tx, stall_rx) = std::sync::mpsc::channel::<()>();
+
+        let shutdown_for_worker = Arc::clone(&shutdown);
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("接続を受理できませんでした");
+            drive_partial_frame_read(stream, shutdown_for_worker, stall_tx)
+        });
 
         let mut stalled = connect_with_retry(addr);
         // 9バイトのヘッダーのうち3バイトだけ送る。残りは送らず、接続も
         // 閉じない。
         stalled.write_all(&[MSG_QUERY, 0x00, 0x00]).unwrap();
 
-        shutdown.trigger();
-        let result = rx
+        // ワーカーが実際に部分フレームの続きを待つ状態(タイムアウト経由の
+        // 再試行)へ入るまで待つ。`sleep`による時間待ちではなく、
+        // `ShutdownAwareReader`自身からの通知を同期点として使う。
+        stall_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("shutdownがPOLL_INTERVALの数サイクル以内に完了しませんでした(部分ヘッダー状態で接続がstallしたまま)");
-        result.expect("runがErrを返した");
+            .expect("ShutdownAwareReaderが部分フレームの続きを待つ状態へ入りませんでした(部分ヘッダー)");
+
+        shutdown.store(true, Ordering::Release);
+
+        let result = worker
+            .join()
+            .expect("workerがpanicした")
+            .expect_err("シャットダウン要求により、部分フレームの読み取りはエラーで中断されるはず");
+        assert!(matches!(result, ProtocolError::Io(_)), "{result:?}");
         drop(stalled);
     }
 
     /// 第6部レビュー対応: [`shutdown_completes_while_a_connection_is_stalled_mid_header`]と
     /// 対になる、ペイロードの途中で止まった接続からのシャットダウン。
     /// ヘッダーは完全に送り、`payload_len`で100バイトを申告したうえで
-    /// 実際には10バイトしか送らず、接続を開いたまま止める。
+    /// 実際には10バイトしか送らず、接続を開いたまま止める。同期の理由は
+    /// [`shutdown_completes_while_a_connection_is_stalled_mid_header`]と同じ。
     #[test]
     fn shutdown_completes_while_a_connection_is_stalled_mid_payload() {
-        let shared = Arc::new(SharedDatabase::new(Database::memory()));
-        let server = Server::bind_with_config("127.0.0.1:0", shared, ServerConfig::default()).unwrap();
-        let addr = server.local_addr().unwrap();
-        let shutdown = server.shutdown_handle();
-        let rx = run_in_background(server);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (stall_tx, stall_rx) = std::sync::mpsc::channel::<()>();
+
+        let shutdown_for_worker = Arc::clone(&shutdown);
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("接続を受理できませんでした");
+            drive_partial_frame_read(stream, shutdown_for_worker, stall_tx)
+        });
 
         let mut stalled = connect_with_retry(addr);
         let mut header = Vec::new();
@@ -641,11 +711,17 @@ mod tests {
         stalled.write_all(&header).unwrap();
         stalled.write_all(&[b'x'; 10]).unwrap(); // 実際には10バイトしか送らない
 
-        shutdown.trigger();
-        let result = rx
+        stall_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("shutdownがPOLL_INTERVALの数サイクル以内に完了しませんでした(部分ペイロード状態で接続がstallしたまま)");
-        result.expect("runがErrを返した");
+            .expect("ShutdownAwareReaderが部分フレームの続きを待つ状態へ入りませんでした(部分ペイロード)");
+
+        shutdown.store(true, Ordering::Release);
+
+        let result = worker
+            .join()
+            .expect("workerがpanicした")
+            .expect_err("シャットダウン要求により、部分フレームの読み取りはエラーで中断されるはず");
+        assert!(matches!(result, ProtocolError::Io(_)), "{result:?}");
         drop(stalled);
     }
 }

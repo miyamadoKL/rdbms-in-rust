@@ -83,8 +83,15 @@ pub fn encode_tuple(schema: &Schema, tuple: &Tuple) -> Vec<u8> {
 /// バイト列から`schema`に従う`Tuple`を復元する。
 ///
 /// `bytes`が短すぎる、`TEXT`の長さプレフィックスが残りバイト数を超えている、
-/// `TEXT`の内容が妥当なUTF-8でないなど、`encode_tuple`が書き出しえない
-/// バイト列を受け取った場合は`DbError::CorruptTuple`を返す。
+/// `TEXT`の内容が妥当なUTF-8でない、全列を読み終えてもまだ`bytes`が残って
+/// いるなど、`encode_tuple`が書き出しえないバイト列を受け取った場合は
+/// `DbError::CorruptTuple`を返す(末尾の余剰バイトの検査は第6部レビュー
+/// 2巡目対応。`encode_tuple`は列の値を過不足なく書き出すだけで、
+/// 呼び出し側が渡す`bytes`の長さ自体は保証しない。`crate::protocol`の
+/// `decode_rows_payload`は各行の`row_len`ぶんのバイト列をそのままこの
+/// 関数へ渡すため、`row_len`が実際の列データより大きい(末尾に余剰バイトが
+/// ある)フレームを、全列を正しく読み切ったという理由だけで受理してしまう
+/// 余地があった)。
 pub fn decode_tuple(schema: &Schema, bytes: &[u8]) -> DbResult<Tuple> {
     let column_count = schema.len();
     let bitmap_len = null_bitmap_len(column_count);
@@ -164,6 +171,13 @@ pub fn decode_tuple(schema: &Schema, bytes: &[u8]) -> DbResult<Tuple> {
             }
         };
         values.push(value);
+    }
+
+    if cursor != bytes.len() {
+        return Err(DbError::CorruptTuple(format!(
+            "全列を読み終えた後にバイト列が{}バイト残っています",
+            bytes.len() - cursor
+        )));
     }
 
     Tuple::new(schema, values)
@@ -333,6 +347,25 @@ mod tests {
         let bytes = vec![0u8, 2u8]; // 1列分のビットマップ(NULLではない)、続けてBOOLEANの値2。
         let err = decode_tuple(&schema, &bytes).unwrap_err();
         assert!(matches!(err, DbError::CorruptTuple(_)));
+    }
+
+    /// 第6部レビュー2巡目対応の再現条件: `BOOLEAN`1列の正規データ(ビットマップ
+    /// 1バイト+値1バイト、計2バイト)の末尾に、余剰の1バイトを追加した
+    /// 3バイトを渡すと、`decode_tuple`が全列を正しく読み終えた時点で検査を
+    /// やめてしまい、この余剰バイトを黙って無視して`Ok`を返していた。
+    /// `crate::protocol::decode_rows_payload`は各行の`row_len`ぶんの
+    /// バイト列をそのままこの関数へ渡すため、`row_len`が実際の列データより
+    /// 大きい(送信側の自己申告が信用できない)フレームを、全列を読み切れた
+    /// という理由だけで受理してしまう経路になっていた。
+    #[test]
+    fn decode_rejects_a_trailing_byte_after_all_columns_are_read() {
+        let schema = Schema::new(vec![Column::new("b", DataType::Boolean, false)]);
+        let tuple = Tuple::new(&schema, vec![Value::Boolean(true)]).unwrap();
+        let mut bytes = encode_tuple(&schema, &tuple);
+        assert_eq!(bytes.len(), 2, "ビットマップ1バイト+BOOLEANの値1バイトのはず");
+        bytes.push(0xAB); // 行本体の中に紛れ込んだ余剰の1バイト。
+        let err = decode_tuple(&schema, &bytes).unwrap_err();
+        assert!(matches!(err, DbError::CorruptTuple(_)), "{err:?}");
     }
 
     #[test]
