@@ -215,7 +215,7 @@ pub fn range<'a>(&'a self, lower: Bound<&Value>, upper: Bound<&Value>) -> DbResu
 `next_leaf`は右方向にしか進めないので、`find_leaf`が一致の**最後**の葉に着地してしまうと、そこより左にある同じキーのエントリには二度とたどり着けません。
 
 必要なのは、一致の**最初**の葉から出発することです。
-そこで内部ページ探索にもう1つ、区切りキーと`key`が等しい場合の分岐だけが違う関数を用意しました。
+そこで内部ページ探索にもう1つ、区切りキーと`key`が等しい場合の分岐だけが違う関数を用意します。
 `src/btree_page.rs`に、次の`child_for_lower_bound`を追加します。
 
 ```rust
@@ -980,7 +980,7 @@ if layout_version != CATALOG_LAYOUT_VERSION {
 索引メタデータ、テーブル定義、Free Page Listのいずれかのレイアウトを今後変更するときは、`CATALOG_LAYOUT_VERSION`を必ず1つ増やします。
 増やし忘れると、ここで解決したのと同じ「たまたま妥当に見える値を静かに受理してしまう」不具合が再発します。
 
-「旧形式で制約索引1本」「旧形式で制約索引複数本」のCatalogページを、`is_constraint`もマジックバイト列も持たない旧レイアウトのまま手書きで組み立て、現在のコードの`Storage::open`がどちらも`DbError::CorruptCatalog`で拒否することを確認する回帰テストを追加しました。
+「旧形式で制約索引1本」「旧形式で制約索引複数本」のCatalogページを、`is_constraint`もマジックバイト列も持たない旧レイアウトのまま手書きで組み立て、現在のコードの`Storage::open`がどちらも`DbError::CorruptCatalog`で拒否することを確認する回帰テストを追加します。
 
 ### 走査ベース検査の退役範囲
 
@@ -1013,7 +1013,7 @@ n= 16000 elapsed=34.90µs
 `crate::btree`のテストは、Range Scanの境界(`Included`、`Excluded`、`Unbounded`の組み合わせ、空の範囲)、複数ページにまたがる重複キーが取りこぼされないことの回帰、`unique`フラグの動作、Lazy Delete後の`lookup`と`range`の一貫性を確認します。
 `delete_finds_the_target_rid_regardless_of_which_leaf_it_ended_up_in_after_duplicate_key_splits`は、この節で直した`delete`の境界値テストです。
 同じキーで500件のエントリを挿入してLeaf Splitを複数回起こしたうえで、先頭、中間、末尾それぞれの葉に残った`RecordId`を指定して削除できることを確認します。
-5,000件規模のシードつき乱数列を`std::collections::BTreeMap`と突き合わせるモデルベーステスト(第23章から続く手法)は、`range`と`delete`の両方に対しても`src/btree.rs`に書きました。
+5,000件規模のシードつき乱数列を`std::collections::BTreeMap`と突き合わせるモデルベーステスト(第23章から続く手法)は、`range`と`delete`の両方に対しても`src/btree.rs`に書きます。
 
 ```rust
 #[test]

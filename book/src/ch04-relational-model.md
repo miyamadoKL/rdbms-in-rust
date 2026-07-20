@@ -238,7 +238,7 @@ impl Schema {
 列数の一致を先に検査してから`zip`で1列ずつ`conforms_to`を呼んでいるのは、列数が食い違ったまま`zip`にかけると、短い側に合わせて残りの列が黙って無視されるためです。
 列数の不一致自体が呼び出し側の間違いなので、`zip`の前に弾いておきます。
 
-`src/error.rs`の`DbError`には`SchemaMismatch`バリアントを1つ追加しました。
+`src/error.rs`の`DbError`には`SchemaMismatch`バリアントを1つ追加します。
 
 ```rust
     /// 値の並びがSchemaの列数・型・nullable制約に適合しないエラー。

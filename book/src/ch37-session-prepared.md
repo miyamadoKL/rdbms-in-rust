@@ -122,7 +122,7 @@ pub fn bind_statement(&self, statement: Statement, sql: &str) -> DbResult<BoundS
 
 問題は、`SharedDatabase::execute_in_tx`が受け取るのが束縛済みの`BoundStatement`ではなく、生のSQL文字列だったことです。
 そのままでは、`Session`が一度パースして束縛した結果を渡す先がありません。
-そこでこの章は、`src/database.rs`で`Database::execute_in_tx`が内部で共有していた「文を実行する本体」を切り出し、束縛済みの文をそのまま受け取る経路を新設しました。
+そこでこの章は、`src/database.rs`で`Database::execute_in_tx`が内部で共有していた「文を実行する本体」を切り出し、束縛済みの文をそのまま受け取る経路を新設します。
 
 ```rust
 fn execute_bound_statement(&mut self, statement: Statement, sql: &str) -> DbResult<QueryResult> {
@@ -146,7 +146,7 @@ fn run_bound_statement(&mut self, bound: BoundStatement) -> DbResult<QueryResult
 }
 ```
 
-同じ`src/database.rs`の`execute_in_tx`自身も、同じ形に切り出した`run_in_tx`を共有するように書き直しました。
+同じ`src/database.rs`の`execute_in_tx`自身も、同じ形に切り出した`run_in_tx`を共有するように書き直します。
 
 ```rust
 pub fn execute_in_tx(&mut self, handle: &TxHandle, sql: &str) -> DbResult<QueryResult> {
@@ -179,7 +179,7 @@ fn run_bound(&mut self, bound: BoundStatement) -> DbResult<QueryResult> {
 
 `Database::execute`(第9章以来の低レベルAPI)自体は、この章でも変更していません。
 構文解析から実行までを1回の呼び出しで済ませる単純さは、これまでの章のテストのほとんどが`db.execute("...")`という形で直接使ってきたもので、テストのたびに`Session`を組み立てさせる理由がありません。
-`Session`は`Database::execute`を置き換えるのではなく、その上に接続の寿命(トランザクション状態、Prepared Statementの名前空間)を積む層として追加しました。
+`Session`は`Database::execute`を置き換えるのではなく、その上に接続の寿命(トランザクション状態、Prepared Statementの名前空間)を積む層として追加します。
 `Database::execute`に直接`PREPARE`、`EXECUTE`、`DEALLOCATE`を渡した場合は、`Binder::bind`が位置情報つきの`DbError::Bind`で「Sessionを経由してください」と案内し、`Database`自身がこの3文の意味を知る必要が無いようにしてあります。
 
 ## Prepared Statement:構文と値を分ける
@@ -192,7 +192,7 @@ EXECUTE find_by_name('Alice')
 DEALLOCATE find_by_name
 ```
 
-`$1`という記号(プレースホルダ)は、字句解析器(`src/lexer.rs`)に新しいトークンとして追加しました。
+`$1`という記号(プレースホルダ)は、字句解析器(`src/lexer.rs`)に新しいトークンとして追加します。
 
 ```rust
 /// `$`に続く数字列を読み、`TokenKind::Param`にする(第37章、`PREPARE`が
@@ -478,7 +478,7 @@ PostgreSQLのExtended Query Protocolは、`Parse`、`Bind`、`Describe`、`Execu
 - `BEGIN`で開いたトランザクションの中でも`EXECUTE`が動き、`ROLLBACK`すれば変更は残らない
 - 文字列連結によるインジェクションが実際に成立する例と、`execute_prepared`がその同じ入力を安全に扱える例を並べて確認する
 
-`tests/wire_protocol.rs`には、同じ`PREPARE`、`EXECUTE`、`DEALLOCATE`の一連をTCP接続越しに動かすテストと、Prepared Statementが接続(TCP接続 = 1個の`Session`)をまたいで見えないことを確認するテストを追加しました。
+`tests/wire_protocol.rs`には、同じ`PREPARE`、`EXECUTE`、`DEALLOCATE`の一連をTCP接続越しに動かすテストと、Prepared Statementが接続(TCP接続 = 1個の`Session`)をまたいで見えないことを確認するテストを追加します。
 REPL(`src/main.rs`)は`Session::execute`をそのまま呼ぶだけの薄いループなので、REPL固有のテストは追加していません。
 `src/database.rs`側は、`Database::execute`の既存の回帰テストをすべてそのまま維持しています。
 `bind`から`bind_statement`という薄いラッパーを増やし、`execute_bound_statement`の中身を`run_bound_statement`へ切り出しただけなので、`Database::execute`が返す結果は1つも変わっていません。

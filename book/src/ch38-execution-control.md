@@ -331,7 +331,7 @@ fn new_execution_context(&self) -> crate::cancellation::ExecutionContext {
 `execute`の一番最初でリセットしても、「リセット」という操作自体が「直前に届いた合図を確認せずに消す」性質を持つ以上、この窓は原理的に閉じられません。
 `cancellation_handle().cancel()`の直後に(実スレッドを使わず、同じスレッドの中で)`execute("SELECT 1")`を呼ぶだけの単純な直接検証で、実際にキャンセルされずに正常結果が返ることを確認しました。
 
-そこでこの章は、`cancel_flag`と`checkpoints`を接続で使い回す代わりに、`ExecutionSlot`という小さな構造体へまとめ、`current_slot`(`Mutex<Arc<ExecutionSlot>>`)から**文ごとに使い捨てる**設計に直しました。
+そこでこの章は、`cancel_flag`と`checkpoints`を接続で使い回す代わりに、`ExecutionSlot`という小さな構造体へまとめ、`current_slot`(`Mutex<Arc<ExecutionSlot>>`)から**文ごとに使い捨てる**設計に直します。
 `cancellation_handle`と`new_execution_context`は、どちらも同じ`current_slot`から、その時点の`Arc<ExecutionSlot>`を取り出します。
 `new_execution_context`は取り出すと同時に、次の文のために真新しい(`cancelled = false`の)`ExecutionSlot`を`current_slot`へ差し込みます(`std::mem::replace`)。
 これで、`cancellation_handle`を呼んでから`execute`を呼ぶまでの間に`cancel`が呼ばれても、両者は**同じ`Arc<AtomicBool>`を指している**ため、消えようがありません。

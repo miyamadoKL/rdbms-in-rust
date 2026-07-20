@@ -302,7 +302,7 @@ impl std::fmt::Display for QueryResult {
 ```
 
 列名の行、区切り線、値の行、件数の footer という並びは、`psql`のような既存のSQLクライアントの表示に寄せた形です。
-値そのものの文字列化は、同じ`src/database.rs`に置く`format_value`という小さな関数に切り出しました。
+値そのものの文字列化は、同じ`src/database.rs`に置く`format_value`という小さな関数に切り出します。
 
 ```rust
 /// `Value`をユーザー向けの表示形式に変換する。
@@ -419,7 +419,7 @@ pub fn execute_sql(sql: &str) -> DbResult<QueryResult> {
 
 ### 単体テスト
 
-`src/toy_sql.rs`の`#[cfg(test)] mod tests`には、構文解析が受理すべき入力と拒否すべき入力を確認するテストを追加しました。
+`src/toy_sql.rs`の`#[cfg(test)] mod tests`には、構文解析が受理すべき入力と拒否すべき入力を確認するテストを追加します。
 加算の右辺に整数以外を置いた式が`DbError::Parse`として拒否されることを、次のように確認します。
 
 ```rust
@@ -430,7 +430,7 @@ pub fn execute_sql(sql: &str) -> DbResult<QueryResult> {
     }
 ```
 
-`src/database.rs`の`#[cfg(test)] mod tests`には、`Database::execute`が返す`Tuple`の値と列名を確認するテストを追加しました。
+`src/database.rs`の`#[cfg(test)] mod tests`には、`Database::execute`が返す`Tuple`の値と列名を確認するテストを追加します。
 `SELECT 1;`の結果が`Value::BigInt(1)`を1件返し、列名が`1`になることを、次のように確認します。
 
 ```rust
@@ -460,7 +460,7 @@ fn run_sql(sql: &str) -> String {
 ```
 
 `tests/golden/001_echo.sql`という名前も、もう実態に合いません。
-`001_select_int.sql`に改名し、`002_select_add.sql`(加算)と`003_select_bool.sql`(真偽値)を追加しました。
+`001_select_int.sql`に改名し、`002_select_add.sql`(加算)と`003_select_bool.sql`(真偽値)を追加します。
 `001_select_int.expected`の中身は、`SELECT 1;`を実行した`QueryResult`の`Display`出力そのものです。
 
 ```text

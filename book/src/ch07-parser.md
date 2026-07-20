@@ -567,7 +567,7 @@ fn eval_expr(expr: &Expr) -> DbResult<Value> {
 
 ## テストで確認する
 
-`parser`モジュールには、優先順位、結合性、括弧、`NOT`と`IS NULL`、各文、構文エラーの位置を確認する単体テストを追加しました。
+`parser`モジュールには、優先順位、結合性、括弧、`NOT`と`IS NULL`、各文、構文エラーの位置を確認する単体テストを追加します。
 優先順位は、`Span`を比較対象から外した`Expr`どうしの構造比較で検証します。
 `src/parser.rs`の`mod tests`に追加します。
 

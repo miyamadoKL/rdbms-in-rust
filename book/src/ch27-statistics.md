@@ -359,7 +359,7 @@ fn build_equi_depth_histogram(sorted_values: &[Value]) -> Vec<Bucket> {
 
 ## `ANALYZE`文: 統計を集める
 
-`ANALYZE [テーブル名]`という新しい文を追加しました。
+`ANALYZE [テーブル名]`という新しい文を追加します。
 テーブル名を省略すると、カタログに登録されている全テーブルが対象になります。
 
 ```console

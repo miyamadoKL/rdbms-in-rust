@@ -352,7 +352,7 @@ psqlをはじめ多くのクライアントが、DDL文の完了を`CREATE TABLE
 
 ## テストで確認する
 
-`catalog`モジュールには、登録、重複拒否、大文字小文字の区別、削除、不存在の拒否、`TableId`が使い回されないことを確認する単体テストを追加しました。
+`catalog`モジュールには、登録、重複拒否、大文字小文字の区別、削除、不存在の拒否、`TableId`が使い回されないことを確認する単体テストを追加します。
 `src/catalog.rs`の`mod tests`に追加します。
 
 ```rust
@@ -369,7 +369,7 @@ fn table_id_is_not_reused_after_drop() {
 ```
 
 `database`側には、`CREATE TABLE`がカタログへ正しい`Schema`を登録すること、`NOT NULL`の有無が`nullable`へ正しく反転すること、テーブル名の重複と不存在がそれぞれ`DbError::DuplicateTable`、`DbError::TableNotFound`になること、列名の重複が`DbError::DuplicateColumn`になり、その場合はカタログに何も登録されないことを確認するテストを加えています。
-削除してから同じ名前で作り直す一連の流れも、1つのテストにまとめました。
+削除してから同じ名前で作り直す一連の流れも、1つのテストにまとめます。
 `src/database.rs`の`mod tests`に追加します。
 
 ```rust

@@ -87,7 +87,7 @@ pub mod protocol;
 書き出し側もこの時点で`MAX_FRAME_PAYLOAD_LEN`を検査している点が、後述「フレーム長の上限とDoS防止」の読み取り側の検査と対称になっています。
 
 リクエストのペイロードは、実行するSQL文をそのままUTF-8バイト列にしたものです。
-`tag`には`MSG_QUERY`(`0x01`)という値だけを定義しました。
+`tag`には`MSG_QUERY`(`0x01`)という値だけを定義します。
 この章のクライアントが送るメッセージはSQLの実行要求1種類しかなく、複数の種別を用意する理由がまだありません。
 
 レスポンスの`tag`は3種類です。
@@ -208,7 +208,7 @@ fn encode_rows_payload(schema: &Schema, rows: &[Tuple]) -> Result<Vec<u8>, Proto
 
 `crate::database::QueryResult`をそのままシリアライズする案もありえましたが、採りませんでした。
 `QueryResult`はコマンドタグを`Option<String>`として内部的に持ち回り、`Display`実装の中でだけそれを文字列へ変換しています(`schema`、`rows`という2つの公開アクセサはあっても、コマンドタグ自体を取り出す公開APIはありません)。
-そこでこのモジュールが接する境界は、`Display`実装と`schema()`/`rows()`という、すでに公開されているAPIの上に置きました。
+そこでこのモジュールが接する境界は、`Display`実装と`schema()`/`rows()`という、すでに公開されているAPIの上に置きます。
 列を持たない結果(`schema().is_empty()`、DDL、DMLの完了)は`Display`実装(`to_string()`)がそのままコマンドタグ文字列を返すため`Response::Command`に、列を持つ結果(`SELECT`、`EXPLAIN`)は`Response::Rows`に、`src/protocol.rs`の次の`from_db_result`が詰め替えます。
 
 ```rust
@@ -456,7 +456,7 @@ REPLは同じプロセス内の`Database`を直接呼び、CLIクライアント
 その`Session`自身も、最終的には同じ`SharedDatabase::execute_in_tx`/`begin_tx`/`commit_tx`/`rollback_tx`を呼んでいます。
 つまりCLIクライアントとサーバーの`Session`は、SQLの実行そのものについては同じ`SharedDatabase`の同じAPIを共有しており、REPLと分岐しているのはネットワークの往復という入出力の皮1枚だけです。
 
-サーバーの起動は、既存の`src/main.rs`に`--serve`という起動引数を1つ足すことで実現しました。
+サーバーの起動は、既存の`src/main.rs`に`--serve`という起動引数を1つ足すことで実現します。
 
 ```rust
 match args.next() {

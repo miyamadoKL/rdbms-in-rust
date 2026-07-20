@@ -269,7 +269,7 @@ pub fn build_insert(insert: BoundInsert) -> LogicalPlan {
 }
 ```
 
-`BoundInsert`には、この章から`table_name`というフィールドを加えました。
+`BoundInsert`には、この章から`table_name`というフィールドを加えます。
 第17章の`resolve_table`はテーブル名をすでに`BoundTableRef::table_name`として持っていましたが、`bind_insert`、`bind_update`、`bind_delete`はそれを使わずに捨てていました。
 `LogicalPlan`の木を表示する際([次節](#演算子木を表示する)参照)にテーブル名を出すには、この情報が必要です。
 すでに`resolve_table`が計算していた値を捨てずに運ぶだけの変更なので、名前解決のやり方自体は変わりません。
@@ -461,7 +461,7 @@ fn execute_insert(&mut self, plan: LogicalPlan) -> DbResult<QueryResult> {
 
 ## テストで確認する
 
-`src/logical_plan.rs`には、各文種が正しい形の木になることを確認するテストを追加しました。
+`src/logical_plan.rs`には、各文種が正しい形の木になることを確認するテストを追加します。
 木の形の検証は、そのテストモジュールで、`to_string()`した結果を期待する文字列と比較する、ゴールデンテストに近いやり方です。
 
 ```rust

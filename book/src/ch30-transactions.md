@@ -530,7 +530,7 @@ Statement Rollbackは「1本の文の中の部分的な失敗が、その文の�
 `Database`の`tx: Option<TransactionContext>`は、`Active`なトランザクションを高々1本しか保持できません。
 複数のトランザクションを行き来しながら進めるテストは、この1本しか無い`tx`をそのまま使えません。
 
-`tx`とは別に、複数のトランザクションを`TransactionId`ごとに保持できる対応表を`src/database.rs`の`Database`に追加しました。
+`tx`とは別に、複数のトランザクションを`TransactionId`ごとに保持できる対応表を`src/database.rs`の`Database`に追加します。
 
 ```rust
 harness_contexts: HashMap<TransactionId, TransactionContext>,
@@ -667,7 +667,7 @@ Strict 2PLのExclusive Lockが働けば、T1がまだコミットしていない
 
 ## テストで確認する
 
-`src/database.rs`には、`BEGIN`、`COMMIT`、`ROLLBACK`の基本動作、Autocommit、入れ子の`BEGIN`が拒否されること、Statement Error時のAbort、同一行への複数回の`UPDATE`をUndoが正しく逆順適用できることを、MemoryバックエンドとDiskバックエンドの両方で確認するテストを追加しました。
+`src/database.rs`には、`BEGIN`、`COMMIT`、`ROLLBACK`の基本動作、Autocommit、入れ子の`BEGIN`が拒否されること、Statement Error時のAbort、同一行への複数回の`UPDATE`をUndoが正しく逆順適用できることを、MemoryバックエンドとDiskバックエンドの両方で確認するテストを追加します。
 
 ```rust
 #[test]
@@ -691,7 +691,7 @@ fn rollback_undoes_repeated_updates_to_the_same_row_on_disk() {
 同じ行を3回書き換えてから`ROLLBACK`すると、残高は最初の100まで戻ります。
 `apply_undo_disk`の`remap`が正しく働いていなければ、このテストは(無限ループに陥るか、途中の値のどれかで止まるかのどちらかで)失敗します。
 
-`tests/interleave.rs`には、4つの異常の再現テストに加えて、3本のトランザクションを同時に開き、`commit_tx`、`rollback_tx`を混ぜて呼んでもそれぞれ独立に効くことを確認するテストを追加しました。
+`tests/interleave.rs`には、4つの異常の再現テストに加えて、3本のトランザクションを同時に開き、`commit_tx`、`rollback_tx`を混ぜて呼んでもそれぞれ独立に効くことを確認するテストを追加します。
 
 ```console
 $ cargo test --lib

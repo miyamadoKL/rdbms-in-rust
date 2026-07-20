@@ -594,7 +594,7 @@ fn scan_filter_projection_pipeline_pulls_exactly_as_many_rows_as_requested() {
 1,000行すべてが条件に一致する状況でも、根から3回しか`next()`を呼ばなければ、葉も3回しか`next()`されません。
 これが第18章までの`eval_query_plan`(`Filter`が呼ばれた時点で1,000行すべてを読み切り、`Vec`にまとめてしまう)との違いです。
 
-`src/database.rs`には、より大きな規模でこの性質を確認する統合テストを追加しました。
+`src/database.rs`には、より大きな規模でこの性質を確認する統合テストを追加します。
 
 ```rust
 #[test]

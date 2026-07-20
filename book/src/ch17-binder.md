@@ -446,7 +446,7 @@ fn bind_assignment(&self, assignment: &Assignment, tables: &[BoundTableRef]) -> 
 `BoundInsert`、`BoundUpdate`、`BoundDelete`は、いずれも`schema: Schema`を値として(カタログからの借用ではなく複製として)持ちます。
 第16章までの`execute_insert`は、`table_info`という`&TableInfo`を`self.table_info(...)`から借りたあと、`&mut self.backend`を借用する直前に`.clone()`していました。
 `self`を不変借用したまま`&mut self.backend`を取ることはできないため、複製してから借用を手放す、という手順を`execute_insert`、`execute_update`、`execute_delete`のそれぞれが個別に書く必要があったのです。
-この章では、その複製を`Binder::resolve_table`の内部(`schema: info.schema.clone()`)へ1箇所にまとめました。
+この章では、その複製を`Binder::resolve_table`の内部(`schema: info.schema.clone()`)へ1箇所にまとめます。
 `Database::execute_insert`が受け取る`BoundInsert`はすでに独立した値なので、`&mut self.backend`をいつ借りても構いません。
 借用の都合に合わせて複製のタイミングを呼び出し側ごとに調整する、という同じ形のコードが3箇所に散らばっていた状態が、この章で1箇所に集まりました。
 
@@ -494,7 +494,7 @@ BoundExpr::ColumnRef { table_ordinal, column_index, name, .. } => {
 
 ## テストで確認する
 
-`src/binder.rs`のテストモジュールには、この章が扱う名前解決、型検査のそれぞれについて単体テストを追加しました。
+`src/binder.rs`のテストモジュールには、この章が扱う名前解決、型検査のそれぞれについて単体テストを追加します。
 
 ```rust
 #[test]

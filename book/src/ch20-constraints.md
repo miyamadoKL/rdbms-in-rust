@@ -434,7 +434,7 @@ Catalogページの`payload`の中身がどうエンコードされているか�
 
 ## テストで確認する
 
-`src/constraints.rs`には、既存行との重複検出、文内の重複検出、`NULL`同士が衝突しないこと、制約を持たないテーブルでは何も検査しないことを確認する単体テストを追加しました。
+`src/constraints.rs`には、既存行との重複検出、文内の重複検出、`NULL`同士が衝突しないこと、制約を持たないテーブルでは何も検査しないことを確認する単体テストを追加します。
 
 ```rust
 #[test]
@@ -471,11 +471,11 @@ fn update_statement_rollback_leaves_earlier_rows_untouched_on_later_violation() 
 `id = 1`の行は、`UPDATE`の対象(`WHERE id <= 2`)に含まれていたにもかかわらず、`email`は更新前の`'a@example.com'`のままです。
 `id = 2`の行との重複が判明した時点で文全体が打ち切られ、`id = 1`の行に対する変更もテーブルへは一切反映されていません。
 
-`tests/persistence.rs`には、`PRIMARY KEY`と`UNIQUE`を持つテーブルを永続モードで作り、`flush`してから再オープンしても制約が引き続き効くことを確認するテストを、`tests/differential.rs`には、SQLiteとの比較テストを追加しました。
+`tests/persistence.rs`には、`PRIMARY KEY`と`UNIQUE`を持つテーブルを永続モードで作り、`flush`してから再オープンしても制約が引き続き効くことを確認するテストを、`tests/differential.rs`には、SQLiteとの比較テストを追加します。
 SQLiteとの比較では、両者のエラーメッセージの文言までは一致させません。
 minidbは`PRIMARY KEY制約違反です: 列'id'の値1が重複しています`、SQLiteは`UNIQUE constraint failed: users.id`のように、エラーメッセージの語彙や形式はもともと独立に決められたもので、文字列としての一致を求める意味がありません。
 比較するのは「制約違反の文がエラーとして拒否されること」という意味論の一致だけです。
-`tests/differential.rs`には、次の`assert_both_error`を用意しました。
+`tests/differential.rs`には、次の`assert_both_error`を用意します。
 
 ```rust
 fn assert_both_error(setup: &[&str], failing_statement: &str) {

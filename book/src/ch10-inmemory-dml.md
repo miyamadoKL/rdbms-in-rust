@@ -436,7 +436,7 @@ minidb> SELECT id FROM users WHERE 1;
 PostgreSQLやSQLiteは、`FROM`が無い`SELECT`を、0列1行の暗黙の入力に対する`SELECT`とみなし、`WHERE`はその1行を通常どおり絞り込みます。
 `SELECT 1 WHERE FALSE`は0行、`SELECT 1 WHERE TRUE`は1行になるべきで、`WHERE`を無視して常に1行返す実装は誤りです。
 
-これらをまとめて直すため、`src/database.rs`の`execute_select_without_from`を次のように書き直しました。
+これらをまとめて直すため、`src/database.rs`の`execute_select_without_from`を次のように書き直します。
 
 ```rust
 fn execute_select_without_from(
@@ -758,7 +758,7 @@ fn infer_type(
 
 以前のこの章では、`infer_type`はトップレベルの演算子の種類だけを見て出力の型を決め、被演算子の型検査は`eval_expr`に任せていました。
 しかしそれでは、`predicate_matches`の節で見た`WHERE 1 AND 2`のような非対称が生まれます。
-そこで、演算子と関数それぞれが被演算子に課す型制約を、`infer_type`自身が再帰的に検査するように直しました。
+そこで、演算子と関数それぞれが被演算子に課す型制約を、`infer_type`自身が再帰的に検査するように直します。
 単項`-`は被演算子が`BigInt`か`None`(型未定の`NULL`)であることを、単項`NOT`と`AND`/`OR`は被演算子が`Boolean`か`None`であることを、算術演算は両辺が`BigInt`か`None`であることを、比較演算は両辺が同じ型か、どちらかが`None`であることを、関数呼び出しは`FunctionRegistry`に登録された引数の個数と型(`functions.arg_types(name)`)を、それぞれ検査します。
 違反があれば、`eval_expr`が実際にその式を評価したときに返すのと同じ文言の`DbError::Eval`を返すため、`WHERE 1 AND 2`や`WHERE NOT 1`、`WHERE abs('x') = 1`は、空のテーブルでも行を持つテーブルでも同じ`エラー`になります。
 `IS [NOT] NULL`だけは被演算子の型を問いません(ただし被演算子自身の式は再帰的に検査するので、`abs('x') IS NULL`のような無効な式はここでも検出されます)。
@@ -913,7 +913,7 @@ psqlは`INSERT 0 1`のように、行の挿入先を表す2つ目の数値(OID�
 
 ## テストで確認する
 
-`executor`モジュールには、SeqScan、Filter、Projection、Insert、Update、Deleteそれぞれの単体テストを追加しました。
+`executor`モジュールには、SeqScan、Filter、Projection、Insert、Update、Deleteそれぞれの単体テストを追加します。
 `database`モジュールには、`INSERT`→`SELECT`→`UPDATE`→`SELECT`→`DELETE`→`SELECT`という一連の流れを1つのテストとして確認するものも加えています。
 `src/database.rs`の`mod tests`に追加します。
 
@@ -976,7 +976,7 @@ fn select_where_1_is_rejected_even_on_an_empty_table() {
 Golden Testは、これまで1ファイルにつき1文しか置けませんでした(第3章)。
 `CREATE TABLE`と`INSERT`をまたぐ流れは、複数文を実行できる単体テストの役目として書き分ける、という方針を第9章で採っています。
 しかしこの章のDMLは、`CREATE TABLE`で作ったテーブルに`INSERT`してから`SELECT`で覗く、という組み合わせを抜きにして単独では意味を持ちません。
-そこで、Golden Testのランナーを拡張し、`.sql`ファイルが`;`区切りの複数文を持てるようにしました。
+そこで、Golden Testのランナーを拡張し、`.sql`ファイルが`;`区切りの複数文を持てるようにします。
 文を分ける実装は、`;`という文字だけを見て`str::split`する素朴な形にはしません。
 `SELECT 'a;b'`のような文字列リテラルや、`-- a;b`のようなコメントの内側にも`;`は現れるため、その`;`まで文の区切りとして誤認してしまうからです。
 そこで`split_statements`は、字句解析器の`tokenize`を一度通し、`TokenKind::Semicolon`のトークンだけを区切りとして扱います。
@@ -1025,7 +1025,7 @@ fn split_by_tokens<'a>(sql: &'a str, tokens: &[Token]) -> Vec<&'a str> {
 コメントは字句解析の段階でトークンを1個も生成しないため、`SELECT 1; -- trailing`のように最後の`;`の後ろにコメントしか無い場合、その範囲には実トークンが無く、文として`db.execute`に渡されることはありません。
 最初、この判定を`text.trim().is_empty()`(切り出した文字列を`trim`して空かどうか)で行っていましたが、それでは不十分でした。
 コメントの文字自体は空白文字ではないため、`trim`しても`-- trailing`は空文字列にならず、コメントだけの断片を2文目として拾って`db.execute`に渡してしまうという不具合があったからです。
-`has_real_token_since_start`という`bool`で「区切りの間に`Semicolon`、`Eof`以外のトークンが現れたか」を直接追うことで、文字列の見た目ではなく字句解析の結果そのものを根拠に判定するよう直しました。
+`has_real_token_since_start`という`bool`で「区切りの間に`Semicolon`、`Eof`以外のトークンが現れたか」を直接追うことで、文字列の見た目ではなく字句解析の結果そのものを根拠に判定するよう直します。
 
 もう1つ、`tokenize`は成功か失敗かのどちらかしか返さず、閉じない文字列リテラルのようなエラーに遭遇した時点で、そこまでに読めていたトークンも含めてすべて捨ててしまうという性質があります。
 そのため、字句解析器自体が失敗するSQL(閉じない文字列リテラルなど)を期待値にするgoldenケースを素直に書こうとすると、`split_statements`がSpan基準の分割に入る前に`tokenize`自体が失敗し、ファイルを文へ分ける段階でpanicしてしまいます。
@@ -1190,7 +1190,7 @@ fn assert_same_result(setup: &[&str], query: &str) {
 `minidb_rows`と`sqlite_rows`をそれぞれ`.sort()`してから`assert_eq!`することで、行の集合としての一致(多重集合としての一致)だけを見るようにし、順序の違いを比較の対象から外しています。
 ソートは重複行の個数を潰さないため、`(1, 'a'), (1, 'a'), (2, 'b')`という結果は`(1, 'a'), (2, 'b'), (1, 'a')`とは一致しても`(1, 'a'), (2, 'b')`とは一致しません。
 
-三値論理の扱いをminidbとSQLiteで突き合わせるテストは、`tests/differential.rs`に次のように追加しました。
+三値論理の扱いをminidbとSQLiteで突き合わせるテストは、`tests/differential.rs`に次のように追加します。
 
 ```rust
 #[test]

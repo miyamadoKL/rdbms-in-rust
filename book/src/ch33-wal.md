@@ -412,7 +412,7 @@ Memoryバックエンドはそもそも永続化しないデータベースで�
 
 この章はまだCrash Recoveryを実装しません。
 ログを読んで状態を復元するRedo、Undoは第34章の仕事で、この章は「WALファーストを守ってログを先に書く」ところまでです。
-それでも、書いたログが実際にディスクへ残っていることは目視で確認したいので、開発用のダンプを用意しました。
+それでも、書いたログが実際にディスクへ残っていることは目視で確認したいので、開発用のダンプを用意します。
 `dump`は`src/wal.rs`の`WalWriter`に生やしたメソッドです。
 
 ```rust
@@ -473,9 +473,9 @@ assert!(dump.iter().any(|line| line.contains("type=Commit")));
 
 ## テストで確認する
 
-`src/wal.rs`には、ログレコードのencode/decode往復、torn tailの検出と切り詰め、`sync_up_to`が同期済みのLSNへ再同期しないことを確認する単体テストを追加しました。
-`src/buffer_pool.rs`には、`flush_page`とeviction(Clock置換)のどちらの経路でも、ページを書き戻す前にそのページのPage LSNまでWALが同期されていることを確認するテストを追加しました。
-`tests/wal_durability.rs`には、この章の一連の主張(COMMITはテーブル本体を同期しない、WALは同期する、COMMITはWALの同期を待ってから返る、Autocommitも同じ規律に従う、ROLLBACKはWALのBefore Imageで復元する)をそれぞれ確認する統合テストを追加しました。
+`src/wal.rs`には、ログレコードのencode/decode往復、torn tailの検出と切り詰め、`sync_up_to`が同期済みのLSNへ再同期しないことを確認する単体テストを追加します。
+`src/buffer_pool.rs`には、`flush_page`とeviction(Clock置換)のどちらの経路でも、ページを書き戻す前にそのページのPage LSNまでWALが同期されていることを確認するテストを追加します。
+`tests/wal_durability.rs`には、この章の一連の主張(COMMITはテーブル本体を同期しない、WALは同期する、COMMITはWALの同期を待ってから返る、Autocommitも同じ規律に従う、ROLLBACKはWALのBefore Imageで復元する)をそれぞれ確認する統合テストを追加します。
 
 ```console
 $ cargo test --lib

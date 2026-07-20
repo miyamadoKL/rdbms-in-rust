@@ -94,7 +94,7 @@ pub struct Page {
 
 Page Headerに8バイト増えた分、`PAGE_HEADER_SIZE`は16から24へ、`PAGE_PAYLOAD_SIZE`はその分だけ縮み、`FORMAT_VERSION`も1つ上げてあります。
 `BufferPool`は、ページを新しく読み込むとき、ディスクに永続化されていた`page_lsn`をそのままフレームの初期値として引き継ぎます。
-`src/buffer_pool.rs`には、次のように書き加えました。
+`src/buffer_pool.rs`には、次のように書き加えます。
 
 ```rust
         let page_lsn = page.page_lsn;
@@ -178,7 +178,7 @@ Dirty Page Tableに相当するものは、あえて作りません。
 
 Redoは、Analysisが決めた走査範囲のレコードを、LSNの昇順のまま1件ずつ再適用します。
 `Insert`、`Update`、`Delete`のどれであっても、対象ページの現在のPage LSNがそのレコードのLSN以上であれば、もう反映済みなので何もしません。
-`src/storage.rs`に、次の`redo_insert`を定義しました。
+`src/storage.rs`に、次の`redo_insert`を定義します。
 
 ```rust
     pub(crate) fn redo_insert(&mut self, table_id: TableId, rid: RecordId, bytes: &[u8], lsn: Lsn) -> DbResult<()> {
@@ -223,7 +223,7 @@ Redoは1本のWALを昇順にたどり、あるページに対して行う操作
 
 `Update`は、`old_rid`と`rid`が一致するかどうかで処理が分かれます。
 一致すれば同じページ内で完結する更新、食い違えば「新しい位置へ挿入し、古い位置をtombstone化する」という2つの物理操作に分解されます。
-この振り分けは`src/recovery.rs`に書きました。
+この振り分けは`src/recovery.rs`に書きます。
 
 ```rust
             if old_rid == new_rid {
@@ -321,7 +321,7 @@ Redoが冪等であることはすでに確認したとおりで、Undoも`apply
 Analysisは、WALの先頭からすべてのレコードを見て回ります。
 稼働時間が延びるほどWALは長くなり、Analysisが見て回る範囲も広がっていきます。
 `CHECKPOINT`は、この範囲を短く保つための手段です。
-`src/storage.rs`に、次の`checkpoint`を定義しました。
+`src/storage.rs`に、次の`checkpoint`を定義します。
 
 ```rust
     pub fn checkpoint(&mut self, active: &[(TransactionId, Option<Lsn>)]) -> DbResult<Lsn> {
@@ -341,7 +341,7 @@ Analysisが次にWALを読むとき、`Checkpoint`より前のレコードを1�
 ただし、`Checkpoint`の瞬間にActiveだったトランザクションだけは例外です。
 そのトランザクションが以後1件もWALへ書かず、Checkpointの直後にクラッシュしたなら、Analysisが`Checkpoint`より後ろしか見なければ、そのトランザクションの存在にすら気づけません。
 そこで`Checkpoint`レコードには、その瞬間のActiveトランザクション一覧(**Active Transaction Table**)を埋め込みます。
-このエンコードは、ログレコードの形式を扱う`src/wal.rs`に置きました。
+このエンコードは、ログレコードの形式を扱う`src/wal.rs`に置きます。
 
 ```rust
 pub(crate) fn encode_active_transactions(active: &[(TransactionId, Option<Lsn>)]) -> Vec<u8> {
@@ -408,7 +408,7 @@ SQLの`CHECKPOINT`文は、現在Activeなトランザクションをすべて�
 けれども「Undoの途中でRecoveryそのものがもう一度クラッシュする」状況は、この手口では再現できません。
 `recover`は`Storage::open`という1回の関数呼び出しの**内部**で最初から最後まで進むため、その内側で止める仕掛けが要ります。
 
-この章は、実プロセスを本当には止めない、テスト専用のcrash point注入機構を自作しました。
+この章は、実プロセスを本当には止めない、テスト専用のcrash point注入機構を自作します。
 `src/failpoint.rs`を新しいモジュールとして作成します。
 その中身は、次のとおりです。
 
@@ -456,7 +456,7 @@ pub mod failpoint;
 
 ## クラッシュシナリオを試す
 
-`tests/crash_recovery.rs`に、この章が主張する8つの場面をそれぞれテストとして書きました。
+`tests/crash_recovery.rs`に、この章が主張する8つの場面をそれぞれテストとして書きます。
 
 **(a) COMMIT応答後、データページ書き戻し前のクラッシュ**は、`BEGIN`のうちに`INSERT`を2件実行して`COMMIT`し、そのあとで`flush`せずに`drop`し、開き直した`Database`が両方の行を読めることを確認します。
 `last_recovery_report()`の`records_redone`が2以上であることも合わせて確かめます。

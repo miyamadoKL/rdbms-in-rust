@@ -188,7 +188,7 @@ let column_index = table_offset(tables, table_ordinal) + local_index;
 
 `table_ordinal`が`0`の唯一のテーブルしか無い(`JOIN`を持たない)`SELECT`では、`table_offset`は常に`0`を返すため、`column_index`はこれまでどおりテーブル内のローカルな添字と一致します。
 この章の変更は、単一テーブルの`SELECT`が経由するコード経路を1つも書き換えていません。
-`SELECT *`の展開(`bind_select`のWildcard分岐)も同じ理由でオフセットを足すように直しましたが、結果として複数テーブルの`*`は「テーブルの登場順、各テーブル内は列の宣言順」に展開されます。
+`SELECT *`の展開(`bind_select`のWildcard分岐)も同じ理由でオフセットを足すように直しますが、結果として複数テーブルの`*`は「テーブルの登場順、各テーブル内は列の宣言順」に展開されます。
 
 ```console
 minidb> SELECT * FROM customers JOIN orders ON customers.id = orders.customer_id;
@@ -658,10 +658,10 @@ fn nested_loop_and_hash_join_produce_identical_results_for_an_equi_join() {
 
 `a.id = 2`の行が2件、`b.id = 2`の行が2件あるため、この鍵だけで2×2=4件のマッチが生まれます(重複キーの多重集合としての結合)。
 この4件が、Nested Loop JoinとHash Joinのどちらから見ても行の値、順序ともに一致することを確認しています。
-`database`モジュールにも、`a.id = b.id`(Hash Join)と、これと同値な`a.id >= b.id AND a.id <= b.id`(等値条件として認識されないためNested Loop Joinが選ばれる)を実際のSQL文として実行し、同じ結果になることを確認する統合テストを追加しました。
+`database`モジュールにも、`a.id = b.id`(Hash Join)と、これと同値な`a.id >= b.id AND a.id <= b.id`(等値条件として認識されないためNested Loop Joinが選ばれる)を実際のSQL文として実行し、同じ結果になることを確認する統合テストを追加します。
 
 NULLキーの除外は、`HashJoinExec`、`NestedLoopJoinExec`それぞれについて、鍵にNULLを含む行が結果に現れないことを単体テストで確認しています。
-`differential`テストにも、`customer_id`が`NULL`の注文が結合結果に現れないことをSQLiteと突き合わせて確認するケースを追加しました。
+`differential`テストにも、`customer_id`が`NULL`の注文が結合結果に現れないことをSQLiteと突き合わせて確認するケースを追加します。
 空テーブル(左が空、右が空それぞれ)、3テーブルの連鎖`JOIN`、`WHERE`、`GROUP BY`、`ORDER BY`との組み合わせも、`database`モジュールと`differential`テストの両方でカバーしています。
 
 計算量の違いは、実際に実行時間を測って確認しました。

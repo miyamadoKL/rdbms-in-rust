@@ -92,7 +92,7 @@ impl Drop for PageReadGuard<'_> {
 これはモジュール冒頭の規律が禁じている逆順そのものであり、単一スレッドの間は誰も気づけません(同じスレッドの中で複数のGuardが同時に生きて競合することがないため)。
 複数スレッドがBuffer Poolを本当に共有した瞬間、この逆順はデッドロックの芽になります。
 
-この章では、`src/buffer_pool.rs`の`PageReadGuard`の`guard`フィールドを`std::mem::ManuallyDrop`で包み、`Drop::drop`の中で明示的に順序を固定しました。
+この章では、`src/buffer_pool.rs`の`PageReadGuard`の`guard`フィールドを`std::mem::ManuallyDrop`で包み、`Drop::drop`の中で明示的に順序を固定します。
 
 ```rust
 pub struct PageReadGuard<'a> {
@@ -127,7 +127,7 @@ impl Drop for PageReadGuard<'_> {
 
 `BufferPool`のLatchはページ1枚の中身を守るだけで、複数ページにまたがる木の構造そのものを守ってはくれません。
 `BTree`の`insert`が根から葉まで降りる途中、別のスレッドが同じ経路のどこかを書き換えていたら、探索は正しい葉にたどり着けません。
-この章では、B+Treeの木構造を並行アクセスから守るために**Lock Coupling**(Crabbing、蟹のように親のハサミを閉じてから次のハサミを開く動きに由来する通称)を実装しました。
+この章では、B+Treeの木構造を並行アクセスから守るために**Lock Coupling**(Crabbing、蟹のように親のハサミを閉じてから次のハサミを開く動きに由来する通称)を実装します。
 
 ### 探索: 子のLatchを取ってから親を放す
 
@@ -295,7 +295,7 @@ Latchの取得順序は、常に**上から下、左から右**に固定して�
 ## Database層のスレッド対応: `SharedDatabase`と「待機」に変わったBlocked
 
 `BufferPool`とB+Treeが本物のLatchを持つようになった一方で、`Database`自身(`Catalog`、`Backend`、`LockManager`等)はスレッドセーフになっていません。
-この章では、`Database`全体を`Mutex`1本で包む最小限のラッパー`SharedDatabase`を、`src/database.rs`に追加しました。
+この章では、`Database`全体を`Mutex`1本で包む最小限のラッパー`SharedDatabase`を、`src/database.rs`に追加します。
 
 ```rust
 pub struct SharedDatabase {
@@ -373,7 +373,7 @@ let handles: Vec<_> = (0..THREADS)
 Victim Selection(第32章)は循環の中で最も新しいTransactionIdを選ぶため、先に`begin_tx`した側が生き残り、後から`begin_tx`した側が必ずVictimになります。
 この決定性を使って、実行順序を一切アサートせずに最終残高だけを検証しています。
 実スレッドが本当にデッドロックしたまま検出されずに止まっていれば、このテスト自体がハングします。
-ハングしたままCIを止めないよう、別スレッドからの完了通知に上限時間を設けました。
+ハングしたままCIを止めないよう、別スレッドからの完了通知に上限時間を設けます。
 
 決定的インターリーブテストのハーネス(第30〜34章)は、この章のあとも1文字も変えずに緑のままです。
 実スレッドを解禁したことは、既存の単一スレッドテストを置き換えるのではなく、その上に積み増すものだという位置づけを、テストスイート自体が示しています。

@@ -665,7 +665,7 @@ fn parse_expr(tokens: &[&Token]) -> DbResult<ToyExpr> {
 
 ## テストで確認する
 
-`Lexer`と`toy_sql`のそれぞれに単体テストを追加しました。
+`Lexer`と`toy_sql`のそれぞれに単体テストを追加します。
 キーワード、識別子、リテラル、演算子、コメント、そして位置情報付きのエラーを確認します。
 `src/lexer.rs`の末尾の`mod tests`に、次のテストを追加します。
 

@@ -684,7 +684,7 @@ fn order_by_referencing_a_column_outside_the_select_list_adds_a_hidden_column() 
 }
 ```
 
-`tests/differential.rs`の`differential`テストは、`ORDER BY`の追加にあわせて比較のしかたを見直しました。
+`tests/differential.rs`の`differential`テストは、`ORDER BY`の追加にあわせて比較のしかたを見直します。
 第20章まで、`SELECT`の行の順序はSQLの意味論上未規定であるという理由から、`differential`テストは常に両エンジンの結果をソートしてから比較していました。
 `ORDER BY`が構文解析器を通るようになった今、`ORDER BY`を伴う`SELECT`については、並べ替え自体が検証したい意味論の一部です。
 `assert_same_result_ordered`という、ソートせずに順序ごと突き合わせる比較を新設し、`ORDER BY`を持たないテストは引き続き`assert_same_result`(ソートしてから比較)を使う形で使い分け、`tests/differential.rs`に次のようなテストを追加しています。
