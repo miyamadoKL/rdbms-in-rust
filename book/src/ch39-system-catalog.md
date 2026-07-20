@@ -133,7 +133,8 @@ index_usage: RefCell<HashMap<String, u64>>,
 ```
 
 `&mut Storage`ではなく`&Storage`のまま増やせる必要があるのは、この値を増やす場所が`IndexScanExec`、`IndexNestedLoopJoinExec`(第25章)という、`Storage`を`&'a Storage`としてしか借用していない`Executor`の内部だからです。
-`RefCell`による内部可変性を使い、`BTree::lookup`、`BTree::range`を呼ぶ直前にそれぞれ1箇所ずつ、`src/physical_plan.rs`の`IndexScanExec`と`IndexNestedLoopJoinExec`で記録します。
+`RefCell`による内部可変性を使い、`src/physical_plan.rs`の2つの`Executor`で記録します。
+`IndexScanExec`ではPointまたはRangeの実行を開始する時に1回、`IndexNestedLoopJoinExec`では外側の行ごとに内側の`lookup`を呼ぶ直前に記録します。
 
 ```rust
 storage.record_index_use(index_name);
