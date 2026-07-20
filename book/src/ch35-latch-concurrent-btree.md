@@ -76,7 +76,7 @@ pub struct BufferPool {
 この2つのロックを両方とも触る箇所(`locate_or_load`と`evict`)は、常に「`Inner`を先にロックし、その`MutexGuard`を握ったままFrameのLatchを取る」という順序で統一されています。
 逆順(Frameを先に、Innerをあとに)を許すと、スレッドAが`evict`のためにInnerを確保してFrameを待ち、スレッドBがFrameを確保したままunpinのためにInnerを待つ、という循環待ちが起こりえます。
 
-ここで、`PageReadGuard`と`PageWriteGuard`の`Drop`を素朴に書くと、この逆順を自分から踏んでしまうことに気づきました。
+ここで、`src/buffer_pool.rs`の`PageReadGuard`と`PageWriteGuard`の`Drop`を素朴に書くと、この逆順を自分から踏んでしまうことに気づきました。
 
 ```rust
 impl Drop for PageReadGuard<'_> {
@@ -194,6 +194,7 @@ loop {
 「安全」の判定は2種類あります。
 葉については、`(key_bytes, rid)`を実際に挿入した後のエントリ一覧を仮に組み立て、`leaf_entries_fit`で収まるかどうかを確認します。
 挿入する値そのものが分かっているので、この判定は厳密です。
+`src/btree.rs`に`leaf_is_safe_for_insert`として定義します。
 
 ```rust
 fn leaf_is_safe_for_insert(view: &LeafPageRef<'_>, key_bytes: &[u8], rid: RecordId) -> bool {
@@ -206,6 +207,7 @@ fn leaf_is_safe_for_insert(view: &LeafPageRef<'_>, key_bytes: &[u8], rid: Record
 
 内部ページについては、この時点ではまだ下の階層でSplitが起きるかどうかも、起きた場合に押し上げられてくる区切りキーの実際の長さも分かりません。
 `max_key_len`(`insert`が受け付ける最大のキー長)を持つダミーのエントリを1件仮に足して判定することで、実際に来る区切りキーがどんな長さであっても安全側に倒します。
+同じ`src/btree.rs`に、次の`internal_is_safe_for_insert`を定義します。
 
 ```rust
 fn internal_is_safe_for_insert(view: &InternalPageRef<'_>, max_key_len: usize) -> bool {
@@ -216,7 +218,7 @@ fn internal_is_safe_for_insert(view: &InternalPageRef<'_>, max_key_len: usize) -
 ```
 
 葉に着いた時点で`ancestors`に残っているのは、末尾(最も深い)が葉自身、それより前が実際にSplitしうる祖先だけです。
-伝播は、この`ancestors`から都度`pop`したGuardをそのまま使い回します。
+伝播は、`src/btree.rs`の同じ`insert`の中で、この`ancestors`から都度`pop`したGuardをそのまま使い回します。
 
 ```rust
 let mut current_guard = ancestors.pop().expect("...");
@@ -250,6 +252,7 @@ Rootが分割されるとき(`ancestors`が空になったとき)は、`grow_new
 この章の統合テストを書く過程で、実際にこの経路の破損を観測しました。
 
 そこでこの章では、**Rootの`PageId`を`create`のときのまま生涯変えない**ことにしました。
+`src/btree.rs`の`grow_new_root`は、次のようになります。
 
 ```rust
 fn grow_new_root(&self, mut old_root_guard: PageWriteGuard<'_>, separator: &[u8], new_page_id: PageId) -> DbResult<()> {
@@ -309,7 +312,7 @@ pub struct SharedDatabase {
 両立しないロックを見つけたら、`Blocked`という**値**を返すだけで、呼び出し元のスレッドを止めはしません。
 決定的インターリーブテストハーネスは、この値を受け取って「今は再試行しない」と判断する側に回ることで、単一スレッドのままインターリーブを制御していました。
 
-`SharedDatabase::execute_in_tx`は、同じ`DbError::WouldBlock`を受け取ったら`Condvar`でスレッドを実際に眠らせます。
+`src/database.rs`の`SharedDatabase::execute_in_tx`は、同じ`DbError::WouldBlock`を受け取ったら`Condvar`でスレッドを実際に眠らせます。
 
 ```rust
 pub fn execute_in_tx(&self, handle: &TxHandle, sql: &str) -> DbResult<QueryResult> {

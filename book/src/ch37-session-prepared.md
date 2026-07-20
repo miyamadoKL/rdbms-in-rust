@@ -68,7 +68,7 @@ pub struct Session {
 `SharedDatabase`はもともと複数スレッドから安全に共有するための型(第35章)でした。
 単一スレッドのEmbedded、REPLで使っても`Mutex`の獲得は競合しないので、複数スレッドの場合と地続きの型のまま使えます。
 
-`Session::execute`は、届いたSQLを一度だけパースし、以後は`Statement`という構造化された値だけを使います。
+`src/session.rs`に定義する`Session::execute`は、届いたSQLを一度だけパースし、以後は`Statement`という構造化された値だけを使います。
 
 ```rust
 pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
@@ -117,7 +117,7 @@ pub fn bind_statement(&self, statement: Statement, sql: &str) -> DbResult<BoundS
 
 問題は、`SharedDatabase::execute_in_tx`が受け取るのが束縛済みの`BoundStatement`ではなく、生のSQL文字列だったことです。
 そのままでは、`Session`が一度パースして束縛した結果を渡す先がありません。
-そこでこの章は、`Database::execute_in_tx`が内部で共有していた「文を実行する本体」を切り出し、束縛済みの文をそのまま受け取る経路を新設しました。
+そこでこの章は、`src/database.rs`で`Database::execute_in_tx`が内部で共有していた「文を実行する本体」を切り出し、束縛済みの文をそのまま受け取る経路を新設しました。
 
 ```rust
 fn execute_bound_statement(&mut self, statement: Statement, sql: &str) -> DbResult<QueryResult> {
@@ -141,7 +141,7 @@ fn run_bound_statement(&mut self, bound: BoundStatement) -> DbResult<QueryResult
 }
 ```
 
-`execute_in_tx`自身も、同じ形に切り出した`run_in_tx`を共有するように書き直しました。
+同じ`src/database.rs`の`execute_in_tx`自身も、同じ形に切り出した`run_in_tx`を共有するように書き直しました。
 
 ```rust
 pub fn execute_in_tx(&mut self, handle: &TxHandle, sql: &str) -> DbResult<QueryResult> {
@@ -226,7 +226,7 @@ Param {
 ```
 
 `PREPARE`、`EXECUTE`、`DEALLOCATE`自身も、`Statement`の新しいバリアントです。
-`EXECUTE`の引数は式ではなくリテラル(整数、文字列、真偽値、`NULL`)に限定しています。
+`EXECUTE`の引数は式ではなくリテラル(整数、文字列、真偽値、`NULL`)に限定し、`src/ast.rs`に次のように定義します。
 
 ```rust
 /// `EXECUTE name [(値, ...)]`文(第37章)。
@@ -289,7 +289,7 @@ Param {
 },
 ```
 
-推論そのものは、`coerce_param_type`という小さな関数が担います。
+推論そのものは、`src/binder.rs`に定義する`coerce_param_type`という小さな関数が担います。
 
 ```rust
 /// `expr`が型未確定の`BoundExpr::Param`であれば、その`data_type`を`hint`で
@@ -305,7 +305,7 @@ fn coerce_param_type(expr: BoundExpr, hint: Option<DataType>) -> BoundExpr {
 ```
 
 `bind_expr`は、二項演算子、単項演算子、`CAST`、関数呼び出しという4箇所で、この`hint`を組み立てて`coerce_param_type`に渡します。
-二項演算子の場合を見ます。
+まずは`src/binder.rs`の`bind_expr`から、二項演算子の場合を見ます。
 
 ```rust
 Expr::BinaryOp { op, lhs, rhs, span } => {
@@ -341,7 +341,7 @@ Expr::BinaryOp { op, lhs, rhs, span } => {
 値が式の要求する型と食い違っていれば(たとえば`$1 = $2`に整数と文字列を渡す)、`Binder`ではなく`crate::eval::eval_bound_expr`が実行時の`DbError::Eval`として検出します。
 つまりこの片務的な設計は、「決まる場合には`PREPARE`の時点で決める」だけであり、決まらない場合の実行時エラーへ倒れる余地を最初から許容しています。
 
-もう1つの実装場所は`CAST`です。
+もう1つの実装場所は、同じ`src/binder.rs`の`bind_expr`が扱う`CAST`です。
 
 ```rust
 Expr::Cast { expr, type_name, span } => {
@@ -380,7 +380,7 @@ fn collect_insert(insert: &BoundInsert, types: &mut Vec<Option<DataType>>) -> Db
 
 `PREPARE`が確定させるのは、`$n`をまだプレースホルダのまま持つ`BoundStatement`です。
 `EXECUTE`は、この`BoundStatement`を複製し、すべての`$n`を渡された値のリテラルへ置き換えてから実行します。
-束縛(名前解決と型検査)をやり直さない、というのがこの章の`EXECUTE`の要点です。
+束縛(名前解決と型検査)をやり直さない、というのがこの章の`EXECUTE`の要点で、`src/session.rs`の`substitute_bound_expr`がその置き換えを行います。
 
 ```rust
 fn substitute_bound_expr(expr: BoundExpr, values: &[Value]) -> BoundExpr {
@@ -402,7 +402,7 @@ fn substitute_bound_expr(expr: BoundExpr, values: &[Value]) -> BoundExpr {
 木を再帰的に辿り、`Param`ノードだけをリテラルへ置き換え、それ以外のノード(演算子、型、`Span`)はそのまま複製します。
 `INSERT`の`VALUES`(生の`Expr`)にも、同じ形の`substitute_ast_expr`を用意してあります。
 
-個数と型の検査を済ませてから置き換えるのが`Session::execute_prepared`です。
+個数と型の検査を済ませてから置き換えるのが、`src/session.rs`の`Session::execute_prepared`です。
 
 ```rust
 pub fn execute_prepared(&mut self, name: &str, args: &[Value]) -> DbResult<QueryResult> {
@@ -429,7 +429,7 @@ pub fn execute_prepared(&mut self, name: &str, args: &[Value]) -> DbResult<Query
 `NULL`はどんな型のプレースホルダにも許します(`value.data_type()`が`None`を返すので、型検査そのものをすり抜けます)。
 通常の列がNULL制約の無い限りどんな型の列にもNULLを書き込めるのと同じ扱いです。
 
-SQL文字列の`EXECUTE find_by_name('Alice')`は、この`execute_prepared`の薄いラッパーです。
+SQL文字列の`EXECUTE find_by_name('Alice')`は、`src/session.rs`に定義する、この`execute_prepared`の薄いラッパーです。
 
 ```rust
 fn execute_execute(&mut self, execute: &ExecuteStatement) -> DbResult<QueryResult> {

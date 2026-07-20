@@ -30,7 +30,7 @@ crateを分けるとpub化の範囲やCargo.tomlの依存関係を都度調整�
 第2部の終わり、あるいはそれ以降が目安です。
 
 `src/main.rs` はまだ何もしません。
-挨拶を1行`println!`で出すだけです。
+その`src/main.rs`に、挨拶を1行`println!`で出すだけの内容を書きます。
 
 ```rust
 fn main() {
@@ -57,6 +57,8 @@ RDBMSの実装では、I/Oエラー、パースエラー、型エラー、制約
 ```rust
 pub mod error;
 ```
+
+`src/error.rs`には、次の`DbError`と`DbResult`を定義します。
 
 ```rust
 use thiserror::Error;
@@ -114,6 +116,8 @@ fn load_page(table_id: u64, page_id: u64) -> DbResult<()> {
 pub mod ids;
 ```
 
+`src/ids.rs`の中身は、次の3つの型です。
+
 ```rust
 /// ディスク上の1ページを指す識別子。
 ///
@@ -141,7 +145,7 @@ pub struct TransactionId(pub u64);
 
 これは**Newtype**と呼ばれるパターンで、既存の型(ここでは`u64`)を1要素のタプル構造体で包み、別の型として扱えるようにします。
 
-先ほどの`load_page`をNewtypeで書き直すと、次のようになります。
+先ほどの`load_page`をNewtypeで書き直すとどうなるか、次の例で確認します。
 
 ```rust
 fn load_page(table_id: TableId, page_id: PageId) -> DbResult<()> {
@@ -260,7 +264,7 @@ fn golden_tests_pass() {
 `collect_sql_files`が`fs::read_dir`の結果を`filter_map(|entry| entry.ok())`のようにエラーを黙って捨てて集めていたなら、権限エラーなどで一部のエントリの列挙に失敗しても、その事実に気づかないままテスト対象のファイルが減ります。
 `collect::<Result<Vec<_>, _>>()`で一度`Result`にまとめてから展開すれば、列挙中のエラーは`unwrap_or_else`が捕捉し、`panic!`としてテストの失敗に変換されます。
 
-`run_sql`が肝心のクエリ実行部分ですが、現時点ではエンジンが存在しないため、入力をそのまま返すエコーになっています。
+`run_sql`が肝心のクエリ実行部分ですが、現時点ではエンジンが存在しないため、`tests/golden.rs`には入力をそのまま返すエコーとして仮実装します。
 
 ```rust
 /// 仮実装: クエリエンジンがまだ無いので、SQLをそのままエコーするだけ。

@@ -80,6 +80,7 @@ ColumnRef {
 「構文解析器は`Expr`しか返さない」「`executor`は`BoundExpr`しか受け取らない」という制約を、テストではなく型で保証できることが、この2つを分けた最大の理由です。
 
 `BoundExpr`は`Expr`の他のバリアントとも1対1に対応しますが、`UnaryOp`、`BinaryOp`、`FunctionCall`、`Cast`にはそれぞれ`data_type: DataType`が加わります。
+同じ`src/binder.rs`に、`BinaryOp`を例に次のように追記します。
 
 ```rust
 BinaryOp {
@@ -95,7 +96,7 @@ BinaryOp {
 `BoundExpr`には`data_type(&self) -> Option<DataType>`というメソッドがあり、`NullLiteral`とそれを素通しする`Paren`の入れ子だけが`None`(型が定まらない)を返します。
 値そのものではなく型だけを問う`bind_predicate`や`executor::project`は、この関数を呼ぶだけで済み、式木をもう一度たどり直す必要がありません。
 
-`SELECT`全体は`BoundSelect`という型に変換します。
+`SELECT`全体は、同じ`src/binder.rs`に定義する`BoundSelect`という型に変換します。
 
 ```rust
 pub struct BoundSelect {
@@ -116,7 +117,7 @@ pub struct BoundSelect {
 `Binder`がテーブル名を解決するには、名前からテーブル定義を引ける何かが必要です。
 このクレートには、その役目を果たす型がすでに2つあります。
 インメモリモードの`Catalog`(第9章)と、永続モードの`Storage`(第15章)です。
-どちらも`table(&self, name: &str) -> Option<&TableInfo>`という同じ形のメソッドを持っているので、この共通部分をtraitとして取り出します。
+どちらも`table(&self, name: &str) -> Option<&TableInfo>`という同じ形のメソッドを持っているので、この共通部分を`src/binder.rs`にtraitとして取り出します。
 
 ```rust
 pub trait CatalogLookup {
@@ -143,7 +144,7 @@ impl CatalogLookup for Storage {
 一方`Binder`にとって、`Catalog`と`Storage`は「テーブル名から`TableInfo`を引ける」という1つの操作しか要らない相手であり、`Database`のように両者の差を`match`で読み比べたい理由がありません。
 同じ「2つの実装を切り替える」問題でも、呼び出し側が知りたい情報の量によって`enum`とtraitのどちらが素直かが変わる、という一例になっています。
 
-テーブル名の解決自体は、`resolve_table`という1つの関数に集まります。
+テーブル名の解決自体は、`src/binder.rs`の`resolve_table`という1つの関数に集まります。
 
 ```rust
 fn resolve_table(&self, table: &Ident, alias: Option<&Ident>) -> DbResult<BoundTableRef> {
@@ -235,7 +236,7 @@ u.id
 列参照の解決は`resolve_column`が担います。
 修飾子(`qualifier`)の有無で経路が分かれます。
 
-修飾子が無い場合、`tables`を先頭から順に見て、その列名を持つテーブルを探します。
+修飾子が無い場合、`src/binder.rs`の`resolve_column`は`tables`を先頭から順に見て、その列名を持つテーブルを探します。
 
 ```rust
 let matches: Vec<(usize, usize, DataType)> = tables
@@ -269,7 +270,7 @@ match matches.as_slice() {
 それでもこの分岐を今のうちに書いておくのは、`resolve_column`という関数自体を「`tables`の要素数を1個と決め打たない」形で設計しておけば、第22章で`JOIN`が`tables`を複数要素にしたときに、この関数を書き直す必要が無いからです。
 テストでは、`resolve_column`を`Binder`の外から直接呼び、2つのテーブルが同じ列名`id`を持つ状況を人工的に作って、この分岐が実際に機能することを確認しています。
 
-修飾子がある場合(`u.id`)は、まず`tables`の中から`qualifier() == "u"`のテーブルを探し、見つかったテーブルの中だけで列名を探します。
+修飾子がある場合(`u.id`)は、`src/binder.rs`の同じ`resolve_column`が、まず`tables`の中から`qualifier() == "u"`のテーブルを探し、見つかったテーブルの中だけで列名を探します。
 
 ```rust
 let (table_ordinal, table) = tables
@@ -294,7 +295,7 @@ minidb> SELECT id FROM users AS u WHERE users.id = 1;
 
 ## `*`の展開と式の型検査をBinderへ統合する
 
-`SELECT *`の展開は、`bind_select`が射影対象リストを組み立てる中で行います。
+`SELECT *`の展開は、`src/binder.rs`の`bind_select`が射影対象リストを組み立てる中で行います。
 
 ```rust
 SelectItem::Wildcard { span } => {
@@ -317,7 +318,7 @@ SelectItem::Wildcard { span } => {
 
 式の型検査は、`bind_expr`という1つの再帰関数に集約しました。
 規則そのものは第10章の`executor::infer_type`と同一で、算術演算は両辺が`BIGINT`か型未定の`NULL`であること、比較演算は両辺が同じ型であること、論理演算は両辺が`BOOLEAN`か`NULL`であること、関数呼び出しは`FunctionRegistry`に登録された引数の型と一致することを、式木全体にわたって再帰的に検査します。
-`WHERE`句には、この検査に加えて「最終的な型が`BOOLEAN`または型未定の`NULL`であること」をもう1段検査する`bind_predicate`を通します。
+`WHERE`句には、この検査に加えて「最終的な型が`BOOLEAN`または型未定の`NULL`であること」をもう1段検査する、`src/binder.rs`の`bind_predicate`を通します。
 
 ```rust
 fn bind_predicate(&self, expr: &Expr, tables: &[BoundTableRef]) -> DbResult<BoundExpr> {
@@ -374,7 +375,7 @@ pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
 }
 ```
 
-`bind`自身は`Backend`の分岐を1箇所に閉じ込めるだけの薄い関数です。
+`bind`自身は、`src/database.rs`の中で`Backend`の分岐を1箇所に閉じ込めるだけの薄い関数です。
 
 ```rust
 fn bind(&self, statement: Statement, sql: &str) -> DbResult<BoundStatement> {
@@ -422,6 +423,7 @@ minidb> INSERT INTO users (id, id) VALUES (1, 2);
 `VALUES`は既存の行を参照する構文を持たないので、列参照が現れようが無く、`Binder`が解決すべき名前もそこにはありません。
 
 `UPDATE`、`DELETE`は、テーブル名の解決に加えて、`SET`の対象列と`WHERE`の述語を束縛します。
+`SET`の対象列を束縛する`bind_assignment`は、`src/binder.rs`に次のように定義します。
 
 ```rust
 fn bind_assignment(&self, assignment: &Assignment, tables: &[BoundTableRef]) -> DbResult<BoundAssignment> {
@@ -499,7 +501,7 @@ fn unknown_column_is_rejected_with_position() {
 ```
 
 未知のテーブル、未知の列、`WHERE`句の型不一致は、いずれも発生位置の行、列を固定するテストにしてあります。
-曖昧な列参照は、`resolve_column`を`Binder`の外から直接呼び、2つのテーブルが同じ列名を持つ状況を人工的に作って検証しました(この章の`Parser`では`FROM`に複数テーブルを書けないため、SQL文からこの分岐を踏むことはまだできません)。
+曖昧な列参照は、`src/binder.rs`のテストモジュールで`resolve_column`を`Binder`の外から直接呼び、2つのテーブルが同じ列名を持つ状況を人工的に作って検証しました(この章の`Parser`では`FROM`に複数テーブルを書けないため、SQL文からこの分岐を踏むことはまだできません)。
 
 ```rust
 #[test]

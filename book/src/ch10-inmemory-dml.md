@@ -227,7 +227,7 @@ pub fn insert(
 `planned`という`Vec<Tuple>`にすべての行の`Tuple::new`が成功してから、最後に`table.rows_mut().extend(planned)`で1回だけ書き込んでいるのは、「守るべき不変条件」の2番目(All-or-Nothing)を満たすためです。
 3行目の型が`NOT NULL`列に違反していれば、`?`によってその場でこの関数全体が打ち切られ、`table`は一切変更されません。
 
-列名指定がある場合の並べ替えは、`expand_to_schema`が担当します。
+列名指定がある場合の並べ替えは、同じ`src/executor.rs`に定義する`expand_to_schema`が担当します。
 
 ```rust
 fn expand_to_schema(
@@ -375,6 +375,7 @@ minidb> SELECT id FROM users WHERE 1;
 この抜け穴を塞ぐため、行ループへ入る前に`predicate`の型を静的に検査する`check_predicate_type`を用意し、`filter`、`update`、`delete`の冒頭で呼びます。
 使うのは`infer_type`という関数で、`SELECT`の計算列の型を決めるところ(このあとのProjection演算子の節)でも登場します。
 行を1件も評価せず、式のASTと`schema`だけから`predicate`の型を決められるので、テーブルの行数に関係なく同じ検査ができます。
+`src/executor.rs`に、次のように定義します。
 
 ```rust
 fn check_predicate_type(
@@ -543,6 +544,7 @@ pub fn filter(
 ```
 
 Projection演算子は、`*`をテーブルの全列参照へ展開してから、「列参照または式のリスト」という1種類の形だけを扱います。
+この展開を担う`resolve_items`は、`src/executor.rs`に次のように定義します。
 
 ```rust
 fn resolve_items(table_schema: &Schema, items: &[SelectItem], sql: &str) -> Vec<(Expr, String)> {
@@ -583,6 +585,7 @@ fn resolve_items(table_schema: &Schema, items: &[SelectItem], sql: &str) -> Vec<
 この章の`project`は、行を1行も評価せずに出力列の型を決める`infer_type`という関数を使い、この問題を避けます。
 
 `infer_type`は、片方が`None`(型未定の`NULL`)でもう片方が型違反というエラーメッセージを組み立てるときに、次の小さなヘルパーを使います。
+これも`src/executor.rs`に定義します。
 
 ```rust
 fn describe_type(data_type: Option<DataType>) -> String {
@@ -595,6 +598,7 @@ fn describe_type(data_type: Option<DataType>) -> String {
 
 `Option<DataType>`をそのまま`{:?}`で表示すると、以前の章で避けたのと同じ理由(`Some(BigInt)`のようなRustの内部表現が漏れる)で問題になります。
 `describe_type`は`Some`ならSQLの型名を、`None`なら`NULL`という文字列を返し、エラーメッセージの両辺を同じ形式で表示します。
+続けて`src/executor.rs`に、次の`infer_type`を定義します。
 
 ```rust
 fn infer_type(
@@ -842,6 +846,7 @@ INSERT演算子と同じく、書き換え後の`Tuple`をすべて`planned`に�
 
 Delete演算子は、`Filter`演算子と対になる形をしています。
 こちらも`table`が空でも`WHERE 1`を見逃さないよう、行ループへ入る前に`check_predicate_type`を呼びます。
+同じ`src/executor.rs`に、次のように定義します。
 
 ```rust
 pub fn delete(
@@ -925,7 +930,7 @@ fn insert_select_update_delete_round_trip() {
 }
 ```
 
-NOT NULL違反やWHEREの三値論理も、直接それを狙ったテストで確認しています。
+NOT NULL違反やWHEREの三値論理も、`src/database.rs`に直接それを狙ったテストを加えて確認しています。
 
 ```rust
 #[test]
@@ -944,6 +949,7 @@ fn select_where_drops_unknown_rows() {
 ```
 
 `check_predicate_type`が行の有無に関係なく`WHERE 1`を拒否することも、`users`テーブルへ1行も`INSERT`しない状態から狙って確認しています。
+同じ`src/database.rs`に、次のテストを追加します。
 
 ```rust
 #[test]
@@ -1023,11 +1029,14 @@ fn split_by_tokens<'a>(sql: &'a str, tokens: &[Token]) -> Vec<&'a str> {
 SELECT 'unterminated;
 ```
 
+このファイルを`cargo test`に流すと、次のとおり字句エラーがそのままGolden Testの期待値になります。
+
 ```console
 ERROR: 行1列8: 字句エラー: 閉じない文字列リテラルです
 ```
 
 `run_sql`は、この`split_statements`が返した文をそのまま`Database`に順に流し込みます。
+同じ`tests/golden.rs`に、次のように定義します。
 
 ```rust
 fn run_sql(sql: &str) -> String {
@@ -1128,6 +1137,7 @@ minidbが対応する`CREATE TABLE`、`INSERT`、`UPDATE`、`DELETE`の構文は
 異なる型の値が同じ文字列表現を持つことがある以上、文字列化してからの比較は、この2つを取り違えたまま「一致した」と誤判定しかねません。
 
 そこでこの章のDifferential Testは、値を文字列へ変換する代わりに、型ごとに別のバリアントを持つ`DiffValue`という列挙型に変換してから比較します。
+`tests/differential.rs`に、次のように定義します。
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1147,6 +1157,7 @@ SQLiteは真偽値専用の型を持たず、`BOOLEAN`列も内部的には`0`�
 そこでこの章のDifferential Testは、値からの推測に頼らず、minidb側で`query`を実行して得られる`QueryResult`のスキーマから、SELECTした各列の`DataType`を求め、その列型が`DataType::Boolean`だと分かっている列でだけ、SQLiteの整数`0`や`1`をそれぞれ`DiffValue::Boolean(false)`、`DiffValue::Boolean(true)`に読み替えます。
 
 結果の比較は、行の順序を無視した比較にしています。
+同じ`tests/differential.rs`の`assert_same_result`を、次のように書き直します。
 
 ```rust
 fn assert_same_result(setup: &[&str], query: &str) {
@@ -1169,7 +1180,7 @@ fn assert_same_result(setup: &[&str], query: &str) {
 `minidb_rows`と`sqlite_rows`をそれぞれ`.sort()`してから`assert_eq!`することで、行の集合としての一致(多重集合としての一致)だけを見るようにし、順序の違いを比較の対象から外しています。
 ソートは重複行の個数を潰さないため、`(1, 'a'), (1, 'a'), (2, 'b')`という結果は`(1, 'a'), (2, 'b'), (1, 'a')`とは一致しても`(1, 'a'), (2, 'b')`とは一致しません。
 
-三値論理の扱いをminidbとSQLiteで突き合わせるテストは、次のようになりました。
+三値論理の扱いをminidbとSQLiteで突き合わせるテストは、`tests/differential.rs`に次のように追加しました。
 
 ```rust
 #[test]
@@ -1186,6 +1197,7 @@ fn where_with_null_drops_unknown_rows() {
 ```
 
 `Value::Null`と文字列`'NULL'`、整数`1`と文字列`'1'`が取り違えられないことも、それぞれ専用のテストで確認しています。
+同じ`tests/differential.rs`に、次のテストを追加します。
 
 ```rust
 #[test]

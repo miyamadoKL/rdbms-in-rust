@@ -140,7 +140,7 @@ fn generate_token_soup(rng: &mut Xorshift64, len: usize) -> String {
 章末の演習で扱います。
 
 判定はどちらの生成器でも同じで、`catch_unwind`で包んで`panic`しないことだけを見ます。
-`Err`を返すのは正常系(壊れた入力を拒否できた)として扱います。
+`Err`を返すのは正常系(壊れた入力を拒否できた)として扱う`assert_no_panic`を、`tests/fuzz_parser.rs`に次のように定義します。
 
 ```rust
 fn assert_no_panic(input: &str) {
@@ -231,7 +231,7 @@ for step in 0..3_000usize {
 
 2つ目は合計の不変条件です。
 口座間の送金(ある行から引いた分だけ別の行へ足す)を何回繰り返しても、`SUM(balance)`は変わらないはずです。
-この送金を1回分実行する次のコードを書きます。
+この送金を1回分実行する次のコードを、`tests/property_sql.rs`に書きます。
 
 ```rust
 db.execute("BEGIN").unwrap();
@@ -374,7 +374,7 @@ oltp_transfer accounts=100 transfers=2000 total=6.6200069s avg=3.310003ms tps=30
 
 テストは実装の正しさを確認しますが、実装の使い方そのものは示しません。
 新規に作成する`examples/todo.rs`は、この教材が積み上げてきたEmbedded APIを、1つのToDoリストアプリケーションとして動かします。
-`cargo run --example todo`で実行できます。
+`examples/todo.rs`は`cargo run --example todo`で実行でき、次のように書き始めます。
 
 ```rust
 let shared = Arc::new(SharedDatabase::new(Database::memory()));

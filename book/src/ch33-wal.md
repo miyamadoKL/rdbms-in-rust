@@ -12,7 +12,7 @@ COMMIT
 ```
 
 この直後にプロセスが落ちても、次に開いたときには残高100の行が読めるはずだ、という期待です。
-実際に試してみます。
+`tests/wal_durability.rs`に次のテストを書いて、実際に試してみます。
 
 ```rust
 let mut db = Database::open(&path).unwrap();
@@ -26,7 +26,7 @@ db.execute("COMMIT").unwrap();
 ```
 
 `db`をスコープの外へ出してdropすると、`COMMIT`直後にプロセスが死んだ状況を模せます。
-そのあとで同じファイルを開き直し、先ほどの行を探してみます。
+続けて同じ`tests/wal_durability.rs`のテストの中で、ファイルを開き直し、先ほどの行を探してみます。
 
 ```rust
 let mut db = Database::open(&path).unwrap();
@@ -69,7 +69,7 @@ WALは、データファイルとは別のファイル(`<db_path>.wal`)に、追
 
 WALを扱うコードは、この章で新規作成する`src/wal.rs`にまとめます。
 `src/lib.rs`には`pub mod wal;`という1行を追加し、このモジュールを公開します。
-まずは、そこに次の`LogRecord`を定義します。
+まずは、`src/wal.rs`に次の`LogRecord`を定義します。
 
 ```rust
 pub struct LogRecord {
@@ -100,7 +100,7 @@ pub struct LogRecord {
 
 ## LSNの採番とtorn writeへの備え
 
-ログレコードは、`WalWriter`が手書きのリトルエンディアンでエンコードし、追記専用のファイルへ書きます。
+ログレコードは、同じ`src/wal.rs`に定義する`WalWriter`が手書きのリトルエンディアンでエンコードし、追記専用のファイルへ書きます。
 
 ```rust
 pub struct WalWriter {
@@ -126,6 +126,7 @@ pub struct WalWriter {
 `checksum`は`crc32`(第11章の`Page::encode`と同じアルゴリズム)です。
 ファイルへの1回の書き込みの途中でプロセスやOSが落ちると、末尾に「長さは足りているが中身が壊れている」、あるいは「長さ自体が足りていない」バイト列が残ることがあります。
 これが**torn write**です。
+これを検出する`decode_stream`を、`src/wal.rs`に次のように定義します。
 
 ```rust
 pub fn decode_stream(bytes: &[u8]) -> (Vec<LogRecord>, usize) {
@@ -146,7 +147,7 @@ pub fn decode_stream(bytes: &[u8]) -> (Vec<LogRecord>, usize) {
 
 `decode_stream`は1レコードずつ長さとchecksumを検証しながら読み進め、どちらかに失敗した時点で止まります。
 返り値は「読めた完全なレコードの列」と「そこまでの有効なバイト数」の組であり、それより後ろに残っているバイト列がtorn writeです。
-`WalWriter::open`は、ファイルを開くたびにこれを使って末尾のtorn writeを検出し、有効なバイト数のところまで`File::set_len`で切り詰めます。
+`src/wal.rs`の`WalWriter::open`は、ファイルを開くたびにこれを使って末尾のtorn writeを検出し、有効なバイト数のところまで`File::set_len`で切り詰めます。
 
 ```rust
 let (records, valid_len) = decode_stream(&bytes);
@@ -217,8 +218,7 @@ fn flush_frame(&self, frame_id: usize) -> DbResult<()> {
 }
 ```
 
-`sync_up_to`は`src/wal.rs`の`WalWriter`に定義します。
-指定したLSNがすでに同期済みなら何もせず、まだなら`sync`を呼びます。
+`src/wal.rs`の`WalWriter`に定義する`sync_up_to`は、指定したLSNがすでに同期済みなら何もせず、まだなら`sync`を呼びます。
 
 ```rust
 pub fn sync_up_to(&mut self, lsn: Lsn) -> DbResult<()> {
@@ -260,6 +260,8 @@ fn execute_commit(&mut self, _commit: CommitStatement) -> DbResult<QueryResult> 
 }
 ```
 
+WALへの書き込みと`sync`は、同じ`src/database.rs`に定義する`wal_commit_if_disk`が受け持ちます。
+
 ```rust
 fn wal_commit_if_disk(backend: &Backend, tx_id: TransactionId, wal_last_lsn: Option<Lsn>) -> DbResult<()> {
     let Backend::Disk { storage } = backend else { return Ok(()) };
@@ -280,7 +282,7 @@ fn wal_commit_if_disk(backend: &Backend, tx_id: TransactionId, wal_last_lsn: Opt
 
 ### 明示的な`BEGIN`を伴わない1文も、それ自体が耐久性を持つ
 
-`BEGIN`を書かずに実行した1文(Autocommit)にも、同じ規律を適用します。
+`BEGIN`を書かずに実行した1文(Autocommit)にも、`src/database.rs`に定義する次の`run_disk_dml`が同じ規律を適用します。
 
 ```rust
 fn run_disk_dml<F>(
@@ -385,7 +387,7 @@ pub(crate) fn apply_wal_undo_disk(storage: &mut Storage, last_lsn: Option<Lsn>) 
 ### `UndoRecord`はMemoryバックエンド専用になった
 
 Diskバックエンドが`apply_wal_undo_disk`へ切り替わったことで、第30章の`apply_undo_disk`はもう誰からも呼ばれません。
-`UndoRecord`という型自体は、`Vec<Tuple>`の並びでしかなくディスクに何も書かないMemoryバックエンド向けの実装として残しました。
+`UndoRecord`という型自体は、`src/transaction.rs`に、`Vec<Tuple>`の並びでしかなくディスクに何も書かないMemoryバックエンド向けの実装として残しました。
 
 ```rust
 #[derive(Debug, Clone)]
@@ -413,6 +415,8 @@ pub fn dump(&self) -> Vec<String> {
     self.records.iter().map(format_record).collect()
 }
 ```
+
+たとえば、次のようにいくつかの文を実行してみます。
 
 ```console
 minidb> BEGIN;

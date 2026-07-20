@@ -121,7 +121,7 @@ fn parse_column_def(&mut self) -> DbResult<ColumnDef> {
 どちらの順序で書くかは利用者の好みの問題であり、構文としてどちらか一方に決め打つ理由がありません。
 
 `src/types.rs`の`Column`(第4章)にも同じ2つのフラグを追加します。
-既存の呼び出し箇所(`Column::new(name, data_type, nullable)`という3引数の呼び出しが、このクレートだけで30箇所以上あります)を1つも壊さないよう、`new`のシグネチャ自体は変えず、追加のフラグはビルダーメソッドで立てる形にしました。
+既存の呼び出し箇所(`Column::new(name, data_type, nullable)`という3引数の呼び出しが、このクレートだけで30箇所以上あります)を1つも壊さないよう、`src/types.rs`では`new`のシグネチャ自体は変えず、追加のフラグはビルダーメソッドで立てる形にしました。
 
 ```rust
 pub struct Column {
@@ -271,6 +271,8 @@ for &n in &[1_000, 2_000, 4_000, 8_000, 16_000] {
 }
 ```
 
+手元で実行すると、次の結果が得られました。
+
 ```text
 n=  1000 elapsed=29.25µs
 n=  2000 elapsed=49.2µs
@@ -317,6 +319,7 @@ pub fn insert(
 `UPDATE`は`INSERT`より少し込み入っています。
 `UPDATE`が変更するのは、テーブルにすでにある行の一部です。
 一意性の比較相手を「既存の全行」にそのまま広げると、これから書き換えようとしている行が、書き換わる前の自分自身の値と比較されて、常に衝突してしまいます。
+`src/executor.rs`の`update`は、この衝突を避けるため次のように書き換えます。
 
 ```rust
 let planned_indices: HashSet<usize> = planned.iter().map(|(index, _)| *index).collect();
@@ -335,7 +338,7 @@ constraints::check_uniqueness(schema, others, &candidates)?;
 一方で、`candidates`同士の比較(`check_uniqueness`の2つ目のループ)は、`UPDATE users SET email = 'a@example.com' WHERE id <= 2`のように、複数行を同じ値へ書き換えようとした場合の衝突をそのまま検出します。
 
 `Storage`版(`storage_insert`と`storage_update`)も同じ順序を踏みます。
-`storage_update`は、`Storage::scan`で読んだ各行を、`WHERE`に一致するかどうかでその場で`planned`(書き換える行)と`others`(書き換えない行)へ振り分けます。
+同じ`src/executor.rs`の`storage_update`は、`Storage::scan`で読んだ各行を、`WHERE`に一致するかどうかでその場で`planned`(書き換える行)と`others`(書き換えない行)へ振り分けます。
 
 ```rust
 let mut planned: Vec<(RecordId, Tuple)> = Vec::new();
@@ -394,7 +397,7 @@ out.push(u8::from(column.primary_key));
 out.push(u8::from(column.unique));
 ```
 
-`decode_catalog`側もこの2バイトを読み、`Column`のビルダーメソッドへ渡します。
+同じ`src/storage.rs`の`decode_catalog`側もこの2バイトを読み、`Column`のビルダーメソッドへ渡します。
 
 ```rust
 let nullable = take_bool(&mut cursor, "nullable")?;
@@ -467,6 +470,7 @@ fn update_statement_rollback_leaves_earlier_rows_untouched_on_later_violation() 
 SQLiteとの比較では、両者のエラーメッセージの文言までは一致させません。
 minidbは`PRIMARY KEY制約違反です: 列'id'の値1が重複しています`、SQLiteは`UNIQUE constraint failed: users.id`のように、エラーメッセージの語彙や形式はもともと独立に決められたもので、文字列としての一致を求める意味がありません。
 比較するのは「制約違反の文がエラーとして拒否されること」という意味論の一致だけです。
+`tests/differential.rs`には、次の`assert_both_error`を用意しました。
 
 ```rust
 fn assert_both_error(setup: &[&str], failing_statement: &str) {
@@ -497,7 +501,7 @@ test result: ok. 378 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 ## 壊して確認する
 
-`constraints::check_uniqueness`から、`candidates`同士を比較する2つ目のループだけを外すと何が起きるか、実際に試します。
+`constraints::check_uniqueness`から、`candidates`同士を比較する2つ目のループだけを外すと何が起きるか、次のように試しに崩してみます。
 
 ```rust
 // for i in 0..candidates.len() { ... } のブロックを丸ごとコメントアウト

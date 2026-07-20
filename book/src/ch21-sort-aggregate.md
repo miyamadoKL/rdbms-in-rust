@@ -139,7 +139,7 @@ let predicate = match &select.where_clause {
 
 `SELECT`と`HAVING`に現れる集約関数は、いつ集計されるのでしょうか。
 `SELECT dept, COUNT(*) FROM orders GROUP BY dept`は、`GROUP BY`が確定させたグループごとに`COUNT(*)`を1回だけ計算し、その結果を`dept`と並べて返します。
-`Binder`はこの計算を1箇所(後の節で見る`Aggregate`演算子)に集約するため、`SELECT`、`HAVING`に現れる集約関数呼び出しを、最初に現れた順に重複無く1つのリストへ集めます。
+`Binder`はこの計算を1箇所(後の節で見る`Aggregate`演算子)に集約するため、`SELECT`、`HAVING`に現れる集約関数呼び出しを、最初に現れた順に重複無く1つのリストへ集める`build_aggregate`を`src/binder.rs`に用意します。
 
 ```rust
 fn build_aggregate(
@@ -166,7 +166,7 @@ fn build_aggregate(
 
 この検査を、`Binder::rewrite_for_aggregate`が担います。
 この関数は、射影、`HAVING`の式木を先頭から辿り、式全体が`GROUP BY`のいずれかの式と一致すれば、その式をまるごと`Aggregate`演算子の出力列への参照へ書き換えます。
-一致しなければ子の式へ再帰し、途中で生の列参照(`BoundExpr::ColumnRef`)に出会った時点でエラーにします。
+一致しなければ子の式へ再帰し、途中で生の列参照(`BoundExpr::ColumnRef`)に出会った時点でエラーにするこの関数を、`src/binder.rs`に次のように定義します。
 
 ```rust
 fn rewrite_for_aggregate(
@@ -202,7 +202,7 @@ fn rewrite_for_aggregate(
 
 書き換えた後の式は、`table_ordinal = 0`の`ColumnRef`になります。
 これは架空のテーブルではなく、`Aggregate`演算子が実際に生成する行の列を指します。
-`GROUP BY`の各式(先頭の列)に、集約関数呼び出し(残りの列)を続けた`Schema`を、`Binder`があらかじめ組み立てておくためです。
+`GROUP BY`の各式(先頭の列)に、集約関数呼び出し(残りの列)を続けた`Schema`を、`Binder`が`src/binder.rs`の`BoundAggregate`としてあらかじめ組み立てておくためです。
 
 ```rust
 pub struct BoundAggregate {
@@ -225,7 +225,7 @@ pub struct BoundAggregate {
 2. 見つからなければ、`FROM`(集約が絡む`SELECT`では`GROUP BY`の列と集約関数)のスコープで新しく束縛し、その結果を射影の末尾に**隠し列**として追加する。
 
 「構造が完全に一致するか」の判定には、集約関数の呼び出しの重複排除(前節)と同じ`logical_plan::fmt_bound_expr`を使います。
-`SELECT dept ... ORDER BY dept`のように、`ORDER BY`が`SELECT`の対象式と同じ列を指す場合、新しい列を増やさずに済みます(「射影に同名の出力列があればそれが優先される」という、標準SQLの名前解決の優先順位そのものです)。
+`SELECT dept ... ORDER BY dept`のように、`ORDER BY`が`SELECT`の対象式と同じ列を指す場合、`src/binder.rs`の`resolve_order_by_in_plain_scope`は新しい列を増やさずに済ませます(「射影に同名の出力列があればそれが優先される」という、標準SQLの名前解決の優先順位そのものです)。
 
 ```rust
 fn resolve_order_by_in_plain_scope(
@@ -245,7 +245,7 @@ fn resolve_order_by_in_plain_scope(
 }
 ```
 
-集約が絡む`SELECT`も同じ考え方で解決しますが、`tables`ではなく`aggregate`(`HAVING`と同じスコープ、集約関数呼び出しを含んでよい)を経由し、前節の`rewrite_for_aggregate`にそのまま通します。
+集約が絡む`SELECT`も、`src/binder.rs`の`resolve_order_by_in_aggregate_scope`が同じ考え方で解決しますが、`tables`ではなく`aggregate`(`HAVING`と同じスコープ、集約関数呼び出しを含んでよい)を経由し、前節の`rewrite_for_aggregate`にそのまま通します。
 
 ```rust
 fn resolve_order_by_in_aggregate_scope(
@@ -499,7 +499,7 @@ fn update(&mut self, func: AggregateFunc, value: Option<&Value>) -> DbResult<()>
 `None`(`COUNT(*)`)なら`is_none_or`は無条件で`true`を返し、`Some(v)`(`COUNT(expr)`)なら`v`が`NULL`でないときだけ`true`を返します。
 
 `SUM`、`MIN`、`MAX`は、`NULL`の行を単純に読み飛ばします。
-`self.sum`、`self.extreme`が`None`のままなら、そのグループには非`NULL`の値が1件も無かったということであり、最終結果は`NULL`になります。
+`self.sum`、`self.extreme`が`None`のままなら、そのグループには非`NULL`の値が1件も無かったということであり、`src/physical_plan.rs`の`finish`はその最終結果を`NULL`として返します。
 
 ```rust
 fn finish(&self, func: AggregateFunc) -> Value {
@@ -522,7 +522,7 @@ fn finish(&self, func: AggregateFunc) -> Value {
 標準SQLはこの非対称性をそのまま採用しており、この章もそれに従います。
 
 `GROUP BY`が無い集約(`SELECT COUNT(*) FROM orders`)は、対象行が0件でもちょうど1行を返します。
-`groups`が空で、かつ`group_by`も空だった場合に、初期状態のままの`AggState`を持つグループを1つだけ合成しているのはこのためです。
+`groups`が空で、かつ`group_by`も空だった場合に、`src/physical_plan.rs`が初期状態のままの`AggState`を持つグループを1つだけ次のように合成しているのはこのためです。
 
 ```rust
 if groups.is_empty() && group_by.is_empty() {
@@ -537,7 +537,7 @@ if groups.is_empty() && group_by.is_empty() {
 ### `SortExec`: In-memory SortとNULLの順序
 
 `SortExec`も`HashAggregateExec`と同じ理由でblocking演算子です。
-子を`None`まで読み切って`Vec<Tuple>`へ溜め、ソートキーを1回ずつ評価してから、`Vec::sort_by`で並べ替えます。
+`src/physical_plan.rs`の`SortExec`は、子を`None`まで読み切って`Vec<Tuple>`へ溜め、ソートキーを1回ずつ評価してから、`Vec::sort_by`で次のように並べ替えます。
 
 ```rust
 let mut keyed: Vec<(Vec<Value>, Tuple)> = Vec::new();
@@ -624,7 +624,7 @@ fn next(&mut self) -> DbResult<Option<Tuple>> {
 
 ### `LimitExec`: 子を打ち切るstreaming演算子
 
-`LimitExec`は、この章で唯一の純粋なstreaming演算子です。
+`src/physical_plan.rs`の`LimitExec`(この章で唯一の純粋なstreaming演算子)の`next()`は、次のようになります。
 
 ```rust
 fn next(&mut self) -> DbResult<Option<Tuple>> {
@@ -655,7 +655,7 @@ fn next(&mut self) -> DbResult<Option<Tuple>> {
 ## テストで確認する
 
 各演算子の単体テストは`src/physical_plan.rs`の`#[cfg(test)]`モジュールに置き、`orders`(`dept TEXT`、`amount BIGINT`、どちらも`NULL`を許す)という専用のテーブル定義を使っています。
-第19章までの`users`テーブルは`id`が`NOT NULL`のため、`SUM`、`MIN`、`MAX`の`NULL`規則を確かめるテストが書けません。
+第19章までの`users`テーブルは`id`が`NOT NULL`のため、`SUM`、`MIN`、`MAX`の`NULL`規則を確かめるテストが書けず、`src/physical_plan.rs`に次のテストを追加しています。
 
 ```rust
 #[test]
@@ -672,7 +672,7 @@ fn sum_of_empty_group_is_null_but_count_is_zero() {
 `Sort`の安定性、`NULL`の順序、`Distinct`が子を最小限しか引かないこと、`Limit`が要求件数を返した後は子を1回も引かないことは、それぞれ`CountingExecutor`(第19章で導入した、`next()`の呼び出し回数を数えるテスト専用の葉演算子)を使って確認しています。
 
 `src/binder.rs`の`#[cfg(test)]`モジュールに置く`Binder`のテストは、`WHERE`、`GROUP BY`の中の集約関数、入れ子の集約関数、`GROUP BY`に無い列の射影、`DISTINCT`と隠し列の組み合わせといった、この章で新しく導入した検査それぞれについて、期待どおり`DbError::Bind`になることを確認します。
-`ORDER BY`が隠し列を追加する側のテストは、逆にエラーにならないことと、`hidden_column_count`が期待どおりの値になることを確認します。
+`ORDER BY`が隠し列を追加する側のテストは、逆にエラーにならないことと、`hidden_column_count`が期待どおりの値になることを、`src/binder.rs`に次のように確認します。
 
 ```rust
 #[test]
@@ -687,7 +687,7 @@ fn order_by_referencing_a_column_outside_the_select_list_adds_a_hidden_column() 
 `tests/differential.rs`の`differential`テストは、`ORDER BY`の追加にあわせて比較のしかたを見直しました。
 第20章まで、`SELECT`の行の順序はSQLの意味論上未規定であるという理由から、`differential`テストは常に両エンジンの結果をソートしてから比較していました。
 `ORDER BY`が構文解析器を通るようになった今、`ORDER BY`を伴う`SELECT`については、並べ替え自体が検証したい意味論の一部です。
-`assert_same_result_ordered`という、ソートせずに順序ごと突き合わせる比較を新設し、`ORDER BY`を持たないテストは引き続き`assert_same_result`(ソートしてから比較)を使う形で使い分けています。
+`assert_same_result_ordered`という、ソートせずに順序ごと突き合わせる比較を新設し、`ORDER BY`を持たないテストは引き続き`assert_same_result`(ソートしてから比較)を使う形で使い分け、`tests/differential.rs`に次のようなテストを追加しています。
 
 ```rust
 #[test]

@@ -2,7 +2,7 @@
 
 前章で`Lexer`が生まれ、`toy_sql`は文字列を直接分割する代わりにToken列を読むようになりました。
 それでも`toy_sql`の中身は、前章の前から変わっていない部分が1つ残っています。
-`parse_expr`が、Token列を`Plus`というトークンの前後で分割し、分割できた個数がいくつかで場合分けするという構造です。
+`src/toy_sql.rs`の`parse_expr`が、Token列を`Plus`というトークンの前後で分割し、分割できた個数がいくつかで場合分けするという構造です。
 
 ```rust
 fn parse_expr(tokens: &[&Token]) -> DbResult<ToyExpr> {
@@ -110,7 +110,7 @@ pub enum Expr {
 
 `Expr::ColumnRef`は`id`のような識別子が式として出てきたことだけを表し、名前を文字列として持つだけです。
 この`id`が本当にどれかのテーブルの列なのか、それとも存在しない名前なのかは、ASTの時点では判定しません。
-`CreateTableStatement`の列定義も同様で、`BIGINT`という型名は`Ident`として、つまりただの文字列として保持します。
+`CreateTableStatement`の列定義も同様で、`BIGINT`という型名を`Ident`として、つまりただの文字列として保持する`ColumnDef`を、同じ`src/ast.rs`に次のように定義します。
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
@@ -179,7 +179,7 @@ struct Parser<'a> {
 }
 ```
 
-現在のトークンを覗く`peek`、1個読み進める`advance`、期待するキーワードや記号でなければエラーを返す`expect_keyword`、`expect_punct`、`expect_ident`という基本操作を用意し、`parse_statement`はこれらを組み合わせて先頭のキーワードで分岐します。
+現在のトークンを覗く`peek`、1個読み進める`advance`、期待するキーワードや記号でなければエラーを返す`expect_keyword`、`expect_punct`、`expect_ident`という基本操作を用意し、これらを組み合わせて先頭のキーワードで分岐する`parse_statement`を、同じ`src/parser.rs`に次のように定義します。
 
 ```rust
 fn parse_statement(&mut self) -> DbResult<Statement> {
@@ -198,7 +198,7 @@ fn parse_statement(&mut self) -> DbResult<Statement> {
 }
 ```
 
-`SELECT`の解析は、式リストをカンマ区切りで読んだあと、`FROM`と`WHERE`をそれぞれ省略可能な節として読みます。
+`SELECT`の解析は、式リストをカンマ区切りで読んだあと、`FROM`と`WHERE`をそれぞれ省略可能な節として読む`parse_select_statement`で行い、同じ`src/parser.rs`に次のように実装します。
 
 ```rust
     fn parse_select_statement(&mut self) -> DbResult<SelectStatement> {
@@ -237,7 +237,7 @@ fn parse_statement(&mut self) -> DbResult<Statement> {
 それでも構文として受理しておけば、この章のASTとParserは第9〜10章でそのまま使い回せます。
 受理はするが実行はしない、という境界線をどこに引いたかは、後で`Database::execute`のところで扱います。
 
-`CREATE TABLE`と`INSERT INTO`も同じ形の手続きです。
+`CREATE TABLE`と`INSERT INTO`も同じ形の手続きで、同じ`src/parser.rs`に次のように実装します。
 
 ```rust
 fn parse_create_table_statement(&mut self) -> DbResult<CreateTableStatement> {
@@ -270,7 +270,7 @@ fn parse_create_table_statement(&mut self) -> DbResult<CreateTableStatement> {
 ## Pratt Parserで式を読む
 
 式の解析は、`parse_expr(min_bp)`という1個の関数が中心になります。
-`min_bp`は「この呼び出しが消費してよい演算子の下限」を表す数値で、最初の呼び出しは`0`から始まります。
+`min_bp`は「この呼び出しが消費してよい演算子の下限」を表す数値で、最初の呼び出しは`0`から始まり、同じ`src/parser.rs`に次の`parse_expr`を定義します。
 
 ```rust
 fn parse_expr(&mut self, min_bp: u8) -> DbResult<Expr> {
@@ -304,7 +304,7 @@ fn parse_expr(&mut self, min_bp: u8) -> DbResult<Expr> {
 `lbp`が`min_bp`を下回ったら、その演算子は今の呼び出しの管轄外なので、消費せずにループを抜けて呼び出し元に返します。
 2項演算子を実際に読み込むとき、右辺の解析には`rhs`(右結合力)を新しい`min_bp`として渡します。
 
-演算子ごとの`(lbp, rbp)`は、次の対応表から機械的に求めます。
+演算子ごとの`(lbp, rbp)`は、同じ`src/parser.rs`に置く次の対応表から機械的に求めます。
 
 ```rust
 fn infix_binding_power(kind: &TokenKind) -> Option<(BinaryOperator, u8, u8)> {
@@ -335,7 +335,7 @@ fn infix_binding_power(kind: &TokenKind) -> Option<(BinaryOperator, u8, u8)> {
 この`min_bp=9`の呼び出しは`2`を読んだ後、`*`(`lbp=10 >= 9`)も消費するので、右辺は`2 * 3`というまとまりとして先に確定し、最後に`1 + (2 * 3)`が組み上がります。
 `*`の`lbp`が`+`の`rbp`より大きいという、この表の数値の並びだけから、`2 * 3`が先にまとまるという構造が導かれています。
 
-前置演算子(単項`-`と`NOT`)は`parse_prefix`が扱います。
+前置演算子(単項`-`と`NOT`)は、同じ`src/parser.rs`に置く`parse_prefix`が扱います。
 
 ```rust
 fn parse_prefix(&mut self) -> DbResult<Expr> {
@@ -378,7 +378,7 @@ fn parse_prefix(&mut self) -> DbResult<Expr> {
 仮に`NOT_RBP`を比較の`lbp`より大きい値にしていたら、`NOT`は`1`だけを取り込んで`(NOT 1) = 2`になり、`NOT AND比較`の間にある優先順位の関係が逆転してしまいます。
 `OR < AND < NOT < 比較`という並びを保つ`NOT_RBP=5`は、`AND`の`lbp`(`3`)より大きく比較の`lbp`(`6`)より小さい、その間の値です。
 
-`IS [NOT] NULL`は左に式を1個取るだけで右辺を持たないので、2項演算子のための`infix_binding_power`とは別に、`parse_expr`のループの中で直接処理します。
+`IS [NOT] NULL`は左に式を1個取るだけで右辺を持たないので、2項演算子のための`infix_binding_power`とは別に、同じ`src/parser.rs`の`parse_expr`のループの中で直接処理します。
 
 ```rust
 if let TokenKind::Keyword(Keyword::Is) = self.peek_kind() {
@@ -407,7 +407,7 @@ if let TokenKind::Keyword(Keyword::Is) = self.peek_kind() {
 `IS_NULL_BP`を比較演算子と同じ`6`にしているので、`1 + 2 IS NULL`は`(1 + 2) IS NULL`と解釈されます(加減の`lbp=8`が先に消費され、`+`の右辺が確定してから`IS`に出会うため)。
 
 残る`parse_primary`は、整数や文字列、真偽値、`NULL`のリテラル、識別子(列参照か関数呼び出し)、`(`から始まる括弧の3系統を読みます。
-識別子を読んだ直後に`(`が続いていれば関数呼び出しとして引数リストを読み、続いていなければ列参照として扱います。
+識別子を読んだ直後に`(`が続いていれば関数呼び出しとして引数リストを読み、続いていなければ列参照として扱う処理を、同じ`src/parser.rs`の`parse_primary`に次のように実装します。
 
 ```rust
 TokenKind::Ident(name) => {
@@ -458,7 +458,7 @@ fn error_at(&self, span: Span, message: impl Into<String>) -> DbError {
 }
 ```
 
-期待していたトークンと違うものに出会ったときのエラーは、`unexpected`が組み立てます。
+期待していたトークンと違うものに出会ったときのエラーは、同じ`src/parser.rs`に置く`unexpected`が組み立てます。
 
 ```rust
 fn unexpected(&self, expected: &str) -> DbError {
@@ -504,7 +504,7 @@ pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
 存在しない機能を黙って何もしないまま`Ok`を返すのではなく、`DbError::NotImplemented`という、それとわかる形で呼び出し元に伝えます。
 
 `SELECT`にも同じ考え方が及びます。
-`FROM`や`WHERE`を構文として受理できるようにしたのは前述のとおりですが、それらを実行するにはテーブルの中身を読む手段が要ります。
+`FROM`や`WHERE`を構文として受理できるようにしたのは前述のとおりですが、それらを実行するにはテーブルの中身を読む手段が要るため、同じ`src/database.rs`に置く`execute_select`は次のように両者を区別します。
 
 ```rust
 fn execute_select(&self, sql: &str, select: &SelectStatement) -> DbResult<QueryResult> {
@@ -521,7 +521,7 @@ fn execute_select(&self, sql: &str, select: &SelectStatement) -> DbResult<QueryR
 `FROM`が無い`SELECT`だけが、この章で最後まで実行できる構文です。
 各対象式を評価して`Value`にし、そのソーステキストを列名として`Schema`と`Tuple`を組み立てる処理は、前章までの`toy_sql`が担っていた役割をそのまま引き継いでいます。
 
-式の評価(`eval_expr`)も、この章で対応するのはリテラルと整数の加算だけに絞っています。
+式の評価(`eval_expr`)も、この章で対応するのはリテラルと整数の加算だけに絞り、同じ`src/database.rs`に次のように実装します。
 
 ```rust
 fn eval_expr(expr: &Expr) -> DbResult<Value> {
@@ -582,7 +582,7 @@ fn multiplication_binds_tighter_than_addition() {
 }
 ```
 
-構文エラーの位置も、`SELECT 1 +`のように途中で入力が尽きる例で確認しています。
+構文エラーの位置も、`SELECT 1 +`のように途中で入力が尽きる例で、同じ`src/parser.rs`の`mod tests`で確認しています。
 
 ```rust
 #[test]

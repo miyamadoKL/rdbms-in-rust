@@ -111,6 +111,7 @@ pub struct FileHeader {
 `page_size`と`page_count`だけを構造体のフィールドに残し、Magic NumberとFormat Versionは定数として持たせています。
 `FileHeader`が保持しているのは「このファイル固有の値」だけであり、Magic Numberは全ての`minidb`ファイルに共通の固定値、Format Versionはこの章の`minidb`のバージョンが対応している唯一の値だからです。
 これらはバイト列に変換するときに書き込みますが、`FileHeader`自身のフィールドとして持ち回る必要はありません。
+同じ`src/page.rs`に、次の定数として定義します。
 
 ```rust
 pub const MAGIC: [u8; 4] = *b"MDB1";
@@ -123,6 +124,7 @@ Format Versionは、この章で決めるファイル形式そのものに付け
 将来ページの詰め方やヘッダーのレイアウトを変更したときにこの値を上げれば、古い形式のファイルを新しいコードで誤って読み、意味の取り違えたバイト列をそのまま構造体として解釈してしまう事故を防げます。
 
 `encode`は、この`FileHeader`を24バイトの固定長バイト列に変換します。
+同じ`src/page.rs`の`impl FileHeader`に、次のように定義します。
 
 ```rust
 pub fn encode(&self) -> [u8; FILE_HEADER_SIZE] {
@@ -150,6 +152,7 @@ pub fn encode(&self) -> [u8; FILE_HEADER_SIZE] {
 
 もう1つ、ページそれぞれの先頭にも固定長のヘッダーを置きます。
 こちらは**Page Header**と呼び、File Headerとは別の情報を持ちます。
+`src/page.rs`に、次の`Page`を定義します。
 
 ```rust
 pub struct Page {
@@ -162,6 +165,7 @@ pub struct Page {
 `Page`は、`PAGE_SIZE`バイトのページを、Rust側では「先頭16バイトのPage Header相当の情報」と「残りの`payload`」に分けて保持する構造体です。
 `page_id`は、このページがファイル中の何番目のページかを表す識別子で、第3章から骨格として存在していた`PageId`をここで初めて使います。
 `page_type`は、このページが何を表すページかを区別するための値です。
+同じ`src/page.rs`に、次の`PageType`を定義します。
 
 ```rust
 pub enum PageType {
@@ -178,6 +182,7 @@ B+Treeの内部ページと葉ページ(第23章)のように、後の章で新�
 このバイト列を「スロットの並び」として解釈するSlotted Pageの構造(第12章)は、まだこの章には登場しません。
 
 `Page::encode`は、`Page`を`PAGE_SIZE`バイトのバイト列に変換します。
+同じ`src/page.rs`の`impl Page`に、次のように定義します。
 
 ```rust
 pub fn encode(&self) -> [u8; PAGE_SIZE] {
@@ -233,6 +238,7 @@ fn crc32(bytes: &[u8]) -> u32 {
 `serde`や`bincode`を避けた理由(依存を増やさず、バイト単位の対応を自分のコードで説明できる状態を保つ)は、ここでも同じ形で当てはまります。
 
 `Page::decode`は、`encode`と逆の手順でバイト列から`Page`を復元しながら、この`checksum`を検証します。
+同じ`src/page.rs`の`impl Page`に、次のように定義します。
 
 ```rust
 pub fn decode(bytes: &[u8]) -> DbResult<Self> {
@@ -356,7 +362,7 @@ fn page_round_trip() {
 }
 ```
 
-`crc32`自体にも、既知の入力に対する既知の出力を確認するテストを1つ加えています。
+`crc32`自体にも、既知の入力に対する既知の出力を確認するテストを、同じ`src/page.rs`の`mod tests`に1つ加えています。
 
 ```rust
 #[test]
@@ -377,7 +383,7 @@ fn crc32_matches_known_vector() {
 ラウンドトリップのテストは、`encode`と`decode`が互いに正しく対応していることは確認できますが、`decode`が本当に壊れたバイト列を拒否できているかまでは確認できません。
 `encode`と`decode`のどちらもが同じ間違った前提を共有していれば、ラウンドトリップは黙って通ってしまいます。
 
-そこで、正しく`encode`したバイト列を1バイトだけ意図的に書き換えてから`decode`に渡すテストを、Magic Number、Format Version、checksum、Page Typeのそれぞれについて用意しています。
+そこで、正しく`encode`したバイト列を1バイトだけ意図的に書き換えてから`decode`に渡すテストを、Magic Number、Format Version、checksum、Page Typeのそれぞれについて、同じ`src/page.rs`の`mod tests`に用意しています。
 
 ```rust
 #[test]
@@ -396,7 +402,7 @@ fn page_decode_rejects_corrupted_header() {
 仮に`checksum`が`payload`にしか対応していなければ、`page_id`を書き換えてもこのテストは失敗を検出できず、赤くなるはずのテストが緑のまま通ってしまいます。
 実際に`bytes[0] ^= 0xFF`のあと`Page::decode`を実行すると、`stored_checksum`と`actual_checksum`が一致せず、期待どおり`DbError::CorruptPage`が返ります。
 
-`payload`側の破損も、同じ形のテストで確認できます。
+`payload`側の破損も、同じ`src/page.rs`の`mod tests`に、同じ形のテストを加えて確認できます。
 
 ```rust
 #[test]

@@ -75,7 +75,7 @@ pub struct TableInfo {
 `CREATE TABLE users (...)`の直後に`CREATE TABLE Users (...)`を実行したとき、これを「同じテーブルの重複作成」として拒否するのか、「別々の2つのテーブル」として両方受け入れるのか、`Catalog`は決めなければなりません。
 
 この章では、**畳み込まない**、つまり大文字小文字を区別する方針を採ります。
-`users`と`Users`は別のテーブルとして両方登録できます。
+`users`と`Users`は別のテーブルとして両方登録でき、`src/catalog.rs`の`create_table`は次の形になります。
 
 ```rust
 pub fn create_table(&mut self, name: &str, schema: Schema) -> DbResult<TableId> {
@@ -120,7 +120,7 @@ PostgreSQLは引用符なしの識別子を小文字へ畳み込みますが、�
 
 ## `Catalog`の実装
 
-`Catalog`はテーブル名から`TableInfo`を引ける対応表と、次に払い出す`TableId`を持ちます。
+`Catalog`は`src/catalog.rs`にこのように定義し、テーブル名から`TableInfo`を引ける対応表と、次に払い出す`TableId`を持ちます。
 
 ```rust
 pub struct Catalog {
@@ -129,7 +129,7 @@ pub struct Catalog {
 }
 ```
 
-`create_table`は、前節の重複検査を行ったあと、`TableId`を1つ払い出して`tables`に登録します。
+`create_table`は`src/catalog.rs`に、前節の重複検査を行ったあと`TableId`を1つ払い出して`tables`に登録する形で書きます。
 
 ```rust
 pub fn create_table(&mut self, name: &str, schema: Schema) -> DbResult<TableId> {
@@ -156,7 +156,7 @@ pub fn create_table(&mut self, name: &str, schema: Schema) -> DbResult<TableId> 
 番号を再利用しない理由は、将来同じ`TableId(0)`が「最初に作った`users`」と「作り直した後の`users`」のどちらを指すか曖昧になる事態を避けるためです。
 ディスク上のページやログにテーブルを`TableId`で記録するようになる章(第13章以降)では、この曖昧さがそのままデータの取り違えにつながります。
 
-`drop_table`は`HashMap::remove`の戻り値(`Option<TableInfo>`)を、前節で決めた`DbError::TableNotFound`に変換するだけです。
+`drop_table`は`src/catalog.rs`に置き、`HashMap::remove`の戻り値(`Option<TableInfo>`)を、前節で決めた`DbError::TableNotFound`に変換するだけです。
 
 ```rust
 pub fn drop_table(&mut self, name: &str) -> DbResult<TableId> {
@@ -168,7 +168,7 @@ pub fn drop_table(&mut self, name: &str) -> DbResult<TableId> {
 ```
 
 `table`はテーブル名から`TableInfo`を引く読み取り専用の操作で、見つからなければ`None`を返します。
-`create_table`や`drop_table`とは違い、「無い」ことがエラーとは限らない場面(たとえば「このテーブルが存在するかどうかを調べたいだけ」)のために、`DbResult`ではなく`Option`を返す形にしています。
+`create_table`や`drop_table`とは違い、「無い」ことがエラーとは限らない場面(たとえば「このテーブルが存在するかどうかを調べたいだけ」)のために、`DbResult`ではなく`Option`を返す形で`src/catalog.rs`に定義します。
 
 ```rust
 pub fn table(&self, name: &str) -> Option<&TableInfo> {
@@ -188,7 +188,7 @@ pub struct Database {
 ```
 
 `execute_create_table`は、`CreateTableStatement`の`columns`(`Vec<ColumnDef>`)を`Vec<Column>`に変換してから`Catalog::create_table`を呼びます。
-列定義を1件ずつ処理するこの`for`ループでは、型名の解決と合わせて列名の重複も検査します。
+列定義を1件ずつ処理するこの`for`ループでは、型名の解決と合わせて列名の重複も検査する`execute_create_table`を、`src/database.rs`に次のように定義します。
 
 ```rust
 fn execute_create_table(&mut self, create: &CreateTableStatement) -> DbResult<QueryResult> {
@@ -308,7 +308,7 @@ fn execute_drop_table(&mut self, drop: &DropTableStatement) -> DbResult<QueryRes
 
 `CREATE TABLE`と`DROP TABLE`は、`SELECT`と違って返す行を持ちません。
 これまでの`QueryResult`は`Schema`と`Vec<Tuple>`だけを持つ構造体で、「列が0個で行も0件のSELECT結果」と「DDL文が完了したこと」を区別する手段がありませんでした。
-この章では`command_tag: Option<&'static str>`というフィールドを追加し、DDL文の完了を表す専用の構築関数を用意します。
+この章では`src/database.rs`の`QueryResult`に`command_tag: Option<&'static str>`というフィールドを追加し、DDL文の完了を表す専用の構築関数を用意します。
 
 ```rust
 pub struct QueryResult {
@@ -328,7 +328,7 @@ impl QueryResult {
 }
 ```
 
-`Display`実装は`command_tag`が`Some`ならそれだけを表示し、`SELECT`の表形式には進みません。
+`src/database.rs`の`Display`実装は`command_tag`が`Some`ならそれだけを表示し、`SELECT`の表形式には進みません。
 
 ```rust
 impl std::fmt::Display for QueryResult {

@@ -156,7 +156,7 @@ PostgreSQLの既定は`READ COMMITTED`です。
 明示的に`ISOLATION LEVEL`と書いた場合にだけ、その分離レベルの規律に従わせることで、この章より前の章の挙動を1つも壊さずに済みました。
 実際、第30章と第31章が積み上げてきた`tests/interleave.rs`と`tests/interleave_disk.rs`は、この章での変更を1行も加えずに全テスト緑のまま残ります。
 
-決定的インターリーブテストハーネスにも、同じ既定値を持つAPIを用意します。
+決定的インターリーブテストハーネスにも、`src/database.rs`に同じ既定値を持つAPIを用意します。
 
 ```rust
 pub fn begin_tx(&mut self) -> TxHandle {
@@ -177,7 +177,7 @@ pub fn begin_tx_with_isolation(&mut self, isolation_level: IsolationLevel) -> Tx
 ## 4つの分離レベルをロック規律として実装する
 
 分離レベルごとの違いは、`SELECT`が読み取りロックをどう扱うかに集約されます。
-まず、あるトランザクションが今どの分離レベルにいるかを調べる関数が要ります。
+まず、あるトランザクションが今どの分離レベルにいるかを、`src/database.rs`に定義する`isolation_level_of`で調べます。
 
 ```rust
 fn isolation_level_of(&self, owner: TransactionId) -> IsolationLevel {
@@ -197,7 +197,7 @@ fn isolation_level_of(&self, owner: TransactionId) -> IsolationLevel {
 どちらにも見つからない場合、`owner`はAutocommit用に`lock_owner`がその場で割り当てた一時IDです。
 `TransactionContext`自体が存在しないこの場合は`RepeatableRead`を返しますが、これは第31章までの挙動をそのまま保つための既定であり、実際にはAutocommitの1文は文の終わりに`execute_bound_statement`がロックを一括で手放すため、`RepeatableRead`か`ReadCommitted`かで結果に違いは出ません。
 
-この`isolation_level_of`を使って、`SELECT`が読み取りロックを取る`acquire_scan_locks`を書き換えます。
+この`isolation_level_of`を使って、`SELECT`が読み取りロックを取る`src/database.rs`の`acquire_scan_locks`を書き換えます。
 
 ```rust
 fn acquire_scan_locks(&mut self, owner: TransactionId, table_ids: &[TableId], mode: LockMode) -> DbResult<()> {
@@ -267,7 +267,7 @@ T2が実際に文を再試行して`acquire`を呼んだときは、すでに保
 `acquire_scan_locks`は、獲得ループを終えたあとで`take_pending_shared_grants`を呼ぶだけで、いつ、何回の呼び出しをまたいで昇格したかを気にせず、正しい鍵の集合を受け取れます。
 
 `pending_shared_grants`は`txn`ごとに積み上がる記録なので、`txn`自体が`COMMIT`、`ROLLBACK`、強制Abortで終わるときに片付けておかないと、二度と回収されないエントリが残り続けます。
-第31章の`release_all`の末尾に、この後始末を1行加えます。
+`src/lock_manager.rs`にある第31章の`release_all`の末尾に、この後始末を1行加えます。
 
 ```rust
 pub fn release_all(&mut self, txn: TransactionId) {
@@ -291,7 +291,7 @@ pub fn release_all(&mut self, txn: TransactionId) {
 }
 ```
 
-`release_keys`自体(渡された鍵だけを解放する部分)は前の版から変わっていません。
+`src/lock_manager.rs`の`release_keys`自体(渡された鍵だけを解放する部分)は前の版から変わっていません。
 
 ```rust
 pub(crate) fn release_keys(&mut self, txn: TransactionId, keys: &[K]) {
@@ -411,6 +411,7 @@ Lost Updateが防がれるのは`Repeatable Read`以上、つまりSharedロッ�
 `SELECT ... FOR UPDATE`のような、読み取りの時点から書き込み用のロックを明示的に要求する構文を持たないSQLサブセットでは、これがLost Updateを防ぐ唯一の手段になります。
 
 DiskバックエンドのPhantomは、`Repeatable Read`と`Serializable`の違いを直接確認できる唯一の場所です。
+`tests/isolation_levels.rs`に次のテストを追加します。
 
 ```rust
 #[test]
@@ -541,7 +542,7 @@ fn detect_deadlock(&mut self, owner: TransactionId) -> DbResult<Option<Transacti
 }
 ```
 
-`find_cycle_containing`は`owner`から辺をたどり、`owner`自身に戻ってくる経路を1つ見つけたら、その経路(循環を構成するノードの列)を返します。
+`src/database.rs`の`find_cycle_containing`は`owner`から辺をたどり、`owner`自身に戻ってくる経路を1つ見つけたら、その経路(循環を構成するノードの列)を返します。
 
 ```rust
 fn dfs(
@@ -580,7 +581,7 @@ fn dfs(
 
 循環が見つかったら、その中のどれか1本を切らなければ先へ進めません。
 切る対象(**Victim**)をどう選ぶかが**Victim Selection**です。
-この章は、循環の中で最も新しい(`TransactionId`が最大の)トランザクションを選びます。
+この章は、`src/database.rs`の`detect_deadlock`の中で、循環の中で最も新しい(`TransactionId`が最大の)トランザクションを選びます。
 
 ```rust
 let victim = cycle.into_iter().max_by_key(|t| t.0).expect("循環は少なくとも1つの要素を持つ");
@@ -590,7 +591,7 @@ let victim = cycle.into_iter().max_by_key(|t| t.0).expect("循環は少なくと
 後から始まったトランザクションほど、それまでに行った作業(書き込み、獲得したロック)が少ない可能性が高く、Abortしたときに捨てる作業量も小さく済みます。
 もちろんこれは正確な見積もりではありません(後から始まって大量の書き込みをすでに終えているトランザクションもありえます)が、実際に費やした作業量を計測する仕組みをこのクレートは持たないため、`TransactionId`という手元にある情報だけで決定的に選べる規則として、この単純な指標を選びました。
 
-Victimは`abort_transaction`で即座に強制Abortされます。
+Victimは`src/database.rs`の`abort_transaction`で即座に強制Abortされます。
 
 ```rust
 fn abort_transaction(&mut self, victim: TransactionId) -> DbResult<()> {
@@ -659,7 +660,7 @@ Victimになったトランザクションへ以後触れるたびに`DbError::D
 
 ### 要求元自身がVictimになる場合、ならない場合
 
-ロックの獲得を試みる箇所(`acquire_scan_locks`、`acquire_write_locks`、`Serializable`のINSERT)は、すべて次の1個の関数を経由します。
+ロックの獲得を試みる箇所(`acquire_scan_locks`、`acquire_write_locks`、`Serializable`のINSERT)は、すべて`src/database.rs`の次の1個の関数を経由します。
 
 ```rust
 fn acquire_lock_or_detect_deadlock(&mut self, owner: TransactionId, key: LockKey, mode: LockMode) -> DbResult<()> {
@@ -714,7 +715,7 @@ fn a_different_transaction_can_be_chosen_as_the_victim() {
 ```
 
 3本以上のトランザクションが環状に待ち合う場合も、同じ仕組みでそのまま検出できます。
-DFSは辺をたどって`owner`へ戻る経路を探すだけなので、循環の長さは2に限定されません。
+DFSは辺をたどって`owner`へ戻る経路を探すだけなので、循環の長さは2に限定されないことを、`tests/deadlock.rs`の次のテストで確認します。
 
 ```rust
 #[test]

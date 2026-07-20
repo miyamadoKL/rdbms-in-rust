@@ -152,7 +152,7 @@ fn persist_catalog(&self) -> DbResult<()> {
 テーブルごとに専用のカタログエントリページを持たせるといった、カタログ自体を複数ページにまたがらせる構成は、この章では扱いません。
 章末の演習で考えます。
 
-エンコードする際、テーブルは`TableId`の昇順で書き出します。
+`src/storage.rs`の`encode_catalog`は、テーブルを`TableId`の昇順で書き出します。
 
 ```rust
 let mut sorted: Vec<(&TableId, &TableEntry)> = tables.iter().collect();
@@ -166,6 +166,8 @@ sorted.sort_by_key(|(id, _)| id.0);
 デコード側(`decode_catalog`)は、第4章の`tuple_codec`と同じ手作業のカーソルで書きます。
 このカーソルには1つだけ、`tuple_codec`より注意が必要な点があります。
 `table_count`、`column_count`、`page_count`のような「これから何個読むか」を宣言する値は、バイト列が壊れていれば根拠のない数字になりえます。
+
+`src/storage.rs`の`decode_catalog`は、次のようにこの値を読み取ります。
 
 ```rust
 fn decode_catalog(bytes: &[u8]) -> DbResult<DecodedCatalog> {
@@ -182,6 +184,8 @@ fn decode_catalog(bytes: &[u8]) -> DbResult<DecodedCatalog> {
 もし`table_count`をそのまま`Vec::with_capacity(table_count)`のように使ってしまうと、壊れたバイト列に埋め込まれた巨大な数字1つで、実際のデータ量とは無関係に大きなメモリ確保が起きてしまいます。
 この章の`decode_catalog`は、宣言された個数を確保のヒントには使わず、`Vec::new()`から`push`で積み上げていく素朴な形にとどめています。
 各要素を読む前には必ず`take`が残りバイト数を検査するため、壊れたバイト列を渡されたときに実際に確保されるメモリ量は、そのバイト列自身の長さ(高々`PAGE_PAYLOAD_SIZE`)で頭打ちになります。
+
+この`take`は`src/storage.rs`に次のように定義します。
 
 ```rust
 fn take<'a>(bytes: &mut &'a [u8], n: usize, what: &str) -> DbResult<&'a [u8]> {
@@ -202,6 +206,8 @@ fn take<'a>(bytes: &mut &'a [u8], n: usize, what: &str) -> DbResult<&'a [u8]> {
 `DROP TABLE`されたテーブルが使っていたページは、ファイルからは消えません。
 `DiskManager`には、確保したページをファイルから手放す(ファイルを縮める)手段がそもそも無いからです。
 この章では、そのページを**Free Page List**という一覧に積んでおき、次にどれかのテーブルが新しいページを必要としたとき、ファイルを伸ばすより先にそこから1枚もらうという方法で再利用します。
+
+`src/storage.rs`の`drop_table`は、削除したテーブルのページをこのFree Page Listへ積みます。
 
 ```rust
 pub fn drop_table(&mut self, name: &str) -> DbResult<TableId> {
@@ -226,6 +232,8 @@ pub fn drop_table(&mut self, name: &str) -> DbResult<TableId> {
 `drop_table`の時点では、ページの中身自体は書き換えません。
 削除されたテーブルの古いタプルは、Free Page Listに積まれた後もそのページに残ったままです。
 中身を作り直すのは、そのページが実際に再利用されるときです。
+
+`src/storage.rs`の`try_insert_into_fresh_page`が、この作り直しを行います。
 
 ```rust
 fn try_insert_into_fresh_page(
@@ -290,6 +298,7 @@ pub fn find_candidate(&self, candidates: &[PageId], needed: usize) -> Option<Pag
 
 粒度と更新のタイミングも決めておく必要があります。
 この章のFree Space Mapは、`SlottedPage::free_space`が返すバイト数をそのまま保持します。
+この保持は`src/free_space_map.rs`の`update`が担います。
 
 ```rust
 pub fn update(&mut self, page_id: PageId, free_bytes: usize) {
@@ -350,7 +359,7 @@ pub struct Storage {
 }
 ```
 
-`create`と`open`は、第13章の`DiskManager::open`が担っていた「新規作成か、既存ファイルを開くか」という区別を、Storageのレイヤーでも繰り返します。
+`src/storage.rs`の`create`と`open`は、第13章の`DiskManager::open`が担っていた「新規作成か、既存ファイルを開くか」という区別を、Storageのレイヤーでも繰り返します。
 
 ```rust
 pub fn create<P: AsRef<Path>>(path: P) -> DbResult<Self> {
@@ -383,7 +392,7 @@ pub fn create<P: AsRef<Path>>(path: P) -> DbResult<Self> {
 
 `create`は、渡されたパスがまだFile Headerしか持たない(`page_count == 1`)ときだけ初期化を進めます。
 すでにCatalogページを持つファイルに対して`create`を呼んだら、それは既存のデータベースを壊して作り直そうとしている可能性が高いので、エラーで拒みます。
-既存のファイルを正しく読み込みたいときは`open`を使います。
+既存のファイルを正しく読み込みたいときは、`src/storage.rs`の`open`を使います。
 
 ```rust
 pub fn open<P: AsRef<Path>>(path: P) -> DbResult<Self> {
@@ -401,7 +410,7 @@ pub fn open<P: AsRef<Path>>(path: P) -> DbResult<Self> {
 `DiskManager::open`の内部で、File HeaderのMagic Number、Format Version、checksumはすでに検証されています(第13章)。
 `Storage::open`はその結果を`?`でそのまま受け取ったうえで、Catalogページの有無とその`page_type`という、この章で新しく増えた前提をさらに確認します。
 
-`create_table`、`drop_table`、`insert`、`get`、`update`、`delete`、`scan`という公開関数の形は、第9章の`Catalog`と第13章の`HeapFile`をそのまま足し合わせたような見た目をしています。
+`src/storage.rs`の`create_table`、`drop_table`、`insert`、`get`、`update`、`delete`、`scan`という公開関数の形は、第9章の`Catalog`と第13章の`HeapFile`をそのまま足し合わせたような見た目をしています。
 
 ```rust
 pub fn create_table(&mut self, name: &str, schema: Schema) -> DbResult<TableId> {
@@ -445,7 +454,7 @@ debugビルドではpanicし、releaseビルドでは`0`へ巻き戻って`Table
 `insert`、`get`、`update`、`delete`は`TableId`を受け取り、名前からの解決は呼び出し側(次章で`Database`が担う想定)に任せる作りにしてあります。
 これは`HeapFile`の`RecordId`が「ページとスロットの組」という下位のアドレスだけを扱っていたのと同じ立場で、`Storage`にとっての`TableId`も「どのテーブルか」を指すアドレスの1つにすぎません。
 
-`insert`だけは、この章の3つの部品を実際に使い分ける場所なので、少し詳しく見ておきます。
+`src/storage.rs`の`insert`だけは、この章の3つの部品を実際に使い分ける場所なので、少し詳しく見ておきます。
 
 ```rust
 pub fn insert(&mut self, table_id: TableId, bytes: &[u8]) -> DbResult<RecordId> {
@@ -508,6 +517,8 @@ pub fn insert(&mut self, table_id: TableId, bytes: &[u8]) -> DbResult<RecordId> 
 Free Page Listから取り出したページの場合は、それに加えて`insert`自身がそのページ番号を`free_pages`へ押し戻します。
 そうしないと、せっかく再利用できたはずのページが、`page_ids`にも`free_pages`にもどこにも属さないまま宙に浮いてしまいます。
 
+この押し戻しを含め、`src/storage.rs`の`attach_page_to_table`は次のように書きます。
+
 ```rust
 fn attach_page_to_table(&mut self, table_id: TableId, page_id: PageId) -> DbResult<()> {
     self.tables
@@ -568,6 +579,8 @@ fn corrupting_a_byte_in_the_catalog_page_is_detected_on_open() {
 2つ目は、もっと意地の悪い壊し方です。
 checksumはわざと正しく計算し直し、その代わり中身の`name_len`(テーブル名の長さ)を、実際にページへ残っているバイト数よりずっと大きい値に書き換えます。
 
+この実験は`src/storage.rs`の`a_structurally_valid_but_nonsensical_catalog_is_rejected_as_corrupt`というテストに書きます。
+
 ```rust
 let mut payload = vec![0u8; PAGE_PAYLOAD_SIZE];
 payload[0..8].copy_from_slice(&0u64.to_le_bytes()); // next_table_id
@@ -584,7 +597,7 @@ let bytes = page.encode(); // checksumは正しく計算される。
 
 こうして作ったページは、`Page::decode`のchecksum検証を涼しい顔で通過します。
 バイト列としては何も壊れていないからです。
-壊れているのはその中身の**意味**であり、これを捕まえるのは`decode_catalog`の境界検査(`take`)の役目になります。
+壊れているのはその中身の**意味**であり、これを捕まえるのは`src/storage.rs`の`decode_catalog`の境界検査(`take`)の役目になります。
 
 ```rust
 let err = expect_err(Storage::open(&path));
@@ -594,7 +607,7 @@ assert!(matches!(err, DbError::CorruptCatalog(_)));
 `name_len`として宣言された値ぶんのバイト数がもう残っていないので、`take`がその場で`DbError::CorruptCatalog`を返します。
 
 3つ目は、`decode_catalog`自身は正しく読み終えるのに、読み終えた**中身**が意味をなさない壊し方です。
-`free_pages`(Free Page List)に、Metaページ(`PageId(0)`)を紛れ込ませたカタログを直接書き込んでみます。
+`free_pages`(Free Page List)に、Metaページ(`PageId(0)`)を紛れ込ませたカタログを、`src/storage.rs`の`open_rejects_free_pages_that_reference_the_meta_page`というテストで直接書き込んでみます。
 
 ```rust
 let tables = single_table_entry(TableId(0), "a", Vec::new());

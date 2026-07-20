@@ -66,7 +66,7 @@ struct Inner {
 }
 ```
 
-`Inner`をまとめて保持する`DiskManager`自体は、次のような形をしています。
+`Inner`をまとめて保持する`DiskManager`自体は、同じ`src/disk_manager.rs`で次のような形をしています。
 
 ```rust
 pub struct DiskManager {
@@ -81,7 +81,7 @@ pub struct DiskManager {
 
 ## ファイルを開くときにFile Headerを検証する
 
-`DiskManager::open`は、指定したパスのファイルが存在しなければ新規作成し、存在すればその中身を検証してから開きます。
+同じ`src/disk_manager.rs`に定義する`DiskManager::open`は、指定したパスのファイルが存在しなければ新規作成し、存在すればその中身を検証してから開きます。
 
 ```rust
 pub fn open<P: AsRef<Path>>(path: P) -> DbResult<Self> {
@@ -105,7 +105,7 @@ pub fn open<P: AsRef<Path>>(path: P) -> DbResult<Self> {
 }
 ```
 
-ファイルサイズが0であれば、まだ何も書き込まれていない新規のファイルだと判断し、ページ0にMetaページを書き込みます。
+ファイルサイズが0であれば、まだ何も書き込まれていない新規のファイルだと判断し、同じ`src/disk_manager.rs`の次の関数でページ0にMetaページを書き込みます。
 
 ```rust
 fn init_new_file(file: &mut File) -> DbResult<u64> {
@@ -125,7 +125,7 @@ fn init_new_file(file: &mut File) -> DbResult<u64> {
 この時点ではまだデータページが1枚もないので、テーブルに行を1件も持たないファイルの`page_count`は1になります。
 
 ファイルサイズが0でなければ、そのファイルはすでに`minidb`が(あるいは別の何かが)書き込んだ既存のファイルです。
-中身を無条件に信用せず、ページ0を読んで`FileHeader`を検証してからページ数を確定します。
+中身を無条件に信用せず、同じ`src/disk_manager.rs`の次の関数がページ0を読んで`FileHeader`を検証してからページ数を確定します。
 
 ```rust
 fn verify_existing_file(file: &mut File, len: u64) -> DbResult<u64> {
@@ -170,7 +170,7 @@ fn verify_existing_file(file: &mut File, len: u64) -> DbResult<u64> {
 
 ## ページの読み書きにchecksumを組み込む
 
-ファイルを開いたあとの本体は、`read_page`と`write_page`です。
+ファイルを開いたあとの本体は、同じ`src/disk_manager.rs`に定義する`read_page`と`write_page`です。
 
 ```rust
 pub fn read_page(&self, id: PageId) -> DbResult<Page> {
@@ -184,7 +184,7 @@ pub fn read_page(&self, id: PageId) -> DbResult<Page> {
 }
 ```
 
-`read_page`がまず行うのは、`id`が現在の`page_count`の範囲内かどうかの確認です。
+`read_page`がまず行うのは、`id`が現在の`page_count`の範囲内かどうかの確認で、同じ`src/disk_manager.rs`の次の関数が担います。
 
 ```rust
 fn check_range(id: PageId, page_count: u64) -> DbResult<()> {
@@ -204,7 +204,7 @@ fn check_range(id: PageId, page_count: u64) -> DbResult<()> {
 範囲チェックを通過したら、該当するオフセットから`PAGE_SIZE`バイトを読み込み、`Page::decode`に渡します。
 `Page::decode`は第11章の実装のままで、checksumが一致しなければ`DbError::CorruptPage`を返します。
 `DiskManager`はこの検証を自分で書き直さず、`Page`にすでにある実装をそのまま呼び出すだけです。
-`write_page`も対称的な作りです。
+同じ`src/disk_manager.rs`に定義する`write_page`も対称的な作りです。
 
 ```rust
 pub fn write_page(&self, page: &Page) -> DbResult<()> {
@@ -221,6 +221,7 @@ pub fn write_page(&self, page: &Page) -> DbResult<()> {
 呼び出し側が`payload`の中身をどう書き換えていても、`write_page`に渡す前に自分でchecksumを計算し直す必要はありません。
 
 新しいページを割り当てる`allocate_page`は、`read_page`や`write_page`とは違い、ファイルそのものを大きくします。
+同じ`src/disk_manager.rs`に、次のように追加します。
 
 ```rust
 pub fn allocate_page(&self, page_type: PageType) -> DbResult<PageId> {
@@ -261,7 +262,7 @@ OSは、アプリケーションから`write`システムコールを受け取�
 アプリケーションから見ると、`write`はディスクI/Oよりずっと高速に返ってきますが、それはこのキャッシュのおかげです。
 `write_page`が`Ok(())`を返した直後に電源が落ちれば、そのページの内容がディスク上にまだ反映されていない可能性があります。
 
-この事情を扱うために用意するのが`sync`です。
+この事情を扱うために、同じ`src/disk_manager.rs`に`sync`を用意します。
 
 ```rust
 pub fn sync(&self) -> DbResult<()> {
@@ -297,7 +298,7 @@ pub fn sync(&self) -> DbResult<()> {
 必要になった時点で、今の具象型からtraitを後付けで切り出す方が、今の時点で払う抽象化のコストより小さく済みます。
 
 `read_page`、`write_page`、`allocate_page`のシグネチャが`&mut self`ではなく`&self`になっている点にも、同じ先取りの発想が関わっています。
-`file`と`page_count`を`Mutex<Inner>`にまとめているのはこのためで、各メソッドはそのロックを取ってから読み書きします。
+`file`と`page_count`を`Mutex<Inner>`にまとめているのはこのためで、各メソッドは同じ`src/disk_manager.rs`の次の`lock`でそのロックを取ってから読み書きします。
 
 ```rust
 fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -332,6 +333,7 @@ pub struct HeapFile {
 ```
 
 この章の`HeapFile`は、1つの`DiskManager`(1つのファイル)を丸ごと1個のテーブルとして占有します。
+同じ`src/heap_file.rs`に、次の`open`を定義します。
 
 ```rust
 pub fn open(disk: DiskManager) -> Self {
@@ -355,7 +357,7 @@ pub fn open(disk: DiskManager) -> Self {
 
 ## insert、update、deleteの設計とRecordIdの扱い
 
-`insert`は、既存のページを先頭から順に試し、`SlottedPage::insert`が入る場所を見つけられた最初のページへ書き込みます。
+同じ`src/heap_file.rs`に追加する`insert`は、既存のページを先頭から順に試し、`SlottedPage::insert`が入る場所を見つけられた最初のページへ書き込みます。
 
 ```rust
 pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
@@ -392,7 +394,7 @@ pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
 先頭の`max_len_for_fresh_page(PAGE_PAYLOAD_SIZE)`(第12章)による事前検査が、`bytes`自体が空の1ページにも収まらないと分かっている場合はどのページにも触れずに`TupleTooLarge`を返すので、後段の`ok_or`はそこをすり抜けた(通常は起こらない)場合の保険にすぎません。
 この事前検査が無いと、大きすぎる`bytes`を繰り返し`insert`しようとするたびに`allocate_page`が呼ばれ、ファイルが1ページずつ際限なく肥大化してしまいます。
 
-`get`と`delete`は、`SlottedPage`の対応するメソッドをそのまま呼び出す薄い実装です。
+同じ`src/heap_file.rs`に定義する`get`と`delete`は、`SlottedPage`の対応するメソッドをそのまま呼び出す薄い実装です。
 
 ```rust
 pub fn get(&self, rid: RecordId) -> DbResult<Option<Vec<u8>>> {
@@ -403,7 +405,7 @@ pub fn get(&self, rid: RecordId) -> DbResult<Option<Vec<u8>>> {
 }
 ```
 
-`update`だけは、単に`SlottedPage::update`を呼ぶだけでは済みません。
+同じ`src/heap_file.rs`に追加する`update`だけは、単に`SlottedPage::update`を呼ぶだけでは済みません。
 
 ```rust
 pub fn update(&mut self, rid: RecordId, bytes: &[u8]) -> DbResult<Option<RecordId>> {
@@ -463,7 +465,7 @@ pub fn update(&mut self, rid: RecordId, bytes: &[u8]) -> DbResult<Option<RecordI
 この設計のもとでは、`update`を呼び出す側は戻り値の`RecordId`を必ず以後のアクセスに使う必要があります。
 呼び出し側が戻り値を無視して元の`rid`を使い続けると、ページをまたぐ更新のときにその`rid`はもう存在しないレコードを指すことになります。
 
-最後に`scan`です。
+最後に、同じ`src/heap_file.rs`に定義する`scan`です。
 
 ```rust
 pub fn scan(&self) -> Scan<'_> {
@@ -476,6 +478,7 @@ pub fn scan(&self) -> Scan<'_> {
 ```
 
 `Scan`は、今読み込んでいるページとその中の走査位置だけを保持するイテレータで、`next`が呼ばれるたびに1件ずつ生きているタプルを返します。
+同じ`src/heap_file.rs`に、次のように実装します。
 
 ```rust
 impl Iterator for Scan<'_> {
@@ -566,7 +569,7 @@ fn allocate_write_and_read_page_round_trips() {
 }
 ```
 
-次に、プロセス内で`DiskManager`を一度閉じてから同じパスをもう一度`open`し、書き込んだ内容が残っていることを確認します。
+次に、同じ`src/disk_manager.rs`のテストで、プロセス内で`DiskManager`を一度閉じてから同じパスをもう一度`open`し、書き込んだ内容が残っていることを確認します。
 
 ```rust
 #[test]
@@ -594,7 +597,7 @@ fn reopening_the_same_file_preserves_pages() {
 `write_page`のあとに明示的に`sync`を呼んでいるのは、この章で説明したとおり`write_page`自体はディスクへ届いたことまで保証しないからです。
 この`sync`を省くと、環境によっては(OSのページキャッシュがまだ有効なうちにテストプロセスが読み直すだけなので)テスト自体は通ってしまいますが、それは`sync`の意味を確認したことにはなりません。
 
-破損の検出は、正しく書き込んだファイルをテストの中から直接開き、1バイトだけ書き換えてから`DiskManager::open`をやり直すことで確認します。
+破損の検出は、同じ`src/disk_manager.rs`のテストで、正しく書き込んだファイルをテストの中から直接開き、1バイトだけ書き換えてから`DiskManager::open`をやり直すことで確認します。
 
 ```rust
 #[test]
@@ -659,7 +662,7 @@ fn insert_across_multiple_pages_and_scan_returns_them_all() {
 ```
 
 500件という件数自体に特別な意味はなく、1ページ(`payload`が4080バイト)には到底収まらず、`heap.page_ids().len() > 1`が確実に成り立つだけの数を選んでいます。
-`DiskManager`と同じ形で、`HeapFile`を一度閉じてから開き直しても中身が残ることも確認しています。
+`DiskManager`と同じ形で、同じ`src/heap_file.rs`のテストとして、`HeapFile`を一度閉じてから開き直しても中身が残ることも確認しています。
 
 ```rust
 #[test]
@@ -689,7 +692,7 @@ fn reopening_the_disk_manager_preserves_the_heap_file_contents() {
 }
 ```
 
-`update`がページをまたいで`RecordId`を変える場面も、意図的に作って確認します。
+`update`がページをまたいで`RecordId`を変える場面も、同じ`src/heap_file.rs`のテストで意図的に作って確認します。
 
 ```rust
 #[test]

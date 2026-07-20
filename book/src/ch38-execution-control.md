@@ -67,7 +67,7 @@ pub struct CancellationToken {
 `cancelled`が明示的なキャンセル要求、`deadline`がタイムアウトの締切です(締切は次の節で使います)。
 `clone`は`Arc`を複製するだけなので安価で、`clone`した先はすべて同じキャンセル要求を共有します。
 
-意思表示を確認する側は`check`を呼びます。
+意思表示を確認する側は、`src/cancellation.rs`に定義する`check`を呼びます。
 
 ```rust
 pub fn check(&self) -> DbResult<()> {
@@ -223,7 +223,7 @@ pub struct WorkerPool {
 ```
 
 `std::sync::mpsc::sync_channel(queue_capacity)`が、この章のキューです。
-容量固定のバウンデッドチャネルで、容量を超えて`try_send`すると`Err(TrySendError::Full)`を返します。
+容量固定のバウンデッドチャネルで、容量を超えて`try_send`すると`Err(TrySendError::Full)`を返す`dispatch`を、`src/thread_pool.rs`に次のように定義します。
 
 ```rust
 pub fn dispatch(&self, stream: TcpStream) -> Result<(), TcpStream> {
@@ -256,8 +256,8 @@ fn reject_connection(mut stream: TcpStream) {
 即座に拒否すれば、クライアントは待ち続けて何が起きているか分からないまま固まるより先に「今は繋がらない」と知り、必要なら自分の判断で再接続を試みられます。
 `worker_count + queue_capacity`が、この章のサーバーが同時に保持する接続数の実質的な上限になります。
 
-`src/thread_pool.rs`の`WorkerPool::new`に渡す`handler`は`Fn`(`FnOnce`ではありません)です。
-1本のワーカースレッドは生きている間に何本もの接続を順に処理するため、`handler`はワーカーの数だけ複製されるのではなく、`Arc`で全ワーカーに共有されます。
+`WorkerPool::new`に渡す`handler`は`Fn`(`FnOnce`ではありません)です。
+1本のワーカースレッドは生きている間に何本もの接続を順に処理するため、`handler`はワーカーの数だけ複製されるのではなく、`src/thread_pool.rs`の`WorkerPool::new`が`Arc`で全ワーカーに共有します。
 
 ```rust
 pub fn new<F>(worker_count: usize, queue_capacity: usize, handler: F) -> Self
@@ -393,7 +393,7 @@ pub fn trigger(&self) {
 
 フラグを立てただけでは、`TcpListener::accept`でブロックしたままのスレッドは起きません。
 `trigger`は、フラグを立てた直後に自分自身のアドレスへ`TcpStream::connect`します(**自己接続トリック**)。
-これで`accept`がその接続を1回だけ受理して戻り、`Server::run`のループの先頭でフラグを確認して抜けられます。
+これで`accept`がその接続を1回だけ受理して戻り、`src/server.rs`の`Server::run`のループの先頭でフラグを確認して抜けられます。
 
 ```rust
 loop {
@@ -463,7 +463,7 @@ fn wait_for_request_or_shutdown(stream: &mut TcpStream, shutdown: &AtomicBool) -
 クライアントがフレームのヘッダーだけ、あるいはペイロードの途中までしか送らずに接続を開いたまま止まっていた場合、`Request::read`が使う`read_exact`は残りのバイト列を待ち続けます。
 ここで読み取りタイムアウトを外してしまうと、その待ちは無期限になり、シャットダウンフラグを二度と確認できません。
 
-そこで`handle_connection`は、`Request::read`へ`stream`をそのまま渡さず、`ShutdownAwareReader`というラッパー越しに渡します。
+そこで`src/server.rs`の`handle_connection`は、`Request::read`へ`stream`をそのまま渡さず、`ShutdownAwareReader`というラッパー越しに渡します。
 
 ```rust
 impl Read for ShutdownAwareReader<'_> {
@@ -545,7 +545,7 @@ if let Err(e) = ctrlc::set_handler(move || shutdown.trigger()) {
 - `statement_timeout`を短く設定すると、締切に対して十分長くかかるクエリが`DbError::QueryTimeout`で打ち切られる
 - `max_operator_rows`を小さく設定すると、`Sort`、`Hash Join`のBuild側、`Hash Aggregate`がそれぞれ`DbError::MemoryLimitExceeded`で打ち切られ、上限内の行数では正常に完走する
 
-キャンセルのテストは、`sleep`による時間待ちを避けています。
+`src/session.rs`のキャンセルのテストは、`sleep`による時間待ちを避けています。
 
 ```rust
 let handle = session.cancellation_handle();

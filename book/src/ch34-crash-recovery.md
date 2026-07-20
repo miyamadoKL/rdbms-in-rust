@@ -108,7 +108,7 @@ Page Headerに8バイト増えた分、`PAGE_HEADER_SIZE`は16から24へ、`PAG
         };
 ```
 
-逆に、dirtyなページを書き戻す直前には、フレームが覚えている最新の値をページ自身へ書き写してからディスクへ渡します。
+逆に、同じ`src/buffer_pool.rs`で、dirtyなページを書き戻す直前には、フレームが覚えている最新の値をページ自身へ書き写してからディスクへ渡します。
 
 ```rust
         let mut frame = self.lock_frame(frame_id);
@@ -248,7 +248,7 @@ Redoが終わった時点で、テーブルはクラッシュ直前の物理的�
 残るのは、Analysisがloserと判定したトランザクションの変更を取り消すことです。
 
 ここで使うのは、新しいコードではありません。
-第33章の`ROLLBACK`がすでに実装していた`crate::transaction::apply_wal_undo_disk`を、loserごとにそのまま呼び出します。
+`src/recovery.rs`の`recover`は、第33章の`ROLLBACK`がすでに実装していた`crate::transaction::apply_wal_undo_disk`を、loserごとにそのまま呼び出します。
 
 ```rust
     let mut transactions_undone = 0usize;
@@ -285,6 +285,7 @@ Undoの1操作ごとに専用のログレコードを書き、そのレコード
 
 `recover`は、Analysis、Redo、Undoのすべてが終わるまで、`Storage::flush`と`Storage::sync`のどちらも呼びません。
 Redoが書き込むページも、Undoが書き込むページも、Undoが積む`Abort`レコードも、この時点ではすべて`BufferPool`や`WalWriter`のメモリ上のバッファに留まっています。
+`src/recovery.rs`の`recover`は、最後に次のようにまとめて反映します。
 
 ```rust
     storage.flush()?;
@@ -464,7 +465,7 @@ pub(crate) fn hit(name: &'static str) -> DbResult<()> {
 開き直すと、`UPDATE`は元の値へ戻り、`INSERT`した行は消えています。
 
 **(c) Undo中の再クラッシュ**は、決定的インターリーブテストハーネスで2本のトランザクションを同時にActiveにし、どちらもコミットもロールバックもしないままdropします。
-`failpoint::arm("recovery_undo_step", 1)`で「1本目のUndoを終えた直後」に発火するよう仕込むと、1回目の`Database::open`は確かに失敗します。
+`tests/crash_recovery.rs`で`failpoint::arm("recovery_undo_step", 1)`により「1本目のUndoを終えた直後」に発火するよう仕込むと、1回目の`Database::open`は確かに失敗します。
 
 ```rust
     failpoint::arm("recovery_undo_step", 1);

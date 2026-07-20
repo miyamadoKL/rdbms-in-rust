@@ -135,6 +135,7 @@ index_usage: RefCell<HashMap<String, u64>>,
 `&mut Storage`ではなく`&Storage`のまま増やせる必要があるのは、この値を増やす場所が`IndexScanExec`、`IndexNestedLoopJoinExec`(第25章)という、`Storage`を`&'a Storage`としてしか借用していない`Executor`の内部だからです。
 `RefCell`による内部可変性を使い、`src/physical_plan.rs`の2つの`Executor`で記録します。
 `IndexScanExec`ではPointまたはRangeの実行を開始する時に1回、`IndexNestedLoopJoinExec`では外側の行ごとに内側の`lookup`を呼ぶ直前に記録します。
+`src/physical_plan.rs`の`IndexScanExec`側では、次のように呼びます。
 
 ```rust
 storage.record_index_use(index_name);
@@ -357,6 +358,7 @@ struct QueryTimingStats {
 ```
 
 `Database::run_bound_statement`(束縛済みの文を実際に実行する共通の本体、第31章から`lock_owner`とともにこの形です)が、文を1本実行するたびに`Instant::now()`から`elapsed()`までを足し込みます。
+`src/database.rs`のこのメソッドに、次のように書き加えます。
 
 ```rust
 fn run_bound_statement(&mut self, bound: BoundStatement, ctx: &ExecutionContext) -> DbResult<QueryResult> {

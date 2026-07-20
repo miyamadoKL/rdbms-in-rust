@@ -190,7 +190,7 @@ pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
 }
 ```
 
-`BEGIN`の実装は、すでに`Active`なトランザクションがあるかどうかを見るだけです。
+`BEGIN`の実装(`src/database.rs`の`execute_begin`)は、すでに`Active`なトランザクションがあるかどうかを見るだけです。
 
 ```rust
 fn execute_begin(&mut self, _begin: BeginStatement) -> DbResult<QueryResult> {
@@ -214,7 +214,7 @@ PostgreSQLは警告を出したうえで進行中のトランザクションを�
 入れ子の`BEGIN`は`DbError::TransactionAlreadyActive`として素直に拒否し、進行中のトランザクションには一切触れません。
 `Savepoint`(トランザクションの中に部分的な巻き戻し地点を作る仕組み)のような、入れ子に近い機能が欲しくなった場合は、`BEGIN`を読み替えるのではなく、別の構文として設計するべきだと判断しました。
 
-`COMMIT`は、`tx`を手放すだけです。
+`src/database.rs`の`execute_commit`が担う`COMMIT`は、`tx`を手放すだけです。
 
 ```rust
 fn execute_commit(&mut self, _commit: CommitStatement) -> DbResult<QueryResult> {
@@ -231,7 +231,7 @@ fn execute_commit(&mut self, _commit: CommitStatement) -> DbResult<QueryResult> 
 
 `Active`の間に行った書き込みは、すでに`backend`(`MemStorage`または`Storage`)へ反映済みです。
 `COMMIT`はその状態を追認するだけでよく、積んだ`undo_log`もここでは使わずに捨てます。
-`ROLLBACK`は逆に、積んだ`undo_log`を逆順に適用してから`tx`を手放します。
+`src/database.rs`の`execute_rollback`が担う`ROLLBACK`は逆に、積んだ`undo_log`を逆順に適用してから`tx`を手放します。
 
 ```rust
 fn execute_rollback(&mut self, _rollback: RollbackStatement) -> DbResult<QueryResult> {
@@ -245,6 +245,8 @@ fn execute_rollback(&mut self, _rollback: RollbackStatement) -> DbResult<QueryRe
     Ok(QueryResult::command("ROLLBACK"))
 }
 ```
+
+この`execute_rollback`を実際に動かしてみます。
 
 ```console
 minidb> BEGIN;
@@ -286,7 +288,7 @@ pub enum UndoRecord {
 第13章から`Storage`は行の位置を`RecordId`(ページ番号とスロット番号の組)で指しますが、`MemStorage`はそもそも`RecordId`という概念を持たず、行は`Vec<Tuple>`の並びでしかありません。
 Diskバックエンドの記録では`rid`は必ず`Some`、Memoryバックエンドの記録では常に`None`になります。
 
-Memoryバックエンドの逆操作は、`RecordId`が無い代わりに`Tuple`の値そのものの一致で対象行を探します。
+Memoryバックエンドの逆操作(`src/transaction.rs`の`apply_undo_memory`)は、`RecordId`が無い代わりに`Tuple`の値そのものの一致で対象行を探します。
 
 ```rust
 pub(crate) fn apply_undo_memory(storage: &mut MemStorage, undo_log: Vec<UndoRecord>) {
@@ -378,7 +380,7 @@ fn run_insert(&mut self, plan: LogicalPlan) -> DbResult<usize> {
 }
 ```
 
-`record_undo`が、`undo`の行き先を決める1箇所です。
+`src/database.rs`の`record_undo`が、`undo`の行き先を決める1箇所です。
 
 ```rust
 fn record_undo(&mut self, undo: Vec<transaction::UndoRecord>) {
@@ -523,18 +525,20 @@ Statement Rollbackは「1本の文の中の部分的な失敗が、その文の�
 `Database`の`tx: Option<TransactionContext>`は、`Active`なトランザクションを高々1本しか保持できません。
 複数のトランザクションを行き来しながら進めるテストは、この1本しか無い`tx`をそのまま使えません。
 
-`tx`とは別に、複数のトランザクションを`TransactionId`ごとに保持できる対応表を`Database`に追加しました。
+`tx`とは別に、複数のトランザクションを`TransactionId`ごとに保持できる対応表を`src/database.rs`の`Database`に追加しました。
 
 ```rust
 harness_contexts: HashMap<TransactionId, TransactionContext>,
 ```
+
+あわせて、テスト側が個々のトランザクションを指すためのハンドル`TxHandle`を`src/database.rs`に定義します。
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxHandle(TransactionId);
 ```
 
-`begin_tx`が新しい`TransactionContext`を`harness_contexts`へ登録し、以後の操作に使う`TxHandle`を返します。
+`src/database.rs`の`begin_tx`が新しい`TransactionContext`を`harness_contexts`へ登録し、以後の操作に使う`TxHandle`を返します。
 
 ```rust
 pub fn begin_tx(&mut self) -> TxHandle {
@@ -545,7 +549,7 @@ pub fn begin_tx(&mut self) -> TxHandle {
 }
 ```
 
-`execute_in_tx`が、指定した`TxHandle`のトランザクションの中で1文を実行します。
+`src/database.rs`の`execute_in_tx`が、指定した`TxHandle`のトランザクションの中で1文を実行します。
 
 ```rust
 pub fn execute_in_tx(&mut self, handle: &TxHandle, sql: &str) -> DbResult<QueryResult> {
@@ -578,7 +582,7 @@ pub fn execute_in_tx(&mut self, handle: &TxHandle, sql: &str) -> DbResult<QueryR
 つまり`execute_in_tx`は、実行ロジックを1行も複製せず、「今どの`TransactionContext`を`self.tx`として使うか」を差し替えるだけの薄い配線です。
 実行が終わったら、変化した(`undo_log`が伸びた、または`Aborted`へ遷移したかもしれない)`TransactionContext`を対応表へ戻し、差し替え前の`self.tx`を元に戻します。
 
-`commit_tx`、`rollback_tx`も対応表から取り出すだけで、`rollback_tx`は`execute_rollback`と同じ`apply_undo_memory`、`apply_undo_disk`を呼びます。
+`src/database.rs`の`commit_tx`、`rollback_tx`も対応表から取り出すだけで、`rollback_tx`は`execute_rollback`と同じ`apply_undo_memory`、`apply_undo_disk`を呼びます。
 
 ```rust
 pub fn rollback_tx(&mut self, handle: TxHandle) -> DbResult<()> {
@@ -606,7 +610,7 @@ Lost Update、Dirty Read、Non-repeatable Read、Phantomは、教科書がAtomic
 この章の時点でminidbが持つ並行制御は「無い」ため、この4つは実際に起こります。
 以下のテストは、その異常が「起きる」ことを`assert`する形で固定します。
 
-Dirty Readのテストを見てみます。
+`tests/interleave.rs`のDirty Readのテストを見てみます。
 
 ```rust
 #[test]

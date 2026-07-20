@@ -8,7 +8,7 @@
 
 ## 前章の限界
 
-第18章の`Database::eval_query_plan`は、`LogicalPlan`の木を根から葉へたどりながら`executor`モジュールの演算子を呼び出す再帰関数でした。
+第18章の`src/database.rs`にあった`Database::eval_query_plan`は、`LogicalPlan`の木を根から葉へたどりながら`executor`モジュールの演算子を呼び出す再帰関数でした。
 
 ```rust
 fn eval_query_plan(&self, plan: &LogicalPlan) -> DbResult<(Schema, Vec<Tuple>)> {
@@ -36,7 +36,7 @@ fn eval_query_plan(&self, plan: &LogicalPlan) -> DbResult<(Schema, Vec<Tuple>)> 
 `Projection`も同じ形で、子の結果をまるごと受け取ってから新しい`Vec<Tuple>`をまるごと作ります。
 
 「まるごと」という言葉を3回使ったのは、誇張ではありません。
-`executor::filter`の中身を思い出すと、これがそのまま実装になっていたことが分かります。
+`src/executor.rs`にあった`executor::filter`の中身を思い出すと、これがそのまま実装になっていたことが分かります。
 
 ```rust
 pub fn filter(
@@ -81,6 +81,7 @@ Projectionに渡されるrows:        1要素
 
 行を1件ずつ流す実行方式を、**Volcanoモデル**と呼びます。
 [第2章](./ch02-life-of-a-query.md)で経路の概観として触れたとおり、各演算子は共通のインターフェースを実装します。
+まずは骨組みだけを、次のように考えてみます。
 
 ```rust
 trait Executor {
@@ -129,7 +130,7 @@ pub enum PhysicalPlan {
 ```
 
 `Scan`が`SeqScan`という具体的な名前に変わった以外、`LogicalPlan`とバリアントの構成は同じです。
-`LogicalPlan`から`PhysicalPlan`への変換は、`optimize`という1つの関数が担います。
+`LogicalPlan`から`PhysicalPlan`への変換は、同じ`src/physical_plan.rs`に置く`optimize`という1つの関数が担います。
 
 ```rust
 pub fn optimize(plan: LogicalPlan) -> PhysicalPlan {
@@ -203,7 +204,7 @@ pub trait Executor {
 
 ### Values: 構築時にまとめて評価してよい理由
 
-`ValuesExec`は`VALUES`の各行を、構築時にまとめて評価します。
+`src/physical_plan.rs`に定義する`ValuesExec`は、`VALUES`の各行を構築時にまとめて評価します。
 
 ```rust
 pub struct ValuesExec {
@@ -240,7 +241,7 @@ impl Executor for ValuesExec {
 
 ### SeqScan: `MemTable`版と`Storage`版
 
-`SeqScan`は、第16章から続く2つの供給源(`MemTable`と`Storage`)に対応する2つの`struct`を持ちます。
+`SeqScan`は、第16章から続く2つの供給源(`MemTable`と`Storage`)に対応する2つの`struct`を`src/physical_plan.rs`に持ちます。
 
 ```rust
 pub struct MemSeqScanExec<'a> {
@@ -268,7 +269,7 @@ impl<'a> Executor for MemSeqScanExec<'a> {
 第18章までの`executor::seq_scan`は`table.rows().to_vec()`でテーブル全体を複製していました。
 `MemSeqScanExec`は`std::slice::Iter`を1歩ずつ進めるだけなので、`next()`が呼ばれた分しか複製が起きません。
 
-`Storage`版は、`Storage::scan`(第15章)が返す`Scan`イテレータをそのまま持ちます。
+同じ`src/physical_plan.rs`に置く`Storage`版は、`Storage::scan`(第15章)が返す`Scan`イテレータをそのまま持ちます。
 
 ```rust
 pub struct DiskSeqScanExec<'a> {
@@ -304,6 +305,8 @@ impl<'a> Executor for DiskSeqScanExec<'a> {
 `DiskSeqScanExec`はこの`collect()`という一手間を無くし、イテレータをそのまま1件ずつ`decode_tuple`へ通します。
 
 ### Filter: 一致するまで子を引き、一致しない行は溜めない
+
+`src/physical_plan.rs`に、次の`FilterExec`を定義します。
 
 ```rust
 pub struct FilterExec<'a> {
@@ -348,6 +351,8 @@ impl<'a> Executor for FilterExec<'a> {
 この章で`executor`モジュールに残し、`pub(crate)`にして`physical_plan`モジュールからも呼べるようにしました。
 
 ### Projection: 1行受け取り、1行返す
+
+同じ`src/physical_plan.rs`に、次の`ProjectionExec`を定義します。
 
 ```rust
 pub struct ProjectionExec<'a> {
@@ -428,7 +433,7 @@ fn build_query_executor<'a>(&'a self, plan: &'a PhysicalPlan) -> DbResult<Box<dy
 
 `SeqScan`だけが`&self.backend`を見ます。
 `Filter`、`Projection`は供給源を意識せず、`Box<dyn Executor>`という共通のインターフェースだけを相手にします。
-`execute_select`は、この関数が組み立てた木の根に対して`next()`を呼び続けるだけになりました。
+`src/database.rs`の`execute_select`は、この関数が組み立てた木の根に対して`next()`を呼び続けるだけになりました。
 
 ```rust
 fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {
@@ -505,8 +510,7 @@ Statement::Explain(explain) => {
 }
 ```
 
-`src/database.rs`の`Database::execute_explain`は、束縛済みの文を`LogicalPlan`、`PhysicalPlan`へ変換し、木を文字列化しただけの`QueryResult`を返します。
-実際には何も実行しません。
+`src/database.rs`の`Database::execute_explain`は、束縛済みの文を`LogicalPlan`、`PhysicalPlan`へ変換し、木を文字列化しただけの`QueryResult`を返すメソッドで、実際には何も実行しません。
 
 ```rust
 fn execute_explain(&self, inner: BoundStatement) -> DbResult<QueryResult> {
@@ -525,7 +529,7 @@ fn execute_explain(&self, inner: BoundStatement) -> DbResult<QueryResult> {
 ```
 
 `QueryResult::explain`は、PostgreSQLの`EXPLAIN`にならい、`QUERY PLAN`という1列の結果として木を返します。
-木の1行が結果の1行になります。
+同じ`src/database.rs`のこの実装で、木の1行が結果の1行になります。
 
 ```rust
 fn explain(plan_text: String) -> Self {

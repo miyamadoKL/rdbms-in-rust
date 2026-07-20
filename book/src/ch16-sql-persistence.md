@@ -217,7 +217,7 @@ pub fn open<P: AsRef<Path>>(path: P) -> DbResult<Self> {
 利用側のコードは1行のまま、動作だけが状況に応じて変わります。
 
 書き込んだ内容をファイルへ実際に反映させるには、`flush`を呼ぶ必要があります。
-同じく`Database`に、次の`flush`を追記します。
+同じく`src/database.rs`の`Database`に、次の`flush`を追記します。
 
 ```rust
 pub fn flush(&self) -> DbResult<()> {
@@ -264,7 +264,7 @@ let mut db = match args.next() {
 ```
 
 `cargo run -- example.db`のように引数を渡せば永続モード、渡さなければこれまでどおりインメモリモードで起動します。
-終了時は、`\q`の入力でも標準入力のEOFでも同じ後処理を通るように、ループを抜けた直後に`flush`を呼びます。
+終了時は、`\q`の入力でも標準入力のEOFでも同じ後処理を通るように、`src/main.rs`のループを抜けた直後に`flush`を呼びます。
 
 ```rust
 if let Err(e) = db.flush() {

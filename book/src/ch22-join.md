@@ -49,7 +49,7 @@ pub enum JoinKind {
 `JoinKind`を`enum`にしたのは、選択肢が1つしか無い今の時点で意味を持つ設計ではありません。
 `LEFT OUTER JOIN`を演習課題で追加する読者が、このバリアントを1つ増やすだけで済むようにするための先取りです。
 
-`FromClause`は、最初の1テーブルに続く`JOIN`の並びを`joins`として持つように広がります。
+`src/ast.rs`の`FromClause`は、最初の1テーブルに続く`JOIN`の並びを`joins`として持つように広がります。
 
 ```rust
 pub struct FromClause {
@@ -167,7 +167,7 @@ orders:    customer_id, item  (2列、offset 2)
 ```
 
 `orders.item`の`column_index`は、`orders`の中ではローカルに1番目の列ですが、結合後スキーマでは`2 + 1 = 3`番目の列になります。
-この計算を担うのが`table_offset`です。
+この計算を担うのが、`src/binder.rs`に定義する`table_offset`です。
 
 ```rust
 fn table_offset(tables: &[BoundTableRef], table_ordinal: usize) -> usize {
@@ -175,7 +175,7 @@ fn table_offset(tables: &[BoundTableRef], table_ordinal: usize) -> usize {
 }
 ```
 
-`resolve_column`は、修飾子の有無どちらのどちらの経路でも、見つけた列のローカルな添字にこのオフセットを足してから`BoundExpr::ColumnRef`を組み立てます。
+`src/binder.rs`の`resolve_column`は、修飾子の有無どちらの経路でも、見つけた列のローカルな添字にこのオフセットを足してから`BoundExpr::ColumnRef`を組み立てます。
 
 ```rust
 let local_index = table
@@ -234,7 +234,7 @@ pub struct JoinNode {
 }
 ```
 
-`n`個の`JOIN`を持つ`FROM`は、`n`個の`Join`ノードが縦に連なる**左深い木**(left-deep tree)になります。
+`n`個の`JOIN`を持つ`FROM`を、`src/logical_plan.rs`の`build_from`は`n`個の`Join`ノードが縦に連なる**左深い木**(left-deep tree)として次のように組み立てます。
 
 ```rust
 fn build_from(tables: Vec<crate::binder::BoundTableRef>, joins: Vec<crate::binder::BoundJoinStep>) -> LogicalPlan {
@@ -268,7 +268,7 @@ Joinの結合順序(`a`と`b`を先に結合するか、`b`と`c`を先に結合
 続けて`c`を結合するとき、この部分木の出力列数はちょうど`a.len() + b.len()`であり、これは`Binder`が`c`の列に割り当てたオフセットと一致します。
 木の深さに関係なく、左部分木の出力列数が常に「次に結合するテーブルのグローバルなオフセット」と一致し続けるのは、テーブルが左から右へ登場した順序のまま木を組み立てているからです。
 
-`Join`が生成する行の`Schema`は、左右の`Schema`を単純に連結するだけの関数`join_schema`で決めます。
+`Join`が生成する行の`Schema`は、左右の`Schema`を単純に連結するだけの関数`join_schema`(`src/logical_plan.rs`)で決めます。
 
 ```rust
 pub fn join_schema(left: &Schema, right: &Schema) -> Schema {
@@ -337,7 +337,7 @@ LogicalPlan::Join(join) => {
 
 ### 等値条件をハッシュキーへ分解する
 
-`split_equi_join_keys`は、`ON`条件を`AND`で分解し、それぞれの項が「左側だけを参照する式 = 右側だけを参照する式」という形になっているかを調べます。
+`src/physical_plan.rs`の`split_equi_join_keys`は、`ON`条件を`AND`で分解し、それぞれの項が「左側だけを参照する式 = 右側だけを参照する式」という形になっているかを調べます。
 
 ```rust
 fn split_equi_join_keys(condition: &BoundExpr, left_len: usize) -> Option<Vec<(BoundExpr, BoundExpr)>> {
@@ -370,7 +370,7 @@ Hash Joinの鍵が`Vec<Value>`という複数列の組み合わせに対応で�
 
 Hash Joinの`right_key`には、もう1つ変換が必要です。
 `condition`の`column_index`は結合後スキーマ上のフラットな添字ですが、Build段階は`right`単体の`Executor`が返す行(`left`をまだ連結していない、`right`自身のスキーマを持つ行)に対して鍵を評価しなければなりません。
-`shift_column_index`が、この添字を`left_len`だけ引き戻します。
+`src/physical_plan.rs`の`shift_column_index`が、この添字を`left_len`だけ引き戻します。
 
 ```rust
 fn shift_column_index(expr: &BoundExpr, delta: usize) -> BoundExpr {
@@ -393,7 +393,7 @@ fn shift_column_index(expr: &BoundExpr, delta: usize) -> BoundExpr {
 ## Executor: NestedLoopJoinExec
 
 `Executor` trait(第19章)の`next()`は、子の`Executor`を「1回だけ、前から順に」読み進めるという契約を持っていました。
-教科書的なNested Loop Joinは、左の行1件ごとに右の子計画を最初から実行し直します(rescan)が、`Box<dyn Executor>`というTrait Objectには、この「巻き戻し」を行う手段がありません。
+教科書的なNested Loop Joinは、左の行1件ごとに右の子計画を最初から実行し直します(rescan)が、`Box<dyn Executor>`というTrait Objectには、この「巻き戻し」を行う手段がなく、`src/physical_plan.rs`の`NestedLoopJoinExec`は次の形でこれを避けます。
 
 ```rust
 pub struct NestedLoopJoinExec<'a> {
@@ -427,7 +427,7 @@ impl<'a> NestedLoopJoinExec<'a> {
 
 この実装は、`right`をコンストラクタで一度だけ`Vec<Tuple>`へ読み切ります。
 以後は`left`から1行受け取るたびに、この`Vec`を先頭から順に見比べるだけで、`right`を再実行する必要がありません。
-比較の回数は、`left`の行数×`right`の行数のまま変わらないため、計算量(O(n×m))は教科書的な実装と同じです。
+比較の回数は、`left`の行数×`right`の行数のまま変わらないため、計算量(O(n×m))は教科書的な実装と同じで、`src/physical_plan.rs`の`next()`は次のようになります。
 
 ```rust
 impl<'a> Executor for NestedLoopJoinExec<'a> {
@@ -471,7 +471,7 @@ JOIN専用のNULL処理をこの演算子が持たなくても、`customers.id =
 
 ## Executor: HashJoinExec
 
-Hash Joinは、Build(右側を全件読んでハッシュテーブルを作る)とProbe(左側を1件ずつ読んで引く)という、性質の異なる2つの段階を持ちます。
+`src/physical_plan.rs`の`HashJoinExec`が実装するHash Joinは、Build(右側を全件読んでハッシュテーブルを作る)とProbe(左側を1件ずつ読んで引く)という、性質の異なる2つの段階を持ちます。
 
 ```rust
 pub struct HashJoinExec<'a> {
@@ -517,7 +517,7 @@ impl<'a> HashJoinExec<'a> {
 `HashMap<Vec<Value>, Tuple>`のように1鍵1行にしてしまうと、`customers`が同じ`id`を2行持つような重複キーのケースで、後から挿入した行が先の行を上書きして消えてしまいます。
 `orders`側に同じ`customer_id`の注文が複数あるとき、その全件が結果に現れなければならないのはINNER JOINの意味論そのものであり、[第21章](./ch21-sort-aggregate.md)の`GROUP BY`が同じ鍵の行を1つのグループへ畳み込んでいたのとは、鍵の使い方が違います。
 
-Build段階の`while let`ループの中に、この章のもう1つの要点があります。
+`src/physical_plan.rs`の`HashJoinExec::new`が持つBuild段階の`while let`ループの中に、この章のもう1つの要点があります。
 
 ```rust
 if key.iter().any(Value::is_null) {
@@ -527,7 +527,7 @@ if key.iter().any(Value::is_null) {
 
 SQLの等価比較は`NULL = NULL`をUNKNOWN(一致とはみなさない)として扱います(第8章の三値論理)。
 鍵にNULLを含む行をハッシュテーブルへそもそも挿入しなければ、その行はどのProbe行の鍵とも一致しようがなく、結合結果から自然に除外されます。
-Probe側も同じ理由で、鍵にNULLを含む行はハッシュテーブルを引かずに次の行へ進みます。
+Probe側も同じ理由で、鍵にNULLを含む行はハッシュテーブルを引かずに次の行へ進み、`src/physical_plan.rs`の`next()`は次のようになります。
 
 ```rust
 impl<'a> Executor for HashJoinExec<'a> {
@@ -631,7 +631,7 @@ Projection(customers.name)
 ## テストで確認する
 
 `NestedLoopJoinExec`と`HashJoinExec`は、アルゴリズムが違うだけで、同じ入力、同じ等値条件に対しては同じ行集合を返さなければなりません。
-`physical_plan`モジュールのテストは、同じデータを両方の演算子に流し込んで結果を突き合わせることでこれを確認します。
+`src/physical_plan.rs`の`#[cfg(test)]`モジュールのテストは、同じデータを両方の演算子に流し込んで結果を突き合わせることでこれを確認します。
 
 ```rust
 #[test]

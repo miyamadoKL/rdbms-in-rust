@@ -62,6 +62,8 @@ let value = minidb::???; // "SELECT 1"をどう渡せばいいのか、渡す先
 mod toy_sql;
 ```
 
+`src/toy_sql.rs`には、まず式を表す`ToyExpr`を定義します。
+
 ```rust
 /// この仮実装が扱える式。整数リテラル・真偽値リテラル・整数の加算のみを持つ。
 #[derive(Debug, Clone, PartialEq)]
@@ -78,7 +80,7 @@ pub enum ToyExpr {
 `ToyExpr`という名前にしたのは、これが本物のASTではないことを型名からも分かるようにするためです。
 第7章で本物のASTを設計するとき、この型は残さず削除します。
 
-評価は`eval`が受け持ちます。
+評価は、同じ`src/toy_sql.rs`に定義する`eval`が受け持ちます。
 
 ```rust
 impl ToyExpr {
@@ -114,7 +116,7 @@ impl ToyExpr {
 そのため`Add`の評価には`checked_add`を使い、範囲を超えたら`None`を`DbError::Eval`に変換して呼び出し元へ返すようにしています。
 オーバーフローの扱いをどう設計するかは第8章で改めて詰めますが、この仮実装の段階でも「パニックさせない」という条件だけは満たしておく必要があります。
 
-構文解析の入り口が`parse_select`です。
+`src/toy_sql.rs`に置く構文解析の入り口が`parse_select`です。
 
 ```rust
 /// `SELECT <式> [;]`を解析する。
@@ -151,7 +153,7 @@ pub fn parse_select(sql: &str) -> DbResult<ToySelect> {
 `SELECT 1 + 2;`を実行したとき、返ってくる列の名前を`"1 + 2"`にしたいので、パースの過程で得られる元のテキストをそのまま持ち運びます。
 `SELECT`キーワードの判定は、`strip_keyword`という小さな関数で大文字小文字を無視して行っています。
 
-式の解析は`+`で文字列を分割するだけの単純な作りです。
+同じ`src/toy_sql.rs`に加える式の解析は、`+`で文字列を分割するだけの単純な作りです。
 
 ```rust
 /// `+`で連結された式を解析する。項が1つなら`parse_term`にそのまま委ねる。
@@ -202,6 +204,8 @@ fn parse_expr(src: &str) -> DbResult<ToyExpr> {
 pub mod database;
 ```
 
+`src/database.rs`には、次の`Database`を定義します。
+
 ```rust
 /// minidbのデータベース1つを表す。
 ///
@@ -244,7 +248,7 @@ impl Database {
 テーブルを持たないデータベースなので、それで正しい状態です。
 テーブルを持つカタログは第9章で`Database`に追加します。
 
-`QueryResult`は`Schema`と行の並びを持つだけの型です。
+同じ`src/database.rs`に定義する`QueryResult`は、`Schema`と行の並びを持つだけの型です。
 
 ```rust
 /// `Database::execute`の結果。列構成(`Schema`)と、それに従う行の並びを持つ。
@@ -266,7 +270,7 @@ impl QueryResult {
 }
 ```
 
-REPLでの表示のために、`QueryResult`に`Display`を実装します。
+REPLでの表示のために、`src/database.rs`に`QueryResult`の`Display`実装を追加します。
 
 ```rust
 impl std::fmt::Display for QueryResult {
@@ -298,7 +302,7 @@ impl std::fmt::Display for QueryResult {
 ```
 
 列名の行、区切り線、値の行、件数の footer という並びは、`psql`のような既存のSQLクライアントの表示に寄せた形です。
-値そのものの文字列化は`format_value`という小さな関数に切り出しました。
+値そのものの文字列化は、同じ`src/database.rs`に置く`format_value`という小さな関数に切り出しました。
 
 ```rust
 /// `Value`をユーザー向けの表示形式に変換する。
@@ -438,7 +442,7 @@ pub fn execute_sql(sql: &str) -> DbResult<QueryResult> {
 ### SQL Golden Test
 
 第3章で用意した`tests/golden.rs`の`run_sql`は、まだクエリエンジンが無いためSQLをそのままエコーするだけの仮実装でした。
-これを`Database::execute`の呼び出しに差し替えます。
+これを、同じ`tests/golden.rs`の中で`Database::execute`の呼び出しに差し替えます。
 
 ```rust
 /// SQLを1本実行し、Golden Testと突き合わせるための文字列表現を返す。
