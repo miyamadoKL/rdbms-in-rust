@@ -12,7 +12,7 @@
 
 ## 計算の順序をどこが決めているか
 
-第17章までの`Database::execute_select_with_from`を見ると、答えが見つかります。
+`src/database.rs`にある、第17章までの`Database::execute_select_with_from`を見ると、答えが見つかります。
 
 ```rust
 fn execute_select_with_from(&self, select: &BoundSelect) -> DbResult<QueryResult> {
@@ -75,6 +75,7 @@ Projection(name)
 ## `LogicalPlan`を設計する
 
 演算子は7種類にとどめます。
+新規ファイル`src/logical_plan.rs`を作り、`LogicalPlan`を次のように定義します。
 
 ```rust
 pub enum LogicalPlan {
@@ -88,6 +89,12 @@ pub enum LogicalPlan {
 }
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod logical_plan;
+```
+
 `Scan`、`Values`、`Filter`、`Projection`は`SELECT`が使い、`Insert`、`Update`、`Delete`はそれぞれの文が使います。
 `Join`、`Aggregate`、`Sort`、`Limit`に対応する構文は、`Parser`(第7章)にもまだありません。
 `FROM`に書けるテーブルは1つ、`GROUP BY`もソートも`LIMIT`もこのクレートにはまだ無いので、対応する演算子を今作っても、どのSQL文からも組み立てられない死んだコードになります。
@@ -95,7 +102,7 @@ pub enum LogicalPlan {
 第21章で`Aggregate`、`Sort`、`Limit`が、第22章で`Join`が、それぞれ対応する構文と一緒に`LogicalPlan`へ加わります。
 
 `Filter`、`Projection`、`Insert`、`Update`、`Delete`は、それぞれ1個の子(`input`)を持つ`struct`に情報をまとめてあります。
-`Scan`、`Values`は子を持たない葉です。
+`Scan`、`Values`は子を持たない葉で、`src/logical_plan.rs`には次のように定義します。
 
 ```rust
 pub struct ScanNode {
@@ -134,7 +141,7 @@ SELECT 1 + 1
     └─ Values(1 row)
 ```
 
-`Insert`、`Update`、`Delete`も、それぞれ対象のテーブル(`table_id`、`schema`)と、演算に固有の情報を持ちます。
+`Insert`、`Update`、`Delete`も、`src/logical_plan.rs`に、それぞれ対象のテーブル(`table_id`、`schema`)と、演算に固有の情報を持つ形で定義します。
 
 ```rust
 pub struct InsertNode {
@@ -165,7 +172,7 @@ pub struct UpdateNode {
 ## 各ノードが出力スキーマを答える
 
 演算子の木を組み立てただけでは、各ノードが最終的にどんな列を返すのかが分かりません。
-`LogicalPlan`には`output_schema`という、この問いにノード自身が答えるメソッドを持たせます。
+`src/logical_plan.rs`の`LogicalPlan`には、`output_schema`という、この問いにノード自身が答えるメソッドを持たせます。
 
 ```rust
 pub fn output_schema(&self) -> Schema {
@@ -187,6 +194,7 @@ pub fn output_schema(&self) -> Schema {
 
 `Projection`だけは、子の出力を受け取って新しい`Schema`を組み立てる必要があります。
 この組み立て方には規則があり、単純な列参照(`id`のような、式を伴わない列そのもの)は入力側の列定義(型、nullable)をそのまま引き継ぎ、`id + 1`のような計算結果の式は`item.expr.data_type()`(`Binder`が構築時に決めた型)を使います。
+この規則を実装する`projection_schema`は、`src/logical_plan.rs`に次のように定義します。
 
 ```rust
 pub fn projection_schema(input_schema: &Schema, projection: &[BoundSelectItem]) -> Schema {
@@ -217,7 +225,7 @@ pub fn projection_schema(input_schema: &Schema, projection: &[BoundSelectItem]) 
 `BoundStatement`の各バリアントから`LogicalPlan`を組み立てる関数を、文の種類ごとに用意します。
 
 `SELECT`は、`FROM`があれば`Scan`を、無ければ列を持たない行を1件生成する`Values`を根にします。
-どちらの場合も、`WHERE`があれば`Filter`を挟み、最後に必ず`Projection`を積みます。
+どちらの場合も、`WHERE`があれば`Filter`を挟み、最後に必ず`Projection`を積む`build_select`を、`src/logical_plan.rs`に次のように定義します。
 
 ```rust
 pub fn build_select(select: BoundSelect) -> LogicalPlan {
@@ -246,7 +254,7 @@ pub fn build_select(select: BoundSelect) -> LogicalPlan {
 `filtered`は`source`(`Scan`または`Values`)をそのまま指すだけで、木の形自体が「`Filter`を経由しない」ことを表します。
 `SELECT id FROM users`のような`WHERE`の無い`SELECT`は、`Projection(id) └─ Scan(users)`という2段の木になり、`execute_select_with_from`が持っていた「`predicate`があるかどうかで処理を分岐する」という`if`文は、木を組み立てる`build_select`の中だけに残ります。
 
-`INSERT`は、`VALUES`の各行を`Values`ノードへそのまま積み、それを子に持つ`Insert`を組み立てます。
+`INSERT`は、`VALUES`の各行を`Values`ノードへそのまま積み、それを子に持つ`Insert`を組み立てる`build_insert`を、`src/logical_plan.rs`に次のように定義します。
 
 ```rust
 pub fn build_insert(insert: BoundInsert) -> LogicalPlan {
@@ -261,12 +269,12 @@ pub fn build_insert(insert: BoundInsert) -> LogicalPlan {
 }
 ```
 
-`BoundInsert`には、この章から`table_name`というフィールドを加えました。
+`BoundInsert`には、この章から`table_name`というフィールドを加えます。
 第17章の`resolve_table`はテーブル名をすでに`BoundTableRef::table_name`として持っていましたが、`bind_insert`、`bind_update`、`bind_delete`はそれを使わずに捨てていました。
 `LogicalPlan`の木を表示する際([次節](#演算子木を表示する)参照)にテーブル名を出すには、この情報が必要です。
 すでに`resolve_table`が計算していた値を捨てずに運ぶだけの変更なので、名前解決のやり方自体は変わりません。
 
-`UPDATE`、`DELETE`は、対象テーブルを表す`Scan`を子に持つ`Update`、`Delete`を組み立てます。
+`UPDATE`、`DELETE`は、対象テーブルを表す`Scan`を子に持つ`Update`、`Delete`を組み立てる`build_update`、`build_delete`を、`src/logical_plan.rs`に定義します。
 
 ```rust
 pub fn build_update(update: BoundUpdate) -> LogicalPlan {
@@ -292,7 +300,7 @@ pub fn build_update(update: BoundUpdate) -> LogicalPlan {
 
 ## 演算子木を表示する
 
-`LogicalPlan`に`Display`を実装し、木をそのままの形で見られるようにします。
+`src/logical_plan.rs`の`LogicalPlan`に`Display`を実装し、木をそのままの形で見られるようにします。
 
 ```rust
 impl fmt::Display for LogicalPlan {
@@ -303,7 +311,7 @@ impl fmt::Display for LogicalPlan {
 ```
 
 `write_tree`は、自分自身のラベル(`label()`)を1行書いてから、子(`children()`)それぞれに対して自分自身を再帰呼び出しする、素朴な木の描画です。
-深さが増えるたびにインデントを2文字ずつ深くします。
+深さが増えるたびにインデントを2文字ずつ深くする`write_tree`は、`src/logical_plan.rs`に次のように定義します。
 
 ```rust
 fn write_tree(&self, f: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
@@ -339,7 +347,7 @@ Projection(name)
 
 ## `Database::execute`をparse→bind→plan→executeへ再編する
 
-`Database::execute`は、束縛の直後に計画を組み立てる1行が増えます。
+`src/database.rs`の`Database::execute`は、束縛の直後に計画を組み立てる1行が増えます。
 
 ```rust
 pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
@@ -360,7 +368,7 @@ pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
 `Binder`がすでに名前、型を確定させているため、`BoundStatement`から`LogicalPlan`への変換は形を組み替えるだけで、新たに検出すべき誤りが無いからです。
 `CREATE TABLE`、`DROP TABLE`は`LogicalPlan`を経由せず、これまでどおりテーブル定義を直接登録または削除します。
 
-`execute_select`は、`eval_query_plan`という1つの再帰関数へ木を渡すだけになりました。
+`src/database.rs`の`execute_select`は、`eval_query_plan`という1つの再帰関数へ木を渡すだけになります。
 
 ```rust
 fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {
@@ -369,7 +377,7 @@ fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {
 }
 ```
 
-`eval_query_plan`が、`LogicalPlan`の根から葉へたどりながら`executor`の演算子を適用する本体です。
+`src/database.rs`に定義する`eval_query_plan`が、`LogicalPlan`の根から葉へたどりながら`executor`の演算子を適用する本体です。
 
 ```rust
 fn eval_query_plan(&self, plan: &LogicalPlan) -> DbResult<(Schema, Vec<Tuple>)> {
@@ -417,7 +425,7 @@ fn eval_query_plan(&self, plan: &LogicalPlan) -> DbResult<(Schema, Vec<Tuple>)> 
 これは`Filter`が先に行を絞り込んでから`Projection`が動くという、演算子の順序そのものが持つ性質です。
 第17章までの`execute_select_without_from`は、この性質を「`matched`という真偽値を手で追跡し、`matched`が`false`なら射影式を評価しない」という条件分岐として自前で再現していましたが、`Filter`と`Projection`を独立した演算子として素直に合成するだけで、同じ性質が手続きを書かずに手に入ります。
 
-`execute_insert`、`execute_update`、`execute_delete`は、`LogicalPlan`から必要な情報をパターンマッチで取り出してから、これまでと同じ`executor`の関数を呼びます。
+`src/database.rs`の`execute_insert`、`execute_update`、`execute_delete`は、`LogicalPlan`から必要な情報をパターンマッチで取り出してから、これまでと同じ`executor`の関数を呼びます。
 
 ```rust
 fn execute_insert(&mut self, plan: LogicalPlan) -> DbResult<QueryResult> {
@@ -453,8 +461,8 @@ fn execute_insert(&mut self, plan: LogicalPlan) -> DbResult<QueryResult> {
 
 ## テストで確認する
 
-`logical_plan`モジュールには、各文種が正しい形の木になることを確認するテストを追加しました。
-木の形の検証は、`to_string()`した結果を期待する文字列と比較する、ゴールデンテストに近いやり方です。
+`src/logical_plan.rs`には、各文種が正しい形の木になることを確認するテストを追加します。
+木の形の検証は、そのテストモジュールで、`to_string()`した結果を期待する文字列と比較する、ゴールデンテストに近いやり方です。
 
 ```rust
 #[test]

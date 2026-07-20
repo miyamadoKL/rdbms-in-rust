@@ -69,8 +69,9 @@ Left-deep限定とこの最適性の原理は、どちらもSystem R(1979年の�
 
 ## Subset DP: 部分集合ごとに最良の1つだけを覚える
 
-この章の新しいモジュール`join_order`は、この動的計画法(Dynamic Programming、以下DP)を実装します。
+この章は`src/join_order.rs`を新規作成し、この動的計画法(Dynamic Programming、以下DP)を実装します。
 部分集合は`u32`のビットマスクで表します。
+DPの1状態を、次の`DpEntry`として定義します。
 
 ```rust
 /// DPの1状態(部分集合)が持つ、その部分集合に対する最良の計画。
@@ -86,12 +87,18 @@ struct DpEntry {
 }
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod join_order;
+```
+
 `order`を持ち回っているのが、この実装のややこしいところです。
 `Binder`(第17章)が`ON`条件の`BoundExpr::ColumnRef`へ割り当てる`column_index`は、`FROM`に書かれたテーブルの並びをそのまま連結した、結合後スキーマ上の添字です。
 DPが`shipments`より先に`customers`と`orders`を結合すると決めた瞬間、実際に組み立てる`PhysicalPlan`の列の並びは、その`Binder`が前提にしていた並びとずれます。
 `order`は、今組み立てている部分集合が実際にどの並びで列を連結したかを覚えておき、次にテーブルを1個追加するときに`ON`条件の列添字をその並びへ組み替える(`remap_condition`)ために使います。
 
-DP本体は、部分集合を表す`mask`を`1`から`2^n - 1`まで昇順に見ていきます。
+DP本体は、`src/join_order.rs`の同じ関数の中で、部分集合を表す`mask`を`1`から`2^n - 1`まで昇順に見ていきます。
 
 ```rust
 let full_mask: u32 = (1u32 << n) - 1;
@@ -128,6 +135,7 @@ for mask in 1u32..=full_mask {
 ## Cartesian Productの抑制
 
 `connecting_condition`と`connected_best`、`disconnected_best`という2つの変数が、この章のもう1つの主題です。
+同じ`src/join_order.rs`に、次のコードがあります。
 
 ```rust
 let condition = connecting_condition(&edges, prev_mask, i, n, &orig_offset, &new_offset);
@@ -177,14 +185,14 @@ Projection(a.id) rows=1 cost=3.17
 
 ## テーブル数の上限とフォールバック
 
-DPの状態数は`2^n`です。
+DPの状態数は`2^n`で、その上限を`src/join_order.rs`に定数として定義します。
 
 ```rust
 pub const MAX_DP_TABLES: usize = 8;
 ```
 
 `n = 8`なら256状態、各状態が高々8個の拡張先を試すため、2,000通り程度の候補を評価するだけで済み、この教材の実行時間としては問題になりません。
-`n`がこれを超える`FROM`は、`optimize_join_order`がDPを打ち切り、`combine_in_syntactic_order`(「前章の限界」で見た、構文順のまま左深い木を組み立てる関数)へフォールバックします。
+`n`がこれを超える`FROM`は、`src/join_order.rs`の`optimize_join_order`がDPを打ち切り、`combine_in_syntactic_order`(「前章の限界」で見た、構文順のまま左深い木を組み立てる関数)へフォールバックします。
 
 ```rust
 if n > MAX_DP_TABLES {
@@ -200,6 +208,7 @@ if n > MAX_DP_TABLES {
 
 DPが探索するのは、あくまで**3個以上のテーブルを結合するINNER JOINの連鎖**です。
 2テーブルの結合(`JOIN`が1個)には、そもそも順序の選びようがないので、この章でも第22章、第25章、第28章の`choose_join_plan`をそのまま使います。
+この平坦化は`src/physical_plan.rs`に次の`flatten_join_chain`を定義して行います。
 
 ```rust
 fn flatten_join_chain(plan: LogicalPlan, leaves: &mut Vec<LogicalPlan>, conditions: &mut Vec<BoundExpr>) {
@@ -218,7 +227,7 @@ fn flatten_join_chain(plan: LogicalPlan, leaves: &mut Vec<LogicalPlan>, conditio
 `rules::optimize`のPredicate Pushdown(第26章)は`left`、`right`の直上に`Filter`を追加することはあっても、`Join`の構造そのものは変えません。
 `flatten_join_chain`はこの木を、`n`個の葉(`Scan`または`Filter(Scan)`)と`n - 1`個の`ON`条件へ平らにします。
 
-`physical_plan::optimize`の`LogicalPlan::Join`の分岐は、葉が3個以上のときだけこの章の`join_order::optimize_join_order`へ委ねます。
+`src/physical_plan.rs`の`physical_plan::optimize`にある`LogicalPlan::Join`の分岐は、葉が3個以上のときだけこの章の`join_order::optimize_join_order`へ委ねます。
 
 ```rust
 let mut leaves = Vec::new();
@@ -249,7 +258,7 @@ DPが選んだ部分集合の並び(`order`)が、元の`FROM`の並びと違う
 `ORDER BY amount`が続くなら、その`Sort`はもう仕事をしていません。
 
 この「演算子の出力がすでに特定の列で並んでいる」という性質を**Physical Property**と呼びます。
-原案(`docs-local/chatgpt_opinion.md`)は単一ノード版のPhysical Propertyを主に「出力順序」として扱うとしており、この章もそれに倣います。
+原案(`docs-local/chatgpt_opinion.md`)は単一ノード版のPhysical Propertyを主に「出力順序」として扱うとしており、この章もそれに倣い、`src/physical_plan.rs`に`output_ordering`として実装します。
 
 ```rust
 pub(crate) fn output_ordering(plan: &PhysicalPlan) -> Option<usize> {
@@ -293,7 +302,7 @@ pub(crate) fn output_ordering(plan: &PhysicalPlan) -> Option<usize> {
 `right`の順序は失われますが、`left`側の順序は、`left`が結合後スキーマの先頭側を占めることもあって、同じ列添字のまま保たれます。
 Join方式を問わず「左側の順序は生き残る」というこの性質は、実装するまで気づきにくいものの、確実に成り立っています。
 
-`Sort`を実際に省略するのは、`optimize`の`LogicalPlan::Sort`の分岐です。
+`Sort`を実際に省略するのは、`src/physical_plan.rs`の`optimize`にある`LogicalPlan::Sort`の分岐です。
 
 ```rust
 LogicalPlan::Sort(sort) => {

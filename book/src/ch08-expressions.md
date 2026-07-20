@@ -17,7 +17,7 @@
 
 ## NULLは値ではなく「わからない」という状態を表す
 
-`crate::types::Value`はすでに`Null`というバリアントを持っています。
+`src/types.rs`で定義した`crate::types::Value`はすでに`Null`というバリアントを持っています。
 
 ```rust
 pub enum Value {
@@ -48,7 +48,7 @@ SQLの`AND`、`OR`、`NOT`は、この3値を引数に取り3値を返す論理�
 
 `Value::Boolean(bool)`と`Value::Null`という組は、見た目には`Option<bool>`とよく似ています。
 `Some(true)`が`TRUE`、`Some(false)`が`FALSE`、`None`が`UNKNOWN`に対応しそうです。
-この対応を信じて、Rustの`?`演算子で`AND`を実装してみます。
+この対応を信じて、Rustの`?`演算子で`AND`を実装できるかどうか、次のコードを例に考えます。
 
 ```rust
 fn and(l: Option<bool>, r: Option<bool>) -> Option<bool> {
@@ -79,6 +79,7 @@ Rustの`&&`は左辺が`false`のとき右辺を評価しない短絡評価を�
 ## 真理値表をコードに落とす
 
 この章の`eval`モジュールでは、`Value`とは別に`Tri`という3値の列挙型を評価の内部でだけ使います。
+この章では`src/eval.rs`を新規に作成し、評価器の実装をまとめて置きます。
 
 ```rust
 enum Tri {
@@ -88,8 +89,14 @@ enum Tri {
 }
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod eval;
+```
+
 `Value`に3つめのバリアントを増やすのではなく、論理演算の間だけ使う専用の型を用意しているのは、`Value::Boolean`/`Value::Null`という対外的な表現と、論理演算の内部計算を分離するためです。
-`value_to_tri`と`tri_to_value`が、この2つの表現を橋渡しします。
+`src/eval.rs`に定義する`value_to_tri`と`tri_to_value`が、この2つの表現を橋渡しします。
 
 ```rust
 fn value_to_tri(value: &Value) -> DbResult<Tri> {
@@ -115,7 +122,7 @@ fn value_to_tri(value: &Value) -> DbResult<Tri> {
 エラーメッセージには`Option<DataType>`のRust内部表現(`Some(BigInt)`)ではなく、`DataType`の`Display`実装によるSQLの型名(`BIGINT`)だけを表示します。
 `1 AND true`のような式を暗黙に`Boolean`へ変換して通す設計も選べますが、この章では暗黙変換を採らない方針(次節で改めて述べます)を通しています。
 
-`AND`と`OR`は、前節の`?`で崩れた規則を、9通りの組み合わせをすべて列挙するmatch式で書き直します。
+`AND`と`OR`は、前節の`?`で崩れた規則を、`src/eval.rs`で9通りの組み合わせをすべて列挙するmatch式で書き直します。
 
 ```rust
 fn tri_and(l: Tri, r: Tri) -> Tri {
@@ -139,7 +146,7 @@ fn tri_or(l: Tri, r: Tri) -> Tri {
 左右どちらの位置に`False`が来ても、もう一方が`Unknown`であっても、結果は`False`に固定されます。
 `tri_or`はこの勝ち負けが反転するだけで、`True`がどちらの位置にあっても`Unknown`に優先します。
 
-`NOT`は引数を1つしか取らないので、`Tri`に`std::ops::Not`を実装するだけで済みます。
+`NOT`は引数を1つしか取らないので、`src/eval.rs`で`Tri`に`std::ops::Not`を実装するだけで済みます。
 
 ```rust
 impl std::ops::Not for Tri {
@@ -186,7 +193,7 @@ impl std::ops::Not for Tri {
 ## 算術演算：NULLの伝播、ゼロ除算、オーバーフロー
 
 論理演算の次は算術演算です。
-対応するのは`+ - * /`の4つで、いずれも`BIGINT`同士にのみ定義します。
+対応するのは`+ - * /`の4つで、いずれも`BIGINT`同士にのみ、`src/eval.rs`の`eval_arith`として定義します。
 
 ```rust
 fn eval_arith(op: BinaryOperator, l: Value, r: Value) -> DbResult<Value> {
@@ -247,7 +254,7 @@ Rustの`i64`は、`release`ビルドでは既定でオーバーフロー時に�
 
 ## 比較演算：同じ型どうしにしか意味がない
 
-比較演算(`= <> < <= > >=`)は、`BIGINT`同士、`TEXT`同士、`BOOLEAN`同士のときにだけ定義します。
+比較演算(`= <> < <= > >=`)は、`BIGINT`同士、`TEXT`同士、`BOOLEAN`同士のときにだけ、`src/eval.rs`の`eval_compare`として定義します。
 
 ```rust
 fn eval_compare(op: BinaryOperator, l: Value, r: Value) -> DbResult<Value> {
@@ -297,7 +304,7 @@ fn eval_compare(op: BinaryOperator, l: Value, r: Value) -> DbResult<Value> {
 
 ## `IS [NOT] NULL`は三値論理から独立している
 
-`IS NULL`だけは、ここまでの三値論理の外側にあります。
+`IS NULL`だけは、ここまでの三値論理の外側にあり、`src/eval.rs`の`eval_expr`には次の分岐を追加します。
 
 ```rust
 Expr::IsNull { expr, negated, .. } => {
@@ -313,8 +320,8 @@ Expr::IsNull { expr, negated, .. } => {
 
 ## CAST：明示的な型変換だけを許す
 
-`CAST(expr AS type)`は、この章で新しくASTに追加した構文です。
-第7章時点の`Expr`にはこの構文が無かったので、`ast::Expr`に`Cast`バリアントを足しました。
+`CAST(expr AS type)`は、この章で新しくASTに追加する構文です。
+第7章時点の`Expr`にはこの構文が無かったので、`src/ast.rs`の`Expr`に`Cast`バリアントを足します。
 
 ```rust
 Cast {
@@ -327,6 +334,7 @@ Cast {
 `type_name`を`CreateTableStatement`の`ColumnDef`と同じ`Ident`のまま持たせているのは、Parserが型名の一覧を知らなくてよいという第7章の設計をそのまま踏襲しているためです。
 `Parser`はこの構文を`CAST` `(` 式 `AS` 型名 `)`という並びとして受理するだけで、`type_name`が本当に妥当な型かどうかは見ません。
 その判定は評価器の`resolve_data_type`に任せます。
+`src/eval.rs`に戻り、次の関数を定義します。
 
 ```rust
 fn resolve_data_type(type_name: &str) -> DbResult<DataType> {
@@ -354,7 +362,7 @@ fn resolve_data_type(type_name: &str) -> DbResult<DataType> {
 
 `BIGINT`と`BOOLEAN`を相互変換しない決定は、C言語の「0以外はすべて真」のような規約をこのSQLサブセットが持たないためです。
 `CAST(1 AS BOOLEAN)`のような式は、実行時エラーとしてはっきり拒否します。
-この一覧に無いすべての組み合わせも同様にエラーにする実装は、次のとおりです。
+この一覧に無いすべての組み合わせも同様にエラーにする実装を、`src/eval.rs`に`eval_cast`として次のとおり加えます。
 
 ```rust
 fn eval_cast(value: Value, target: DataType) -> DbResult<Value> {
@@ -404,7 +412,7 @@ fn eval_cast(value: Value, target: DataType) -> DbResult<Value> {
 
 ## Scalar Functionのレジストリ
 
-`abs(-5)`や`length('hello')`のような関数呼び出しは、名前から実装への対応表を引く形で評価します。
+`abs(-5)`や`length('hello')`のような関数呼び出しは、名前から実装への対応表を引く形で評価するため、`src/eval.rs`に次の型と構造体を定義します。
 
 ```rust
 type ScalarFn = Box<dyn Fn(&[Value]) -> DbResult<Value> + Send + Sync>;
@@ -433,7 +441,7 @@ impl FunctionRegistry {
 
 `register`が受け取る`f`の型は、`&[Value]`を受け取り`DbResult<Value>`を返すクロージャなら何でも構いません。
 これにより`FunctionRegistry`自体は、`abs`や`length`という具体的な関数名を一切知らずに済みます。
-組み込み関数は、この空のレジストリに対する`register`呼び出しとして定義されます。
+組み込み関数は、`src/eval.rs`のこの空のレジストリに対する`register`呼び出しとして定義されます。
 
 ```rust
 pub fn with_builtins() -> Self {
@@ -444,7 +452,7 @@ pub fn with_builtins() -> Self {
 }
 ```
 
-`builtin_abs`は引数を1個だけ受け取り、`BIGINT`に対してのみ`checked_abs`で絶対値を計算します。
+`src/eval.rs`に定義する`builtin_abs`は引数を1個だけ受け取り、`BIGINT`に対してのみ`checked_abs`で絶対値を計算します。
 
 ```rust
 fn builtin_abs(args: &[Value]) -> DbResult<Value> {
@@ -482,7 +490,7 @@ fn builtin_abs(args: &[Value]) -> DbResult<Value> {
 
 ## 列参照はまだ評価できない
 
-`Expr::ColumnRef`だけは、この章でも評価できません。
+`Expr::ColumnRef`だけは、この章でも評価できないため、`src/eval.rs`の`eval_expr`には次の分岐だけを置きます。
 
 ```rust
 Expr::ColumnRef { name, .. } => Err(DbError::NotImplemented(format!(
@@ -497,7 +505,7 @@ Expr::ColumnRef { name, .. } => Err(DbError::NotImplemented(format!(
 
 ## `Database::execute`を差し替える
 
-`eval::eval_expr`が揃ったので、`database.rs`にあった第7章までの`eval_expr`(リテラルと整数の加算しか対応していなかったもの)は丸ごと削除し、`execute_select`から`eval`モジュールを呼ぶように変えます。
+`eval::eval_expr`が揃ったので、`src/database.rs`にあった第7章までの`eval_expr`(リテラルと整数の加算しか対応していなかったもの)は丸ごと削除し、`execute_select`から`eval`モジュールを呼ぶように変えます。
 
 ```rust
 for item in &select.items {
@@ -510,7 +518,7 @@ for item in &select.items {
 }
 ```
 
-`self.functions`は`Database`が持つ`FunctionRegistry`で、`Database::memory()`が組み込み関数を登録済みの状態で作ります。
+`self.functions`は`Database`が持つ`FunctionRegistry`で、`src/database.rs`の`Database::memory()`が組み込み関数を登録済みの状態で作ります。
 
 ```rust
 pub fn memory() -> Self {
@@ -529,7 +537,7 @@ PostgreSQLはこの状況に`unknown`という専用の型を割り当てます�
 
 ## テストで確認する
 
-`eval`モジュールには、三値論理の真理値表を網羅するテスト、ゼロ除算とオーバーフローのテスト、`CAST`の対応表を1行ずつ確認するテスト、Scalar Functionの呼び出しと引数検査のテストを追加しました。
+`src/eval.rs`の`mod tests`には、三値論理の真理値表を網羅するテスト、ゼロ除算とオーバーフローのテスト、`CAST`の対応表を1行ずつ確認するテスト、Scalar Functionの呼び出しと引数検査のテストを追加します。
 真理値表のテストは、9通りの組み合わせをすべて1つの関数にまとめて書いています。
 
 ```rust
@@ -548,7 +556,7 @@ fn and_truth_table() {
 ```
 
 `false AND NULL`と`NULL AND false`の両方を書いているのは、`FALSE`がどちらの位置にあっても結果を決定づけるという規則が、実装の対称性だけでなくテストの対称性としても保たれているかを確かめるためです。
-`database`側には、`SELECT 1 = 1;`、`SELECT NULL AND FALSE;`、`SELECT CAST(42 AS TEXT);`のように、`Database::execute`が最後まで実行できることを確認するテストを加えています。
+`database`側には、`SELECT 1 = 1;`、`SELECT NULL AND FALSE;`、`SELECT CAST(42 AS TEXT);`のように、`Database::execute`が最後まで実行できることを確認するテストを、`src/database.rs`の`mod tests`に加えています。
 
 ```rust
 #[test]

@@ -8,7 +8,7 @@
 
 ## 前章の限界
 
-第18章の`Database::eval_query_plan`は、`LogicalPlan`の木を根から葉へたどりながら`executor`モジュールの演算子を呼び出す再帰関数でした。
+第18章の`src/database.rs`にあった`Database::eval_query_plan`は、`LogicalPlan`の木を根から葉へたどりながら`executor`モジュールの演算子を呼び出す再帰関数でした。
 
 ```rust
 fn eval_query_plan(&self, plan: &LogicalPlan) -> DbResult<(Schema, Vec<Tuple>)> {
@@ -36,7 +36,7 @@ fn eval_query_plan(&self, plan: &LogicalPlan) -> DbResult<(Schema, Vec<Tuple>)> 
 `Projection`も同じ形で、子の結果をまるごと受け取ってから新しい`Vec<Tuple>`をまるごと作ります。
 
 「まるごと」という言葉を3回使ったのは、誇張ではありません。
-`executor::filter`の中身を思い出すと、これがそのまま実装になっていたことが分かります。
+`src/executor.rs`にあった`executor::filter`の中身を思い出すと、これがそのまま実装になっていたことが分かります。
 
 ```rust
 pub fn filter(
@@ -81,6 +81,7 @@ Projectionに渡されるrows:        1要素
 
 行を1件ずつ流す実行方式を、**Volcanoモデル**と呼びます。
 [第2章](./ch02-life-of-a-query.md)で経路の概観として触れたとおり、各演算子は共通のインターフェースを実装します。
+まずは骨組みだけを、次のように考えてみます。
 
 ```rust
 trait Executor {
@@ -113,6 +114,7 @@ Volcanoモデルの`next()`は、子の`next()`を1回呼んで1行受け取る�
 その変換の受け皿を、この章のうちに用意しておきます。
 
 `LogicalPlan`とほぼ同じ形で、実行アルゴリズムを確定した木を`PhysicalPlan`という別の型として定義します。
+この章では新規モジュール`physical_plan`を作り、`src/physical_plan.rs`に置きます。
 
 ```rust
 pub enum PhysicalPlan {
@@ -126,8 +128,14 @@ pub enum PhysicalPlan {
 }
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod physical_plan;
+```
+
 `Scan`が`SeqScan`という具体的な名前に変わった以外、`LogicalPlan`とバリアントの構成は同じです。
-`LogicalPlan`から`PhysicalPlan`への変換は、`optimize`という1つの関数が担います。
+`LogicalPlan`から`PhysicalPlan`への変換は、同じ`src/physical_plan.rs`に置く`optimize`という1つの関数が担います。
 
 ```rust
 pub fn optimize(plan: LogicalPlan) -> PhysicalPlan {
@@ -186,6 +194,8 @@ Trait Object方式であれば、演算子ごとに独立した`struct`と`impl 
 今後の章(第21章の`Sort`、`Limit`、`Distinct`、`Aggregate`、第22章の`Join`、第25章の`IndexScan`)で演算子の種類を継続的に増やしていくこのクレートの育て方には、演算子ごとに実装を閉じ込められるTrait Object方式のほうが向いています。
 動的ディスパッチのコストが実際にどれだけ効くかは、この章では測定しません(章末の演習課題で、Enum Dispatch方式を実装して比較します)。
 
+`src/physical_plan.rs`に、次の`Executor` traitを定義します。
+
 ```rust
 pub trait Executor {
     fn output_schema(&self) -> &Schema;
@@ -199,7 +209,7 @@ pub trait Executor {
 
 ### Values: 構築時にまとめて評価してよい理由
 
-`ValuesExec`は`VALUES`の各行を、構築時にまとめて評価します。
+`src/physical_plan.rs`に定義する`ValuesExec`は、`VALUES`の各行を構築時にまとめて評価します。
 
 ```rust
 pub struct ValuesExec {
@@ -236,7 +246,7 @@ impl Executor for ValuesExec {
 
 ### SeqScan: `MemTable`版と`Storage`版
 
-`SeqScan`は、第16章から続く2つの供給源(`MemTable`と`Storage`)に対応する2つの`struct`を持ちます。
+`SeqScan`は、第16章から続く2つの供給源(`MemTable`と`Storage`)に対応する2つの`struct`を`src/physical_plan.rs`に持ちます。
 
 ```rust
 pub struct MemSeqScanExec<'a> {
@@ -264,7 +274,7 @@ impl<'a> Executor for MemSeqScanExec<'a> {
 第18章までの`executor::seq_scan`は`table.rows().to_vec()`でテーブル全体を複製していました。
 `MemSeqScanExec`は`std::slice::Iter`を1歩ずつ進めるだけなので、`next()`が呼ばれた分しか複製が起きません。
 
-`Storage`版は、`Storage::scan`(第15章)が返す`Scan`イテレータをそのまま持ちます。
+同じ`src/physical_plan.rs`に置く`Storage`版は、`Storage::scan`(第15章)が返す`Scan`イテレータをそのまま持ちます。
 
 ```rust
 pub struct DiskSeqScanExec<'a> {
@@ -300,6 +310,8 @@ impl<'a> Executor for DiskSeqScanExec<'a> {
 `DiskSeqScanExec`はこの`collect()`という一手間を無くし、イテレータをそのまま1件ずつ`decode_tuple`へ通します。
 
 ### Filter: 一致するまで子を引き、一致しない行は溜めない
+
+`src/physical_plan.rs`に、次の`FilterExec`を定義します。
 
 ```rust
 pub struct FilterExec<'a> {
@@ -345,6 +357,8 @@ impl<'a> Executor for FilterExec<'a> {
 
 ### Projection: 1行受け取り、1行返す
 
+同じ`src/physical_plan.rs`に、次の`ProjectionExec`を定義します。
+
 ```rust
 pub struct ProjectionExec<'a> {
     input: Box<dyn Executor + 'a>,
@@ -386,7 +400,7 @@ impl<'a> Executor for ProjectionExec<'a> {
 
 ### 組み立て: `Database::build_query_executor`
 
-`PhysicalPlan`の木から`Box<dyn Executor>`の入れ子を組み立てるのは、`Database`のprivateメソッドです。
+`PhysicalPlan`の木から`Box<dyn Executor>`の入れ子を組み立てるのは、`src/database.rs`にある`Database`のprivateメソッドです。
 
 ```rust
 fn build_query_executor<'a>(&'a self, plan: &'a PhysicalPlan) -> DbResult<Box<dyn Executor + 'a>> {
@@ -424,7 +438,7 @@ fn build_query_executor<'a>(&'a self, plan: &'a PhysicalPlan) -> DbResult<Box<dy
 
 `SeqScan`だけが`&self.backend`を見ます。
 `Filter`、`Projection`は供給源を意識せず、`Box<dyn Executor>`という共通のインターフェースだけを相手にします。
-`execute_select`は、この関数が組み立てた木の根に対して`next()`を呼び続けるだけになりました。
+`src/database.rs`の`execute_select`は、この関数が組み立てた木の根に対して`next()`を呼び続けるだけになります。
 
 ```rust
 fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {
@@ -471,6 +485,7 @@ Volcanoの子として`INSERT`、`UPDATE`、`DELETE`を分解しなかった理�
 
 Lexerには`EXPLAIN`という予約語を1つ追加します(`Keyword::Explain`)。
 Parserは`EXPLAIN`の直後に、`SELECT`、`INSERT INTO`、`UPDATE`、`DELETE FROM`のいずれかだけを許します。
+`src/parser.rs`に次のメソッドを追加します。
 
 ```rust
 fn parse_explain_statement(&mut self) -> DbResult<ExplainStatement> {
@@ -492,7 +507,7 @@ fn parse_explain_statement(&mut self) -> DbResult<ExplainStatement> {
 `CREATE TABLE`、`DROP TABLE`を対象から外したのは、この2つがどちらの計画も経由しない文だからです(`Binder`を素通りする理由は第17章、`LogicalPlan`を経由しない理由は第18章を参照)。
 対象を`SELECT`等4種の解析関数だけに絞ったことで、`EXPLAIN EXPLAIN ...`のような入れ子も、生の`parse_statement`を再帰的に呼ばないこの書き方によって構文の時点で拒否されます。
 
-`Binder`は対象の文をそのまま束縛するだけです。
+`src/binder.rs`の`Binder`は対象の文をそのまま束縛するだけです。
 
 ```rust
 Statement::Explain(explain) => {
@@ -500,8 +515,7 @@ Statement::Explain(explain) => {
 }
 ```
 
-`Database::execute_explain`は、束縛済みの文を`LogicalPlan`、`PhysicalPlan`へ変換し、木を文字列化しただけの`QueryResult`を返します。
-実際には何も実行しません。
+`src/database.rs`の`Database::execute_explain`は、束縛済みの文を`LogicalPlan`、`PhysicalPlan`へ変換し、木を文字列化しただけの`QueryResult`を返すメソッドで、実際には何も実行しません。
 
 ```rust
 fn execute_explain(&self, inner: BoundStatement) -> DbResult<QueryResult> {
@@ -520,7 +534,7 @@ fn execute_explain(&self, inner: BoundStatement) -> DbResult<QueryResult> {
 ```
 
 `QueryResult::explain`は、PostgreSQLの`EXPLAIN`にならい、`QUERY PLAN`という1列の結果として木を返します。
-木の1行が結果の1行になります。
+同じ`src/database.rs`のこの実装で、木の1行が結果の1行になります。
 
 ```rust
 fn explain(plan_text: String) -> Self {
@@ -552,7 +566,7 @@ Projection(name)
 
 ## テストで確認する
 
-各演算子の`next()`が実際に1行ずつ流れることは、`physical_plan`モジュールに手作りの`CountingExecutor`(`next()`が呼ばれた回数を数える、テスト専用の葉演算子)を使って確認します。
+各演算子の`next()`が実際に1行ずつ流れることは、`src/physical_plan.rs`に手作りの`CountingExecutor`(`next()`が呼ばれた回数を数える、テスト専用の葉演算子)を使って確認します。
 
 ```rust
 #[test]
@@ -580,7 +594,7 @@ fn scan_filter_projection_pipeline_pulls_exactly_as_many_rows_as_requested() {
 1,000行すべてが条件に一致する状況でも、根から3回しか`next()`を呼ばなければ、葉も3回しか`next()`されません。
 これが第18章までの`eval_query_plan`(`Filter`が呼ばれた時点で1,000行すべてを読み切り、`Vec`にまとめてしまう)との違いです。
 
-`database`モジュールには、より大きな規模でこの性質を確認する統合テストを追加しました。
+`src/database.rs`には、より大きな規模でこの性質を確認する統合テストを追加します。
 
 ```rust
 #[test]

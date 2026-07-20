@@ -9,6 +9,7 @@ minidb> COMMIT;
 ```
 
 `db.flush()`を一度も呼ばずにここでプロセスが死んだことにして、WALファイルだけを直接開き直すと、`Insert`と`Commit`のレコードが確かに残っています。
+これは`tests/wal_durability.rs`にある、第33章のテストの一部です。
 
 ```rust
 let wal = minidb::WalWriter::open(wal_path(&path)).unwrap();
@@ -64,6 +65,7 @@ ARIESは3つの段階から成ります。
 Redoが「この変更はもう届いているか」を判定するには、ページの側にも何らかの目印が要ります。
 第33章の`Page LSN`は、この目印そのものでした。
 ただし、その持ち場は`BufferPool`の`FrameMeta`という、プロセスのメモリ上にしかない場所でした。
+`src/buffer_pool.rs`の`FrameMeta`は、次のように`page_lsn`を持っています。
 
 ```rust
 struct FrameMeta {
@@ -79,6 +81,7 @@ struct FrameMeta {
 クラッシュ後に読み直したページが「どこまでの変更をすでに含んでいるか」を、プロセスの寿命をまたいで覚えておく手段が無ければ、Redoは判定のしようがありません。
 
 この章は、`Page LSN`をページのバイト列そのものに埋め込みます。
+`src/page.rs`の`Page`に、次のように`page_lsn`フィールドを追加します。
 
 ```rust
 pub struct Page {
@@ -91,6 +94,7 @@ pub struct Page {
 
 Page Headerに8バイト増えた分、`PAGE_HEADER_SIZE`は16から24へ、`PAGE_PAYLOAD_SIZE`はその分だけ縮み、`FORMAT_VERSION`も1つ上げてあります。
 `BufferPool`は、ページを新しく読み込むとき、ディスクに永続化されていた`page_lsn`をそのままフレームの初期値として引き継ぎます。
+`src/buffer_pool.rs`には、次のように書き加えます。
 
 ```rust
         let page_lsn = page.page_lsn;
@@ -104,7 +108,7 @@ Page Headerに8バイト増えた分、`PAGE_HEADER_SIZE`は16から24へ、`PAG
         };
 ```
 
-逆に、dirtyなページを書き戻す直前には、フレームが覚えている最新の値をページ自身へ書き写してからディスクへ渡します。
+逆に、同じ`src/buffer_pool.rs`で、dirtyなページを書き戻す直前には、フレームが覚えている最新の値をページ自身へ書き写してからディスクへ渡します。
 
 ```rust
         let mut frame = self.lock_frame(frame_id);
@@ -123,6 +127,9 @@ Redoが冪等に振る舞える根拠は、突き詰めればこの1つの永続
 `Storage::open`は、カタログと索引を読み込んだ直後、WALファイルの内容(`WalWriter::open`がすでに全レコードをメモリへ読み込んでいます)を使ってAnalysisを行います。
 やることは単純です。
 WALの記録を先頭から順に見ていき、トランザクションごとに「最後に書いたレコードのLSN」と「`Commit`か`Abort`をすでに見たかどうか」を追跡するだけです。
+
+この章はAnalysis、Redo、Undoをまとめて、新規モジュール`src/recovery.rs`として実装します。
+その中身は、次のように`TxState`を組み立てるところから始まります。
 
 ```rust
     for record in scanned {
@@ -147,6 +154,12 @@ WALの記録を先頭から順に見ていき、トランザクションごと�
     }
 ```
 
+あわせて`src/lib.rs`に次の宣言を加え、このモジュールを公開します。
+
+```rust
+pub mod recovery;
+```
+
 走査を終えた時点で、`resolved`が`false`のまま残っているトランザクションが**loser**です。
 `Commit`も`Abort`も記録されていない、つまりクラッシュの瞬間にActiveだったトランザクションだと分かります。
 
@@ -165,6 +178,7 @@ Dirty Page Tableに相当するものは、あえて作りません。
 
 Redoは、Analysisが決めた走査範囲のレコードを、LSNの昇順のまま1件ずつ再適用します。
 `Insert`、`Update`、`Delete`のどれであっても、対象ページの現在のPage LSNがそのレコードのLSN以上であれば、もう反映済みなので何もしません。
+`src/storage.rs`に、次の`redo_insert`を定義します。
 
 ```rust
     pub(crate) fn redo_insert(&mut self, table_id: TableId, rid: RecordId, bytes: &[u8], lsn: Lsn) -> DbResult<()> {
@@ -209,6 +223,7 @@ Redoは1本のWALを昇順にたどり、あるページに対して行う操作
 
 `Update`は、`old_rid`と`rid`が一致するかどうかで処理が分かれます。
 一致すれば同じページ内で完結する更新、食い違えば「新しい位置へ挿入し、古い位置をtombstone化する」という2つの物理操作に分解されます。
+この振り分けは`src/recovery.rs`に書きます。
 
 ```rust
             if old_rid == new_rid {
@@ -233,7 +248,7 @@ Redoが終わった時点で、テーブルはクラッシュ直前の物理的�
 残るのは、Analysisがloserと判定したトランザクションの変更を取り消すことです。
 
 ここで使うのは、新しいコードではありません。
-第33章の`ROLLBACK`がすでに実装していた`crate::transaction::apply_wal_undo_disk`を、loserごとにそのまま呼び出します。
+`src/recovery.rs`の`recover`は、第33章の`ROLLBACK`がすでに実装していた`crate::transaction::apply_wal_undo_disk`を、loserごとにそのまま呼び出します。
 
 ```rust
     let mut transactions_undone = 0usize;
@@ -270,6 +285,7 @@ Undoの1操作ごとに専用のログレコードを書き、そのレコード
 
 `recover`は、Analysis、Redo、Undoのすべてが終わるまで、`Storage::flush`と`Storage::sync`のどちらも呼びません。
 Redoが書き込むページも、Undoが書き込むページも、Undoが積む`Abort`レコードも、この時点ではすべて`BufferPool`や`WalWriter`のメモリ上のバッファに留まっています。
+`src/recovery.rs`の`recover`は、最後に次のようにまとめて反映します。
 
 ```rust
     storage.flush()?;
@@ -305,6 +321,7 @@ Redoが冪等であることはすでに確認したとおりで、Undoも`apply
 Analysisは、WALの先頭からすべてのレコードを見て回ります。
 稼働時間が延びるほどWALは長くなり、Analysisが見て回る範囲も広がっていきます。
 `CHECKPOINT`は、この範囲を短く保つための手段です。
+`src/storage.rs`に、次の`checkpoint`を定義します。
 
 ```rust
     pub fn checkpoint(&mut self, active: &[(TransactionId, Option<Lsn>)]) -> DbResult<Lsn> {
@@ -324,6 +341,7 @@ Analysisが次にWALを読むとき、`Checkpoint`より前のレコードを1�
 ただし、`Checkpoint`の瞬間にActiveだったトランザクションだけは例外です。
 そのトランザクションが以後1件もWALへ書かず、Checkpointの直後にクラッシュしたなら、Analysisが`Checkpoint`より後ろしか見なければ、そのトランザクションの存在にすら気づけません。
 そこで`Checkpoint`レコードには、その瞬間のActiveトランザクション一覧(**Active Transaction Table**)を埋め込みます。
+このエンコードは、ログレコードの形式を扱う`src/wal.rs`に置きます。
 
 ```rust
 pub(crate) fn encode_active_transactions(active: &[(TransactionId, Option<Lsn>)]) -> Vec<u8> {
@@ -344,6 +362,7 @@ pub(crate) fn encode_active_transactions(active: &[(TransactionId, Option<Lsn>)]
 ```
 
 Analysisは、WALの中から最後の`Checkpoint`レコードを探し、その一覧をTransaction Tableの初期値としてから、`Checkpoint`より後ろだけを走査します。
+これも`src/recovery.rs`の関数です。
 
 ```rust
 fn analysis_start(records: &[LogRecord]) -> (usize, Vec<(TransactionId, Option<Lsn>)>, bool) {
@@ -364,6 +383,7 @@ fn analysis_start(records: &[LogRecord]) -> (usize, Vec<(TransactionId, Option<L
 
 SQLの`CHECKPOINT`文は、現在Activeなトランザクションをすべてこの一覧として渡すだけの薄い入口です。
 通常のSQL経路の`self.tx`(高々1本)だけでなく、決定的インターリーブテストハーネス(第30章)の`harness_contexts`が同時に持ちうる複数のトランザクションも、両方ともこの一覧に含めます。
+`src/database.rs`の`execute_checkpoint`は、次のようになっています。
 
 ```rust
     fn execute_checkpoint(&mut self, _checkpoint: CheckpointStatement) -> DbResult<QueryResult> {
@@ -388,7 +408,9 @@ SQLの`CHECKPOINT`文は、現在Activeなトランザクションをすべて�
 けれども「Undoの途中でRecoveryそのものがもう一度クラッシュする」状況は、この手口では再現できません。
 `recover`は`Storage::open`という1回の関数呼び出しの**内部**で最初から最後まで進むため、その内側で止める仕掛けが要ります。
 
-この章は、実プロセスを本当には止めない、テスト専用のcrash point注入機構を自作しました。
+この章は、実プロセスを本当には止めない、テスト専用のcrash point注入機構を自作します。
+`src/failpoint.rs`を新しいモジュールとして作成します。
+その中身は、次のとおりです。
 
 ```rust
 pub fn arm(name: &'static str, count: usize) {
@@ -416,6 +438,12 @@ pub(crate) fn hit(name: &'static str) -> DbResult<()> {
 }
 ```
 
+あわせて`src/lib.rs`に次の宣言を加え、このモジュールを公開します。
+
+```rust
+pub mod failpoint;
+```
+
 `arm(名前, 回数)`で「この名前のfailpointが何回目に呼ばれたら失敗させるか」を予約し、`recover`の内部が要所(Redoの1レコードごと、Undoの1トランザクションごと)で`hit`を呼びます。
 回数が一致すると`hit`は`Err`を返し、それがそのまま`recover`から`Storage::open`まで伝わります。
 
@@ -428,7 +456,7 @@ pub(crate) fn hit(name: &'static str) -> DbResult<()> {
 
 ## クラッシュシナリオを試す
 
-`tests/crash_recovery.rs`に、この章が主張する8つの場面をそれぞれテストとして書きました。
+`tests/crash_recovery.rs`に、この章が主張する8つの場面をそれぞれテストとして書きます。
 
 **(a) COMMIT応答後、データページ書き戻し前のクラッシュ**は、`BEGIN`のうちに`INSERT`を2件実行して`COMMIT`し、そのあとで`flush`せずに`drop`し、開き直した`Database`が両方の行を読めることを確認します。
 `last_recovery_report()`の`records_redone`が2以上であることも合わせて確かめます。
@@ -438,7 +466,7 @@ pub(crate) fn hit(name: &'static str) -> DbResult<()> {
 開き直すと、`UPDATE`は元の値へ戻り、`INSERT`した行は消えています。
 
 **(c) Undo中の再クラッシュ**は、決定的インターリーブテストハーネスで2本のトランザクションを同時にActiveにし、どちらもコミットもロールバックもしないままdropします。
-`failpoint::arm("recovery_undo_step", 1)`で「1本目のUndoを終えた直後」に発火するよう仕込むと、1回目の`Database::open`は確かに失敗します。
+`tests/crash_recovery.rs`で`failpoint::arm("recovery_undo_step", 1)`により「1本目のUndoを終えた直後」に発火するよう仕込むと、1回目の`Database::open`は確かに失敗します。
 
 ```rust
     failpoint::arm("recovery_undo_step", 1);

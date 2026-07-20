@@ -65,8 +65,8 @@ dense     m= 32000  matches= 32000  IndexNestedLoopJoin=786.240948ms  HashJoin=4
 
 ## 統計収集: 行数、NULL数、NDV、Min/Max、MCV、Histogram
 
-統計情報の型は`src/statistics.rs`に置きます。
-集めるのは、テーブルの行数と、列ごとの5種類の値です。
+統計情報の型は、新規作成する`src/statistics.rs`に置きます。
+この型は、テーブルの行数と、列ごとの5種類の値を集めます。
 
 ```rust
 pub struct TableStats {
@@ -84,13 +84,19 @@ pub struct ColumnStats {
 }
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod statistics;
+```
+
 `mcv`(MCV、Most Common Values)は、出現回数の多い値を個別に(値そのものと実際の頻度の組で)保持するリストです。
 これが要る理由は、等頻度Histogramだけでは特定の値に行が集中する分布をうまく扱えないことにあります(後述の「Histogramは等頻度(equi-depth)を選ぶ」を参照)。
 
 `min`、`max`、`histogram`の対象は、[`crate::types::compare_values`](第21章の`ORDER BY`、`MIN`/`MAX`が使う全順序)で比較できる列すべてです。
 `BOOLEAN`、`BIGINT`、`TEXT`のいずれも、この全順序の上で最小値、最大値、バケツ境界を持てます。
 
-集計は`StatsCollector`という1つの構造体が担います。
+集計は、`src/statistics.rs`に定義する`StatsCollector`という1つの構造体が担います。
 
 ```rust
 pub struct StatsCollector {
@@ -112,7 +118,7 @@ impl StatsCollector {
 `distinct_count`(NDV、Number of Distinct Values)は、大規模なテーブルでは`HashSet`のような厳密な方法では収まらないことがよく知られています。
 値の種類が数百万を超えるテーブルでは、行1件ごとに`HashSet`へ挿入する処理も、`HashSet`自体が使うメモリも無視できなくなり、実務のRDBMSの多くはHyperLogLogのような近似アルゴリズム(数KBのメモリで誤差数%のNDVを見積もる)を採用しています。
 
-この章はその近似を採らず、`HashSet`による厳密なカウントで済ませます。
+この章はその近似を採らず、`src/statistics.rs`で`HashSet`による厳密なカウントを行います。
 
 ```rust
 struct ColumnAccumulator {
@@ -131,7 +137,7 @@ struct ColumnAccumulator {
 
 ### Histogramは等頻度(equi-depth)を選ぶ
 
-Histogramは、列の値の分布を`HISTOGRAM_BUCKET_COUNT`(固定で10)個のバケツに区切って持ちます。
+`src/statistics.rs`に置くHistogramは、列の値の分布を`HISTOGRAM_BUCKET_COUNT`(固定で10)個のバケツに区切って持ちます。
 
 ```rust
 pub const HISTOGRAM_BUCKET_COUNT: usize = 10;
@@ -156,7 +162,7 @@ PostgreSQLの`ANALYZE`が作る`pg_stats.histogram_bounds`も、同じ理由で�
 
 もっとも、等頻度そのものにも弱点が残ります。
 1つの値だけで1バケツぶんの目標行数を超えてしまう場合です。
-`status`列と同じ、1000行のうち900行が`0`という分布で確かめます(サンプルを99行に縮めています)。
+`status`列と同じ、1000行のうち900行が`0`という分布を、`src/statistics.rs`のテストで確かめます(サンプルを99行に縮めています)。
 
 ```rust
 #[test]
@@ -191,7 +197,7 @@ PostgreSQLの`pg_stats.most_common_vals`と同じ役割分担です。
 その結果、`1`の8行は単一値バケツ(5行)と隣接する混合バケツ(3行)に分割され、`v = 1`の見積もりは先頭のバケツの5行しか数えられません。
 
 この問題を避けるため、MCVは**固定点**まで抽出します。
-値を1つ抽出するたびに、まだMCVへ移していない残りの行数から平均バケツ行数を**再計算**し、その新しい閾値を上回る値がもう無くなるまで繰り返します。
+値を1つ抽出するたびに、まだMCVへ移していない残りの行数から平均バケツ行数を**再計算**し、その新しい閾値を上回る値がもう無くなるまで繰り返す`extract_mcv`を、`src/statistics.rs`に定義します。
 
 ```rust
 fn extract_mcv(sorted_values: &[Value]) -> (Vec<(Value, u64)>, Vec<Value>) {
@@ -293,7 +299,7 @@ Projection(v) rows=6 actual=6
 行数だけを見て機械的に切り分けると、1個目のバケツ(目標5行)は`10`の5行、2個目のバケツ(目標5行)は`10`の残り1行と一意な値4件、という具合に、`10`の6行がバケツをまたいでしまいます。
 `col = 10`の等値述語は、値`10`を含む**先頭の1バケツだけ**を見て見積もる仕組みなので、6行のうち一部しか数えられていないバケツの行数比率から見積もることになり、実際の6行よりはるかに小さい値を返してしまいます。
 
-この問題を避けるため、`build_equi_depth_histogram`は、目標の切れ目が同じ値の連続run(同じ値が連なった範囲)の途中に来る場合、runの終わりまで境界を伸ばします。
+この問題を避けるため、`src/statistics.rs`の`build_equi_depth_histogram`は、目標の切れ目が同じ値の連続run(同じ値が連なった範囲)の途中に来る場合、runの終わりまで境界を伸ばします。
 
 ```rust
 fn build_equi_depth_histogram(sorted_values: &[Value]) -> Vec<Bucket> {
@@ -353,7 +359,7 @@ fn build_equi_depth_histogram(sorted_values: &[Value]) -> Vec<Bucket> {
 
 ## `ANALYZE`文: 統計を集める
 
-`ANALYZE [テーブル名]`という新しい文を追加しました。
+`ANALYZE [テーブル名]`という新しい文を追加します。
 テーブル名を省略すると、カタログに登録されている全テーブルが対象になります。
 
 ```console
@@ -368,7 +374,7 @@ ANALYZE 3
 テーブル名が指定されていれば、その存在だけをここで確認し(未知のテーブル名は位置情報付きの`DbError::Bind`になります)、ASTのバリアントをそのまま`BoundStatement::Analyze`として通します。
 `ANALYZE`は既存のカタログエントリの統計欄を書き換えるだけの操作であり、`CREATE INDEX`、`DROP INDEX`(第24章)と同じく、式の名前解決や型検査を必要としないからです。
 
-実行(`Database::execute_analyze`)は、対象テーブルを`SeqScan`と同じ経路で1回走査します。
+実行(`Database::execute_analyze`、`src/database.rs`)は、対象テーブルを`SeqScan`と同じ経路で1回走査します。
 
 ```rust
 fn collect_table_stats(&self, table_id: TableId, table_name: &str, schema: &Schema) -> DbResult<TableStats> {
@@ -391,7 +397,7 @@ fn collect_table_stats(&self, table_id: TableId, table_name: &str, schema: &Sche
 
 ## 統計の保存とデフォルト選択率
 
-`Backend::Memory`の統計は、`Catalog`、`MemStorage`と同じくプロセスのメモリ上だけに保持し、永続化しません。
+`src/database.rs`の`Backend::Memory`の統計は、`Catalog`、`MemStorage`と同じくプロセスのメモリ上だけに保持し、永続化しません。
 
 ```rust
 enum Backend {
@@ -431,7 +437,7 @@ stats × stats_count:
             row_count: u64
 ```
 
-`Value`(`NULL`/`BOOLEAN`/`BIGINT`/`TEXT`)は、既存の`data_type_to_u8`(列の**型**だけを表す1バイト)とは別に、値そのものを復元できる自己記述形式でエンコードします。
+`Value`(`NULL`/`BOOLEAN`/`BIGINT`/`TEXT`)は、既存の`data_type_to_u8`(列の**型**だけを表す1バイト)とは別に、`src/storage.rs`の`encode_value`が値そのものを復元できる自己記述形式でエンコードします。
 
 ```rust
 fn encode_value(value: &Value, out: &mut Vec<u8>) {
@@ -458,7 +464,7 @@ fn encode_value(value: &Value, out: &mut Vec<u8>) {
 `min`と`max`は`Option<Value>`ですが、`StatsCollector`はそもそも`NULL`値を`min`/`max`の対象に含めないため、「値が1件も無い」(`None`)と`Value::Null`が同時に起こることはありません。
 この不変条件を使い、`None`を`Value::Null`と同じタグ(`0`)で表すことで、存在を示す専用のフラグバイトを別に持たずに済ませています。
 
-このセクションを追加したことに伴い、`CATALOG_LAYOUT_VERSION`を`1`から`2`へ上げました。
+このセクションを追加することに伴い、`CATALOG_LAYOUT_VERSION`を`1`から`2`へ上げます。
 モジュール冒頭のドキュメントコメント(第24章までの節と同じ形式)にも、この変更を書き残してあります。
 章をまたいだファイル互換性を約束しない方針(第15章から一貫)はそのままで、`CATALOG_MAGIC`と`CATALOG_LAYOUT_VERSION`による判定が、レイアウトの変わった古いカタログを確実に拒否します(`mcv`セクションを列の途中へ挿入した第4部レビュー対応で、`CATALOG_LAYOUT_VERSION`はさらに`2`から`3`へ上がっています)。
 
@@ -469,7 +475,7 @@ fn encode_value(value: &Value, out: &mut Vec<u8>) {
 検査項目(列数と型の一致、`null_count <= row_count`、`distinct_count <= 非NULL行数`、MCVとバケツそれぞれの上限件数、バケツの境界順序、MCVの値やバケツ境界がMin/Maxの範囲や型に収まること、MCVとバケツの行数合計が非NULL行数に一致すること)の詳細は`src/storage.rs`の`validate_stats_metadata`のドキュメントコメントを参照してください。
 
 `ANALYZE`を一度も実行していないテーブルは、統計を持ちません。
-この場合の推定は、選択率の慣用定数にフォールバックします。
+この場合の推定は、新規作成する`src/estimator.rs`に置く選択率の慣用定数にフォールバックします。
 
 ```rust
 /// 等値述語のデフォルト選択率(統計が無い場合)。出典は本文を参照。
@@ -477,6 +483,12 @@ pub const DEFAULT_EQ_SEL: f64 = 0.005;
 
 /// 不等号述語のデフォルト選択率(統計が無い場合)。出典は本文を参照。
 pub const DEFAULT_INEQ_SEL: f64 = 1.0 / 3.0;
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod estimator;
 ```
 
 この2つの値は、PostgreSQLの`selfuncs.c`が同じ役割で使っている定数(`DEFAULT_EQ_SEL`と`DEFAULT_INEQ_SEL`)から取っています。
@@ -498,7 +510,7 @@ SQLは`TRUE`、`FALSE`、`UNKNOWN`の3値論理を使い、`NULL`を含む比較
 ### 等値述語: `col = 定数`
 
 まず、値が`NULL`(`col = NULL`のような式)であれば、この比較は列の値によらず常に`UNKNOWN`になるため、選択率は0.0です(`v = NULL`は決して`TRUE`になりません)。
-それ以外は、「列が非NULLである割合」と「非NULL行の中での一致割合」の積で見積もります。
+それ以外は、`src/estimator.rs`の`estimate_equality_selectivity`が、「列が非NULLである割合」と「非NULL行の中での一致割合」の積で見積もります。
 
 ```rust
 pub fn estimate_equality_selectivity(stats: Option<&ColumnStats>, row_count: u64, value: &Value) -> f64 {
@@ -511,7 +523,7 @@ pub fn estimate_equality_selectivity(stats: Option<&ColumnStats>, row_count: u64
 }
 ```
 
-「非NULL行の中での一致割合」は、MCV(最頻値)に定数が載っていればその実頻度を、無ければ残余のHistogram(バケツの行数比率を、バケツ内のDistinct値数で割った近似)を、Histogramも無ければ`1 / NDV`を、NDVも無ければ`DEFAULT_EQ_SEL`を使う4段階のフォールバックです。
+「非NULL行の中での一致割合」は、`src/estimator.rs`の`equality_selectivity_within_non_null`が、MCV(最頻値)に定数が載っていればその実頻度を、無ければ残余のHistogram(バケツの行数比率を、バケツ内のDistinct値数で割った近似)を、Histogramも無ければ`1 / NDV`を、NDVも無ければ`DEFAULT_EQ_SEL`を使う4段階のフォールバックで返します。
 
 ```rust
 fn equality_selectivity_within_non_null(stats: &ColumnStats, row_count: u64, value: &Value) -> f64 {
@@ -596,7 +608,7 @@ MCVは「Histogramが空になった」時点で、この列の非NULLの値を�
 それ以外は「列が非NULLである割合」×「非NULL行の中での選択率」の積で見積もります。
 「非NULL行の中での選択率」は、各バケツについて「そのバケツの両端がどちらも述語を満たすか」を見ます。
 両端とも満たせばバケツ全体を選択率1.0として数え、両端とも満たさなければ0.0です。
-片方だけ満たす(バケツの内部に境界がある)場合、`BIGINT`なら`(value - lower) / (upper - lower)`という線形補間(区間内での`value`の位置の比率)で按分します。
+片方だけ満たす(バケツの内部に境界がある)場合、`BIGINT`なら`src/estimator.rs`の`bucket_overlap_fraction`が`(value - lower) / (upper - lower)`という線形補間(区間内での`value`の位置の比率)で按分します。
 
 ```rust
 fn bucket_overlap_fraction(op: RangeOp, value: &Value, lower: &Value, upper: &Value) -> f64 {
@@ -635,6 +647,8 @@ fn bucket_overlap_fraction(op: RangeOp, value: &Value, lower: &Value, upper: &Va
 }
 ```
 
+線形補間の位置計算は、`src/estimator.rs`の`linear_interpolation_position`に切り出しています。
+
 ```rust
 fn linear_interpolation_position(value: &Value, lower: &Value, upper: &Value) -> Option<f64> {
     match (value, lower, upper) {
@@ -664,7 +678,7 @@ MCVもHistogramも無い(NDVやMin/Maxしか分からない)場合だけ、Min/M
 
 ### `IS NULL` / `IS NOT NULL`
 
-`IS NULL`の選択率は、全行のうち`NULL`である割合、つまり`null_count / row_count`(**NULL率**)そのものです。
+`IS NULL`の選択率は、全行のうち`NULL`である割合、つまり`null_count / row_count`(**NULL率**)そのものであり、`src/estimator.rs`の`null_fraction`がこれを計算します。
 
 ```rust
 pub fn null_fraction(null_count: u64, row_count: u64) -> f64 {
@@ -676,6 +690,7 @@ pub fn null_fraction(null_count: u64, row_count: u64) -> f64 {
 ```
 
 `null_fraction`は、前述の`estimate_equality_selectivity`や`estimate_range_selectivity`が「列が非NULLである割合」を求めるためにも使う、共通の関数です。
+同じ`src/estimator.rs`に、これを使う`estimate_is_null_selectivity`を続けて定義します。
 
 ```rust
 pub fn estimate_is_null_selectivity(stats: Option<&ColumnStats>, row_count: u64) -> f64 {
@@ -686,7 +701,7 @@ pub fn estimate_is_null_selectivity(stats: Option<&ColumnStats>, row_count: u64)
 }
 ```
 
-`IS NULL`と`IS NOT NULL`は(`UNKNOWN`を経由せず)全行をちょうど2つに分けるため、`IS NOT NULL`の選択率は単純な補数`1 - IS NULLの選択率`で正確に求まります。
+`IS NULL`と`IS NOT NULL`は(`UNKNOWN`を経由せず)全行をちょうど2つに分けるため、`IS NOT NULL`の選択率は単純な補数`1 - IS NULLの選択率`で正確に求まり、`src/estimator.rs`の`estimate_is_not_null_selectivity`がこれをそのまま実装します。
 
 ```rust
 pub fn estimate_is_not_null_selectivity(stats: Option<&ColumnStats>, row_count: u64) -> f64 {
@@ -723,6 +738,7 @@ Projection(a) rows=100 actual=100
 問題は、`FALSE AND UNKNOWN`が`FALSE`(=`UNKNOWN`ではなく確定している)という規則を、「両辺とも非`UNKNOWN`か」という指標だけでは表せないことにあります。
 
 これを正しく扱うには、選択率を`TRUE`の1値ではなく、**`TRUE`/`FALSE`/`UNKNOWN`の3確率**として持ち運ぶ必要があります(第4部2巡目レビュー対応)。
+`src/estimator.rs`に次の`Selectivity3`を定義します。
 
 ```rust
 pub struct Selectivity3 {
@@ -733,7 +749,7 @@ pub struct Selectivity3 {
 ```
 
 比較や`IS [NOT] NULL`という葉では、この3確率をそれぞれの列のNULL率から組み立てます(`col <op> 定数`なら`is_unknown`は列のNULL率、`IS [NOT] NULL`は常に`is_unknown = 0`)。
-`AND`、`OR`、`NOT`は、独立性を仮定しつつSQLの真理値表どおりに合成します。
+`AND`、`OR`、`NOT`は、`src/estimator.rs`の`and3`、`or3`、`not3`が独立性を仮定しつつSQLの真理値表どおりに合成します。
 
 ```rust
 pub fn and3(a: Selectivity3, b: Selectivity3) -> Selectivity3 {
@@ -770,7 +786,7 @@ pub fn not3(p: Selectivity3) -> Selectivity3 {
 
 ### Join Cardinality
 
-等値結合(第22章、第25章のJoinが前提とする範囲)の結果行数は、標準的な式`|L| × |R| / max(NDV_l, NDV_r)`で見積もります。
+等値結合(第22章、第25章のJoinが前提とする範囲)の結果行数は、`src/estimator.rs`の`estimate_join_row_count`が標準的な式`|L| × |R| / max(NDV_l, NDV_r)`で見積もります。
 
 ```rust
 pub fn estimate_join_row_count(left_rows: u64, right_rows: u64, left_ndv: u64, right_ndv: u64) -> u64 {
@@ -788,7 +804,7 @@ pub fn estimate_join_row_count(left_rows: u64, right_rows: u64, left_ndv: u64, r
 
 ### Aggregate後の行数
 
-`GROUP BY`後の行数は、`GROUP BY`に並ぶ各列のNDVの積で見積もります。
+`GROUP BY`後の行数は、`src/estimator.rs`の`estimate_aggregate_row_count`が、`GROUP BY`に並ぶ各列のNDVの積で見積もります。
 
 ```rust
 pub fn estimate_aggregate_row_count(group_ndvs: &[u64], input_rows: u64) -> u64 {
@@ -846,6 +862,7 @@ Projection(id) rows=150 actual=189
 ```
 
 実測行数は、`Box<dyn Executor>`(第19章)を`CountingExec`という薄いラッパーで包むことで集めます。
+`CountingExec`は`src/physical_plan.rs`に定義します。
 
 ```rust
 pub struct CountingExec<'a> {

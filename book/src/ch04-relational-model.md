@@ -66,8 +66,9 @@ NULLが「無型の値」であることと、「NULLを許すかどうか」が
 
 ## 最小実装
 
-`DataType`から始めます。
+これから定義する型は、新規作成する`src/types.rs`にまとめます。
 このSQLサブセットが対応する型は、`BOOLEAN`、`BIGINT`、`TEXT`の3種類だけです[^double]。
+まず、次の`DataType`を定義します。
 
 ```rust
 /// 列が取りうるデータ型。
@@ -86,8 +87,14 @@ pub enum DataType {
 
 [^double]: `DOUBLE`は式評価と型変換の基礎が固まった段階で追加します(第1章の対応SQLサブセットを参照)。
 
+あわせて`src/lib.rs`に次の行を加え、このモジュールを公開します。
+
+```rust
+pub mod types;
+```
+
 次に`Value`です。
-`DataType`の各バリアントに対応する値を1つずつ持たせ、さらに`Null`を独立したバリアントとして加えます。
+同じ`src/types.rs`に、`DataType`の各バリアントに対応する値を1つずつ持たせ、さらに`Null`を独立したバリアントとして加えた`Value`を定義します。
 
 ```rust
 /// 1つのセルが持つ実際の値。
@@ -108,7 +115,7 @@ pub enum Value {
 
 `Value`が`DataType`と同じ数だけバリアントを持つのは偶然ではありません。
 `Value::Null`を除く各バリアントは、対応する`DataType`のRust表現をそのまま包んでいます。
-この対応を、値からたどれるメソッドとして持たせます。
+この対応を、`src/types.rs`の`impl Value`に、値からたどれるメソッドとして持たせます。
 
 ```rust
 impl Value {
@@ -133,7 +140,7 @@ impl Value {
 `data_type()`が`Option<DataType>`を返すのは、`Value::Null`が本当にどの`DataType`にも属さないことを、シグネチャの時点で表明するためです。
 `Value::Null`に何らかの`DataType`を割り当てて`DataType`(`Option`なし)を返すようにも書けますが、そうすると「NULLは無型である」という不変条件がコードのどこにも残らなくなります。
 
-列との適合判定も、この`data_type()`の上に組み立てます。
+列との適合判定も、`src/types.rs`の同じ`impl Value`の中で、この`data_type()`の上に組み立てます。
 
 ```rust
     /// この値が、指定した列の型・nullable制約に適合するかどうかを判定する。
@@ -153,7 +160,7 @@ impl Value {
 `Value::Null`は`column.nullable`だけを見て適合を決め、それ以外の値は`data_type()`と`column.data_type`の一致だけを見ます。
 この2つの分岐が、NULLの扱いと型の扱いを別の関心事として保つ境目です。
 
-`Column`は名前、型、`nullable`をまとめた構造体です。
+`src/types.rs`に定義する`Column`は、名前、型、`nullable`をまとめた構造体です。
 
 ```rust
 /// テーブルの1列を表す。名前、型、NULLを許すかどうかを持つ。
@@ -168,7 +175,7 @@ pub struct Column {
 }
 ```
 
-`Schema`は`Column`の並びを保持し、列名から索引を引けるようにします。
+同じ`src/types.rs`に定義する`Schema`は、`Column`の並びを保持し、列名から索引を引けるようにします。
 
 ```rust
 /// テーブルの列構成。列の並び順を保持し、列名から索引を引ける。
@@ -185,7 +192,7 @@ impl Schema {
 ```
 
 このほか、列の並びをそのまま返す`columns()`、列数を返す`len()`、空かどうかを返す`is_empty()`、列名から列定義そのものを引く`column()`も持たせています。
-列名から列の索引を引く`index_of`が、以降の実装で中心になります。
+`src/types.rs`の`impl Schema`に続けて加える、列名から列の索引を引く`index_of`が、以降の実装で中心になります。
 
 ```rust
     /// 列名から列の索引を引く。見つからなければ`None`を返す。
@@ -197,7 +204,7 @@ impl Schema {
 `index_of`が`Option<usize>`を返すのは、SQLでは`SELECT does_not_exist FROM users`のように存在しない列名を指定できてしまうためです。
 列名解決の失敗は珍しい例外ではなく、SQLを受け取る以上いつでも起こりうる通常の分岐なので、`panic!`ではなく`Option`で呼び出し側に処理を委ねます。
 
-不変条件1と2と3をまとめて検査するのが`validate_tuple`です。
+不変条件1と2と3をまとめて検査する`validate_tuple`を、同じ`src/types.rs`の`impl Schema`に加えます。
 
 ```rust
     /// 与えられた値の並びが、このSchemaが定める列数・型・nullable制約に
@@ -231,7 +238,7 @@ impl Schema {
 列数の一致を先に検査してから`zip`で1列ずつ`conforms_to`を呼んでいるのは、列数が食い違ったまま`zip`にかけると、短い側に合わせて残りの列が黙って無視されるためです。
 列数の不一致自体が呼び出し側の間違いなので、`zip`の前に弾いておきます。
 
-`DbError`には`SchemaMismatch`バリアントを1つ追加しました。
+`src/error.rs`の`DbError`には`SchemaMismatch`バリアントを1つ追加します。
 
 ```rust
     /// 値の並びがSchemaの列数・型・nullable制約に適合しないエラー。
@@ -240,7 +247,7 @@ impl Schema {
 ```
 
 最後に`Tuple`です。
-`Tuple`は`Schema`から独立した型にはせず、生成時に必ず`Schema`との適合を検査するコンストラクタだけを公開します。
+`src/types.rs`に戻り、`Tuple`は`Schema`から独立した型にはせず、生成時に必ず`Schema`との適合を検査するコンストラクタだけを公開します。
 
 ```rust
 /// `Schema`に従う値の並び。
@@ -262,7 +269,7 @@ impl Tuple {
 
 `Tuple`のフィールド`values`はプライベートです。
 `Tuple { values }`のような直接構築を外部から封じることで、`Tuple::new`を通らない限り`Schema`に適合しない`Tuple`が作れない状態にしています。
-列を名前で取り出す`get_by_name`も、内部では`Schema::index_of`をそのまま使います。
+同じ`src/types.rs`の`impl Tuple`に加える、列を名前で取り出す`get_by_name`も、内部では`Schema::index_of`をそのまま使います。
 
 ```rust
     /// `Schema`と列名を指定して値を取り出す。
@@ -276,7 +283,7 @@ impl Tuple {
 ## テストで確認する
 
 不変条件ごとにテストを書きます。
-まず型対応と、NULLがnullable列にのみ適合することの確認です。
+まず`src/types.rs`のテストモジュールに、型対応とNULLがnullable列にのみ適合することを確認するテストを書きます。
 
 ```rust
     #[test]
@@ -289,7 +296,7 @@ impl Tuple {
 ```
 
 続いて、Schema違反のTupleが実際に拒否されることを確認します。
-列数の不一致、型の不一致、not-null列へのNULL挿入の3パターンです。
+列数の不一致、型の不一致、not-null列へのNULL挿入の3パターンを、同じ`src/types.rs`のテストモジュールに加えます。
 
 ```rust
     #[test]
@@ -301,7 +308,7 @@ impl Tuple {
 ```
 
 最後に列名解決です。
-存在する列名は正しい索引を返し、存在しない列名は`None`を返すことを確認します。
+存在する列名は正しい索引を返し、存在しない列名は`None`を返すことを、同じ`src/types.rs`のテストモジュールで確認します。
 
 ```rust
     #[test]

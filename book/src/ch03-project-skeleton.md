@@ -30,7 +30,7 @@ crateを分けるとpub化の範囲やCargo.tomlの依存関係を都度調整�
 第2部の終わり、あるいはそれ以降が目安です。
 
 `src/main.rs` はまだ何もしません。
-挨拶を1行`println!`で出すだけです。
+そこに、挨拶を1行`println!`で出すだけの内容を書きます。
 
 ```rust
 fn main() {
@@ -51,7 +51,7 @@ RDBMSの実装では、I/Oエラー、パースエラー、型エラー、制約
 `Result<T, String>` のように文字列でエラーを表すと、呼び出し側はエラーの種類を`match`で区別できません。
 エラーの原因ごとに異なる処理をしたい場面(たとえば「一意制約違反ならリトライせず、I/Oエラーならリトライする」)で、文字列を解析するはめになります。
 
-そこで、エラーの種類をenumの列挙子として表します。
+そこで、`src/error.rs`を新規作成し、エラー型のenum`DbError`と、その`Result`エイリアス`DbResult`を定義します。
 
 ```rust
 use thiserror::Error;
@@ -70,6 +70,12 @@ pub enum DbError {
 
 /// minidb の操作全般で使う `Result` エイリアス。
 pub type DbResult<T> = Result<T, DbError>;
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod error;
 ```
 
 `thiserror` は、`#[error("...")]` からDisplay実装を生成し、`#[from]` から`From`実装を生成するだけのcrateです[^thiserror]。
@@ -102,7 +108,7 @@ fn load_page(table_id: u64, page_id: u64) -> DbResult<()> {
 
 ## Newtypeで型を分ける
 
-`u64`をそのまま使う代わりに、識別子ごとに専用の型を定義します。
+`u64`をそのまま使う代わりに、`src/ids.rs`を新規作成し、識別子ごとに専用の型`PageId`、`TableId`、`TransactionId`を定義します。
 
 ```rust
 /// ディスク上の1ページを指す識別子。
@@ -129,9 +135,15 @@ pub struct TableId(pub u64);
 pub struct TransactionId(pub u64);
 ```
 
+あわせて`src/lib.rs`に次の行を加え、このモジュールを公開します。
+
+```rust
+pub mod ids;
+```
+
 これは**Newtype**と呼ばれるパターンで、既存の型(ここでは`u64`)を1要素のタプル構造体で包み、別の型として扱えるようにします。
 
-先ほどの`load_page`をNewtypeで書き直すと、次のようになります。
+先ほどの`load_page`をNewtypeで書き直すとどうなるか、次の例で確認します。
 
 ```rust
 fn load_page(table_id: TableId, page_id: PageId) -> DbResult<()> {
@@ -162,6 +174,7 @@ Rustの`compile_fail`付きdoctestは、コードブロックがコンパイル�
 その段階になってからログの仕組みを用意するのではなく、診断に使う道具をこの章のうちに先に用意しておきます。
 
 `log`や`tracing`のような専用crateを導入する選択肢もありますが、現時点では依存を増やさず、`eprintln!`を薄くラップしたマクロで済ませます。
+クレート全体で使うマクロなので、モジュールではなく`src/lib.rs`に直接置きます。
 
 ```rust
 /// 簡易ログ出力マクロ(依存追加を避けるため `eprintln!` を薄くラップするだけ)。
@@ -197,6 +210,7 @@ macro_rules! log_info {
 
 この形式のテストを、本教材では**SQL Golden Test**と呼びます。
 `.sql`ファイルに入力を、`.expected`ファイルに期待する出力を書き、両者をペアとして突き合わせます。
+このテストランナーは、新規作成する`tests/golden.rs`に実装します。
 
 ```rust
 /// `tests/golden/` 以下の `.sql` ファイルを列挙する。
@@ -248,7 +262,7 @@ fn golden_tests_pass() {
 `collect_sql_files`が`fs::read_dir`の結果を`filter_map(|entry| entry.ok())`のようにエラーを黙って捨てて集めていたなら、権限エラーなどで一部のエントリの列挙に失敗しても、その事実に気づかないままテスト対象のファイルが減ります。
 `collect::<Result<Vec<_>, _>>()`で一度`Result`にまとめてから展開すれば、列挙中のエラーは`unwrap_or_else`が捕捉し、`panic!`としてテストの失敗に変換されます。
 
-`run_sql`が肝心のクエリ実行部分ですが、現時点ではエンジンが存在しないため、入力をそのまま返すエコーになっています。
+`run_sql`が肝心のクエリ実行部分ですが、現時点ではエンジンが存在しないため、`tests/golden.rs`には入力をそのまま返すエコーとして仮実装します。
 
 ```rust
 /// 仮実装: クエリエンジンがまだ無いので、SQLをそのままエコーするだけ。

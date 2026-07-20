@@ -12,7 +12,7 @@ COMMIT
 ```
 
 この直後にプロセスが落ちても、次に開いたときには残高100の行が読めるはずだ、という期待です。
-実際に試してみます。
+`tests/wal_durability.rs`に次のテストを書いて、実際に試してみます。
 
 ```rust
 let mut db = Database::open(&path).unwrap();
@@ -26,7 +26,7 @@ db.execute("COMMIT").unwrap();
 ```
 
 `db`をスコープの外へ出してdropすると、`COMMIT`直後にプロセスが死んだ状況を模せます。
-そのあとで同じファイルを開き直し、先ほどの行を探してみます。
+続けて同じ`tests/wal_durability.rs`のテストの中で、ファイルを開き直し、先ほどの行を探してみます。
 
 ```rust
 let mut db = Database::open(&path).unwrap();
@@ -67,6 +67,9 @@ WALは、データファイルとは別のファイル(`<db_path>.wal`)に、追
 - **対象**：`TableId`と`RecordId`(第13章)の組
 - **Before Image**、**After Image**：書き換え前、書き換え後のタプルのバイト列
 
+WALを扱うコードは、この章で新規作成する`src/wal.rs`にまとめます。
+まずは、次の`LogRecord`を定義します。
+
 ```rust
 pub struct LogRecord {
     pub lsn: Lsn,
@@ -79,6 +82,12 @@ pub struct LogRecord {
     pub before_image: Option<Vec<u8>>,
     pub after_image: Option<Vec<u8>>,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod wal;
 ```
 
 `old_rid`だけは`対象`の説明に出てきませんでした。
@@ -96,7 +105,7 @@ pub struct LogRecord {
 
 ## LSNの採番とtorn writeへの備え
 
-ログレコードは、`WalWriter`が手書きのリトルエンディアンでエンコードし、追記専用のファイルへ書きます。
+ログレコードは、同じ`src/wal.rs`に定義する`WalWriter`が手書きのリトルエンディアンでエンコードし、追記専用のファイルへ書きます。
 
 ```rust
 pub struct WalWriter {
@@ -122,6 +131,7 @@ pub struct WalWriter {
 `checksum`は`crc32`(第11章の`Page::encode`と同じアルゴリズム)です。
 ファイルへの1回の書き込みの途中でプロセスやOSが落ちると、末尾に「長さは足りているが中身が壊れている」、あるいは「長さ自体が足りていない」バイト列が残ることがあります。
 これが**torn write**です。
+これを検出する`decode_stream`を、`src/wal.rs`に次のように定義します。
 
 ```rust
 pub fn decode_stream(bytes: &[u8]) -> (Vec<LogRecord>, usize) {
@@ -142,7 +152,7 @@ pub fn decode_stream(bytes: &[u8]) -> (Vec<LogRecord>, usize) {
 
 `decode_stream`は1レコードずつ長さとchecksumを検証しながら読み進め、どちらかに失敗した時点で止まります。
 返り値は「読めた完全なレコードの列」と「そこまでの有効なバイト数」の組であり、それより後ろに残っているバイト列がtorn writeです。
-`WalWriter::open`は、ファイルを開くたびにこれを使って末尾のtorn writeを検出し、有効なバイト数のところまで`File::set_len`で切り詰めます。
+`src/wal.rs`の`WalWriter::open`は、ファイルを開くたびにこれを使って末尾のtorn writeを検出し、有効なバイト数のところまで`File::set_len`で切り詰めます。
 
 ```rust
 let (records, valid_len) = decode_stream(&bytes);
@@ -169,6 +179,7 @@ if valid_len < bytes.len() {
 
 この不変条件を強制するには、あるページの変更が「どのログレコードまで書けば再現できるか」を、ページ自身に覚えさせる必要があります。
 それが**Page LSN**です。
+`BufferPool`のフレーム管理は`src/buffer_pool.rs`にあり、そこに次の`page_lsn`フィールドを追加します。
 
 ```rust
 struct FrameMeta {
@@ -182,6 +193,7 @@ struct FrameMeta {
 
 `BufferPool`(第14章)の各フレームに、`page_lsn`というフィールドを1つ追加しました。
 `Storage::insert`、`update`、`delete`は、対応するログレコードを書いた直後に、そのページの`page_lsn`をそのレコードのLSNまで引き上げます。
+`INSERT`を処理する`src/executor.rs`では、次のようになります。
 
 ```rust
 let lsn = wal.append_insert(table_id, rid, bytes);
@@ -191,6 +203,7 @@ storage.stamp_page_lsn(rid.page_id, lsn);
 `BufferPool`がdirtyなページを書き戻す経路は2つあります。
 `flush_page`(呼び出し側の明示的な要求)と、`evict`(Clock置換によるキャッシュからの追い出し)です。
 どちらも、実際に`DiskManager::write_page`を呼ぶ直前に、そのページの`page_lsn`まで`WalWriter::sync_up_to`を呼びます。
+`flush_frame`は`src/buffer_pool.rs`に定義されており、両方の経路が最終的にここを通ります。
 
 ```rust
 fn flush_frame(&self, frame_id: usize) -> DbResult<()> {
@@ -210,7 +223,7 @@ fn flush_frame(&self, frame_id: usize) -> DbResult<()> {
 }
 ```
 
-`sync_up_to`は、指定したLSNがすでに同期済みなら何もせず、まだなら`sync`を呼びます。
+`src/wal.rs`の`WalWriter`に定義する`sync_up_to`は、指定したLSNがすでに同期済みなら何もせず、まだなら`sync`を呼びます。
 
 ```rust
 pub fn sync_up_to(&mut self, lsn: Lsn) -> DbResult<()> {
@@ -235,6 +248,7 @@ pub fn sync_up_to(&mut self, lsn: Lsn) -> DbResult<()> {
 WALファースト不変条件は、ページより先にログが届くことを保証します。
 それだけでは、`COMMIT`が返った時点で何が保証されているかがまだ決まりません。
 `COMMIT`は、次の順序を守ります。
+`execute_commit`は`src/database.rs`にあります。
 
 ```rust
 fn execute_commit(&mut self, _commit: CommitStatement) -> DbResult<QueryResult> {
@@ -250,6 +264,8 @@ fn execute_commit(&mut self, _commit: CommitStatement) -> DbResult<QueryResult> 
     }
 }
 ```
+
+WALへの書き込みと`sync`は、同じ`src/database.rs`に定義する`wal_commit_if_disk`が受け持ちます。
 
 ```rust
 fn wal_commit_if_disk(backend: &Backend, tx_id: TransactionId, wal_last_lsn: Option<Lsn>) -> DbResult<()> {
@@ -271,7 +287,7 @@ fn wal_commit_if_disk(backend: &Backend, tx_id: TransactionId, wal_last_lsn: Opt
 
 ### 明示的な`BEGIN`を伴わない1文も、それ自体が耐久性を持つ
 
-`BEGIN`を書かずに実行した1文(Autocommit)にも、同じ規律を適用します。
+`BEGIN`を書かずに実行した1文(Autocommit)にも、`src/database.rs`に定義する次の`run_disk_dml`が同じ規律を適用します。
 
 ```rust
 fn run_disk_dml<F>(
@@ -323,6 +339,7 @@ where
 `COMMIT`、`ROLLBACK`が届くまで、ログレコードはただ積み上がるだけです。
 `tx`が`None`(Autocommit)であれば、この1文だけのための使い捨てのトランザクションIDを採番し、成功すれば`Commit`を書いて`sync`し、失敗すれば`Abort`を書いて終わります。
 `Begin`レコード自体は、実際に1件でも書き込みが起きた時点で`WalCursor`が遅延して書きます。
+`WalCursor`は`src/wal.rs`に定義した型です。
 
 ```rust
 fn ensure_begin(&mut self, wal: &mut WalWriter) {
@@ -343,6 +360,7 @@ fn ensure_begin(&mut self, wal: &mut WalWriter) {
 
 WALはすでに、`Insert`、`Update`、`Delete`のBefore/After Imageを1件ずつ持っています。
 `ROLLBACK`は、プロセスのメモリに別々の`Vec`を積む代わりに、このログレコードをたどるだけで逆操作を再現できます。
+次の`apply_wal_undo_disk`は`src/transaction.rs`に置きます。
 
 ```rust
 pub(crate) fn apply_wal_undo_disk(storage: &mut Storage, last_lsn: Option<Lsn>) -> DbResult<()> {
@@ -374,7 +392,7 @@ pub(crate) fn apply_wal_undo_disk(storage: &mut Storage, last_lsn: Option<Lsn>) 
 ### `UndoRecord`はMemoryバックエンド専用になった
 
 Diskバックエンドが`apply_wal_undo_disk`へ切り替わったことで、第30章の`apply_undo_disk`はもう誰からも呼ばれません。
-`UndoRecord`という型自体は、`Vec<Tuple>`の並びでしかなくディスクに何も書かないMemoryバックエンド向けの実装として残しました。
+`UndoRecord`という型自体は、`src/transaction.rs`に、`Vec<Tuple>`の並びでしかなくディスクに何も書かないMemoryバックエンド向けの実装として残します。
 
 ```rust
 #[derive(Debug, Clone)]
@@ -394,13 +412,16 @@ Memoryバックエンドはそもそも永続化しないデータベースで�
 
 この章はまだCrash Recoveryを実装しません。
 ログを読んで状態を復元するRedo、Undoは第34章の仕事で、この章は「WALファーストを守ってログを先に書く」ところまでです。
-それでも、書いたログが実際にディスクへ残っていることは目視で確認したいので、開発用のダンプを用意しました。
+それでも、書いたログが実際にディスクへ残っていることは目視で確認したいので、開発用のダンプを用意します。
+`dump`は`src/wal.rs`の`WalWriter`に生やしたメソッドです。
 
 ```rust
 pub fn dump(&self) -> Vec<String> {
     self.records.iter().map(format_record).collect()
 }
 ```
+
+たとえば、次のようにいくつかの文を実行してみます。
 
 ```console
 minidb> BEGIN;
@@ -423,6 +444,7 @@ lsn=3 prev=2 txn=1 type=Commit - before=0B after=0B
 
 章の冒頭の「壊して確認する」を、もう一度たどり直します。
 今度は、`COMMIT`直後にプロセスが死んだあとの状態を、テーブル本体ではなくWALファイル側から覗きます。
+これは`tests/wal_durability.rs`の統合テストです。
 
 ```rust
 let path = temp_db_path("wal-crash-keeps-the-log");
@@ -451,9 +473,9 @@ assert!(dump.iter().any(|line| line.contains("type=Commit")));
 
 ## テストで確認する
 
-`src/wal.rs`には、ログレコードのencode/decode往復、torn tailの検出と切り詰め、`sync_up_to`が同期済みのLSNへ再同期しないことを確認する単体テストを追加しました。
-`src/buffer_pool.rs`には、`flush_page`とeviction(Clock置換)のどちらの経路でも、ページを書き戻す前にそのページのPage LSNまでWALが同期されていることを確認するテストを追加しました。
-`tests/wal_durability.rs`には、この章の一連の主張(COMMITはテーブル本体を同期しない、WALは同期する、COMMITはWALの同期を待ってから返る、Autocommitも同じ規律に従う、ROLLBACKはWALのBefore Imageで復元する)をそれぞれ確認する統合テストを追加しました。
+`src/wal.rs`には、ログレコードのencode/decode往復、torn tailの検出と切り詰め、`sync_up_to`が同期済みのLSNへ再同期しないことを確認する単体テストを追加します。
+`src/buffer_pool.rs`には、`flush_page`とeviction(Clock置換)のどちらの経路でも、ページを書き戻す前にそのページのPage LSNまでWALが同期されていることを確認するテストを追加します。
+`tests/wal_durability.rs`には、この章の一連の主張(COMMITはテーブル本体を同期しない、WALは同期する、COMMITはWALの同期を待ってから返る、Autocommitも同じ規律に従う、ROLLBACKはWALのBefore Imageで復元する)をそれぞれ確認する統合テストを追加します。
 
 ```console
 $ cargo test --lib

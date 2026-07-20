@@ -15,7 +15,7 @@
 同じページが再び必要になっても、`HeapFile`自身はそのページの中身をどこにも覚えていないので、`DiskManager`はそのたびにもう1度ファイルへ`seek`して`read`し直します。
 前章の時点では、これを確かめる手段そのものがありませんでした。
 
-この章ではまず、`DiskManager`にI/O回数を数える`io_count`を1つ加えます。
+この章ではまず、`src/disk_manager.rs`の`DiskManager`にI/O回数を数える`io_count`を1つ加えます。
 
 ```rust
 struct Inner {
@@ -35,6 +35,7 @@ struct Inner {
 
 `read_page`と`write_page`がこのカウンタを1ずつ増やすだけの変更です。
 これを使って、同じページを50回参照するテストを書いてみます。
+このテストは、この章で新規作成する`src/buffer_pool.rs`の`#[cfg(test)] mod tests`に置きます。
 
 ```rust
 #[test]
@@ -53,6 +54,12 @@ fn referencing_the_same_page_repeatedly_without_a_pool_costs_disk_io_every_time(
 }
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod buffer_pool;
+```
+
 同じ1ページを50回読んだだけなのに、`io_count`は50になります。
 1ページ目の中身は最初の1回で判明しているのに、`DiskManager`はそれを覚えておらず、毎回律儀にファイルへ`seek`して`read`しています。
 これは`DiskManager`の欠陥ではありません。
@@ -61,7 +68,7 @@ fn referencing_the_same_page_repeatedly_without_a_pool_costs_disk_io_every_time(
 `WHERE`句のないテーブル全件走査を10回実行すれば、ページの中身が1バイトも変わっていなくても、ディスクI/Oの回数は10倍になります。
 
 この章で作る**Buffer Pool**は、ページの中身をメモリ上に留めておくことで、この重複したI/Oを避ける層です。
-同じ50回の参照をBuffer Pool経由で行うと、`io_count`は1のまま増えなくなります。
+同じ50回の参照をBuffer Pool経由で行うと、`io_count`は1のまま増えなくなることを、`src/buffer_pool.rs`に次のテストとして確かめます。
 
 ```rust
 #[test]
@@ -99,6 +106,7 @@ Buffer Poolの仕組み自体は単純です。
 「今使っていないフレームをどうやって選ぶか」がこの章の主題の1つで、その選び方は後の節で説明する**Clock置換**が担います。
 
 フレームには、ページの中身そのものに加えて、evictしてよいかどうかを判断するためのメタデータが必要です。
+`src/buffer_pool.rs`に、次の`Frame`と`FrameMeta`を定義します。
 
 ```rust
 /// 1フレームが保持するページ本体。`None`は「まだどのページも読み込んでいない
@@ -137,7 +145,7 @@ C++で書かれた多くのデータベース実装でも同じ発想の`pin_cou
 しかも、このバグは大抵の入力では発現せず、Buffer Poolがちょうど溢れるくらいの負荷がかかったときにだけ表面化するため、原因を特定するのが厄介です。
 
 この章の`BufferPool`は、`unpin`という関数を呼び出し側に公開しません。
-代わりに、`read_page`と`write_page`はページの中身へのアクセスをそれぞれ`PageReadGuard`と`PageWriteGuard`という値として返します。
+代わりに、`src/buffer_pool.rs`の`read_page`と`write_page`は、ページの中身へのアクセスをそれぞれ`PageReadGuard`と`PageWriteGuard`という値として返します。
 
 ```rust
 pub fn read_page(&self, id: PageId) -> DbResult<PageReadGuard<'_>> {
@@ -152,7 +160,7 @@ pub fn read_page(&self, id: PageId) -> DbResult<PageReadGuard<'_>> {
 }
 ```
 
-`PageReadGuard`は、`Drop`が実装された構造体です。
+`PageReadGuard`は、`src/buffer_pool.rs`で`Drop`を実装した構造体です。
 
 ```rust
 impl Drop for PageReadGuard<'_> {
@@ -167,7 +175,7 @@ impl Drop for PageReadGuard<'_> {
 早期リターンで関数を抜けても、`?`でエラーを伝播させても、Rustのコンパイラが保証する変数のドロップの規則にそのまま従うので、pinの解除だけが忘れられるという事態が起こりません。
 `unpin`の呼び忘れは、「プログラマが手続きを1つ忘れる」という規律の問題から、「変数を生かしたままにする」という、コンパイラ自身が型を見て検査できる話に変わっています。
 
-書き込み用の`PageWriteGuard`も同じ形をしていますが、`Drop`の中身が違います。
+書き込み用の`PageWriteGuard`も、同じ`src/buffer_pool.rs`に同じ形で定義されていますが、`Drop`の中身が違います。
 
 ```rust
 impl Drop for PageWriteGuard<'_> {
@@ -181,11 +189,14 @@ impl Drop for PageWriteGuard<'_> {
 実際にバイト列を書き換えたかどうかにかかわらず、`write_page`で取得したGuardは無条件にdirty扱いになります。
 変更した範囲だけを正確に追跡する仕組みを持たない、この章の割り切りです。
 `PageReadGuard`と`PageWriteGuard`の違いは、`data_mut`という可変アクセス用のメソッドを持つかどうかと、この`Drop`の中身だけです。
+読み取り側は、`src/buffer_pool.rs`のテストにあるように`read_page`で取得し、`data`で中身を読みます。
 
 ```rust
 let g1 = pool.read_page(PageId(1)).unwrap();
 assert_eq!(&g1.data()[0..5], b"alice");
 ```
+
+書き込み側は、同じ`src/buffer_pool.rs`のテストで`write_page`を使って取得し、`data_mut`で書き換えます。
 
 ```rust
 let mut g = pool.write_page(PageId(1)).unwrap();
@@ -209,6 +220,8 @@ Clock置換は、全フレームを環状に並べ、`clock_hand`という針で
 - **pin中**: evictの候補になりえないので、`referenced`ビットには触れずそのまま次へ進みます。
 - **`referenced`が立っている**: 「最近参照された」という情報を1回だけ消費し、ビットを倒して次へ進みます(2度目に針が巡ってきたときは、もう`referenced`は立っていないので、そのときは容赦なくevictされます)。
 - **`referenced`が立っていない、かつpin中でもない**: このフレームをevictします。
+
+`src/buffer_pool.rs`の`evict`は、この3通りの判定をそのまま実装します。
 
 ```rust
 fn evict(&self, inner: &mut Inner) -> DbResult<usize> {
@@ -249,6 +262,8 @@ fn evict(&self, inner: &mut Inner) -> DbResult<usize> {
 その場合は`DbError::BufferPoolFull`を返します。
 容量に対してpinしたままのページが多すぎる呼び出し側の使い方そのものが誤りであり、Buffer Poolが黙って動作を続けるべきではありません。
 
+このことを、`src/buffer_pool.rs`に次のテストとして確かめます。
+
 ```rust
 #[test]
 fn pinning_beyond_capacity_returns_buffer_pool_full() {
@@ -277,7 +292,7 @@ fn pinning_beyond_capacity_returns_buffer_pool_full() {
 
 ## メタデータとページ本体を別のMutexで守る
 
-`FrameMeta`(pin_count、dirty、referenced、occupant)と、フレームが持つページ本体(`Frame`)は、あえて別々の`Mutex`で守っています。
+`src/buffer_pool.rs`では、`FrameMeta`(pin_count、dirty、referenced、occupant)と、フレームが持つページ本体(`Frame`)を、あえて別々の`Mutex`で守っています。
 
 ```rust
 struct Inner {
@@ -290,6 +305,8 @@ struct Inner {
     misses: u64,
 }
 ```
+
+この`Inner`全体を、`src/buffer_pool.rs`の`BufferPool`は1本の`Mutex`で持ちます。
 
 ```rust
 pub struct BufferPool {
@@ -317,6 +334,7 @@ pub struct BufferPool {
 
 第13章の`HeapFile`は`DiskManager`を直接保持していました。
 この章では、その保持先を`BufferPool`に置き換えます。
+`src/heap_file.rs`の`HeapFile`定義を、次のように書き換えます。
 
 ```rust
 pub struct HeapFile {
@@ -328,7 +346,7 @@ pub struct HeapFile {
 ```
 
 置き換えの影響が最も大きいのは`insert`です。
-第13章では「`disk.read_page`でページを取り出し、書き換えてから`disk.write_page`で書き戻す」という2段階の手続きでしたが、この章では書き戻しの手続きそのものが消えます。
+第13章では「`disk.read_page`でページを取り出し、書き換えてから`disk.write_page`で書き戻す」という2段階の手続きでしたが、`src/heap_file.rs`のこの`insert`では書き戻しの手続きそのものが消えます。
 
 ```rust
 pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
@@ -368,7 +386,8 @@ pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
 `HeapFile`の内部専用だからと言って、crateの外から見えないだけでこの抜け道を空けてよい理由にはなりません。
 crateの中には`get`、`scan`だけでなく、将来のB+Treeの検索のような、同じく読み取り専用のまま`SlottedPage`相当の構造を読みたいコードが他にも増えていくからです。
 
-この壁を壊す方法は、`PageReadGuard`側に抜け道を空けることではなく、`SlottedPage`(第12章)の側に読み取り専用の入口を追加することでした。
+この壁を壊す方法は、`PageReadGuard`側に抜け道を空けることではなく、`SlottedPage`(第12章)の側に読み取り専用の入口を設けることです。
+`src/slotted_page.rs`に、次の`SlottedPageRef`を追加します。
 
 ```rust
 pub struct SlottedPageRef<'a> {
@@ -378,7 +397,7 @@ pub struct SlottedPageRef<'a> {
 
 `SlottedPageRef`は`&'a mut [u8]`ではなく`&'a [u8]`だけを借用し、`get`、`slot_count`、`free_space`、`status`という読み取り系のメソッドだけを持ちます。
 `insert`、`delete`、`update`、`compact`のような書き込み系のメソッドは最初から存在しないため、`SlottedPageRef`をどれだけ経由しても`payload`を書き換えるコードを書きようがありません。
-ヘッダーやスロットエントリを読む下請けのロジック(`read_header`、`read_slot_entry`)は`SlottedPage`と`SlottedPageRef`の両方から呼ばれる自由関数として切り出してあり、`payload`が可変か不変かでロジックが重複することはありません。
+`src/slotted_page.rs`では、ヘッダーやスロットエントリを読む下請けのロジック(`read_header`、`read_slot_entry`)を`SlottedPage`と`SlottedPageRef`の両方から呼ばれる自由関数として切り出してあり、`payload`が可変か不変かでロジックが重複することはありません。
 
 ```rust
 pub fn get(&self, slot: SlotId) -> Option<&[u8]> {
@@ -392,6 +411,7 @@ pub fn get(&self, slot: SlotId) -> Option<&[u8]> {
 ```
 
 `HeapFile::get`は、`PageReadGuard::data()`が返す`&[u8]`をそのまま`SlottedPageRef::open`に渡すだけになります。
+`src/heap_file.rs`の`get`をこう書き換えます。
 
 ```rust
 pub fn get(&self, rid: RecordId) -> DbResult<Option<Vec<u8>>> {
@@ -404,7 +424,7 @@ pub fn get(&self, rid: RecordId) -> DbResult<Option<Vec<u8>>> {
 
 `guard`はもう`mut`である必要がありません。
 `PageReadGuard`と`PageWriteGuard`を分けている本質は、こうして「可変な参照を返せるかどうか」で表現できるようになりました。
-`update`が、存在確認のためだけに`write_page`を呼ばないようにしているのも同じ設計の延長です。
+`src/heap_file.rs`の`update`が、存在確認のためだけに`write_page`を呼ばないようにしているのも同じ設計の延長です。
 
 ```rust
 pub fn update(&mut self, rid: RecordId, bytes: &[u8]) -> DbResult<Option<RecordId>> {
@@ -471,6 +491,7 @@ pub fn update(&mut self, rid: RecordId, bytes: &[u8]) -> DbResult<Option<RecordI
 `BufferPool`はdirtyなページを明示的に`flush`するまでディスクへ書き戻しません。
 第13章の`HeapFile`は`insert`のたびに`disk.write_page`を呼んでいたので、事実上つねに書き込み済みでしたが、この章の`HeapFile`はそうではありません。
 プロセスの再起動をまたいでデータを残したいコードは、`HeapFile::flush`を呼んでからファイルを閉じる必要があります。
+このテストは`src/heap_file.rs`の`#[cfg(test)] mod tests`に置きます。
 
 ```rust
 #[test]
@@ -512,6 +533,7 @@ fn reopening_the_disk_manager_preserves_the_heap_file_contents() {
 ## dirtyなページはevict時にも書き戻される
 
 `flush`を呼ばなくても、容量を超えてページを参照し続ければ、evictのタイミングで自動的に書き戻しは起こります。
+このテストは`src/buffer_pool.rs`の`#[cfg(test)] mod tests`に戻ります。
 
 ```rust
 #[test]
@@ -547,7 +569,7 @@ fn dirty_page_is_written_back_on_eviction() {
 
 ## テストで確認する
 
-ここまでの`buffer_pool`モジュールのテストは、ヒット/ミス、容量超過によるeviction、dirtyな変更の書き戻し、全pin時のエラー、Guardのdropによるunpinという5つの観点をそれぞれ独立したテストとして持っています。
+ここまでの`src/buffer_pool.rs`のテストは、ヒット/ミス、容量超過によるeviction、dirtyな変更の書き戻し、全pin時のエラー、Guardのdropによるunpinという5つの観点をそれぞれ独立したテストとして持っています。
 
 ```rust
 #[test]
@@ -583,7 +605,7 @@ fn exceeding_capacity_evicts_a_page() {
 `referenced`ビットの扱いにより、Clock置換の候補は針の位置に依存しますが、どちらがevictされるにせよ「容量を超えて3枚目を読み込むと、既存の2枚のうち少なくとも1枚は必ず追い出される」という性質は変わりません。
 テストはこの不変条件だけを、`misses`が確かに1つ増えることによって確認しています。
 
-Guardのdropが確実にunpinすることは、`pinning_beyond_capacity_returns_buffer_pool_full`の続きとして確認できます。
+Guardのdropが確実にunpinすることは、`src/buffer_pool.rs`の`pinning_beyond_capacity_returns_buffer_pool_full`の続きとして確認できます。
 
 ```rust
 #[test]
@@ -613,6 +635,7 @@ fn dropping_a_guard_unpins_and_frees_a_slot_for_eviction() {
 `insert`、`get`、`update`、`delete`、`scan`の挙動、複数ページにまたがる走査、ページをまたぐ`update`によるRecordIdの変化は、第13章と同じ結果になることをそのまま確認しています。
 違うのは、`open_heap`ヘルパーが`DiskManager`を直接ではなく`BufferPool::new(disk, 16)`を経由して`HeapFile::open`に渡す点と、再起動を確認するテストが`heap.flush()`を挟む点だけです。
 Buffer Poolの容量がテーブルのページ数を下回っていても正しく動くことも、別に確認しています。
+このテストも`src/heap_file.rs`の`#[cfg(test)] mod tests`に置きます。
 
 ```rust
 #[test]

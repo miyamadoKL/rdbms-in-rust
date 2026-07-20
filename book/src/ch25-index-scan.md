@@ -50,6 +50,7 @@ Projection(amount)
 `WHERE`にはPointともRangeとも判定できない条件が混じっていることも珍しくありません。
 `id = 2 AND name = 'Bob'`という条件のうち索引で引けるのは`id = 2`だけで、`name = 'Bob'`は索引に無い列への条件です。
 そこでこの章の`optimize`は、`WHERE`をANDの連言に分解し、索引で引ける述語だけを取り出してIndex Scanに渡し、残りは今までどおり`Filter`に残すという役割分担を採ります。
+`src/physical_plan.rs`に、次の`AccessPath`を追加します。
 
 ```rust
 enum AccessPath {
@@ -66,7 +67,7 @@ enum AccessPath {
 ```
 
 `choose_access_path`は、`predicate`をANDで分解した連言(conjunct)を出現順に見ていき、Point述語を最優先で探します。
-見つからなければ、列ごとに下限と上限の候補を集めながらRangeを探し、それも無ければ`SeqScan`を返します。
+見つからなければ、列ごとに下限と上限の候補を集めながらRangeを探し、それも無ければ`SeqScan`を返すこの関数を、`src/physical_plan.rs`に追加します。
 
 ```rust
 fn choose_access_path(storage: &Storage, scan: &logical_plan::ScanNode, predicate: BoundExpr) -> AccessPath {
@@ -162,6 +163,7 @@ fn choose_access_path(storage: &Storage, scan: &logical_plan::ScanNode, predicat
 
 `as_column_literal_comparison`は、`column OP literal`(あるいは`literal OP column`)という形の比較を、列の添字、演算子、リテラル値の組に変換します。
 定数式ではない項(`a.x + 1 = 3`のような)や、比較の両辺がどちらも列参照の項(`a.x = a.y`のような)は`None`を返し、この関数の対象から外れます。
+`src/physical_plan.rs`に置くこの関数は、次のような形をしています。
 
 ```rust
 fn as_column_literal_comparison(expr: &BoundExpr) -> Option<(usize, BinaryOperator, Value)> {
@@ -196,7 +198,7 @@ fn as_column_literal_comparison(expr: &BoundExpr) -> Option<(usize, BinaryOperat
 `col = NULL`をFilterに残せば、`eval_bound_expr`と`predicate_matches`が三値論理どおりに0行だけを返し、索引はそもそも引かれません。
 
 最後に`optimize`本体です。
-`Filter`の直下が`Scan`で、かつ`storage`が索引を持てるディスクバックエンドであるときに限り、`choose_access_path`を試します。
+`src/physical_plan.rs`の`optimize`のうち、`Filter`の直下が`Scan`で、かつ`storage`が索引を持てるディスクバックエンドであるときに限り、`choose_access_path`を試す部分は次のようになります。
 
 ```rust
         LogicalPlan::Filter(filter) => match (storage, *filter.input) {
@@ -233,7 +235,7 @@ fn as_column_literal_comparison(expr: &BoundExpr) -> Option<(usize, BinaryOperat
 ## Executor: IndexScanExec
 
 `choose_access_path`が選んだアクセスパスは、`IndexScanNode`という値として`PhysicalPlan`の木に積まれます。
-これを実際に実行するのが`IndexScanExec`で、`source`フィールドがPointかRangeかを`IndexScanSource`という2択の`enum`で持ちます。
+これを実際に実行するのが`IndexScanExec`で、`source`フィールドがPointかRangeかを、`src/physical_plan.rs`に定義する`IndexScanSource`という2択の`enum`で持ちます。
 
 ```rust
 enum IndexScanSource<'a> {
@@ -243,7 +245,7 @@ enum IndexScanSource<'a> {
 ```
 
 Pointは`BTree::lookup`が返す`RecordId`の一覧を、Rangeは`BTree::range`が返す`RangeScan`(第24章、Leaf間リンクをたどるイテレータ)をそのまま持ち回すだけです。
-索引はディスクバックエンドにしか存在しない(第24章)ため、`MemSeqScanExec`に対応する索引版はこのクレートにはなく、`IndexScanExec`は常に`Storage`への参照を持ちます。
+索引はディスクバックエンドにしか存在しない(第24章)ため、`MemSeqScanExec`に対応する索引版はこのクレートになく、`src/physical_plan.rs`に定義する`IndexScanExec`は常に`Storage`への参照を持ちます。
 
 ```rust
 pub struct IndexScanExec<'a> {
@@ -267,7 +269,7 @@ impl<'a> IndexScanExec<'a> {
 }
 ```
 
-どちらも索引が返すのは`RecordId`であって行の中身ではないため、`next()`は`RecordId`を1件受け取るたびに`Storage::get`でHeapページから実データを`fetch`し、`decode_tuple`で`Tuple`へ復元します。
+どちらも索引が返すのは`RecordId`であって行の中身ではないため、`src/physical_plan.rs`の`IndexScanExec`が実装する`next()`は、`RecordId`を1件受け取るたびに`Storage::get`でHeapページから実データを`fetch`し、`decode_tuple`で`Tuple`へ復元します。
 
 ```rust
     fn next(&mut self) -> DbResult<Option<Tuple>> {
@@ -340,6 +342,7 @@ Projection(id, amount, name)
 `HashJoin`は`right`(内側テーブル)の全行を読み切ってハッシュテーブルへ積む**Build**を必ず1回行います。
 `right`に使える索引があるなら、この全件読み込みを丸ごと避け、`left`(外側テーブル)の行数ぶんだけ索引を`lookup`する方が少ない仕事で済むはずです。
 この章では、等値結合の鍵がちょうど1本で、かつ内側テーブルの結合列に索引があるときに限り、`HashJoin`より`IndexNestedLoopJoin`を優先します。
+この判定を行う`index_scan_target`を、`src/physical_plan.rs`に定義します。
 
 ```rust
 fn index_scan_target(
@@ -368,7 +371,7 @@ fn index_scan_target(
 `right`が`PhysicalPlan::SeqScan`のままであることも条件にしています。
 `JOIN`の右辺には`WHERE`が押し下げられない(前節と同じ理由)ため、この章では`right`が`Filter`を伴うことはなく、この条件は常に満たされます。
 
-`optimize`の`Join`アームは、等値結合の鍵を取り出せた場合、まず`index_scan_target`を試し、それが失敗したときだけ`HashJoin`を組み立てます。
+`src/physical_plan.rs`の`optimize`の`Join`アームは、等値結合の鍵を取り出せた場合、まず`index_scan_target`を試し、それが失敗したときだけ`HashJoin`を組み立てます。
 
 ```rust
                     match index_scan_target(storage, &right, &keys) {
@@ -395,7 +398,7 @@ fn index_scan_target(
 
 `IndexNestedLoopJoinNode`が`right`を独立した`PhysicalPlan`として持たない点が、`HashJoinNode`と`NestedLoopJoinNode`との違いです。
 内側テーブルの行は、外側の1行が来るたびに`outer_key`を評価し、その値で索引を`lookup`して初めて決まります。
-`HashJoinExec`のBuildのように内側の全行を先読みして`Vec`やハッシュテーブルへ積む段階そのものがありません。
+`HashJoinExec`のBuildのように内側の全行を先読みして`Vec`やハッシュテーブルへ積む段階は、`src/physical_plan.rs`に定義する`IndexNestedLoopJoinExec`の`next()`にはありません。
 
 ```rust
     fn next(&mut self) -> DbResult<Option<Tuple>> {
@@ -454,6 +457,7 @@ Projection(customers.name, orders.item)
 
 アクセスパスが変わっても、`SELECT`が返す行は変わってはいけません。
 これを確かめる一番直接的な方法は、同じデータと同じクエリを索引あり(Index Scan)と索引無し(SeqScan)の両方の`Storage`に対して実行し、行集合を突き合わせることです。
+このテストは`src/database.rs`に書きます。
 
 ```rust
         for query in [
@@ -481,7 +485,7 @@ Projection(customers.name, orders.item)
 索引が空を返す0行という結果は、`RangeScan`が1件も返さない場合と`Vec::new()`のまま`Point`を終える場合の両方で正しく`Ok(None)`へたどり着く必要があり、どちらの経路が壊れても検出できるからです。
 
 NULLの扱いは、Point述語の抽出そのものを避けるという設計であることをすでに見ました。
-テストでは、`id = NULL`が`SeqScan`のまま(`IndexScan`を1度も選ばない)ことと、結果が0行になることの両方を確認します。
+テストでは、`id = NULL`が`SeqScan`のまま(`IndexScan`を1度も選ばない)ことと、結果が0行になることの両方を、`src/database.rs`で確認します。
 
 ```rust
         let plan = db.execute("EXPLAIN SELECT id FROM orders WHERE id = NULL").unwrap().to_string();
@@ -492,7 +496,7 @@ NULLの扱いは、Point述語の抽出そのものを避けるという設計�
         assert!(result.rows().is_empty());
 ```
 
-削除済みエントリの除外は、`DELETE`の直後にそのキーへ`IndexScan`を実行して確かめます。
+削除済みエントリの除外は、`DELETE`の直後にそのキーへ`IndexScan`を実行し、`src/database.rs`で確かめます。
 
 ```rust
         assert_eq!(db.execute("DELETE FROM orders WHERE id = 2").unwrap().to_string(), "DELETE 1");
@@ -508,7 +512,7 @@ NULLの扱いは、Point述語の抽出そのものを避けるという設計�
 `IndexScanExec`が読み飛ばすのは、モジュールドキュメントで説明したとおりHeap側にだけ食い違いが生じた万一の場合であり、この削除のような通常の運用では`BTree::lookup`の時点ですでに0件です。
 `id`列は`PRIMARY KEY`なので今回のキーは1つの葉に収まっていますが、`UNIQUE`ではない列を索引化した場合、同じキーを持つエントリがLeaf Splitで複数の葉にまたがっていても、`BTree::delete`が一致の最初の葉から`next_leaf`をたどって対象の`RecordId`を探し当てるため(第24章)、この「削除したキーはもう索引に無い」という前提は崩れません。
 
-`UPDATE`が索引キーを書き換えた場合は、更新前の値では見つからず、更新後の値では見つかるという2つの向きを両方確かめます。
+`UPDATE`が索引キーを書き換えた場合は、更新前の値では見つからず、更新後の値では見つかるという2つの向きを、`src/database.rs`で両方確かめます。
 
 ```rust
         assert_eq!(db.execute("UPDATE orders SET id = 42 WHERE id = 1").unwrap().to_string(), "UPDATE 1");
@@ -525,7 +529,7 @@ NULLの扱いは、Point述語の抽出そのものを避けるという設計�
 `storage_update`(第24章)が「削除してから挿入し直す」という手順を常に踏むおかげで、索引側のエントリは`RecordId`が変わっていてもずれません。
 この章のIndex Scanは、その保証の上に成り立っています。
 
-Index Nested Loop Joinの正しさは、同じ結合を索引あり(Index Nested Loop Join)と索引無し(Hash Join)の両方で実行して突き合わせます。
+Index Nested Loop Joinの正しさは、同じ結合を索引あり(Index Nested Loop Join)と索引無し(Hash Join)の両方で実行し、`src/database.rs`で突き合わせます。
 
 ```rust
         let with_index_rows: Vec<Vec<Value>> =

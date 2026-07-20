@@ -45,7 +45,8 @@ PostgreSQL Wire Protocolは、認証方式(`SCRAM-SHA-256`等)、メッセージ
 
 ## フレームのレイアウト
 
-`src/protocol.rs`が定義するフレームは、リクエスト・レスポンスのどちらも同じ9バイトのヘッダを持ちます。
+この章で新しく作成する`src/protocol.rs`がフレームを定義します。
+リクエストとレスポンスのどちらも同じ9バイトのヘッダを持ちます。
 
 ```text
 +----------+----------------+------------------+------------------+
@@ -57,7 +58,7 @@ PostgreSQL Wire Protocolは、認証方式(`SCRAM-SHA-256`等)、メッセージ
 - **request_id**: 呼び出し側が採番する識別子です。レスポンスは対応するリクエストの`request_id`をそのまま書き戻します。この章のサーバーは1本の接続の中でリクエストを1件ずつ順に処理するため、1接続だけを見れば対応関係は到着順から追えます。`request_id`を独立したフィールドとして持たせているのは、複数のリクエストを応答を待たずに送りつけるパイプライン化や、非同期クライアントを将来追加したときに、どの応答がどのリクエストのものかをクライアント側で突き合わせるためです。
 - **payload_len**: ペイロードのバイト数(`u32`)です。
 
-整数フィールドはすべて、ページファイル(第11章)やタプルのエンコード(`crate::tuple_codec`)と同じ、手書きのリトルエンディアン(`to_le_bytes`/`from_le_bytes`)で書きます。
+整数フィールドはすべて、ページファイル(第11章)やタプルのエンコード(`crate::tuple_codec`)と同じ、手書きのリトルエンディアン(`to_le_bytes`/`from_le_bytes`)で、`src/protocol.rs`に次のように書きます。
 
 ```rust
 fn write_raw_frame(writer: &mut impl Write, tag: u8, request_id: u32, payload: &[u8]) -> Result<(), ProtocolError> {
@@ -77,10 +78,16 @@ fn write_raw_frame(writer: &mut impl Write, tag: u8, request_id: u32, payload: &
 }
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod protocol;
+```
+
 書き出し側もこの時点で`MAX_FRAME_PAYLOAD_LEN`を検査している点が、後述「フレーム長の上限とDoS防止」の読み取り側の検査と対称になっています。
 
 リクエストのペイロードは、実行するSQL文をそのままUTF-8バイト列にしたものです。
-`tag`には`MSG_QUERY`(`0x01`)という値だけを定義しました。
+`tag`には`MSG_QUERY`(`0x01`)という値だけを定義します。
 この章のクライアントが送るメッセージはSQLの実行要求1種類しかなく、複数の種別を用意する理由がまだありません。
 
 レスポンスの`tag`は3種類です。
@@ -95,7 +102,7 @@ fn write_raw_frame(writer: &mut impl Write, tag: u8, request_id: u32, payload: &
 
 `payload_len`は送信側の自己申告に過ぎません。
 これを無条件に信用して`vec![0u8; payload_len as usize]`を確保すると、悪意のある、あるいは単に壊れたクライアントが`payload_len`に`u32::MAX`(4GiB弱)を書き込むだけで、受信側に4GiB近いメモリを確保させられます。
-この章では、`payload_len`が16MiB(`MAX_FRAME_PAYLOAD_LEN`)を超えるフレームを、ペイロードを1バイトも読まずに拒否します。
+この章では、`src/protocol.rs`の`read_raw_frame`が、`payload_len`が16MiB(`MAX_FRAME_PAYLOAD_LEN`)を超えるフレームを、ペイロードを1バイトも読まずに拒否します。
 
 ```rust
 fn read_raw_frame(reader: &mut impl Read) -> Result<RawFrame, ProtocolError> {
@@ -121,7 +128,7 @@ fn read_raw_frame(reader: &mut impl Read) -> Result<RawFrame, ProtocolError> {
 書き出し側の検査が無いと、サーバーが`payload_len`の上限を超える`Response`を実際に書き出せてしまい、そのバイト列を同じ上限を守る公式クライアント自身が読めないという非対称が生まれます。
 `SELECT`の結果セットが大きくなるほど`Response::Rows`のペイロードは大きくなるため、この非対称は現実に起こりえます。
 
-`Response::write`は、`Response::Rows`のペイロードが上限を超えていたら、`write_raw_frame`が`FrameTooLarge`を返すより前に検査し、行を1件も書き出さずに小さな`STATUS_ERROR`応答へ差し替えます。
+`src/protocol.rs`の`Response::write`は、`Response::Rows`のペイロードが上限を超えていたら、`write_raw_frame`が`FrameTooLarge`を返すより前に検査し、行を1件も書き出さずに小さな`STATUS_ERROR`応答へ差し替えます。
 
 ```rust
 Response::Rows { schema, rows } => {
@@ -171,7 +178,7 @@ row_count回繰り返し:
 `tuple_codec`は「1行の値の並びを、`Schema`が分かっている前提でバイト列に変換する」というモジュールです。
 元々の用途はSlotted Pageへ書き込む1レコード分のペイロードでしたが、「`Schema`を1回どこかで確定させ、以後の値の並びはそのSchemaを前提に読み書きする」という関係は、ページに書き込む場合でもフレームに乗せる場合でも変わりません。
 違うのは、Slotted Pageの場合はテーブル定義(カタログ)が`Schema`の情報源になるのに対し、この章ではフレーム自身の先頭にSchema(列名、型、NULL許容)を書き込む点です。
-`tuple_codec`自身は列名や型といったSchemaの情報を一切知らないため、Schemaのエンコードは`crate::protocol`がこの章で新しく書いています。
+`tuple_codec`自身は列名や型といったSchemaの情報を一切知らないため、Schemaのエンコードは、この章で新しく`src/protocol.rs`に書いています。
 
 ```rust
 fn encode_rows_payload(schema: &Schema, rows: &[Tuple]) -> Result<Vec<u8>, ProtocolError> {
@@ -201,8 +208,8 @@ fn encode_rows_payload(schema: &Schema, rows: &[Tuple]) -> Result<Vec<u8>, Proto
 
 `crate::database::QueryResult`をそのままシリアライズする案もありえましたが、採りませんでした。
 `QueryResult`はコマンドタグを`Option<String>`として内部的に持ち回り、`Display`実装の中でだけそれを文字列へ変換しています(`schema`、`rows`という2つの公開アクセサはあっても、コマンドタグ自体を取り出す公開APIはありません)。
-そこでこのモジュールが接する境界は、`Display`実装と`schema()`/`rows()`という、すでに公開されているAPIの上に置きました。
-列を持たない結果(`schema().is_empty()`、DDL、DMLの完了)は、`Display`実装(`to_string()`)がそのままコマンドタグ文字列を返すため`Response::Command`に詰め替えられ、列を持つ結果(`SELECT`、`EXPLAIN`)は`Response::Rows`に詰め替えます。
+そこでこのモジュールが接する境界は、`Display`実装と`schema()`/`rows()`という、すでに公開されているAPIの上に置きます。
+列を持たない結果(`schema().is_empty()`、DDL、DMLの完了)は`Display`実装(`to_string()`)がそのままコマンドタグ文字列を返すため`Response::Command`に、列を持つ結果(`SELECT`、`EXPLAIN`)は`Response::Rows`に、`src/protocol.rs`の次の`from_db_result`が詰め替えます。
 
 ```rust
 pub fn from_db_result(result: crate::error::DbResult<crate::database::QueryResult>) -> Response {
@@ -227,6 +234,8 @@ pub fn from_db_result(result: crate::error::DbResult<crate::database::QueryResul
 
 並行モデルは最も単純な形、接続を受け付けるたびに`std::thread::spawn`でスレッドを1本立てる方式を採ります。
 
+この章で新しく作成する`src/server.rs`に、次の`Server::run`を実装します。
+
 ```rust
 pub fn run(self) -> std::io::Result<()> {
     for stream in self.listener.incoming() {
@@ -238,6 +247,12 @@ pub fn run(self) -> std::io::Result<()> {
     }
     Ok(())
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod server;
 ```
 
 接続数がそのままスレッド数になるため、大量の接続を長時間張られる用途には向きません。
@@ -260,7 +275,7 @@ pub fn run(self) -> std::io::Result<()> {
 `SharedDatabase`の`TxHandle`API自体が`harness_contexts`の上に実装されているため、後者を選べば前者の仕組みをそのまま使うことになります。
 この章では、`Database`側を一切変更せずに済む後者を採用しました。
 
-問題は、`SharedDatabase::execute_in_tx`が`Database::execute`の先頭で行っている`BEGIN`、`COMMIT`、`ROLLBACK`の分岐を経由しないことです。
+問題は、`src/database.rs`が持つ`SharedDatabase::execute_in_tx`が、`Database::execute`の先頭で行っている`BEGIN`、`COMMIT`、`ROLLBACK`の分岐を経由しないことです。
 
 ```rust
 pub fn execute_in_tx(&mut self, handle: &TxHandle, sql: &str) -> DbResult<QueryResult> {
@@ -324,7 +339,7 @@ fn execute_inner(&mut self, sql: &str) -> DbResult<QueryResult> {
 この重複を「セッションの状態と責務を1箇所にまとめる」形で解消するのは、第37章がSessionを正式に導入する仕事です。
 この章の`Session`は、接続ごとに独立したトランザクション状態を持てるという最小限の性質だけを満たす前身にとどめます。
 
-明示的な`BEGIN`が無いまま届いた文(Autocommit)は、1文だけのために`begin_tx`でトランザクションを開き、成功すれば`commit_tx`、失敗すれば`rollback_tx`します。
+明示的な`BEGIN`が無いまま届いた文(Autocommit)は、`src/server.rs`の`execute_autocommit`が、1文だけのために`begin_tx`でトランザクションを開き、成功すれば`commit_tx`、失敗すれば`rollback_tx`します。
 
 ```rust
 fn execute_autocommit(&self, sql: &str) -> DbResult<QueryResult> {
@@ -354,7 +369,7 @@ fn execute_autocommit(&self, sql: &str) -> DbResult<QueryResult> {
 ### 切断時のトランザクション後始末
 
 接続が(正常な`\q`ではなく)途中で切れた場合、そのセッションが持っていた未コミットのトランザクションをどうするかを決めておかないと、そのトランザクションが獲得したロック(第31章)を他の接続が永久に待たされます。
-この章では`Session`の`Drop`実装で、保持中の`TxHandle`があれば無条件に`rollback_tx`します。
+この章では`src/server.rs`の`Session`の`Drop`実装で、保持中の`TxHandle`があれば無条件に`rollback_tx`します。
 
 ```rust
 impl Drop for Session<'_> {
@@ -369,7 +384,7 @@ impl Drop for Session<'_> {
 ```
 
 `Session`の`Drop`は、正常な切断、異常な切断、パニックのどの経路でも通ります。
-`handle_connection`のループは、フレームの読み書きに失敗したら`break`するだけで、切断の理由ごとに個別の後始末を書いてはいません。
+`src/server.rs`の`handle_connection`のループは、フレームの読み書きに失敗したら`break`するだけで、切断の理由ごとに個別の後始末を書いてはいません。
 
 ```rust
 fn handle_connection(mut stream: TcpStream, shared: &SharedDatabase) {
@@ -414,7 +429,8 @@ match db.execute(input) {
 }
 ```
 
-CLIクライアントは、`Database::execute`の代わりに`Request`をフレームへ詰めて送り、返ってきた`Response`を表示します。
+この章で新しく作成する`src/bin/minidb_client.rs`のCLIクライアントは、`Database::execute`の代わりに`Request`をフレームへ詰めて送り、返ってきた`Response`を表示します。
+バイナリ名を`minidb-client`にするため、`Cargo.toml`にも`name = "minidb-client"`、`path = "src/bin/minidb_client.rs"`という`[[bin]]`エントリを追加します。
 
 ```rust
 fn send(stream: &mut TcpStream, request_id: u32, sql: &str) -> Result<Response, ClientError> {
@@ -440,7 +456,7 @@ REPLは同じプロセス内の`Database`を直接呼び、CLIクライアント
 その`Session`自身も、最終的には同じ`SharedDatabase::execute_in_tx`/`begin_tx`/`commit_tx`/`rollback_tx`を呼んでいます。
 つまりCLIクライアントとサーバーの`Session`は、SQLの実行そのものについては同じ`SharedDatabase`の同じAPIを共有しており、REPLと分岐しているのはネットワークの往復という入出力の皮1枚だけです。
 
-サーバーの起動は、既存の`main.rs`に`--serve`という起動引数を1つ足すことで実現しました。
+サーバーの起動は、既存の`src/main.rs`に`--serve`という起動引数を1つ足すことで実現します。
 
 ```rust
 match args.next() {

@@ -50,7 +50,7 @@ CREATE TABLE
 `ColumnDef`という型自体が「1つの列に対する制約」という形をすでに持っているため、単一列の制約はその型にフィールドを足すだけで表現できますが、複合キーは列をまたぐ制約なので、`CreateTableStatement`にテーブルレベルの制約リストを別途持たせる設計変更が要ります。
 この設計変更は章末の演習で扱います。
 
-第6章のLexerに`PRIMARY`、`KEY`、`UNIQUE`という3つの予約語を追加します。
+第6章の`src/lexer.rs`にある`Keyword`に、`PRIMARY`、`KEY`、`UNIQUE`という3つの予約語を追加します。
 
 ```rust
 pub enum Keyword {
@@ -61,7 +61,7 @@ pub enum Keyword {
 }
 ```
 
-`ColumnDef`(第7章のAST)に、`PRIMARY KEY`と`UNIQUE`が指定されていたかどうかを持たせます。
+`src/ast.rs`の`ColumnDef`(第7章のAST)に、`PRIMARY KEY`と`UNIQUE`が指定されていたかどうかを持たせます。
 
 ```rust
 pub struct ColumnDef {
@@ -74,7 +74,7 @@ pub struct ColumnDef {
 }
 ```
 
-`Parser`の`parse_column_def`は、型名の後ろに`NOT NULL`、`PRIMARY KEY`、`UNIQUE`が任意の順序、任意の個数だけ並ぶ列として読みます。
+`src/parser.rs`にある`Parser::parse_column_def`は、型名の後ろに`NOT NULL`、`PRIMARY KEY`、`UNIQUE`が任意の順序、任意の個数だけ並ぶ列として読みます。
 
 ```rust
 fn parse_column_def(&mut self) -> DbResult<ColumnDef> {
@@ -120,8 +120,8 @@ fn parse_column_def(&mut self) -> DbResult<ColumnDef> {
 `id BIGINT NOT NULL PRIMARY KEY`のように書いても、`id BIGINT PRIMARY KEY NOT NULL`のように書いても、同じ3つのフラグに解決されます。
 どちらの順序で書くかは利用者の好みの問題であり、構文としてどちらか一方に決め打つ理由がありません。
 
-`Column`(第4章)にも同じ2つのフラグを追加します。
-既存の呼び出し箇所(`Column::new(name, data_type, nullable)`という3引数の呼び出しが、このクレートだけで30箇所以上あります)を1つも壊さないよう、`new`のシグネチャ自体は変えず、追加のフラグはビルダーメソッドで立てる形にしました。
+`src/types.rs`の`Column`(第4章)にも同じ2つのフラグを追加します。
+既存の呼び出し箇所(`Column::new(name, data_type, nullable)`という3引数の呼び出しが、このクレートだけで30箇所以上あります)を1つも壊さないよう、`new`のシグネチャ自体は変えず、これらのフラグはビルダーメソッドで立てる形にします。
 
 ```rust
 pub struct Column {
@@ -159,7 +159,7 @@ impl Column {
 `with_primary_key`が`nullable`を`false`へ強制しているのが、`PRIMARY KEY`は`NOT NULL`を含意するというこの章の設計判断そのものです。
 `id BIGINT PRIMARY KEY`のように`NOT NULL`を明示しなくても、`PRIMARY KEY`だけで`NULL`を拒否できます。
 
-`Database::execute_create_table`(第9章)は、`ColumnDef`のフラグを`Column`のビルダーメソッドへ橋渡しし、あわせて`PRIMARY KEY`が2列以上に指定されていないかを検査します。
+`src/database.rs`の`Database::execute_create_table`(第9章)は、`ColumnDef`のフラグを`Column`のビルダーメソッドへ橋渡しし、あわせて`PRIMARY KEY`が2列以上に指定されていないかを検査します。
 
 ```rust
 let mut primary_key_count = 0;
@@ -193,7 +193,7 @@ if primary_key_count > 1 {
 この章の時点で、テーブルの行を高速に検索できる索引はまだ存在しません。
 索引が無い以上、この章の一意性検査は「これから書き込もうとしている値を、テーブルの全行と1つずつ比較する」という線形走査で実装するしかありません。
 
-この走査を`constraints`という新しいモジュールに`check_uniqueness`という関数としてまとめます。
+この走査を、新規作成する`src/constraints.rs`に`check_uniqueness`という関数としてまとめます。
 
 ```rust
 pub fn check_uniqueness<'a>(
@@ -229,6 +229,12 @@ pub fn check_uniqueness<'a>(
 }
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod constraints;
+```
+
 `schema.unique_constrained_columns()`は、`PRIMARY KEY`または`UNIQUE`が指定された列だけを、Schema上の索引とセットで返す`Schema`の新しいメソッドです。
 一意性を検査すべき列が1つも無いテーブル(この章より前に作った、`NOT NULL`だけのテーブルすべてを含みます)では、この関数はループを1度も回さずに`Ok(())`を返します。
 
@@ -255,6 +261,7 @@ INSERT 2
 `others.clone().any(...)`という部分が、この章のコストの正体です。
 `others`は`Clone`を要求されたイテレータで、`candidates`の各行ごとに`others`全体を1回ずつなめ直します。
 実際にどれくらいのコストがかかるか、`PRIMARY KEY`を持つテーブルへの`INSERT`を1件だけ測ってみます。
+次のコードはクレートのファイルには組み込まず、手元で書いて実行するだけの一時的な測定コードです。
 
 ```rust
 for &n in &[1_000, 2_000, 4_000, 8_000, 16_000] {
@@ -268,6 +275,8 @@ for &n in &[1_000, 2_000, 4_000, 8_000, 16_000] {
     println!("n={n:>6} elapsed={:?}", start.elapsed());
 }
 ```
+
+手元で実行すると、次の結果が得られました。
 
 ```text
 n=  1000 elapsed=29.25µs
@@ -291,7 +300,7 @@ n= 16000 elapsed=349.193µs
 
 この章では、書き込む前に済ませる検査の対象へ、一意性検査(`check_uniqueness`)も加えます。
 検査の種類が増えるだけで、「検査をすべて終えるまで書き込みを一切始めない」という順序自体は変わりません。
-`executor::insert`(第10章、インメモリ版)は次のようになります。
+`src/executor.rs`の`insert`(第10章、インメモリ版)は次のようになります。
 
 ```rust
 pub fn insert(
@@ -315,6 +324,7 @@ pub fn insert(
 `UPDATE`は`INSERT`より少し込み入っています。
 `UPDATE`が変更するのは、テーブルにすでにある行の一部です。
 一意性の比較相手を「既存の全行」にそのまま広げると、これから書き換えようとしている行が、書き換わる前の自分自身の値と比較されて、常に衝突してしまいます。
+`src/executor.rs`の`update`は、この衝突を避けるため次のように書き換えます。
 
 ```rust
 let planned_indices: HashSet<usize> = planned.iter().map(|(index, _)| *index).collect();
@@ -333,7 +343,7 @@ constraints::check_uniqueness(schema, others, &candidates)?;
 一方で、`candidates`同士の比較(`check_uniqueness`の2つ目のループ)は、`UPDATE users SET email = 'a@example.com' WHERE id <= 2`のように、複数行を同じ値へ書き換えようとした場合の衝突をそのまま検出します。
 
 `Storage`版(`storage_insert`と`storage_update`)も同じ順序を踏みます。
-`storage_update`は、`Storage::scan`で読んだ各行を、`WHERE`に一致するかどうかでその場で`planned`(書き換える行)と`others`(書き換えない行)へ振り分けます。
+同じ`src/executor.rs`の`storage_update`は、`Storage::scan`で読んだ各行を、`WHERE`に一致するかどうかでその場で`planned`(書き換える行)と`others`(書き換えない行)へ振り分けます。
 
 ```rust
 let mut planned: Vec<(RecordId, Tuple)> = Vec::new();
@@ -383,7 +393,7 @@ data_type:    u8 (0=BOOLEAN, 1=BIGINT, 2=TEXT)
 nullable:     u8 (0 または 1)
 ```
 
-この章では、`nullable`の直後に`primary_key`と`unique`という2バイトを追加します。
+この章では、`src/storage.rs`のエンコード処理で`nullable`の直後に`primary_key`と`unique`という2バイトを追加します。
 
 ```rust
 out.push(data_type_to_u8(column.data_type));
@@ -392,7 +402,7 @@ out.push(u8::from(column.primary_key));
 out.push(u8::from(column.unique));
 ```
 
-`decode_catalog`側もこの2バイトを読み、`Column`のビルダーメソッドへ渡します。
+同じ`src/storage.rs`の`decode_catalog`側もこの2バイトを読み、`Column`のビルダーメソッドへ渡します。
 
 ```rust
 let nullable = take_bool(&mut cursor, "nullable")?;
@@ -424,7 +434,7 @@ Catalogページの`payload`の中身がどうエンコードされているか�
 
 ## テストで確認する
 
-`constraints`モジュールには、既存行との重複検出、文内の重複検出、`NULL`同士が衝突しないこと、制約を持たないテーブルでは何も検査しないことを確認する単体テストを追加しました。
+`src/constraints.rs`には、既存行との重複検出、文内の重複検出、`NULL`同士が衝突しないこと、制約を持たないテーブルでは何も検査しないことを確認する単体テストを追加します。
 
 ```rust
 #[test]
@@ -436,7 +446,7 @@ fn detects_duplicate_among_candidates_themselves() {
 }
 ```
 
-`database`モジュールには、`PRIMARY KEY`と`UNIQUE`の挿入時と更新時の違反、文内重複、`NULL`と`UNIQUE`の共存に加えて、Statement Rollbackを直接狙ったテストを追加しています。
+`src/database.rs`には、`PRIMARY KEY`と`UNIQUE`の挿入時と更新時の違反、文内重複、`NULL`と`UNIQUE`の共存に加えて、Statement Rollbackを直接狙ったテストを追加しています。
 
 ```rust
 #[test]
@@ -461,10 +471,11 @@ fn update_statement_rollback_leaves_earlier_rows_untouched_on_later_violation() 
 `id = 1`の行は、`UPDATE`の対象(`WHERE id <= 2`)に含まれていたにもかかわらず、`email`は更新前の`'a@example.com'`のままです。
 `id = 2`の行との重複が判明した時点で文全体が打ち切られ、`id = 1`の行に対する変更もテーブルへは一切反映されていません。
 
-`tests/persistence.rs`には、`PRIMARY KEY`と`UNIQUE`を持つテーブルを永続モードで作り、`flush`してから再オープンしても制約が引き続き効くことを確認するテストを、`tests/differential.rs`には、SQLiteとの比較テストを追加しました。
+`tests/persistence.rs`には、`PRIMARY KEY`と`UNIQUE`を持つテーブルを永続モードで作り、`flush`してから再オープンしても制約が引き続き効くことを確認するテストを、`tests/differential.rs`には、SQLiteとの比較テストを追加します。
 SQLiteとの比較では、両者のエラーメッセージの文言までは一致させません。
 minidbは`PRIMARY KEY制約違反です: 列'id'の値1が重複しています`、SQLiteは`UNIQUE constraint failed: users.id`のように、エラーメッセージの語彙や形式はもともと独立に決められたもので、文字列としての一致を求める意味がありません。
 比較するのは「制約違反の文がエラーとして拒否されること」という意味論の一致だけです。
+`tests/differential.rs`には、次の`assert_both_error`を用意します。
 
 ```rust
 fn assert_both_error(setup: &[&str], failing_statement: &str) {
@@ -495,7 +506,7 @@ test result: ok. 378 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 ## 壊して確認する
 
-`constraints::check_uniqueness`から、`candidates`同士を比較する2つ目のループだけを外すと何が起きるか、実際に試します。
+`constraints::check_uniqueness`から、`candidates`同士を比較する2つ目のループだけを外すと何が起きるか、次のように試しに崩してみます。
 
 ```rust
 // for i in 0..candidates.len() { ... } のブロックを丸ごとコメントアウト

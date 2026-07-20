@@ -1,7 +1,7 @@
 # 第12章 Slotted Page、Tuple、RID
 
 前章で`Page`は、`PAGE_SIZE`(4096バイト)のうち先頭16バイトをPage Headerに、残り`PAGE_PAYLOAD_SIZE`(4080バイト)を`payload`に割り当てるところまで決まりました。
-`Page::payload_mut()`は、この4080バイトへの可変参照を返します。
+試しに、この4080バイトへの可変参照を返す`Page::payload_mut()`を使って、次のように書き込んでみます。
 
 ```rust
 let mut page = Page::new(PageId(1), PageType::Data);
@@ -83,9 +83,18 @@ Slot Directoryは先頭から後ろへ、Tuple Dataは末尾から前へ向か�
 `slot_count`番目のスロットは、`payload`のオフセット`SLOTTED_HEADER_SIZE + slot_count * SLOT_ENTRY_SIZE`から8バイトに書かれています。
 スロット番号さえ分かれば、この掛け算1つでSlot Directory内の位置を直接求められ、先頭から順に走査する必要はありません。
 
+ここから先のコードは、この章で新しく作る`src/slotted_page.rs`に置いていきます。
+まず、この2つの定数を定義します。
+
 ```rust
 pub const SLOTTED_HEADER_SIZE: usize = 4;
 pub const SLOT_ENTRY_SIZE: usize = 8;
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod slotted_page;
 ```
 
 Slot DirectoryとTuple Dataは、互いに向かい合って伸びる分だけ、いずれ衝突する可能性があります。
@@ -104,6 +113,7 @@ Slot DirectoryとTuple Dataは、互いに向かい合って伸びる分だけ�
 Slot Directoryの1エントリを指す番号を`SlotId`という型で表します。
 `PageId`と同じくNewtypeで、`u64`ではなく`u16`を包みます。
 4080バイトの`payload`に収まるスロット数は最大でも510件程度なので、`u16`(最大65535)で十分足ります。
+`SlotId`は、既存の`src/ids.rs`に追記します。
 
 ```rust
 pub struct SlotId(pub u16);
@@ -112,7 +122,7 @@ pub struct SlotId(pub u16);
 `SlotId`だけでは、データベース全体でタプル1件を特定できません。
 あるページのスロット3と、別のページのスロット3は無関係な区画です。
 `PageId`と`SlotId`の組があって初めて、データベース全体で1件のタプルの位置を指せます。
-この組を**Record ID**(**RID**)と呼び、`RecordId`という構造体で表します。
+この組を**Record ID**(**RID**)と呼び、同じ`src/ids.rs`に`RecordId`という構造体を追記して表します。
 
 ```rust
 pub struct RecordId {
@@ -152,6 +162,8 @@ Slot Directoryという間接参照は、この安定性のためにあります
 この検証は、空区間をそもそも重複検査の対象から除外することでこの落とし穴を避けています。
 読み取り専用の`SlottedPageRef::open`(第14章で登場)も同じ検証を行います。
 
+`init`は`src/slotted_page.rs`に定義します。
+
 ```rust
 pub fn init(payload: &'a mut [u8]) -> Self {
     let capacity = payload.len();
@@ -168,7 +180,7 @@ pub fn init(payload: &'a mut [u8]) -> Self {
 `init`は`slot_count`を0、`tuple_data_start`を`payload`全体の長さに設定します。
 Slot Directoryが1件も無く、Tuple Data領域がまだ1バイトも使われていない、空のSlotted Pageです。
 
-`insert`は、バイト列を1件のタプルとして書き込み、そのタプルを指す`SlotId`を返します。
+同じ`src/slotted_page.rs`に追加する`insert`は、バイト列を1件のタプルとして書き込み、そのタプルを指す`SlotId`を返します。
 
 ```rust
 pub fn insert(&mut self, bytes: &[u8]) -> Option<SlotId> {
@@ -180,7 +192,7 @@ pub fn insert(&mut self, bytes: &[u8]) -> Option<SlotId> {
 }
 ```
 
-実際の割り当ては`try_insert`が行います。
+実際の割り当ては、同じ`src/slotted_page.rs`の`try_insert`が行います。
 
 ```rust
 fn try_insert(&mut self, bytes: &[u8]) -> Option<SlotId> {
@@ -227,7 +239,7 @@ fn try_insert(&mut self, bytes: &[u8]) -> Option<SlotId> {
 `bytes`自体が、空の1ページにすら収まらないほど大きい場合を考えます。
 第13章のHeap Fileは、既存のページで`None`を受け取るたびに次のページを試し、最後に新しいページを1枚割り当ててからようやくその`bytes`が入らないと分かります。
 この時点で、失敗するだけの`insert`のためにページを1枚確保してしまっています。
-そこで、実際にページへ触れる前に「そもそも入りうるかどうか」を計算だけで判定できる関数を用意しておきます。
+そこで、実際にページへ触れる前に「そもそも入りうるかどうか」を計算だけで判定できる関数を`src/slotted_page.rs`に用意しておきます。
 
 ```rust
 pub fn max_len_for_fresh_page(payload_len: usize) -> usize {
@@ -240,7 +252,7 @@ pub fn max_len_for_fresh_page(payload_len: usize) -> usize {
 
 ## 削除はTombstoneにとどめる
 
-`delete`は、指定したスロットを削除済みとして印付けます。
+同じ`src/slotted_page.rs`に追加する`delete`は、指定したスロットを削除済みとして印付けます。
 
 ```rust
 pub fn delete(&mut self, slot: SlotId) -> bool {
@@ -262,7 +274,7 @@ pub fn delete(&mut self, slot: SlotId) -> bool {
 1つは、`RecordId`の安定性です。
 Slot Directoryのエントリを本当に削除して後続のスロットを詰めてしまうと、それらのスロット番号がずれ、そのスロットを指していた`RecordId`が別のタプルを指すようになってしまいます。
 `Tombstone`はその場に留まり続けるので、この問題は起きません。
-もう1つは、`get`がこの状態を見分けられることです。
+もう1つは、`src/slotted_page.rs`に追加する`get`が、この状態を見分けられることです。
 
 ```rust
 pub fn get(&self, slot: SlotId) -> Option<&[u8]> {
@@ -289,7 +301,7 @@ pub fn get(&self, slot: SlotId) -> Option<&[u8]> {
 `payload`全体としての空きバイト数は十分でも、それが1箇所にまとまっていなければ、新しい大きめのタプルを書き込む連続した領域を確保できません。
 この状態を**断片化**と呼びます。
 
-`compact`は、生きている(Occupiedな)タプルだけを集めてTuple Data領域を隙間なく詰め直し、断片化を解消します。
+同じ`src/slotted_page.rs`に追加する`compact`は、生きている(Occupiedな)タプルだけを集めてTuple Data領域を隙間なく詰め直し、断片化を解消します。
 
 ```rust
 pub fn compact(&mut self) {
@@ -326,7 +338,7 @@ Slot Directoryそのもの(`slot_count`や、Tombstoneのままのエントリ)�
 
 ## サイズが変わる更新
 
-`update`は、指定したスロットが指すタプルを新しいバイト列に置き換えます。
+同じ`src/slotted_page.rs`に追加する`update`は、指定したスロットが指すタプルを新しいバイト列に置き換えます。
 
 ```rust
 pub fn update(&mut self, slot: SlotId, bytes: &[u8]) -> bool {
@@ -357,6 +369,7 @@ Tuple Data領域の同じ位置へ、新しいバイト列をそのまま上書�
 長さが変わる場合はそうはいきません。
 `BIGINT`や`BOOLEAN`は値が変わってもバイト数は変わりませんが、`TEXT`は`UPDATE users SET name = 'Alexandria' WHERE id = 1`のように、元の`'Alice'`より長い文字列に置き換わることがあります。
 その場合、元の場所にそのまま収まる保証はありません。
+そこで、同じ`src/slotted_page.rs`に`try_relocate`という関数を追加します。
 
 ```rust
 fn try_relocate(&mut self, slot: SlotId, bytes: &[u8]) -> bool {
@@ -404,10 +417,19 @@ fn try_relocate(&mut self, slot: SlotId, bytes: &[u8]) -> bool {
 NULLビットマップは、列数を8列単位へ切り上げたバイト数を持ちます。
 列`i`が`NULL`なら、`i / 8`バイト目の`i % 8`ビット目が1になります。
 
+ここから先のコードは、この章で新しく作る`src/tuple_codec.rs`に置いていきます。
+まず、この関数を定義します。
+
 ```rust
 fn null_bitmap_len(column_count: usize) -> usize {
     column_count.div_ceil(8)
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod tuple_codec;
 ```
 
 `NULL`は`Value::Null`という1種類の値であり、`DataType`を持ちません。
@@ -424,7 +446,7 @@ fn null_bitmap_len(column_count: usize) -> usize {
 `TEXT`だけが可変長であり、長さを先に書いておかなければ、どこまでがその列の値でどこからが次の列の値かを区別できません。
 この**長さプレフィックス**方式のおかげで、`decode_tuple`は区切り文字を探す必要も、文字列の終端記号を予約する必要もなく、読むべきバイト数を先頭4バイトから直接計算できます。
 
-`encode_tuple`は、この形式に従って`Tuple`をバイト列へ変換します。
+同じ`src/tuple_codec.rs`に定義する`encode_tuple`は、この形式に従って`Tuple`をバイト列へ変換します。
 
 ```rust
 pub fn encode_tuple(schema: &Schema, tuple: &Tuple) -> Vec<u8> {
@@ -467,6 +489,7 @@ pub fn encode_tuple(schema: &Schema, tuple: &Tuple) -> Vec<u8> {
 
 `decode_tuple`は、この逆方向の変換を行います。
 `Value`自身に型情報を持たない生のバイト列からは、各列が何列目のどの`DataType`かを`schema`を見て判断するしかありません。
+同じ`src/tuple_codec.rs`に、次の`decode_tuple`を定義します。
 
 ```rust
 pub fn decode_tuple(schema: &Schema, bytes: &[u8]) -> DbResult<Tuple> {
@@ -551,7 +574,9 @@ pub fn decode_tuple(schema: &Schema, bytes: &[u8]) -> DbResult<Tuple> {
 `Tuple::new`自身が`Schema`との適合を検査する第4章の関数なので、`decode_tuple`が組み立てた値の並びが本当に`schema`へ適合しているかどうかは、ここでもう一度確認されます。
 
 `bytes`が短すぎる場合や、`TEXT`の長さプレフィックスが実際の残りバイト数を超えている場合、`decode_tuple`は`DbError::CorruptTuple`を返します。
-`bytes.get(range)`のように範囲外アクセスを`Option`として受け取る形で境界チェックを行っているため、不正な`bytes`を渡してもパニックせず、この章で追加したエラーとして呼び出し側に伝わります。
+`bytes.get(range)`のように範囲外アクセスを`Option`として受け取る形で境界チェックを行っているため、不正な`bytes`を渡してもパニックせず、この章で追加するエラーとして呼び出し側に伝わります。
+
+この`CorruptTuple`は、既存の`src/error.rs`の`DbError`に追記します。
 
 ```rust
 /// Tupleのバイト列が、渡された`Schema`のもとで復元できないエラー
@@ -566,6 +591,7 @@ CorruptTuple(String),
 `slotted_page`と`tuple_codec`のテストは、大きく5つの観点をカバーしています。
 
 挿入してすぐ`get`すれば同じバイト列が返ることを確認する、最も基本的なラウンドトリップです。
+これらのテストは`src/slotted_page.rs`の`#[cfg(test)] mod tests`に置きます。
 
 ```rust
 #[test]
@@ -579,7 +605,7 @@ fn insert_then_get_round_trips() {
 }
 ```
 
-`payload`をほぼ埋め尽くす1件を先に入れておき、その後の挿入が空き領域不足で`None`を返すことも確認しています。
+同じ`src/slotted_page.rs`のテストで、`payload`をほぼ埋め尽くす1件を先に入れておき、その後の挿入が空き領域不足で`None`を返すことも確認しています。
 
 ```rust
 #[test]
@@ -601,7 +627,7 @@ fn insert_returns_none_when_page_is_full() {
 
 失敗した挿入が既存のタプルを壊していないことも、同じテストの最後の1行で確かめています。
 
-`delete`してからの再挿入が、同じ`SlotId`を使い回すことも確認します。
+同じ`src/slotted_page.rs`のテストで、`delete`してからの再挿入が、同じ`SlotId`を使い回すことも確認します。
 
 ```rust
 #[test]
@@ -622,7 +648,7 @@ fn insert_reuses_a_tombstoned_slot_id() {
 }
 ```
 
-`compact`の前後でタプルの中身が変わらないことは、その等価性そのものがコンパクションの正しさの定義なので、直接テストします。
+`compact`の前後でタプルの中身が変わらないことは、その等価性そのものがコンパクションの正しさの定義なので、同じ`src/slotted_page.rs`で直接テストします。
 
 ```rust
 #[test]
@@ -651,7 +677,7 @@ fn compact_preserves_tuple_contents_by_slot_id() {
 
 空き領域が増えたことと、生きているタプルが元のスロット番号のまま読めることの両方を、1つのテストで確認しています。
 
-最後に、決定的な乱数で挿入と削除をランダムな順序で繰り返し、常に整合性が保たれることを確認するテストを用意しています。
+最後に、`src/slotted_page.rs`に、決定的な乱数で挿入と削除をランダムな順序で繰り返し、常に整合性が保たれることを確認するテストを用意しています。
 
 ```rust
 #[test]

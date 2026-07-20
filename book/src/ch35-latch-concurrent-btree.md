@@ -55,6 +55,8 @@ Latchが無ければ、書き換えている途中の半端なバイト列を誰
 `Mutex`はExclusiveの区別しか持たないため、同じページを読むだけの`PageReadGuard`が2つあっても、片方が生きている間はもう片方の`read_page`がロック待ちで止まります。
 これが第14章の演習問題2で予告されていた限界です。
 
+`src/buffer_pool.rs`の`BufferPool`を、次のように変えます。
+
 ```rust
 pub struct BufferPool {
     disk: DiskManager,
@@ -74,7 +76,7 @@ pub struct BufferPool {
 この2つのロックを両方とも触る箇所(`locate_or_load`と`evict`)は、常に「`Inner`を先にロックし、その`MutexGuard`を握ったままFrameのLatchを取る」という順序で統一されています。
 逆順(Frameを先に、Innerをあとに)を許すと、スレッドAが`evict`のためにInnerを確保してFrameを待ち、スレッドBがFrameを確保したままunpinのためにInnerを待つ、という循環待ちが起こりえます。
 
-ここで、`PageReadGuard`と`PageWriteGuard`の`Drop`を素朴に書くと、この逆順を自分から踏んでしまうことに気づきました。
+ここで、`src/buffer_pool.rs`の`PageReadGuard`と`PageWriteGuard`の`Drop`を素朴に書くと、この逆順を自分から踏んでしまうことに気づきました。
 
 ```rust
 impl Drop for PageReadGuard<'_> {
@@ -90,7 +92,7 @@ impl Drop for PageReadGuard<'_> {
 これはモジュール冒頭の規律が禁じている逆順そのものであり、単一スレッドの間は誰も気づけません(同じスレッドの中で複数のGuardが同時に生きて競合することがないため)。
 複数スレッドがBuffer Poolを本当に共有した瞬間、この逆順はデッドロックの芽になります。
 
-この章では`guard`フィールドを`std::mem::ManuallyDrop`で包み、`Drop::drop`の中で明示的に順序を固定しました。
+この章では、`src/buffer_pool.rs`の`PageReadGuard`の`guard`フィールドを`std::mem::ManuallyDrop`で包み、`Drop::drop`の中で明示的に順序を固定します。
 
 ```rust
 pub struct PageReadGuard<'a> {
@@ -125,11 +127,12 @@ impl Drop for PageReadGuard<'_> {
 
 `BufferPool`のLatchはページ1枚の中身を守るだけで、複数ページにまたがる木の構造そのものを守ってはくれません。
 `BTree`の`insert`が根から葉まで降りる途中、別のスレッドが同じ経路のどこかを書き換えていたら、探索は正しい葉にたどり着けません。
-この章では、B+Treeの木構造を並行アクセスから守るために**Lock Coupling**(Crabbing、蟹のように親のハサミを閉じてから次のハサミを開く動きに由来する通称)を実装しました。
+この章では、B+Treeの木構造を並行アクセスから守るために**Lock Coupling**(Crabbing、蟹のように親のハサミを閉じてから次のハサミを開く動きに由来する通称)を実装します。
 
 ### 探索: 子のLatchを取ってから親を放す
 
 `lookup`と`range`が使う探索(`find_leaf`と`find_leaf_for_lower_bound`)は、親のRead Latchを持ったまま子のRead Latchを取り、子を取ってから親を放します。
+以下は`src/btree.rs`の`find_leaf`です。
 
 ```rust
 fn find_leaf(&self, key_bytes: &[u8]) -> DbResult<PageReadGuard<'_>> {
@@ -156,6 +159,7 @@ fn find_leaf(&self, key_bytes: &[u8]) -> DbResult<PageReadGuard<'_>> {
 
 `insert`は、根からWrite Latchを取りながら降り、通過したページを`ancestors`にスタックとして積みます。
 各ノードに着いた時点で、このキーを収めても**そのノード自身がSplitして親へ伝播しないか**を判定し、安全だと分かればそれより上の祖先のLatchを全て解放します。
+次の一連のコードは、`src/btree.rs`の`insert`の本体です。
 
 ```rust
 let mut ancestors: Vec<PageWriteGuard<'_>> = Vec::new();
@@ -190,6 +194,7 @@ loop {
 「安全」の判定は2種類あります。
 葉については、`(key_bytes, rid)`を実際に挿入した後のエントリ一覧を仮に組み立て、`leaf_entries_fit`で収まるかどうかを確認します。
 挿入する値そのものが分かっているので、この判定は厳密です。
+`src/btree.rs`に`leaf_is_safe_for_insert`として定義します。
 
 ```rust
 fn leaf_is_safe_for_insert(view: &LeafPageRef<'_>, key_bytes: &[u8], rid: RecordId) -> bool {
@@ -202,6 +207,7 @@ fn leaf_is_safe_for_insert(view: &LeafPageRef<'_>, key_bytes: &[u8], rid: Record
 
 内部ページについては、この時点ではまだ下の階層でSplitが起きるかどうかも、起きた場合に押し上げられてくる区切りキーの実際の長さも分かりません。
 `max_key_len`(`insert`が受け付ける最大のキー長)を持つダミーのエントリを1件仮に足して判定することで、実際に来る区切りキーがどんな長さであっても安全側に倒します。
+同じ`src/btree.rs`に、次の`internal_is_safe_for_insert`を定義します。
 
 ```rust
 fn internal_is_safe_for_insert(view: &InternalPageRef<'_>, max_key_len: usize) -> bool {
@@ -212,7 +218,7 @@ fn internal_is_safe_for_insert(view: &InternalPageRef<'_>, max_key_len: usize) -
 ```
 
 葉に着いた時点で`ancestors`に残っているのは、末尾(最も深い)が葉自身、それより前が実際にSplitしうる祖先だけです。
-伝播は、この`ancestors`から都度`pop`したGuardをそのまま使い回します。
+伝播は、`src/btree.rs`の同じ`insert`の中で、この`ancestors`から都度`pop`したGuardをそのまま使い回します。
 
 ```rust
 let mut current_guard = ancestors.pop().expect("...");
@@ -246,6 +252,7 @@ Rootが分割されるとき(`ancestors`が空になったとき)は、`grow_new
 この章の統合テストを書く過程で、実際にこの経路の破損を観測しました。
 
 そこでこの章では、**Rootの`PageId`を`create`のときのまま生涯変えない**ことにしました。
+`src/btree.rs`の`grow_new_root`は、次のようになります。
 
 ```rust
 fn grow_new_root(&self, mut old_root_guard: PageWriteGuard<'_>, separator: &[u8], new_page_id: PageId) -> DbResult<()> {
@@ -288,7 +295,7 @@ Latchの取得順序は、常に**上から下、左から右**に固定して�
 ## Database層のスレッド対応: `SharedDatabase`と「待機」に変わったBlocked
 
 `BufferPool`とB+Treeが本物のLatchを持つようになった一方で、`Database`自身(`Catalog`、`Backend`、`LockManager`等)はスレッドセーフになっていません。
-この章では、`Database`全体を`Mutex`1本で包む最小限のラッパー`SharedDatabase`を追加しました。
+この章では、`Database`全体を`Mutex`1本で包む最小限のラッパー`SharedDatabase`を、`src/database.rs`に追加します。
 
 ```rust
 pub struct SharedDatabase {
@@ -305,7 +312,7 @@ pub struct SharedDatabase {
 両立しないロックを見つけたら、`Blocked`という**値**を返すだけで、呼び出し元のスレッドを止めはしません。
 決定的インターリーブテストハーネスは、この値を受け取って「今は再試行しない」と判断する側に回ることで、単一スレッドのままインターリーブを制御していました。
 
-`SharedDatabase::execute_in_tx`は、同じ`DbError::WouldBlock`を受け取ったら`Condvar`でスレッドを実際に眠らせます。
+`src/database.rs`の`SharedDatabase::execute_in_tx`は、同じ`DbError::WouldBlock`を受け取ったら`Condvar`でスレッドを実際に眠らせます。
 
 ```rust
 pub fn execute_in_tx(&self, handle: &TxHandle, sql: &str) -> DbResult<QueryResult> {
@@ -339,6 +346,7 @@ pub fn execute_in_tx(&self, handle: &TxHandle, sql: &str) -> DbResult<QueryResul
 スレッドの実行順序そのものをアサートするテストは1つもありません。
 
 複数スレッドが`Arc<BTree>`へ、互いに素なキー集合を同時に`insert`するテストは、`Barrier`で全スレッドの開始を揃え、木がまだ浅い段階から並行アクセスを集中させます。
+`tests/concurrent_threads.rs`から抜粋します。
 
 ```rust
 let handles: Vec<_> = (0..THREADS)
@@ -365,7 +373,7 @@ let handles: Vec<_> = (0..THREADS)
 Victim Selection(第32章)は循環の中で最も新しいTransactionIdを選ぶため、先に`begin_tx`した側が生き残り、後から`begin_tx`した側が必ずVictimになります。
 この決定性を使って、実行順序を一切アサートせずに最終残高だけを検証しています。
 実スレッドが本当にデッドロックしたまま検出されずに止まっていれば、このテスト自体がハングします。
-ハングしたままCIを止めないよう、別スレッドからの完了通知に上限時間を設けました。
+ハングしたままCIを止めないよう、別スレッドからの完了通知に上限時間を設けます。
 
 決定的インターリーブテストのハーネス(第30〜34章)は、この章のあとも1文字も変えずに緑のままです。
 実スレッドを解禁したことは、既存の単一スレッドテストを置き換えるのではなく、その上に積み増すものだという位置づけを、テストスイート自体が示しています。

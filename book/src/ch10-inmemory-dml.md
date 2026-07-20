@@ -34,6 +34,7 @@ minidb> SELECT id FROM users;
 `TableInfo`に`rows: Vec<Tuple>`のようなフィールドを足すと、「名前から定義を引く場所」と「名前から中身を引く場所」が同じ構造体に同居することになり、ディスクへの永続化が入る第2部で、定義と中身をそれぞれ別のファイル、別のページに分けて書き出したくなったときに、両者が絡み合ったままのコードを解きほぐす作業から始めることになります。
 
 そこで、行の集まりは`storage_mem`という新しいモジュールに置きます。
+この章では`src/storage_mem.rs`を新規に作成します。
 
 ```rust
 pub struct MemTable {
@@ -43,6 +44,12 @@ pub struct MemTable {
 pub struct MemStorage {
     tables: HashMap<TableId, MemTable>,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod storage_mem;
 ```
 
 `MemStorage`は`TableId`をキーにする対応表です。
@@ -58,6 +65,7 @@ pub struct MemStorage {
 値を名前から引く環境がまだ存在しなかったからです。
 
 その環境を`Row`という型で導入します。
+`src/types.rs`に追加します。
 
 ```rust
 pub struct Row<'a> {
@@ -81,6 +89,7 @@ impl<'a> Row<'a> {
 `Schema`と`Tuple`をペアで持ち回らずに済むよう1つの型にまとめておくと、`eval_expr`の引数が1個で済み、呼び出し側も「今どの行を処理しているか」を`Row`という1つの値で受け渡せます。
 
 `eval_expr`のシグネチャに、この`Row`を`Option`で受け取る引数を追加します。
+`src/eval.rs`の`eval_expr`を、次のように書き換えます。
 
 ```rust
 pub fn eval_expr(expr: &Expr, functions: &FunctionRegistry, row: Option<&Row>) -> DbResult<Value> {
@@ -149,6 +158,7 @@ pub fn eval_expr(expr: &Expr, functions: &FunctionRegistry, row: Option<&Row>) -
 
 第7章の`InsertStatement`は、`INSERT INTO name VALUES (...)`という1行分の挿入にしか対応していませんでした。
 この章では、複数行の`VALUES (...), (...)`と、列名を明示する`INSERT INTO name (col, ...)`の両方に対応させます。
+`src/ast.rs`の`InsertStatement`を、次の形に変えます。
 
 ```rust
 pub struct InsertStatement {
@@ -160,6 +170,7 @@ pub struct InsertStatement {
 ```
 
 `Parser`側は、`(`が続けば列名の並びを読み、`VALUES`に続く行を`,`区切りで読めるだけ読みます。
+`src/parser.rs`の`parse_insert_statement`に、次の読み取りを追加します。
 
 ```rust
 let columns = if *self.peek_kind() == TokenKind::LParen {
@@ -188,6 +199,7 @@ while *self.peek_kind() == TokenKind::Comma {
 ```
 
 実行側の`executor::insert`は、Values演算子(各行の式を評価する部分)とInsert演算子(評価済みの行を書き込む部分)を1つの関数にまとめています。
+この章では`src/executor.rs`も新規に作成し、実行演算子の関数をまとめて置きます。
 
 ```rust
 pub fn insert(
@@ -213,13 +225,19 @@ pub fn insert(
 }
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod executor;
+```
+
 `VALUES`の各要素を評価するとき、`eval_expr`に渡す`Row`は常に`None`です。
 挿入しようとしている値が、既存の行を参照する構文はこのSQLサブセットに無いため、行環境を用意する必要がありません。
 
 `planned`という`Vec<Tuple>`にすべての行の`Tuple::new`が成功してから、最後に`table.rows_mut().extend(planned)`で1回だけ書き込んでいるのは、「守るべき不変条件」の2番目(All-or-Nothing)を満たすためです。
 3行目の型が`NOT NULL`列に違反していれば、`?`によってその場でこの関数全体が打ち切られ、`table`は一切変更されません。
 
-列名指定がある場合の並べ替えは、`expand_to_schema`が担当します。
+列名指定がある場合の並べ替えは、同じ`src/executor.rs`に定義する`expand_to_schema`が担当します。
 
 ```rust
 fn expand_to_schema(
@@ -267,6 +285,7 @@ fn expand_to_schema(
 `SELECT`の対象式リストに`*`を書けるようにするには、まずASTを拡張する必要があります。
 `*`はLexerの上では乗算のToken(`TokenKind::Star`)と同じもので、これまでの`SelectItem`は式1個を持つ構造体でした。
 `*`を式として扱うのではなく、`SelectItem`自体を列挙型にします。
+`src/ast.rs`の`SelectItem`を、次の形に変えます。
 
 ```rust
 pub enum SelectItem {
@@ -276,6 +295,7 @@ pub enum SelectItem {
 ```
 
 `Parser`は、対象式リストの要素を読む直前に`*`かどうかを先読みして振り分けます。
+`src/parser.rs`の`parse_select_item`を、次のように書き換えます。
 
 ```rust
 fn parse_select_item(&mut self) -> DbResult<SelectItem> {
@@ -290,6 +310,7 @@ fn parse_select_item(&mut self) -> DbResult<SelectItem> {
 ```
 
 実行側は、`FROM`が無ければ第9章までと同じ経路(その場で式を評価し、1行だけ返す)を使い、`FROM`があればSequential Scan、Filter、Projectionの3演算子を順に適用します。
+`src/database.rs`の`execute_select_with_from`に、次の配線を書きます。
 
 ```rust
 let table_info = self
@@ -321,6 +342,7 @@ let (schema, rows) = executor::project(
 `predicate`には`WHERE id = 1`のような`BOOLEAN`を返す式が書かれているのが普通ですが、`WHERE 1`のように`BIGINT`を返す式を書き誤ることもありえます。
 そのような値を、`TRUE`でないというだけで黙って「一致しなかった」側に丸めてしまうと、書き誤りに気づけないまま0行という結果を正常応答として返してしまいます。
 そこで、この変換は`predicate_matches`という1つの関数にまとめ、`filter`、`update`、`delete`の3箇所から共通して呼びます。
+`src/executor.rs`に定義します。
 
 ```rust
 fn predicate_matches(value: Value) -> DbResult<bool> {
@@ -363,6 +385,7 @@ minidb> SELECT id FROM users WHERE 1;
 この抜け穴を塞ぐため、行ループへ入る前に`predicate`の型を静的に検査する`check_predicate_type`を用意し、`filter`、`update`、`delete`の冒頭で呼びます。
 使うのは`infer_type`という関数で、`SELECT`の計算列の型を決めるところ(このあとのProjection演算子の節)でも登場します。
 行を1件も評価せず、式のASTと`schema`だけから`predicate`の型を決められるので、テーブルの行数に関係なく同じ検査ができます。
+`src/executor.rs`に、次のように定義します。
 
 ```rust
 fn check_predicate_type(
@@ -413,7 +436,7 @@ minidb> SELECT id FROM users WHERE 1;
 PostgreSQLやSQLiteは、`FROM`が無い`SELECT`を、0列1行の暗黙の入力に対する`SELECT`とみなし、`WHERE`はその1行を通常どおり絞り込みます。
 `SELECT 1 WHERE FALSE`は0行、`SELECT 1 WHERE TRUE`は1行になるべきで、`WHERE`を無視して常に1行返す実装は誤りです。
 
-これらをまとめて直すため、`execute_select_without_from`を次のように書き直しました。
+これらをまとめて直すため、`src/database.rs`の`execute_select_without_from`を次のように書き直します。
 
 ```rust
 fn execute_select_without_from(
@@ -508,6 +531,7 @@ minidb> SELECT 1 WHERE NULL;
 逆に`SELECT NULL + 1`のように両辺が`BigInt`か`None`(型未定の`NULL`)であれば`infer_type`の検査を正しく通過するので、型として正しい式に対する`eval_arith`の`NULL`伝播(前章で述べたとおり)はそのまま働き、結果は`NULL`のまま成功し、列の型は`FROM`の有無によらず`BIGINT`になります。
 
 Filter演算子は、`守るべき不変条件`の1番目を、`check_predicate_type`と`predicate_matches`の2段構えでコードにしています。
+`src/executor.rs`に戻り、次の関数を定義します。
 
 ```rust
 pub fn filter(
@@ -530,6 +554,7 @@ pub fn filter(
 ```
 
 Projection演算子は、`*`をテーブルの全列参照へ展開してから、「列参照または式のリスト」という1種類の形だけを扱います。
+この展開を担う`resolve_items`は、`src/executor.rs`に次のように定義します。
 
 ```rust
 fn resolve_items(table_schema: &Schema, items: &[SelectItem], sql: &str) -> Vec<(Expr, String)> {
@@ -570,6 +595,7 @@ fn resolve_items(table_schema: &Schema, items: &[SelectItem], sql: &str) -> Vec<
 この章の`project`は、行を1行も評価せずに出力列の型を決める`infer_type`という関数を使い、この問題を避けます。
 
 `infer_type`は、片方が`None`(型未定の`NULL`)でもう片方が型違反というエラーメッセージを組み立てるときに、次の小さなヘルパーを使います。
+これも`src/executor.rs`に定義します。
 
 ```rust
 fn describe_type(data_type: Option<DataType>) -> String {
@@ -582,6 +608,7 @@ fn describe_type(data_type: Option<DataType>) -> String {
 
 `Option<DataType>`をそのまま`{:?}`で表示すると、以前の章で避けたのと同じ理由(`Some(BigInt)`のようなRustの内部表現が漏れる)で問題になります。
 `describe_type`は`Some`ならSQLの型名を、`None`なら`NULL`という文字列を返し、エラーメッセージの両辺を同じ形式で表示します。
+続けて`src/executor.rs`に、次の`infer_type`を定義します。
 
 ```rust
 fn infer_type(
@@ -731,7 +758,7 @@ fn infer_type(
 
 以前のこの章では、`infer_type`はトップレベルの演算子の種類だけを見て出力の型を決め、被演算子の型検査は`eval_expr`に任せていました。
 しかしそれでは、`predicate_matches`の節で見た`WHERE 1 AND 2`のような非対称が生まれます。
-そこで、演算子と関数それぞれが被演算子に課す型制約を、`infer_type`自身が再帰的に検査するように直しました。
+そこで、演算子と関数それぞれが被演算子に課す型制約を、`infer_type`自身が再帰的に検査するように直します。
 単項`-`は被演算子が`BigInt`か`None`(型未定の`NULL`)であることを、単項`NOT`と`AND`/`OR`は被演算子が`Boolean`か`None`であることを、算術演算は両辺が`BigInt`か`None`であることを、比較演算は両辺が同じ型か、どちらかが`None`であることを、関数呼び出しは`FunctionRegistry`に登録された引数の個数と型(`functions.arg_types(name)`)を、それぞれ検査します。
 違反があれば、`eval_expr`が実際にその式を評価したときに返すのと同じ文言の`DbError::Eval`を返すため、`WHERE 1 AND 2`や`WHERE NOT 1`、`WHERE abs('x') = 1`は、空のテーブルでも行を持つテーブルでも同じ`エラー`になります。
 `IS [NOT] NULL`だけは被演算子の型を問いません(ただし被演算子自身の式は再帰的に検査するので、`abs('x') IS NULL`のような無効な式はここでも検出されます)。
@@ -759,6 +786,7 @@ fn infer_type(
 ## `UPDATE`と`DELETE`を実装する
 
 `UPDATE users SET name = 'Bob' WHERE id = 1`のASTは、`SET`のカンマ区切りリストを`Assignment`の並びとして持ちます。
+`src/ast.rs`に追加します。
 
 ```rust
 pub struct UpdateStatement {
@@ -777,6 +805,7 @@ pub struct Assignment {
 
 Update演算子は、`WHERE`に一致した行(`predicate`が無ければ全行)それぞれに`assignments`を適用します。
 `filter`と同じ理由で、`table`が空でも`WHERE 1`のような書き誤りを見逃さないよう、行ループへ入る前に`predicate`が`Some`なら`check_predicate_type`を呼びます。
+`src/executor.rs`に戻ります。
 
 ```rust
 pub fn update(
@@ -827,6 +856,7 @@ INSERT演算子と同じく、書き換え後の`Tuple`をすべて`planned`に�
 
 Delete演算子は、`Filter`演算子と対になる形をしています。
 こちらも`table`が空でも`WHERE 1`を見逃さないよう、行ループへ入る前に`check_predicate_type`を呼びます。
+同じ`src/executor.rs`に、次のように定義します。
 
 ```rust
 pub fn delete(
@@ -865,7 +895,7 @@ pub fn delete(
 
 第9章の`QueryResult`は、DDL文の完了を`command_tag: Option<&'static str>`という、種類の名前だけの文字列で表していました。
 `INSERT`、`UPDATE`、`DELETE`は、それに加えて「何行に影響したか」を報告したいところです。
-`command_tag`を`Option<String>`に変え、影響行数を持つ完了を作る関数を追加します。
+`command_tag`を`Option<String>`に変え、影響行数を持つ完了を作る関数を、`src/database.rs`の`QueryResult`に追加します。
 
 ```rust
 fn command_with_count(tag: &'static str, count: usize) -> Self {
@@ -882,8 +912,8 @@ psqlは`INSERT 0 1`のように、行の挿入先を表す2つ目の数値(OID�
 
 ## テストで確認する
 
-`executor`モジュールには、SeqScan、Filter、Projection、Insert、Update、Deleteそれぞれの単体テストを追加しました。
-`database`モジュールには、`INSERT`→`SELECT`→`UPDATE`→`SELECT`→`DELETE`→`SELECT`という一連の流れを1つのテストとして確認するものも加えています。
+`executor`モジュールには、SeqScan、Filter、Projection、Insert、Update、Deleteそれぞれの単体テストを追加します。
+`database`モジュールには、`INSERT`→`SELECT`→`UPDATE`→`SELECT`→`DELETE`→`SELECT`という一連の流れを1つのテストとして確認するものも、`src/database.rs`の`mod tests`に加えています。
 
 ```rust
 #[test]
@@ -908,7 +938,7 @@ fn insert_select_update_delete_round_trip() {
 }
 ```
 
-NOT NULL違反やWHEREの三値論理も、直接それを狙ったテストで確認しています。
+NOT NULL違反やWHEREの三値論理も、`src/database.rs`に直接それを狙ったテストを加えて確認しています。
 
 ```rust
 #[test]
@@ -927,6 +957,7 @@ fn select_where_drops_unknown_rows() {
 ```
 
 `check_predicate_type`が行の有無に関係なく`WHERE 1`を拒否することも、`users`テーブルへ1行も`INSERT`しない状態から狙って確認しています。
+同じ`src/database.rs`に、次のテストを追加します。
 
 ```rust
 #[test]
@@ -943,10 +974,11 @@ fn select_where_1_is_rejected_even_on_an_empty_table() {
 Golden Testは、これまで1ファイルにつき1文しか置けませんでした(第3章)。
 `CREATE TABLE`と`INSERT`をまたぐ流れは、複数文を実行できる単体テストの役目として書き分ける、という方針を第9章で採っています。
 しかしこの章のDMLは、`CREATE TABLE`で作ったテーブルに`INSERT`してから`SELECT`で覗く、という組み合わせを抜きにして単独では意味を持ちません。
-そこで、Golden Testのランナーを拡張し、`.sql`ファイルが`;`区切りの複数文を持てるようにしました。
+そこで、Golden Testのランナーを拡張し、`.sql`ファイルが`;`区切りの複数文を持てるようにします。
 文を分ける実装は、`;`という文字だけを見て`str::split`する素朴な形にはしません。
 `SELECT 'a;b'`のような文字列リテラルや、`-- a;b`のようなコメントの内側にも`;`は現れるため、その`;`まで文の区切りとして誤認してしまうからです。
 そこで`split_statements`は、字句解析器の`tokenize`を一度通し、`TokenKind::Semicolon`のトークンだけを区切りとして扱います。
+`tests/golden.rs`の`run_sql`を、次のように書き換えます。
 
 ```rust
 fn split_statements(sql: &str) -> Vec<&str> {
@@ -991,7 +1023,7 @@ fn split_by_tokens<'a>(sql: &'a str, tokens: &[Token]) -> Vec<&'a str> {
 コメントは字句解析の段階でトークンを1個も生成しないため、`SELECT 1; -- trailing`のように最後の`;`の後ろにコメントしか無い場合、その範囲には実トークンが無く、文として`db.execute`に渡されることはありません。
 最初、この判定を`text.trim().is_empty()`(切り出した文字列を`trim`して空かどうか)で行っていましたが、それでは不十分でした。
 コメントの文字自体は空白文字ではないため、`trim`しても`-- trailing`は空文字列にならず、コメントだけの断片を2文目として拾って`db.execute`に渡してしまうという不具合があったからです。
-`has_real_token_since_start`という`bool`で「区切りの間に`Semicolon`、`Eof`以外のトークンが現れたか」を直接追うことで、文字列の見た目ではなく字句解析の結果そのものを根拠に判定するよう直しました。
+`has_real_token_since_start`という`bool`で「区切りの間に`Semicolon`、`Eof`以外のトークンが現れたか」を直接追うことで、文字列の見た目ではなく字句解析の結果そのものを根拠に判定するよう直します。
 
 もう1つ、`tokenize`は成功か失敗かのどちらかしか返さず、閉じない文字列リテラルのようなエラーに遭遇した時点で、そこまでに読めていたトークンも含めてすべて捨ててしまうという性質があります。
 そのため、字句解析器自体が失敗するSQL(閉じない文字列リテラルなど)を期待値にするgoldenケースを素直に書こうとすると、`split_statements`がSpan基準の分割に入る前に`tokenize`自体が失敗し、ファイルを文へ分ける段階でpanicしてしまいます。
@@ -1005,11 +1037,14 @@ fn split_by_tokens<'a>(sql: &'a str, tokens: &[Token]) -> Vec<&'a str> {
 SELECT 'unterminated;
 ```
 
+このファイルを`cargo test`に流すと、次のとおり字句エラーがそのままGolden Testの期待値になります。
+
 ```console
 ERROR: 行1列8: 字句エラー: 閉じない文字列リテラルです
 ```
 
 `run_sql`は、この`split_statements`が返した文をそのまま`Database`に順に流し込みます。
+同じ`tests/golden.rs`に、次のように定義します。
 
 ```rust
 fn run_sql(sql: &str) -> String {
@@ -1086,6 +1121,7 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 開発環境にSQLiteの共有ライブラリが入っているかどうかに関係なく、`cargo test`がそのまま動きます。
 
 比較の基本形は、同じ`setup`(`CREATE TABLE`、`INSERT`、`UPDATE`、`DELETE`)をminidbと`rusqlite`の両方に流し、最後に1本の`SELECT`を実行して結果を突き合わせる、というものです。
+この章では`tests/differential.rs`を新規に作成し、Differential Testのハーネスをまとめて置きます。
 
 ```rust
 fn assert_same_result(setup: &[&str], query: &str) {
@@ -1109,6 +1145,7 @@ minidbが対応する`CREATE TABLE`、`INSERT`、`UPDATE`、`DELETE`の構文は
 異なる型の値が同じ文字列表現を持つことがある以上、文字列化してからの比較は、この2つを取り違えたまま「一致した」と誤判定しかねません。
 
 そこでこの章のDifferential Testは、値を文字列へ変換する代わりに、型ごとに別のバリアントを持つ`DiffValue`という列挙型に変換してから比較します。
+`tests/differential.rs`に、次のように定義します。
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1128,6 +1165,7 @@ SQLiteは真偽値専用の型を持たず、`BOOLEAN`列も内部的には`0`�
 そこでこの章のDifferential Testは、値からの推測に頼らず、minidb側で`query`を実行して得られる`QueryResult`のスキーマから、SELECTした各列の`DataType`を求め、その列型が`DataType::Boolean`だと分かっている列でだけ、SQLiteの整数`0`や`1`をそれぞれ`DiffValue::Boolean(false)`、`DiffValue::Boolean(true)`に読み替えます。
 
 結果の比較は、行の順序を無視した比較にしています。
+同じ`tests/differential.rs`の`assert_same_result`を、次のように書き直します。
 
 ```rust
 fn assert_same_result(setup: &[&str], query: &str) {
@@ -1150,7 +1188,7 @@ fn assert_same_result(setup: &[&str], query: &str) {
 `minidb_rows`と`sqlite_rows`をそれぞれ`.sort()`してから`assert_eq!`することで、行の集合としての一致(多重集合としての一致)だけを見るようにし、順序の違いを比較の対象から外しています。
 ソートは重複行の個数を潰さないため、`(1, 'a'), (1, 'a'), (2, 'b')`という結果は`(1, 'a'), (2, 'b'), (1, 'a')`とは一致しても`(1, 'a'), (2, 'b')`とは一致しません。
 
-三値論理の扱いをminidbとSQLiteで突き合わせるテストは、次のようになりました。
+三値論理の扱いをminidbとSQLiteで突き合わせるテストは、`tests/differential.rs`に次のように追加します。
 
 ```rust
 #[test]
@@ -1167,6 +1205,7 @@ fn where_with_null_drops_unknown_rows() {
 ```
 
 `Value::Null`と文字列`'NULL'`、整数`1`と文字列`'1'`が取り違えられないことも、それぞれ専用のテストで確認しています。
+同じ`tests/differential.rs`に、次のテストを追加します。
 
 ```rust
 #[test]

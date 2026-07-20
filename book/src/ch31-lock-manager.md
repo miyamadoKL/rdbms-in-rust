@@ -34,6 +34,8 @@ T2が先に120でコミットしますが、T1はそのコミットを知らな�
 ロックには2種類のモードがあります。
 読み取りのための**Shared**ロックと、書き込みのための**Exclusive**ロックです。
 
+この章から`src/lock_manager.rs`を新規作成し、`LockManager`とその周辺の型をそこへ実装していきます。
+
 ```rust
 pub enum LockMode {
     /// 読み取り用。複数のトランザクションが同じ対象に同時に持てる。
@@ -41,6 +43,12 @@ pub enum LockMode {
     /// 書き込み用。1つのトランザクションしか同時に持てない。
     Exclusive,
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod lock_manager;
 ```
 
 2つのロックが同じ対象に同時に存在してよいかどうかは、次の**互換性行列**で決まります。
@@ -54,7 +62,7 @@ Shared同士だけが両立します。
 複数のトランザクションが同じ行を同時に読むことは何の問題も起こしませんが、誰かが書いている間に別の誰かが読む、あるいは誰かが書いている間に別の誰かも書く、という組み合わせはどちらも許されません。
 先ほどのLost Updateの例で言えば、T1とT2がどちらも`UPDATE`する前にExclusiveロックを取ろうとしていれば、後から来た側は先に来た側が終わるまで待たされていたはずです。
 
-ロックが何に対するものかを表す型が`LockKey`です。
+ロックが何に対するものかを表す型が、`src/lock_manager.rs`に定義する`LockKey`です。
 
 ```rust
 pub enum LockKey {
@@ -82,7 +90,7 @@ Lock Managerの中身をまず`TableId`だけで検証し、それから`Databas
 このクレートにはその手段がありません。
 第30章が導入した決定的インターリーブテストハーネスは、複数のトランザクションを実スレッドではなく単一スレッド上の交互実行で再現しています。
 Buffer PoolとB+Treeがスレッドセーフになるのは第35章であり、それより前にスレッドを増やす選択肢はありません。
-そこでこの章の`LockManager::acquire`は、ロックを取れないときブロックする代わりに、`LockResult::Blocked`という**値**を返してすぐに制御を戻します。
+そこでこの章の`LockManager::acquire`は、ロックを取れないときブロックする代わりに、`src/lock_manager.rs`に定義する`LockResult::Blocked`という**値**を返してすぐに制御を戻します。
 
 ```rust
 pub enum LockResult {
@@ -98,7 +106,7 @@ pub enum LockResult {
 ```
 
 `Blocked`を受け取った要求は消えません。
-`LockManager`の内部で、対象ごとの**Wait Queue**(待ち行列)に積まれたままになります。
+`src/lock_manager.rs`の`LockManager`内部で、対象ごとの**Wait Queue**(待ち行列)に積まれたままになります。
 
 ```rust
 struct Waiter {
@@ -111,7 +119,7 @@ struct Waiter {
 }
 ```
 
-1つの対象(`LockKey`1個)は、今それを持っているトランザクションの集合(`holders`)と、取れずに並んでいるトランザクションの列(`waiters`)を持ちます。
+1つの対象(`LockKey`1個)は、`src/lock_manager.rs`において、今それを持っているトランザクションの集合(`holders`)と、取れずに並んでいるトランザクションの列(`waiters`)を持ちます。
 
 ```rust
 struct LockEntry {
@@ -120,7 +128,7 @@ struct LockEntry {
 }
 ```
 
-ロックが解放されるたび、`release_all`が待ち行列の先頭から順に昇格できるかどうかを再評価します。
+ロックが解放されるたび、`src/lock_manager.rs`の`release_all`が待ち行列の先頭から順に昇格できるかどうかを再評価します。
 
 ```rust
 pub fn release_all(&mut self, txn: TransactionId) {
@@ -143,7 +151,7 @@ pub fn release_all(&mut self, txn: TransactionId) {
 }
 ```
 
-再評価の中身が`promote_waiters`です。
+再評価の中身が、同じ`src/lock_manager.rs`の`promote_waiters`です。
 
 ```rust
 fn promote_waiters(&mut self, key: &K) {
@@ -180,7 +188,7 @@ Shared同士は何人いても両立するため、先頭に連続して並ん�
 これがStarvation(飢餓)です。
 `promote_waiters`が「先頭が両立しなければ即座に止める」という単純な規則を守っているのは、この追い越しを起こさないためです。
 新規要求を積む側にも同じ規則が働きます。
-`acquire`は、待ち行列が空でない限り、たとえ今の保持者と両立するShared要求であっても即座には許可せず、末尾に並ばせます。
+`src/lock_manager.rs`の`acquire`は、待ち行列が空でない限り、たとえ今の保持者と両立するShared要求であっても即座には許可せず、末尾に並ばせます。
 
 ```rust
 if entry.waiters.is_empty() && entry.compatible_with_holders(mode) {
@@ -190,7 +198,7 @@ if entry.waiters.is_empty() && entry.compatible_with_holders(mode) {
 ```
 
 この2つの規則(先頭からしか昇格させない、待ち行列が空でなければ新規要求も並ばせる)が揃って、この`LockManager`はFIFOに沿った公平性を持ちます。
-テストでこの振る舞いを確認しています。
+`src/lock_manager.rs`のテストでこの振る舞いを確認しています。
 
 ```rust
 #[test]
@@ -212,7 +220,7 @@ fn a_later_shared_request_does_not_overtake_an_earlier_exclusive_request() {
 トランザクションが自分の読んだ行を書き換えたくなることはよくあります。
 `SELECT`でSharedロックを取った行を、続く`UPDATE`でExclusiveへ切り替えたい場合です。
 これを新しい要求として扱うと、自分自身のSharedロックが自分自身の新しい要求とぶつかってしまい、常にBlockedになってしまいます。
-そこで`acquire`は、要求元がすでに同じ対象へ何らかのロックを持っている場合を別扱いします。
+そこで`src/lock_manager.rs`の`acquire`は、要求元がすでに同じ対象へ何らかのロックを持っている場合を別扱いします。
 
 ```rust
 if let Some(held) = entry.holder_mode(txn) {
@@ -240,6 +248,7 @@ Upgradeを要求するトランザクションは、無関係な割り込みで�
 すでに部分的な権利(Shared)をそのキーに対して持っている、既存の参加者です。
 これを末尾に積んでしまうと、あとから来た無関係な新規Shared要求に何度も追い越され、Upgradeだけがいつまでも成立しない**Upgrade starvation**が起こります。
 先頭に積むことで、Upgrade要求は「これから新しく来る要求」より先に扱われ、あとは他の保持者が抜けるのを待つだけの状態になります。
+この規則は、`src/lock_manager.rs`の次のテストで確認できます。
 
 ```rust
 #[test]
@@ -269,7 +278,7 @@ Growing PhaseとShrinking Phaseの境目を実行の途中に置くと、境目�
 独立したShrinking Phaseを持たないのは省略ではなく、Strict 2PLという規律そのものの定義です。
 
 このクレートでの実装は素直です。
-`execute_bound_statement`が、文を実行する前にこの文のロック保持者(`owner`)を決めます。
+`src/database.rs`の`execute_bound_statement`が、文を実行する前にこの文のロック保持者(`owner`)を決めます。
 
 ```rust
 fn execute_bound_statement(&mut self, statement: Statement, sql: &str) -> DbResult<QueryResult> {
@@ -289,7 +298,7 @@ fn execute_bound_statement(&mut self, statement: Statement, sql: &str) -> DbResu
 }
 ```
 
-`owner`は、`Active`なトランザクションがあればその`TransactionId`、無ければ(Autocommit)この1文だけのために新しく割り当てたIDです。
+`src/database.rs`の`lock_owner`が返す`owner`は、`Active`なトランザクションがあればその`TransactionId`、無ければ(Autocommit)この1文だけのために新しく割り当てたIDです。
 
 ```rust
 fn lock_owner(&mut self) -> TransactionId {
@@ -307,6 +316,7 @@ fn lock_owner(&mut self) -> TransactionId {
 `self.tx`が`None`(Autocommit)のときだけ、文の実行が終わった直後に`release_all`を呼びます。
 Autocommitの1文はそれ自体が完結したトランザクションであり、Strict 2PLで言うところの「確定するとき」は文の終わりそのものです。
 `Active`なトランザクションの中であれば、`self.tx`は`Some`のままなのでここでは手放さず、`COMMIT`、`ROLLBACK`まで持ち越します。
+`src/database.rs`の`execute_commit`は次のとおりです。
 
 ```rust
 fn execute_commit(&mut self, _commit: CommitStatement) -> DbResult<QueryResult> {
@@ -326,7 +336,7 @@ fn execute_commit(&mut self, _commit: CommitStatement) -> DbResult<QueryResult> 
 ハーネス専用の`commit_tx`、`rollback_tx`も、SQL経路の`execute_commit`、`execute_rollback`とまったく同じ理由で`release_all`を呼びます。
 
 もう1つ、`WouldBlock`(ロックを獲得できなかったという結果)は、他のエラーとは扱いを変える必要があります。
-第30章の`finish`は、`Active`なトランザクション中に実行した文が失敗したら状態を`Aborted`へ倒していました。
+`src/database.rs`にある第30章の`finish`は、`Active`なトランザクション中に実行した文が失敗したら状態を`Aborted`へ倒していました。
 
 ```rust
 fn finish(&mut self, result: DbResult<QueryResult>) -> DbResult<QueryResult> {
@@ -365,7 +375,7 @@ Memoryバックエンド(`MemStorage`)は`RecordId`という概念を持ちま�
 `INSERT`もテーブル全体のExclusiveを取るため、他のトランザクションが同じテーブルにSharedを持っている間は新しい行を差し込めません。
 
 Diskバックエンド(`Storage`)は`RecordId`を持つため、`LockKey::Tuple(table_id, rid)`という、より細かい粒度に切り替えます。
-`SELECT`はその時点でテーブルに**存在する**行の`RecordId`をすべて列挙し、それぞれにSharedを掛けます。
+`src/database.rs`に定義する`acquire_scan_locks`の中で、`SELECT`はその時点でテーブルに**存在する**行の`RecordId`をすべて列挙し、それぞれにSharedを掛けます。
 
 ```rust
 fn acquire_scan_locks(&mut self, owner: TransactionId, table_ids: &[TableId], mode: LockMode) -> DbResult<()> {
@@ -399,7 +409,7 @@ fn acquire_scan_locks(&mut self, owner: TransactionId, table_ids: &[TableId], mo
 この章はその特定を見送り、絞り込み前の全行を対象にする代わりに、`WHERE`の評価を二重に行わずに済ませました。
 
 書き込み側(`UPDATE`、`DELETE`)は事情が違います。
-対象はただ1個の`table_id`と`predicate`に決まるため、`WHERE`に一致した行だけを先に確定させてからロックできます。
+対象はただ1個の`table_id`と`predicate`に決まるため、`src/database.rs`の`acquire_write_locks`は`WHERE`に一致した行だけを先に確定させてからロックできます。
 
 ```rust
 fn acquire_write_locks(
@@ -433,6 +443,7 @@ fn acquire_write_locks(
 `storage_matching_rids`は、`storage_update`、`storage_delete`の冒頭にある走査とまったく同じ絞り込みをもう一度行い、対象の`RecordId`だけを返す関数です。
 `WHERE`を二重に評価することにはなりますが、ロックの獲得と実際の書き込みを1回の走査に統合する配線はこの章の範囲を超えるため見送りました。
 この絞り込みの見返りとして、`id`の異なる行を書き換える2本の`UPDATE`は、Diskバックエンドでは互いにブロックし合いません。
+`tests/interleave_disk.rs`のテストで確認できます。
 
 ```rust
 #[test]
@@ -503,7 +514,7 @@ T2の`SELECT`は、T1がExclusiveロックを持っている間`WouldBlock`を�
 Lost Update、Non-repeatable Read、Phantomも同じ形で反転し、Memoryバックエンドの粗い粒度のもとでは4つとも起きなくなります。
 
 Diskバックエンド(`tests/interleave_disk.rs`)では、結果が3対1に分かれます。
-Lost Update、Dirty Read、Non-repeatable ReadはTuple Lockでも防がれますが、Phantomだけは防がれません。
+Lost Update、Dirty Read、Non-repeatable ReadはTuple Lockでも防がれますが、`tests/interleave_disk.rs`のテストが示すとおり、Phantomだけは防がれません。
 
 ```rust
 #[test]
@@ -537,6 +548,7 @@ Phantomをふさぐには、まだ存在しない行の範囲そのものをロ�
 
 この章はデッドロックの**検出**を行いません。
 2本のトランザクションが互いの持つロックを欲しがる状況は、この章のLock Managerでも普通に起こります。
+次のテストは`src/lock_manager.rs`にあり、その状況を再現します。
 
 ```rust
 #[test]

@@ -52,7 +52,7 @@ OSのレベルでは`pthread_cancel`のような強制終了の仕組みが存�
 
 ## CancellationTokenと同期ポイント
 
-意思表示そのものは、`crate::cancellation::CancellationToken`という小さな型が運びます。
+意思表示そのものは、新しいモジュール`cancellation`(`src/cancellation.rs`)に置く`CancellationToken`という小さな型が運びます。
 
 ```rust
 #[derive(Clone)]
@@ -63,10 +63,16 @@ pub struct CancellationToken {
 }
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod cancellation;
+```
+
 `cancelled`が明示的なキャンセル要求、`deadline`がタイムアウトの締切です(締切は次の節で使います)。
 `clone`は`Arc`を複製するだけなので安価で、`clone`した先はすべて同じキャンセル要求を共有します。
 
-意思表示を確認する側は`check`を呼びます。
+意思表示を確認する側は、`src/cancellation.rs`に定義する`check`を呼びます。
 
 ```rust
 pub fn check(&self) -> DbResult<()> {
@@ -90,7 +96,7 @@ pub fn check(&self) -> DbResult<()> {
 `next()`を呼ぶたびに`check`すれば理論上もっとも早く気付けますが、`AtomicBool::load`はゼロコストではありません。
 この章は、行を1件処理するたびに定数コストが乗っても実害の無い場所にだけ`check`を差し込みます。
 
-1つは`Executor::next()`を駆動する最上位のループです。
+1つは`Executor::next()`を駆動する最上位のループで、`src/database.rs`の`execute_select`にあります。
 
 ```rust
 let mut rows = Vec::new();
@@ -104,7 +110,7 @@ while let Some(tuple) = executor.next()? {
 
 もう1つは、`Sort`、`Hash Join`のBuild側、`Hash Aggregate`のように、子を`None`まで読み切ってから初めて1行返す**blocking演算子**です。
 これらは最上位のループへ戻ってくる前に、内部で何万行も読み進めることがあります。
-`SortExec::new`を見ます。
+`src/physical_plan.rs`の`SortExec::new`を見ます。
 
 ```rust
 let mut keyed: Vec<(Vec<Value>, Tuple)> = Vec::new();
@@ -131,7 +137,7 @@ while let Some(tuple) = input.next()? {
 どの箇所でキャンセル要求に気付いても、そこで安全に打ち切れます。
 `a.id = a.id`は行ごとに高い確率で一致するため実害は小さい例ですが、`ON`の条件がどの組み合わせとも一致しない場合は、`NestedLoopJoinExec::next()`内部の`check`が無ければ、組み合わせを最後まで読み切るまで打ち切れません。
 
-`ctx`は`crate::cancellation::ExecutionContext`という、`CancellationToken`と`max_operator_rows`(メモリ上限、後述)をまとめた型です。
+`ctx`は`crate::cancellation::ExecutionContext`(`src/cancellation.rs`)という、`CancellationToken`と`max_operator_rows`(メモリ上限、後述)をまとめた型です。
 
 ```rust
 pub struct ExecutionContext {
@@ -152,7 +158,7 @@ pub struct ExecutionContext {
 `CancellationToken`へキャンセル要求を立てる経路は2つあります。
 
 1つは、クライアントが接続を切ったことをサーバーが検知する経路です。
-`crate::server`は、文を1本実行している間、`stream.try_clone()`で複製した読み取り専用のソケットを別スレッドで`peek`し続けます。
+`crate::server`(`src/server.rs`)は、文を1本実行している間、`stream.try_clone()`で複製した読み取り専用のソケットを別スレッドで`peek`し続けます。
 
 ```rust
 fn watch_for_disconnect(stream: TcpStream, done: &AtomicBool, cancel: &CancellationToken) {
@@ -187,7 +193,7 @@ fn watch_for_disconnect(stream: TcpStream, done: &AtomicBool, cancel: &Cancellat
 `peek`が`0`バイトを返すのは、相手が接続を正常に閉じた(TCPのFIN)ときです。
 1バイト以上読めた場合はまだ切断ではない(パイプライン化されたクライアントが次のリクエストを先に送ってきただけかもしれない)ため、中身を見ずに読み進めもせず、ポーリングを続けます。
 
-もう1つは、Rustの公開APIとして`Session::cancellation_handle`を呼ぶ経路です。
+もう1つは、Rustの公開APIとして`src/session.rs`の`Session::cancellation_handle`を呼ぶ経路です。
 
 ```rust
 pub fn cancellation_handle(&self) -> CancellationToken {
@@ -209,7 +215,7 @@ PostgreSQLは実際にこれを、実行中の接続とは別のTCP接続、共�
 ## 接続数を固定するワーカープール
 
 キャンセルが効くようになっても、接続を受け付けるたびにスレッドを立て続ける限り、同時に処理できる接続数はクライアントの都合次第のままです。
-この章は`crate::thread_pool::WorkerPool`という、固定サイズのワーカースレッドの集合へ置き換えます。
+この章は新しいモジュール`thread_pool`(`src/thread_pool.rs`)に置く`WorkerPool`という、固定サイズのワーカースレッドの集合へ置き換えます。
 
 ```rust
 pub struct WorkerPool {
@@ -220,8 +226,14 @@ pub struct WorkerPool {
 }
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod thread_pool;
+```
+
 `std::sync::mpsc::sync_channel(queue_capacity)`が、この章のキューです。
-容量固定のバウンデッドチャネルで、容量を超えて`try_send`すると`Err(TrySendError::Full)`を返します。
+容量固定のバウンデッドチャネルで、容量を超えて`try_send`すると`Err(TrySendError::Full)`を返す`dispatch`を、`src/thread_pool.rs`に次のように定義します。
 
 ```rust
 pub fn dispatch(&self, stream: TcpStream) -> Result<(), TcpStream> {
@@ -240,7 +252,7 @@ pub fn dispatch(&self, stream: TcpStream) -> Result<(), TcpStream> {
 キューに積んで**待たせる**か、**即座に拒否する**かです。
 
 この章は拒否を選びます。
-`queue_capacity`個までは待たせますが、それも埋まっていれば`Err`を返し、`crate::server`はその接続へエラー応答を1つ書いてから切断します。
+`queue_capacity`個までは待たせますが、それも埋まっていれば`Err`を返し、`crate::server`(`src/server.rs`)はその接続へエラー応答を1つ書いてから切断します。
 
 ```rust
 fn reject_connection(mut stream: TcpStream) {
@@ -255,7 +267,7 @@ fn reject_connection(mut stream: TcpStream) {
 `worker_count + queue_capacity`が、この章のサーバーが同時に保持する接続数の実質的な上限になります。
 
 `WorkerPool::new`に渡す`handler`は`Fn`(`FnOnce`ではありません)です。
-1本のワーカースレッドは生きている間に何本もの接続を順に処理するため、`handler`はワーカーの数だけ複製されるのではなく、`Arc`で全ワーカーに共有されます。
+1本のワーカースレッドは生きている間に何本もの接続を順に処理するため、`handler`はワーカーの数だけ複製されるのではなく、`src/thread_pool.rs`の`WorkerPool::new`が`Arc`で全ワーカーに共有します。
 
 ```rust
 pub fn new<F>(worker_count: usize, queue_capacity: usize, handler: F) -> Self
@@ -287,7 +299,7 @@ where
 文単位の実行時間の上限(Query Timeout)は、この`deadline`を使うだけで実装できます。
 新しい仕組みを1つも足す必要はありません。
 
-締切は`crate::database::ResourceLimits`が持つ`statement_timeout`から作ります。
+締切は`crate::database::ResourceLimits`(`src/database.rs`)が持つ`statement_timeout`から作ります。
 
 ```rust
 pub struct ResourceLimits {
@@ -299,7 +311,7 @@ pub struct ResourceLimits {
 }
 ```
 
-`Session`は文を1本実行するたびに、`SharedDatabase`に設定された`ResourceLimits`を元に新しい`ExecutionContext`を作ります。
+`src/session.rs`の`Session`は文を1本実行するたびに、`SharedDatabase`に設定された`ResourceLimits`を元に新しい`ExecutionContext`を作ります。
 
 ```rust
 fn new_execution_context(&self) -> crate::cancellation::ExecutionContext {
@@ -319,7 +331,7 @@ fn new_execution_context(&self) -> crate::cancellation::ExecutionContext {
 `execute`の一番最初でリセットしても、「リセット」という操作自体が「直前に届いた合図を確認せずに消す」性質を持つ以上、この窓は原理的に閉じられません。
 `cancellation_handle().cancel()`の直後に(実スレッドを使わず、同じスレッドの中で)`execute("SELECT 1")`を呼ぶだけの単純な直接検証で、実際にキャンセルされずに正常結果が返ることを確認しました。
 
-そこでこの章は、`cancel_flag`と`checkpoints`を接続で使い回す代わりに、`ExecutionSlot`という小さな構造体へまとめ、`current_slot`(`Mutex<Arc<ExecutionSlot>>`)から**文ごとに使い捨てる**設計に直しました。
+そこでこの章は、`cancel_flag`と`checkpoints`を接続で使い回す代わりに、`ExecutionSlot`という小さな構造体へまとめ、`current_slot`(`Mutex<Arc<ExecutionSlot>>`)から**文ごとに使い捨てる**設計に直します。
 `cancellation_handle`と`new_execution_context`は、どちらも同じ`current_slot`から、その時点の`Arc<ExecutionSlot>`を取り出します。
 `new_execution_context`は取り出すと同時に、次の文のために真新しい(`cancelled = false`の)`ExecutionSlot`を`current_slot`へ差し込みます(`std::mem::replace`)。
 これで、`cancellation_handle`を呼んでから`execute`を呼ぶまでの間に`cancel`が呼ばれても、両者は**同じ`Arc<AtomicBool>`を指している**ため、消えようがありません。
@@ -342,7 +354,7 @@ fn new_execution_context(&self) -> crate::cancellation::ExecutionContext {
 `Sort`、`Hash Join`のBuild側、`Hash Aggregate`は、子から読んだ行を`Vec`やハッシュテーブルへすべて溜め込んでから結果を返す、blocking演算子です。
 上限の無いテーブルを`ORDER BY`すれば、この収集バッファはテーブルの全行分そのままメモリに載ります。
 
-`ExecutionContext::check_row_limit`が、この上限を検査します。
+`src/cancellation.rs`の`ExecutionContext::check_row_limit`が、この上限を検査します。
 
 ```rust
 pub fn check_row_limit(&self, operator: &'static str, rows: usize) -> DbResult<()> {
@@ -375,7 +387,7 @@ pub fn check_row_limit(&self, operator: &'static str, rows: usize) -> DbResult<(
 3. **未コミットTxのROLLBACK**
 4. **flush/sync**
 
-`Server::shutdown_handle`が返す`ShutdownHandle`の`trigger`が、この手順の起点です。
+`src/server.rs`の`Server::shutdown_handle`が返す`ShutdownHandle`の`trigger`が、この手順の起点です。
 
 ```rust
 pub fn trigger(&self) {
@@ -391,7 +403,7 @@ pub fn trigger(&self) {
 
 フラグを立てただけでは、`TcpListener::accept`でブロックしたままのスレッドは起きません。
 `trigger`は、フラグを立てた直後に自分自身のアドレスへ`TcpStream::connect`します(**自己接続トリック**)。
-これで`accept`がその接続を1回だけ受理して戻り、`Server::run`のループの先頭でフラグを確認して抜けられます。
+これで`accept`がその接続を1回だけ受理して戻り、`src/server.rs`の`Server::run`のループの先頭でフラグを確認して抜けられます。
 
 ```rust
 loop {
@@ -423,7 +435,7 @@ Ok(())
 ```
 
 `pool.join()`が、手順2と3を実質的に担います。
-`WorkerPool::join`はSenderを`drop`し、それぞれの接続の処理ループが次のリクエストを待つ間もワーカースレッドを離れずにいます。
+`src/thread_pool.rs`の`WorkerPool::join`はSenderを`drop`し、それぞれの接続の処理ループが次のリクエストを待つ間もワーカースレッドを離れずにいます。
 
 ```rust
 pub fn join(mut self) {
@@ -434,7 +446,7 @@ pub fn join(mut self) {
 }
 ```
 
-`crate::server::handle_connection`の読み取りループは、次のフレームが届く前に定期的にシャットダウンフラグを確認します。
+`crate::server::handle_connection`(`src/server.rs`)の読み取りループは、次のフレームが届く前に定期的にシャットダウンフラグを確認します。
 
 ```rust
 fn wait_for_request_or_shutdown(stream: &mut TcpStream, shutdown: &AtomicBool) -> WaitOutcome {
@@ -461,7 +473,7 @@ fn wait_for_request_or_shutdown(stream: &mut TcpStream, shutdown: &AtomicBool) -
 クライアントがフレームのヘッダーだけ、あるいはペイロードの途中までしか送らずに接続を開いたまま止まっていた場合、`Request::read`が使う`read_exact`は残りのバイト列を待ち続けます。
 ここで読み取りタイムアウトを外してしまうと、その待ちは無期限になり、シャットダウンフラグを二度と確認できません。
 
-そこで`handle_connection`は、`Request::read`へ`stream`をそのまま渡さず、`ShutdownAwareReader`というラッパー越しに渡します。
+そこで`src/server.rs`の`handle_connection`は、`Request::read`へ`stream`をそのまま渡さず、`ShutdownAwareReader`というラッパー越しに渡します。
 
 ```rust
 impl Read for ShutdownAwareReader<'_> {
@@ -508,6 +520,7 @@ REPL(`src/main.rs`)がすでに終了時に`shared.flush()`を呼んでいたの
 シグナルハンドラの中で呼んでよい処理は、OSのシグナル配送の一般的な制約により、シグナルセーフな一部の関数に限られます。
 この教材は生の`libc`シグナルハンドラを自作せず、`ctrlc`クレートに任せます。
 `ctrlc`はハンドラの中で安全な操作だけを行い、実際のシャットダウン処理(`Server::run`のループがフラグを見て抜ける)はシグナルハンドラの外、通常のスレッドの上で進みます。
+`src/main.rs`は次のように`ctrlc::set_handler`を呼びます。
 
 ```rust
 let shutdown = server.shutdown_handle();
@@ -542,7 +555,7 @@ if let Err(e) = ctrlc::set_handler(move || shutdown.trigger()) {
 - `statement_timeout`を短く設定すると、締切に対して十分長くかかるクエリが`DbError::QueryTimeout`で打ち切られる
 - `max_operator_rows`を小さく設定すると、`Sort`、`Hash Join`のBuild側、`Hash Aggregate`がそれぞれ`DbError::MemoryLimitExceeded`で打ち切られ、上限内の行数では正常に完走する
 
-キャンセルのテストは、`sleep`による時間待ちを避けています。
+`src/session.rs`のキャンセルのテストは、`sleep`による時間待ちを避けています。
 
 ```rust
 let handle = session.cancellation_handle();
@@ -559,7 +572,7 @@ let result = worker.join().expect("ワーカースレッドがpanicした");
 assert!(matches!(result, Err(DbError::QueryCancelled)), "{result:?}");
 ```
 
-`wait_for_checkpoints`は、`CancellationToken::check`が呼ばれた回数が指定の閾値に達するまでスピンウェイトします。
+`src/cancellation.rs`の`wait_for_checkpoints`は、`CancellationToken::check`が呼ばれた回数が指定の閾値に達するまでスピンウェイトします。
 
 ```rust
 pub fn wait_for_checkpoints(&self, at_least: usize) {

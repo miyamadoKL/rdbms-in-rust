@@ -55,7 +55,8 @@ let value = minidb::???; // "SELECT 1"をどう渡せばいいのか、渡す先
 
 ### 仮の構文解析器
 
-`SELECT`に続く式だけを解析する仮実装を、独立したモジュール`toy_sql`に置きます。
+`SELECT`に続く式だけを解析する仮実装を、新規作成する`src/toy_sql.rs`に置きます。
+まず、式を表す`ToyExpr`を定義します。
 
 ```rust
 /// この仮実装が扱える式。整数リテラル・真偽値リテラル・整数の加算のみを持つ。
@@ -73,7 +74,14 @@ pub enum ToyExpr {
 `ToyExpr`という名前にしたのは、これが本物のASTではないことを型名からも分かるようにするためです。
 第7章で本物のASTを設計するとき、この型は残さず削除します。
 
-評価は`eval`が受け持ちます。
+あわせて`src/lib.rs`に次の行を加え、クレート内だけで使う非公開モジュールとして登録します。
+公開APIとして外部に見せる必要がないため、`pub`は付けません。
+
+```rust
+mod toy_sql;
+```
+
+評価は、同じ`src/toy_sql.rs`に定義する`eval`が受け持ちます。
 
 ```rust
 impl ToyExpr {
@@ -109,7 +117,7 @@ impl ToyExpr {
 そのため`Add`の評価には`checked_add`を使い、範囲を超えたら`None`を`DbError::Eval`に変換して呼び出し元へ返すようにしています。
 オーバーフローの扱いをどう設計するかは第8章で改めて詰めますが、この仮実装の段階でも「パニックさせない」という条件だけは満たしておく必要があります。
 
-構文解析の入り口が`parse_select`です。
+`src/toy_sql.rs`に置く構文解析の入り口が`parse_select`です。
 
 ```rust
 /// `SELECT <式> [;]`を解析する。
@@ -146,7 +154,7 @@ pub fn parse_select(sql: &str) -> DbResult<ToySelect> {
 `SELECT 1 + 2;`を実行したとき、返ってくる列の名前を`"1 + 2"`にしたいので、パースの過程で得られる元のテキストをそのまま持ち運びます。
 `SELECT`キーワードの判定は、`strip_keyword`という小さな関数で大文字小文字を無視して行っています。
 
-式の解析は`+`で文字列を分割するだけの単純な作りです。
+同じ`src/toy_sql.rs`に加える式の解析は、`+`で文字列を分割するだけの単純な作りです。
 
 ```rust
 /// `+`で連結された式を解析する。項が1つなら`parse_term`にそのまま委ねる。
@@ -190,6 +198,7 @@ fn parse_expr(src: &str) -> DbResult<ToyExpr> {
 ### `Database`と`QueryResult`
 
 `Database`は、SQL文字列を受け取って結果を返す入り口です。
+新規作成する`src/database.rs`に、次の`Database`を定義します。
 
 ```rust
 /// minidbのデータベース1つを表す。
@@ -233,7 +242,13 @@ impl Database {
 テーブルを持たないデータベースなので、それで正しい状態です。
 テーブルを持つカタログは第9章で`Database`に追加します。
 
-`QueryResult`は`Schema`と行の並びを持つだけの型です。
+あわせて`src/lib.rs`に次の行を加え、このモジュールを公開します。
+
+```rust
+pub mod database;
+```
+
+同じ`src/database.rs`に定義する`QueryResult`は、`Schema`と行の並びを持つだけの型です。
 
 ```rust
 /// `Database::execute`の結果。列構成(`Schema`)と、それに従う行の並びを持つ。
@@ -255,7 +270,7 @@ impl QueryResult {
 }
 ```
 
-REPLでの表示のために、`QueryResult`に`Display`を実装します。
+REPLでの表示のために、`src/database.rs`に`QueryResult`の`Display`実装を追加します。
 
 ```rust
 impl std::fmt::Display for QueryResult {
@@ -287,7 +302,7 @@ impl std::fmt::Display for QueryResult {
 ```
 
 列名の行、区切り線、値の行、件数の footer という並びは、`psql`のような既存のSQLクライアントの表示に寄せた形です。
-値そのものの文字列化は`format_value`という小さな関数に切り出しました。
+値そのものの文字列化は、同じ`src/database.rs`に置く`format_value`という小さな関数に切り出します。
 
 ```rust
 /// `Value`をユーザー向けの表示形式に変換する。
@@ -404,8 +419,8 @@ pub fn execute_sql(sql: &str) -> DbResult<QueryResult> {
 
 ### 単体テスト
 
-`toy_sql`と`database`のそれぞれに、単体テストを追加しました。
-構文解析が受理すべき入力と拒否すべき入力の両方、そして`Database::execute`が返す`Tuple`の値と列名を確認します。
+`src/toy_sql.rs`の`#[cfg(test)] mod tests`には、構文解析が受理すべき入力と拒否すべき入力を確認するテストを追加します。
+加算の右辺に整数以外を置いた式が`DbError::Parse`として拒否されることを、次のように確認します。
 
 ```rust
     #[test]
@@ -413,7 +428,12 @@ pub fn execute_sql(sql: &str) -> DbResult<QueryResult> {
         let result = parse_select("SELECT true + 1;");
         assert!(matches!(result, Err(DbError::Parse(_))));
     }
+```
 
+`src/database.rs`の`#[cfg(test)] mod tests`には、`Database::execute`が返す`Tuple`の値と列名を確認するテストを追加します。
+`SELECT 1;`の結果が`Value::BigInt(1)`を1件返し、列名が`1`になることを、次のように確認します。
+
+```rust
     #[test]
     fn executes_integer_literal() {
         let mut db = Database::memory();
@@ -426,8 +446,8 @@ pub fn execute_sql(sql: &str) -> DbResult<QueryResult> {
 
 ### SQL Golden Test
 
-第3章で用意した`run_sql`は、まだクエリエンジンが無いためSQLをそのままエコーするだけの仮実装でした。
-これを`Database::execute`の呼び出しに差し替えます。
+第3章で用意した`tests/golden.rs`の`run_sql`は、まだクエリエンジンが無いためSQLをそのままエコーするだけの仮実装でした。
+これを、同じ`tests/golden.rs`の中で`Database::execute`の呼び出しに差し替えます。
 
 ```rust
 /// SQLを1本実行し、Golden Testと突き合わせるための文字列表現を返す。
@@ -440,7 +460,7 @@ fn run_sql(sql: &str) -> String {
 ```
 
 `tests/golden/001_echo.sql`という名前も、もう実態に合いません。
-`001_select_int.sql`に改名し、`002_select_add.sql`(加算)と`003_select_bool.sql`(真偽値)を追加しました。
+`001_select_int.sql`に改名し、`002_select_add.sql`(加算)と`003_select_bool.sql`(真偽値)を追加します。
 `001_select_int.expected`の中身は、`SELECT 1;`を実行した`QueryResult`の`Display`出力そのものです。
 
 ```text

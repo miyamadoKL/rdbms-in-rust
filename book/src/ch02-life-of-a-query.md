@@ -150,6 +150,7 @@ Physical Planは、後段のExecutorがそのまま実行できる形をして�
 ## Executor: Physical Planを実際に動かす
 
 **Executor**は、Physical Planの各ノードを、共通のインターフェースを持つ演算子として実行します。
+そのインターフェースは、第19章で実装するとおおむね次のような形になります。
 
 ```rust
 trait Executor {

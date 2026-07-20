@@ -72,6 +72,7 @@ B+Treeはキーを挿入するたびに、次の3つの性質を保ち続けま�
 
 Leaf PageとInternal Pageの探索は、キーを`Value`へ戻さずバイト列のまま大小比較できるほうが単純です。
 そこでこの章のキーは、**順序を保存するバイト列**へエンコードします。
+この章では新しく`src/btree.rs`を作り、次の`encode_key`を定義します。
 
 ```rust
 fn encode_key(value: &Value) -> DbResult<Vec<u8>> {
@@ -88,6 +89,12 @@ fn encode_bigint(n: i64) -> [u8; 8] {
 }
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod btree;
+```
+
 `BOOLEAN`は`0`または`1`の1バイト、`TEXT`はUTF-8バイト列をそのまま使います。
 Rustの`&[u8]`の`Ord`はバイト列の辞書式順序で、`"ab" < "abc"`のように短い文字列を長い文字列の接頭辞として正しく先に並べるため、長さプレフィックスを足す必要がありません。
 UTF-8のバイト表現は、基本多言語面の範囲では符号点順とバイト列としての辞書式順序が一致するので、追加の変換なしにそのまま索引キーに使えます。
@@ -95,6 +102,8 @@ UTF-8のバイト表現は、基本多言語面の範囲では符号点順とバ
 `BIGINT`だけひと工夫あります。
 `i64`は2の補数表現なので、そのままビッグエンディアンの8バイトへ変換すると、負の数(先頭ビットが1)が正の数より大きいバイト列になり、バイト列としての大小関係と数値としての大小関係が一部で逆転します。
 符号ビットを反転させてから`u64`として並べると、この逆転が`i64`全域で解消されます。
+
+このエンコードが往復することを、`src/btree.rs`の`#[cfg(test)] mod tests`に置く次のテストで確認します。
 
 ```rust
 #[test]
@@ -173,7 +182,7 @@ offset 0        2                10                   10+4n
 | Directory | `4 * n` | `n`個の`(key_offset: u16, key_len: u16)`の並び(LE) |
 
 Directoryの`i`番目のエントリが指す位置には、キーに続けて`(i + 1)`番目の子を指す`child_page_id: u64`(8バイト)が置かれます。
-この章では新しい`PageType`を2つ追加し、ページの外枠(第11章)だけからLeafとInternalを区別できるようにします。
+この章では、`src/page.rs`の`PageType`に次の2つのバリアントを追加し、ページの外枠(第11章)だけからLeafとInternalを区別できるようにします。
 
 ```rust
 pub enum PageType {
@@ -190,6 +199,7 @@ pub enum PageType {
 ```
 
 書き込み側の`write_entries`は、`entries`が収まりきらなければ`payload`を一切変更せず`false`を返します。
+この章では新しく`src/btree_page.rs`を作り、次の`write_entries`を定義します。
 
 ```rust
 pub fn write_entries(&mut self, entries: &[(Vec<u8>, RecordId)]) -> bool {
@@ -221,6 +231,12 @@ pub fn write_entries(&mut self, entries: &[(Vec<u8>, RecordId)]) -> bool {
 }
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod btree_page;
+```
+
 必要バイト数を先に計算してから書き込むという順序が、`HeapFile::insert`(第13章)が`max_len_for_fresh_page`で事前にサイズを見積もっていたのと同じ理由で重要です。
 書き込み始めてから足りないと分かる実装では、途中まで書きかけたページを元に戻す処理が要りますが、この順序ならその処理自体が不要になります。
 
@@ -230,6 +246,7 @@ pub fn write_entries(&mut self, entries: &[(Vec<u8>, RecordId)]) -> bool {
 
 `open`(検証つきで開く経路)は、`SlottedPage::open`(第12章)と同じ理由でバイト範囲を検証しますが、もう1つ`SlottedPage`には無い検証を加えています。
 キーが昇順に並んでいるかどうかです。
+この検査は`src/btree_page.rs`の`validate`に加えます。
 
 ```rust
 let key = &payload[key_offset..key_end];
@@ -247,7 +264,7 @@ if let Some(prev) = &previous_key {
 
 Leaf、Internalどちらの探索も二分探索で行うため、`entry_count()`だけを使った添字配列をいったん`Vec`へ`collect`してから`slice::binary_search_by`に渡すような実装は書きません。
 それでは1回の探索がエントリ数に比例した`Vec`確保を伴い、この章が目指す「ページ内探索は`O(log n)`」という前提が崩れてしまいます。
-代わりに`lo`と`hi`だけを持つ二分探索を手で書き、ページの`payload`を直接読んで比較します。
+代わりに`lo`と`hi`だけを持つ二分探索を手で書き、ページの`payload`を直接読んで比較する`find`を、`src/btree_page.rs`に定義します。
 
 ```rust
 pub fn find(&self, key: &[u8]) -> Result<usize, usize> {
@@ -270,6 +287,7 @@ pub fn find(&self, key: &[u8]) -> Result<usize, usize> {
 `BTree`はページ1(ページ0はDiskManagerのFile Headerが占有します)をMetaページとして使い、現在のRootの`PageId`とキー型を持たせます。
 `Storage`(第15章)がCatalogページ専用に`PageType::Catalog`を新設したのとは対照的に、この章では新しいPage Typeを追加せず、既存の`PageType::Data`を転用します。
 Metaページが持つ情報は「Rootの`PageId`(8バイト)」と「キー型(1バイト)」の2値だけで、複数テーブルの定義という可変長のコレクションを持っていたCatalogページとは事情が異なるからです。
+`src/btree.rs`に、次の`BTree::create`を定義します。
 
 ```rust
 pub fn create(pool: BufferPool, key_type: DataType, unique: bool) -> DbResult<Self> {
@@ -296,7 +314,7 @@ pub fn create(pool: BufferPool, key_type: DataType, unique: bool) -> DbResult<Se
 `unique`の使い道が分かるまでは読み飛ばして構いません。
 
 作りたての`BTree`は、空のLeaf Page1枚だけを持つ、高さ1の木です。
-検索(`lookup`)は、Rootから葉までの経路を`find_leaf`で下ります。
+検索(`lookup`)は、Rootから葉までの経路を、`src/btree.rs`に定義する`find_leaf`で下ります。
 
 ```rust
 fn find_leaf(&self, key_bytes: &[u8]) -> DbResult<PageId> {
@@ -317,7 +335,7 @@ fn find_leaf(&self, key_bytes: &[u8]) -> DbResult<PageId> {
 }
 ```
 
-`InternalPageRef::child_for`が、区切りキーとの二分探索で「`key`未満の区切りキーの本数」を数え、その本数に応じて`leftmost_child`かいずれかの`child_after(i)`を返します。
+`src/btree_page.rs`の`InternalPageRef::child_for`が、区切りキーとの二分探索で「`key`未満の区切りキーの本数」を数え、その本数に応じて`leftmost_child`かいずれかの`child_after(i)`を返します。
 
 ```rust
 pub fn child_for(&self, key: &[u8]) -> PageId {
@@ -337,6 +355,7 @@ pub fn child_for(&self, key: &[u8]) -> PageId {
 
 葉に着いたら、その葉の中を`LeafPageRef::find`で二分探索します。
 重複キーが許されている(次の節で決めます)ため、一致した1件の前後にも同じキーが続いていないかを確認してから、一致した全件をまとめて返す必要があります。
+`src/btree.rs`に、次の`BTree::lookup`を定義します。
 
 ```rust
 pub fn lookup(&self, key: &Value) -> DbResult<Vec<RecordId>> {
@@ -357,6 +376,7 @@ pub fn lookup(&self, key: &Value) -> DbResult<Vec<RecordId>> {
 `insert`は、まずRootから葉までの経路を`find_leaf`と同じ要領で下ります。
 違うのは、通過したInternal Pageの`PageId`を`path`という`Vec`へ記録しておく点です。
 この`path`が、Splitが起きたときに「どのページへ区切りキーを押し上げればよいか」を教えてくれます。
+この経路を辿る処理は、`src/btree.rs`の`insert`に書きます。
 
 ```rust
 let mut path: Vec<PageId> = Vec::new();
@@ -380,7 +400,7 @@ let leaf_id = current;
 
 ### Leaf Split
 
-葉に着いたら、その葉の全エントリを`Vec`へ取り出し、挿入位置を二分探索で決めて差し込み、`write_entries`を試します。
+葉に着いたら、その葉の全エントリを`Vec`へ取り出し、挿入位置を二分探索で決めて差し込み、`write_entries`を試す`insert_into_leaf`を、`src/btree.rs`に定義します。
 
 ```rust
 fn insert_into_leaf(&self, leaf_id: PageId, key_bytes: &[u8], rid: RecordId) -> DbResult<Option<(Vec<u8>, PageId)>> {
@@ -409,7 +429,7 @@ fn insert_into_leaf(&self, leaf_id: PageId, key_bytes: &[u8], rid: RecordId) -> 
 `PRIMARY KEY`や`UNIQUE`の一意性検査(第20章の`crate::constraints`と同じ役割のもの)をこの索引自身に持たせる変更は、第24章でIndex Maintenanceを実装するときに扱います。
 
 `write_entries`が`false`を返したら(収まらなかったら)、`split_leaf`を呼びます。
-挿入後の全エントリをバイト容量が釣り合う位置で2つに割り(次節「キー長の上限がSplitの伝播全体を安全にする」で理由を説明します)、前半は元のページへ、後半は新しく確保したLeaf Pageへ書き直します。
+挿入後の全エントリをバイト容量が釣り合う位置で2つに割り(次節「キー長の上限がSplitの伝播全体を安全にする」で理由を説明します)、前半は元のページへ、後半は新しく確保したLeaf Pageへ書き直す`split_leaf`を、`src/btree.rs`に続けて定義します。
 
 ```rust
 fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbResult<(Vec<u8>, PageId)> {
@@ -471,7 +491,7 @@ fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbR
 
 ### Internal Split
 
-`split_leaf`が返した`(区切りキー, 新しいページのId)`は、`path`から取り出した親のInternal Pageへ、Leaf Splitと同じ要領で挿入します。
+`split_leaf`が返した`(区切りキー, 新しいページのId)`は、`path`から取り出した親のInternal Pageへ、Leaf Splitと同じ要領で挿入する`insert_into_internal`を、`src/btree.rs`に定義します。
 
 ```rust
 fn insert_into_internal(&self, parent_id: PageId, separator: &[u8], new_page_id: PageId) -> DbResult<Option<(Vec<u8>, PageId)>> {
@@ -496,7 +516,7 @@ fn insert_into_internal(&self, parent_id: PageId, separator: &[u8], new_page_id:
 ```
 
 収まらなければ`split_internal`です。
-ここがLeaf Splitと異なる、この章で唯一非対称な箇所になります。
+ここがLeaf Splitと異なる、この章で唯一非対称な箇所になる`split_internal`を、`src/btree.rs`に続けて定義します。
 
 ```rust
 fn split_internal(&self, entries: &[(Vec<u8>, PageId)], leftmost_child: PageId, current_id: PageId) -> DbResult<(Vec<u8>, PageId)> {
@@ -534,7 +554,7 @@ Internal Pageのキーは「どちらの子を見るべきか」という境界�
 ### Root Split
 
 Splitの結果を押し上げる先が無くなった(`path`が空になった)ときは、Root自身が分割されたということです。
-新しいInternal Pageを1枚確保し、古いRootを`leftmost_child`、Splitで生まれた新しいページを唯一の区切りキーの右側の子として、これを新しいRootに据えます。
+新しいInternal Pageを1枚確保し、古いRootを`leftmost_child`、Splitで生まれた新しいページを唯一の区切りキーの右側の子として、これを新しいRootに据える`grow_new_root`を、`src/btree.rs`に定義します。
 
 ```rust
 fn grow_new_root(&mut self, separator: &[u8], new_page_id: PageId) -> DbResult<()> {
@@ -550,7 +570,7 @@ fn grow_new_root(&mut self, separator: &[u8], new_page_id: PageId) -> DbResult<(
 }
 ```
 
-`insert`本体は、この3つの操作(`insert_into_leaf`、`insert_into_internal`、`grow_new_root`)を、Splitが止まるまで下から上へ繰り返すだけです。
+`src/btree.rs`の`insert`本体は、この3つの操作(`insert_into_leaf`、`insert_into_internal`、`grow_new_root`)を、Splitが止まるまで下から上へ繰り返すだけです。
 
 ```rust
 let mut pending = self.insert_into_leaf(leaf_id, &key_bytes, rid)?;
@@ -570,7 +590,7 @@ while let Some((separator, new_page_id)) = pending {
 どちらの場合も「これ以上押し上げる先が無い」という同じ状況であり、Root Splitで新しいRootを作る以外に取りうる道はありません。
 B+Treeが常に「全ての葉が同じ深さに揃う」性質を保つのは、木を高くする操作がこのRoot Splitだけであり、あるRootから葉までの経路を1段掘り下げるとき、他のどの経路も必ず同時に1段深くなるからです。
 
-Rootが変わったら、その`PageId`をMetaページへ書き戻します。
+Rootが変わったら、その`PageId`をMetaページへ書き戻す`set_root`を、`src/btree.rs`に定義します。
 
 ```rust
 fn set_root(&mut self, new_root: PageId) -> DbResult<()> {
@@ -591,7 +611,7 @@ fn set_root(&mut self, new_root: PageId) -> DbResult<()> {
 この矛盾を、`insert`が伝播を開始する**前**の入力検証だけで構造的に起こりえなくします。
 鍵は2つあります。
 
-1つ目は、`insert`が受け付けるキー長の上限を、「空のページに**同じ長さのキーを持つエントリを1件**収められる」水準ではなく、「**2件**収められる」水準まで引き下げることです。
+1つ目は、`insert`が受け付けるキー長の上限を、「空のページに**同じ長さのキーを持つエントリを1件**収められる」水準ではなく、「**2件**収められる」水準まで引き下げる`max_key_len`を、`src/btree.rs`に定義することです。
 
 ```rust
 fn max_key_len(&self) -> usize {
@@ -600,7 +620,7 @@ fn max_key_len(&self) -> usize {
 ```
 
 `leaf_max_key_len_for_two_entries`と`internal_max_key_len_for_two_entries`は、それぞれLeafとInternal Pageが空の状態から同じ長さのキーを2件受け入れられる上限を計算するだけの、実際のページに触れない純粋な計算です。
-`insert`は、`key_bytes`を求めた直後、木を下り始める前にこの上限を検査します。
+`src/btree.rs`の`insert`は、`key_bytes`を求めた直後、木を下り始める前にこの上限を検査します。
 
 ```rust
 let key_bytes = encode_key(key)?;
@@ -632,6 +652,7 @@ if key_bytes.len() > self.max_key_len() {
 
 2つ目は、`BTree`自体の機能テストです。
 `NULL`キーやキー型の不一致が拒否されること、重複キーを挿入すると全件が`lookup`で返ること、`BOOLEAN`や`TEXT`のキーでも正しく動くことを確認したうえで、昇順、降順、ランダムな順序で挿入した場合のいずれでも、挿入した全キーが`lookup`で一致することを確認します。
+ランダムな順序で挿入したときのテストは、`src/btree.rs`の`#[cfg(test)] mod tests`に次のように置きます。
 
 ```rust
 #[test]
@@ -652,7 +673,7 @@ fn random_insert_then_lookup_all() {
 
 Split自体が実際に起きていることは、単に「挿入したキーが後から引ける」だけでは確認できません。
 ページサイズがそこそこ大きい(4080バイト)ため、`BIGINT`キーを数千件挿入しただけではLeaf Splitが数回起きるだけで終わり、Internal SplitやRoot Splitまで踏み込みません。
-そこで幅の広い`TEXT`キー(128バイト程度)を使い、1ページに収まるエントリ数を意図的に減らしたテストを別に用意し、`height()`(Rootから葉までの階層数を返すメソッド)で3段以上に育っていることを確認しています。
+そこで幅の広い`TEXT`キー(128バイト程度)を使い、1ページに収まるエントリ数を意図的に減らしたテストを、`src/btree.rs`の`#[cfg(test)] mod tests`に別に用意し、`height()`(Rootから葉までの階層数を返すメソッド)で3段以上に育っていることを確認しています。
 
 ```rust
 #[test]
@@ -675,7 +696,7 @@ fn many_keys_force_multi_level_split_and_all_remain_findable() {
 }
 ```
 
-`height()`は、Rootから常に`leftmost_child`をたどるだけの単純なメソッドです。
+`src/btree.rs`に定義する`height()`は、Rootから常に`leftmost_child`をたどるだけの単純なメソッドです。
 
 ```rust
 pub fn height(&self) -> DbResult<usize> {
@@ -712,7 +733,7 @@ pub fn height(&self) -> DbResult<usize> {
 `insert_leaves_every_reachable_page_byte_identical_when_a_key_exceeds_the_limit_in_a_deep_tree`は、同じように育てた深い木に対して上限を1バイト超えるキーを`insert`し、`DbError::BTreeKeyTooLarge`を受け取った後もRootと到達可能な全ページの生バイト列が呼び出し前と完全に一致することを、個々のページの中身まで直接突き合わせて確認します。
 
 3つ目は、`Storage`(第15章)がすでに使っている「シード固定のXorshiftで決定的な乱数列を作る」という手法を借りたモデルベーステストです。
-5,000件の`BIGINT`キーをシャッフルして挿入しながら、同じキーと`RecordId`を`std::collections::BTreeMap`にも積んでおき、全キーについて`lookup`の結果が`BTreeMap`の記録と一致することを確認します。
+5,000件の`BIGINT`キーをシャッフルして挿入しながら、同じキーと`RecordId`を`std::collections::BTreeMap`にも積んでおき、全キーについて`lookup`の結果が`BTreeMap`の記録と一致することを、`src/btree.rs`の`#[cfg(test)] mod tests`に置く次のテストで確認します。
 
 ```rust
 #[test]
@@ -755,7 +776,7 @@ test result: ok. 23 passed; 0 failed; 1 ignored; 0 measured; 472 filtered out; f
 ### 測って確認する
 
 第20章の走査ベースの一意性検査は、行数`n`に比例して`INSERT`1件あたりのコストが伸びていました。
-`BTree::lookup`が本当に`O(log n)`で伸びないかを、同じ`n`(1,000から16,000)で測って確かめます。
+`BTree::lookup`が本当に`O(log n)`で伸びないかを、`src/btree.rs`の`#[cfg(test)] mod tests`に置く次のテストで、同じ`n`(1,000から16,000)で測って確かめます。
 
 ```rust
 #[test]
@@ -779,6 +800,8 @@ fn lookup_time_grows_much_slower_than_table_size() {
     }
 }
 ```
+
+実際に測定すると、次のような出力を得ます。
 
 ```console
 $ cargo test --release --lib lookup_time_grows_much_slower -- --ignored --nocapture

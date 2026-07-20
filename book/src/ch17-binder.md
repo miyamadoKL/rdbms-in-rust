@@ -41,7 +41,7 @@ minidb> SELECT age FROM users;
 
 ## ASTとBound ASTを分離する
 
-`Binder`が変換の入り口で最初に手にするのは、第7章の`Expr::ColumnRef`です。
+`Binder`が変換の入り口で最初に手にするのは、`src/ast.rs`に定義された第7章の`Expr::ColumnRef`です。
 
 ```rust
 /// 列参照。`users.id`のような修飾名も、`qualifier`に`users`を持つことで
@@ -55,6 +55,7 @@ ColumnRef {
 
 `name`は文字列でしかなく、それが`users`の列を指すのか、単なる書き誤りなのかは、この型からは何も分かりません。
 これに対応する`Binder`側の型が`BoundExpr::ColumnRef`です。
+新規ファイル`src/binder.rs`を作り、次のように定義します。
 
 ```rust
 ColumnRef {
@@ -64,6 +65,12 @@ ColumnRef {
     data_type: DataType,
     span: Span,
 },
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod binder;
 ```
 
 `table_ordinal`と`column_index`は、`FROM`に並ぶテーブルの何番目の、`Schema`の何番目の列かという、解決済みの座標です。
@@ -78,6 +85,7 @@ ColumnRef {
 「構文解析器は`Expr`しか返さない」「`executor`は`BoundExpr`しか受け取らない」という制約を、テストではなく型で保証できることが、この2つを分けた最大の理由です。
 
 `BoundExpr`は`Expr`の他のバリアントとも1対1に対応しますが、`UnaryOp`、`BinaryOp`、`FunctionCall`、`Cast`にはそれぞれ`data_type: DataType`が加わります。
+同じ`src/binder.rs`に、`BinaryOp`を例に次のように追記します。
 
 ```rust
 BinaryOp {
@@ -93,7 +101,7 @@ BinaryOp {
 `BoundExpr`には`data_type(&self) -> Option<DataType>`というメソッドがあり、`NullLiteral`とそれを素通しする`Paren`の入れ子だけが`None`(型が定まらない)を返します。
 値そのものではなく型だけを問う`bind_predicate`や`executor::project`は、この関数を呼ぶだけで済み、式木をもう一度たどり直す必要がありません。
 
-`SELECT`全体は`BoundSelect`という型に変換します。
+`SELECT`全体は、同じ`src/binder.rs`に定義する`BoundSelect`という型に変換します。
 
 ```rust
 pub struct BoundSelect {
@@ -114,7 +122,7 @@ pub struct BoundSelect {
 `Binder`がテーブル名を解決するには、名前からテーブル定義を引ける何かが必要です。
 このクレートには、その役目を果たす型がすでに2つあります。
 インメモリモードの`Catalog`(第9章)と、永続モードの`Storage`(第15章)です。
-どちらも`table(&self, name: &str) -> Option<&TableInfo>`という同じ形のメソッドを持っているので、この共通部分をtraitとして取り出します。
+どちらも`table(&self, name: &str) -> Option<&TableInfo>`という同じ形のメソッドを持っているので、この共通部分を`src/binder.rs`にtraitとして取り出します。
 
 ```rust
 pub trait CatalogLookup {
@@ -141,7 +149,7 @@ impl CatalogLookup for Storage {
 一方`Binder`にとって、`Catalog`と`Storage`は「テーブル名から`TableInfo`を引ける」という1つの操作しか要らない相手であり、`Database`のように両者の差を`match`で読み比べたい理由がありません。
 同じ「2つの実装を切り替える」問題でも、呼び出し側が知りたい情報の量によって`enum`とtraitのどちらが素直かが変わる、という一例になっています。
 
-テーブル名の解決自体は、`resolve_table`という1つの関数に集まります。
+テーブル名の解決自体は、`src/binder.rs`の`resolve_table`という1つの関数に集まります。
 
 ```rust
 fn resolve_table(&self, table: &Ident, alias: Option<&Ident>) -> DbResult<BoundTableRef> {
@@ -168,6 +176,7 @@ minidb> SELECT id FROM does_not_exist;
 
 `Alias`(`FROM users AS u`)に対応するには、まずParserにその構文を追加する必要があります。
 `SelectStatement`の`from`フィールドは、これまで`Option<Ident>`(テーブル名だけ)でしたが、この章から`Option<FromClause>`に変えます。
+`src/ast.rs`に次の`FromClause`を追加します。
 
 ```rust
 pub struct FromClause {
@@ -180,7 +189,7 @@ pub struct FromClause {
 `AS`というキーワードは第8章の`CAST(expr AS type)`ですでにLexerが認識しているので、`FROM`の直後に`AS`が続けば`Alias`を読む、という分岐を1つ足すだけで済みます。
 `u.id`のような修飾列参照には、もう1つ構文上の穴がありました。
 第7章の`Lexer`は`.`をどのTokenにも対応させておらず、`ast.rs`のコメントにも「`users.id`のような修飾名は、Lexerが`.`を扱わないため対象外」と明記されていました。
-この章で`TokenKind::Dot`を追加し、識別子の直後に`.`が続けば、もう1つ識別子を読んで`Expr::ColumnRef`の`qualifier`に詰めます。
+この章で`TokenKind::Dot`を追加し、識別子の直後に`.`が続けば、もう1つ識別子を読んで`Expr::ColumnRef`の`qualifier`に詰める分岐を、`src/parser.rs`に加えます。
 
 ```rust
 if *self.peek_kind() == TokenKind::Dot {
@@ -195,7 +204,7 @@ if *self.peek_kind() == TokenKind::Dot {
 }
 ```
 
-`resolve_table`が返す`BoundTableRef`は、`qualifier()`という補助メソッドを持ちます。
+`resolve_table`が返す`BoundTableRef`の`qualifier()`という補助メソッドを、`src/binder.rs`に次のように定義します。
 
 ```rust
 pub fn qualifier(&self) -> &str {
@@ -230,7 +239,7 @@ u.id
 列参照の解決は`resolve_column`が担います。
 修飾子(`qualifier`)の有無で経路が分かれます。
 
-修飾子が無い場合、`tables`を先頭から順に見て、その列名を持つテーブルを探します。
+修飾子が無い場合、`src/binder.rs`の`resolve_column`は`tables`を先頭から順に見て、その列名を持つテーブルを探します。
 
 ```rust
 let matches: Vec<(usize, usize, DataType)> = tables
@@ -264,7 +273,7 @@ match matches.as_slice() {
 それでもこの分岐を今のうちに書いておくのは、`resolve_column`という関数自体を「`tables`の要素数を1個と決め打たない」形で設計しておけば、第22章で`JOIN`が`tables`を複数要素にしたときに、この関数を書き直す必要が無いからです。
 テストでは、`resolve_column`を`Binder`の外から直接呼び、2つのテーブルが同じ列名`id`を持つ状況を人工的に作って、この分岐が実際に機能することを確認しています。
 
-修飾子がある場合(`u.id`)は、まず`tables`の中から`qualifier() == "u"`のテーブルを探し、見つかったテーブルの中だけで列名を探します。
+修飾子がある場合(`u.id`)は、`src/binder.rs`の同じ`resolve_column`が、まず`tables`の中から`qualifier() == "u"`のテーブルを探し、見つかったテーブルの中だけで列名を探します。
 
 ```rust
 let (table_ordinal, table) = tables
@@ -289,7 +298,7 @@ minidb> SELECT id FROM users AS u WHERE users.id = 1;
 
 ## `*`の展開と式の型検査をBinderへ統合する
 
-`SELECT *`の展開は、`bind_select`が射影対象リストを組み立てる中で行います。
+`SELECT *`の展開は、`src/binder.rs`の`bind_select`が射影対象リストを組み立てる中で行います。
 
 ```rust
 SelectItem::Wildcard { span } => {
@@ -310,9 +319,9 @@ SelectItem::Wildcard { span } => {
 展開の順序は「テーブルの登場順、各テーブル内は列の宣言順」と決めてあります。
 この章では`tables`が高々1個なので実質的には「列の宣言順」と同じ結果にしかなりませんが、この順序規則自体は複数テーブルを前提にして書いてあるので、第22章で`JOIN`が入っても書き直しは要りません。
 
-式の型検査は、`bind_expr`という1つの再帰関数に集約しました。
+式の型検査は、`bind_expr`という1つの再帰関数に集約します。
 規則そのものは第10章の`executor::infer_type`と同一で、算術演算は両辺が`BIGINT`か型未定の`NULL`であること、比較演算は両辺が同じ型であること、論理演算は両辺が`BOOLEAN`か`NULL`であること、関数呼び出しは`FunctionRegistry`に登録された引数の型と一致することを、式木全体にわたって再帰的に検査します。
-`WHERE`句には、この検査に加えて「最終的な型が`BOOLEAN`または型未定の`NULL`であること」をもう1段検査する`bind_predicate`を通します。
+`WHERE`句には、この検査に加えて「最終的な型が`BOOLEAN`または型未定の`NULL`であること」をもう1段検査する、`src/binder.rs`の`bind_predicate`を通します。
 
 ```rust
 fn bind_predicate(&self, expr: &Expr, tables: &[BoundTableRef]) -> DbResult<BoundExpr> {
@@ -341,18 +350,18 @@ minidb> SELECT id FROM users WHERE 1;
 このエラーは、`users`が空でも、行を何件持っていても同じ文言、同じ位置で返ります。
 第10章の`check_predicate_type`が持っていた「行の有無に関わらず同じ検査結果になる」という不変条件は、検査の場所を`Binder`に変えても、束縛が実行より必ず先に走るという順序によってそのまま保たれています。
 
-`executor::predicate_matches`(`WHERE`の評価結果を`bool`へ変換する関数)だけは、`BOOLEAN`でも`NULL`でもない値に出会った場合の分岐を消さずに残しました。
+`executor::predicate_matches`(`WHERE`の評価結果を`bool`へ変換する関数)だけは、`BOOLEAN`でも`NULL`でもない値に出会った場合の分岐を消さずに残します。
 `Binder`を経由しない呼び出し経路を想定した保険ではありません。
 `Database::execute`は必ず`Binder`を経由するため、そのような経路はこの章にはありません。
 残しているのは、「`BoundExpr::data_type()`が`Some(Boolean)`または`None`である」という事実を、Rustの型システムがコンパイル時に保証してはくれないからです。
-仮に`Binder`側にバグがあって型検査をすり抜けたとしても、`executor`が`BOOLEAN`でない値を暗黙に「マッチしない」側へ丸めてしまう(誤りを隠してしまう)ことだけは避けたい、という最終防衛線としてこの分岐を残しました。
+仮に`Binder`側にバグがあって型検査をすり抜けたとしても、`executor`が`BOOLEAN`でない値を暗黙に「マッチしない」側へ丸めてしまう(誤りを隠してしまう)ことだけは避けたい、という最終防衛線としてこの分岐を残します。
 
 `Aggregate`(`COUNT`、`SUM`等)の使用位置の検査は、この章では行いません。
 `SELECT`の対象式にだけ許し、`GROUP BY`の無い列との共存を禁じるといった規則は、`Aggregate`という式の種類自体が第21章まで実装されないため、検査する対象がまだ存在しません。
 
 ## Database::executeをparse→bind→executeへ再編する
 
-`Database::execute`は、構文解析の直後に束縛を挟む1行が増えました。
+`src/database.rs`の`Database::execute`には、構文解析の直後に束縛を挟む1行を加えます。
 
 ```rust
 pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
@@ -369,7 +378,7 @@ pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
 }
 ```
 
-`bind`自身は`Backend`の分岐を1箇所に閉じ込めるだけの薄い関数です。
+`bind`自身は、`src/database.rs`の中で`Backend`の分岐を1箇所に閉じ込めるだけの薄い関数です。
 
 ```rust
 fn bind(&self, statement: Statement, sql: &str) -> DbResult<BoundStatement> {
@@ -385,12 +394,13 @@ fn bind(&self, statement: Statement, sql: &str) -> DbResult<BoundStatement> {
 `CREATE TABLE`だけは`Binder`を素通りします。
 `BoundStatement::CreateTable`はASTの`CreateTableStatement`をそのまま持ち回るバリアントで、`Binder`が行う名前解決とは性質が違う仕事をする文だからです。
 `Binder`が解決するのは、すでにカタログにある名前を指す参照(`SELECT`の列、`INSERT`の行き先、`WHERE`の述語)ですが、`CREATE TABLE`が持つ名前(テーブル名、列名)はこれから新しく作る名前であり、突き合わせるべき既存のエントリがありません。
-列の型名(`BIGINT`等)をテキストから`DataType`へ解決する処理も、`Database::execute_create_table`にそのまま残しました。
+列の型名(`BIGINT`等)をテキストから`DataType`へ解決する処理も、`Database::execute_create_table`にそのまま残します。
 これは既存の列への参照ではなく、新しい`Schema`を組み立てる作業の一部であり、`Binder`の名前解決とは扱う対象が異なります。
 `DROP TABLE`は、テーブルが存在することだけを`Binder`(`bind_drop_table`)が事前に検査し、位置情報付きの`DbError::Bind`にします。
 実行(`Catalog::drop_table`、`Storage::drop_table`)は引き続き名前で削除するので、`BoundStatement::DropTable`もASTのバリアントをそのまま返します。
 
 `INSERT`、`UPDATE`、`DELETE`は、それぞれ専用の`Bound`型を持ちます。
+`src/binder.rs`に、次の`BoundInsert`を定義します。
 
 ```rust
 pub struct BoundInsert {
@@ -416,6 +426,7 @@ minidb> INSERT INTO users (id, id) VALUES (1, 2);
 `VALUES`は既存の行を参照する構文を持たないので、列参照が現れようが無く、`Binder`が解決すべき名前もそこにはありません。
 
 `UPDATE`、`DELETE`は、テーブル名の解決に加えて、`SET`の対象列と`WHERE`の述語を束縛します。
+`SET`の対象列を束縛する`bind_assignment`は、`src/binder.rs`に次のように定義します。
 
 ```rust
 fn bind_assignment(&self, assignment: &Assignment, tables: &[BoundTableRef]) -> DbResult<BoundAssignment> {
@@ -433,11 +444,11 @@ fn bind_assignment(&self, assignment: &Assignment, tables: &[BoundTableRef]) -> 
 `BoundInsert`、`BoundUpdate`、`BoundDelete`は、いずれも`schema: Schema`を値として(カタログからの借用ではなく複製として)持ちます。
 第16章までの`execute_insert`は、`table_info`という`&TableInfo`を`self.table_info(...)`から借りたあと、`&mut self.backend`を借用する直前に`.clone()`していました。
 `self`を不変借用したまま`&mut self.backend`を取ることはできないため、複製してから借用を手放す、という手順を`execute_insert`、`execute_update`、`execute_delete`のそれぞれが個別に書く必要があったのです。
-この章では、その複製を`Binder::resolve_table`の内部(`schema: info.schema.clone()`)へ1箇所にまとめました。
+この章では、その複製を`Binder::resolve_table`の内部(`schema: info.schema.clone()`)へ1箇所にまとめます。
 `Database::execute_insert`が受け取る`BoundInsert`はすでに独立した値なので、`&mut self.backend`をいつ借りても構いません。
 借用の都合に合わせて複製のタイミングを呼び出し側ごとに調整する、という同じ形のコードが3箇所に散らばっていた状態が、この章で1箇所に集まりました。
 
-`executor`側の関数は、生の`Expr`ではなく`BoundExpr`、`BoundSelectItem`、`BoundAssignment`を受け取るようになりました。
+`src/executor.rs`側の関数も、生の`Expr`ではなく`BoundExpr`、`BoundSelectItem`、`BoundAssignment`を受け取る形に変えます。
 
 ```rust
 pub fn filter(
@@ -458,7 +469,7 @@ pub fn filter(
 }
 ```
 
-`BoundExpr`を評価する`eval::eval_bound_expr`は、列参照を名前ではなく`column_index`で引きます。
+`BoundExpr`を評価する`eval::eval_bound_expr`は`src/eval.rs`に定義されており、列参照を名前ではなく`column_index`で引きます。
 
 ```rust
 BoundExpr::ColumnRef { table_ordinal, column_index, name, .. } => {
@@ -481,7 +492,7 @@ BoundExpr::ColumnRef { table_ordinal, column_index, name, .. } => {
 
 ## テストで確認する
 
-`binder`モジュールには、この章が扱う名前解決、型検査のそれぞれについて単体テストを追加しました。
+`src/binder.rs`のテストモジュールには、この章が扱う名前解決、型検査のそれぞれについて単体テストを追加します。
 
 ```rust
 #[test]
@@ -493,7 +504,7 @@ fn unknown_column_is_rejected_with_position() {
 ```
 
 未知のテーブル、未知の列、`WHERE`句の型不一致は、いずれも発生位置の行、列を固定するテストにしてあります。
-曖昧な列参照は、`resolve_column`を`Binder`の外から直接呼び、2つのテーブルが同じ列名を持つ状況を人工的に作って検証しました(この章の`Parser`では`FROM`に複数テーブルを書けないため、SQL文からこの分岐を踏むことはまだできません)。
+曖昧な列参照は、`src/binder.rs`のテストモジュールで`resolve_column`を`Binder`の外から直接呼び、2つのテーブルが同じ列名を持つ状況を人工的に作って検証します(この章の`Parser`では`FROM`に複数テーブルを書けないため、SQL文からこの分岐を踏むことはまだできません)。
 
 ```rust
 #[test]

@@ -1,6 +1,6 @@
 # 第32章 Isolation LevelとDeadlock
 
-第31章の最後に書いたテストを、もう一度見てみます。
+第31章の最後に`src/lock_manager.rs`へ書いたテスト`mutual_wait_leaves_both_transactions_blocked_without_detection`を、もう一度見てみます。
 
 ```rust
 assert_eq!(lm.acquire(T1, table(1), LockMode::Exclusive), LockResult::Granted);
@@ -29,6 +29,7 @@ T2も同じ立場です。
 
 2つ目は`Backend::Disk`(Tuple Lock)に残ったPhantomです。
 第31章は`SELECT`のロックを「その時点で存在する行」だけに掛けました。
+`tests/interleave_disk.rs`に書いた次のテストが、それを示しています。
 
 ```rust
 #[test]
@@ -75,6 +76,7 @@ SQL標準は各レベルを「どの異常を許すか」で定義しており�
 ## BEGIN文に分離レベルを持たせる
 
 `BEGIN`単体しか受理していなかった構文に、`BEGIN ISOLATION LEVEL <level>`を追加します。
+`src/ast.rs`に次の`BeginStatement`と`IsolationLevel`を定義します。
 
 ```rust
 /// `BEGIN`文(第30章)。`BEGIN TRANSACTION`のような修飾は持たず、`BEGIN`
@@ -110,6 +112,7 @@ pub enum IsolationLevel {
 構文を1つ増やす代わりに、状態遷移の分岐を1つ減らせる選択です。
 
 `Parser`はこの1個のオプション句を読み取るだけです。
+`src/parser.rs`に次の`parse_begin_statement`を書きます。
 
 ```rust
 fn parse_begin_statement(&mut self) -> DbResult<BeginStatement> {
@@ -131,6 +134,7 @@ fn parse_begin_statement(&mut self) -> DbResult<BeginStatement> {
 ### 分離レベルの既定値
 
 `BEGIN`単体(`ISOLATION LEVEL`を省略した場合)がどのレベルになるかは、この章が新しく決める必要がある設計判断です。
+`src/database.rs`の`execute_begin`を次のように書きます。
 
 ```rust
 fn execute_begin(&mut self, begin: BeginStatement) -> DbResult<QueryResult> {
@@ -152,7 +156,7 @@ PostgreSQLの既定は`READ COMMITTED`です。
 明示的に`ISOLATION LEVEL`と書いた場合にだけ、その分離レベルの規律に従わせることで、この章より前の章の挙動を1つも壊さずに済みました。
 実際、第30章と第31章が積み上げてきた`tests/interleave.rs`と`tests/interleave_disk.rs`は、この章での変更を1行も加えずに全テスト緑のまま残ります。
 
-決定的インターリーブテストハーネスにも、同じ既定値を持つAPIを用意します。
+決定的インターリーブテストハーネスにも、`src/database.rs`に同じ既定値を持つAPIを用意します。
 
 ```rust
 pub fn begin_tx(&mut self) -> TxHandle {
@@ -173,7 +177,7 @@ pub fn begin_tx_with_isolation(&mut self, isolation_level: IsolationLevel) -> Tx
 ## 4つの分離レベルをロック規律として実装する
 
 分離レベルごとの違いは、`SELECT`が読み取りロックをどう扱うかに集約されます。
-まず、あるトランザクションが今どの分離レベルにいるかを調べる関数が要ります。
+まず、あるトランザクションが今どの分離レベルにいるかを、`src/database.rs`に定義する`isolation_level_of`で調べます。
 
 ```rust
 fn isolation_level_of(&self, owner: TransactionId) -> IsolationLevel {
@@ -193,7 +197,7 @@ fn isolation_level_of(&self, owner: TransactionId) -> IsolationLevel {
 どちらにも見つからない場合、`owner`はAutocommit用に`lock_owner`がその場で割り当てた一時IDです。
 `TransactionContext`自体が存在しないこの場合は`RepeatableRead`を返しますが、これは第31章までの挙動をそのまま保つための既定であり、実際にはAutocommitの1文は文の終わりに`execute_bound_statement`がロックを一括で手放すため、`RepeatableRead`か`ReadCommitted`かで結果に違いは出ません。
 
-この`isolation_level_of`を使って、`SELECT`が読み取りロックを取る`acquire_scan_locks`を書き換えます。
+この`isolation_level_of`を使って、`SELECT`が読み取りロックを取る`src/database.rs`の`acquire_scan_locks`を書き換えます。
 
 ```rust
 fn acquire_scan_locks(&mut self, owner: TransactionId, table_ids: &[TableId], mode: LockMode) -> DbResult<()> {
@@ -245,6 +249,7 @@ fn acquire_scan_locks(&mut self, owner: TransactionId, table_ids: &[TableId], mo
 「獲得する前に尋ねる」というやり方は、獲得(または待ち行列からの昇格)が実際に起きた**タイミング**と、それを尋ねる**タイミング**が一致している前提に頼っており、`WouldBlock`をまたぐ再試行ではその前提が崩れるのです。
 
 採用したのは、「新規に獲得した」という事実そのものを、獲得が実際に起きた瞬間に`LockManager`自身に記録させる方式です。
+`src/lock_manager.rs`に次の`take_pending_shared_grants`を追加します。
 
 ```rust
 pub(crate) fn take_pending_shared_grants(&mut self, txn: TransactionId) -> Vec<K> {
@@ -262,7 +267,7 @@ T2が実際に文を再試行して`acquire`を呼んだときは、すでに保
 `acquire_scan_locks`は、獲得ループを終えたあとで`take_pending_shared_grants`を呼ぶだけで、いつ、何回の呼び出しをまたいで昇格したかを気にせず、正しい鍵の集合を受け取れます。
 
 `pending_shared_grants`は`txn`ごとに積み上がる記録なので、`txn`自体が`COMMIT`、`ROLLBACK`、強制Abortで終わるときに片付けておかないと、二度と回収されないエントリが残り続けます。
-第31章の`release_all`の末尾に、この後始末を1行加えます。
+`src/lock_manager.rs`にある第31章の`release_all`の末尾に、この後始末を1行加えます。
 
 ```rust
 pub fn release_all(&mut self, txn: TransactionId) {
@@ -286,7 +291,7 @@ pub fn release_all(&mut self, txn: TransactionId) {
 }
 ```
 
-`release_keys`自体(渡された鍵だけを解放する部分)は前の版から変わっていません。
+`src/lock_manager.rs`の`release_keys`自体(渡された鍵だけを解放する部分)は前の版から変わっていません。
 
 ```rust
 pub(crate) fn release_keys(&mut self, txn: TransactionId, keys: &[K]) {
@@ -330,6 +335,7 @@ Key Range Lockは範囲外の`INSERT`まで巻き込まないぶん並行度が�
 捨てたのは、`Serializable`のSELECTと無関係な範囲への`INSERT`まで一律にブロックしてしまうという並行度です。
 
 この追加のTable Lockが刺さる相手が、`INSERT`側の変更です。
+`src/database.rs`の`run_insert`を次のように変更します。
 
 ```rust
 fn run_insert(&mut self, plan: LogicalPlan, owner: TransactionId) -> DbResult<usize> {
@@ -374,6 +380,7 @@ Memoryバックエンド(テーブル単位のロック)でのマトリクスは
 
 Lost Updateがこのマトリクスの中で唯一、「読み取りロックを一瞬でも取るかどうか」と「その読み取りロックをいつまで保持するか」の両方に左右される異常だという点に注意してください。
 `Read Committed`はSELECTの瞬間にはShared Lockを取りますが、直後に手放します。
+`tests/isolation_levels.rs`に書いた次のテストが、それを示します。
 
 ```rust
 #[test]
@@ -404,6 +411,7 @@ Lost Updateが防がれるのは`Repeatable Read`以上、つまりSharedロッ�
 `SELECT ... FOR UPDATE`のような、読み取りの時点から書き込み用のロックを明示的に要求する構文を持たないSQLサブセットでは、これがLost Updateを防ぐ唯一の手段になります。
 
 DiskバックエンドのPhantomは、`Repeatable Read`と`Serializable`の違いを直接確認できる唯一の場所です。
+`tests/isolation_levels.rs`に次のテストを追加します。
 
 ```rust
 #[test]
@@ -458,6 +466,7 @@ Timeoutは`std::time`のような実時間に依存する方式であり、決�
 この辺の集合に閉路(サイクル)があれば、それがそのままデッドロックです。
 
 この辺を組み立てるための生データを、`LockManager`が新しく提供します。
+`src/lock_manager.rs`に次の`wait_for_edges`を追加します。
 
 ```rust
 pub(crate) fn wait_for_edges(&self) -> Vec<(TransactionId, TransactionId)> {
@@ -510,6 +519,7 @@ T1の持つSharedとは両立するのですが、待ち行列にはすでにT2�
 これは「モードが衝突する保持者」への辺とは別の、待ち行列の位置そのものによる依存です。
 
 `Database`側は、この辺からトランザクションIDごとの隣接表を組み立て、要求元(`owner`)を起点にDFSで自分自身へ戻ってくる経路を探します。
+`src/database.rs`に次の`detect_deadlock`を書きます。
 
 ```rust
 fn detect_deadlock(&mut self, owner: TransactionId) -> DbResult<Option<TransactionId>> {
@@ -532,7 +542,7 @@ fn detect_deadlock(&mut self, owner: TransactionId) -> DbResult<Option<Transacti
 }
 ```
 
-`find_cycle_containing`は`owner`から辺をたどり、`owner`自身に戻ってくる経路を1つ見つけたら、その経路(循環を構成するノードの列)を返します。
+`src/database.rs`の`find_cycle_containing`は`owner`から辺をたどり、`owner`自身に戻ってくる経路を1つ見つけたら、その経路(循環を構成するノードの列)を返します。
 
 ```rust
 fn dfs(
@@ -571,7 +581,7 @@ fn dfs(
 
 循環が見つかったら、その中のどれか1本を切らなければ先へ進めません。
 切る対象(**Victim**)をどう選ぶかが**Victim Selection**です。
-この章は、循環の中で最も新しい(`TransactionId`が最大の)トランザクションを選びます。
+この章は、`src/database.rs`の`detect_deadlock`の中で、循環の中で最も新しい(`TransactionId`が最大の)トランザクションを選びます。
 
 ```rust
 let victim = cycle.into_iter().max_by_key(|t| t.0).expect("循環は少なくとも1つの要素を持つ");
@@ -581,7 +591,7 @@ let victim = cycle.into_iter().max_by_key(|t| t.0).expect("循環は少なくと
 後から始まったトランザクションほど、それまでに行った作業(書き込み、獲得したロック)が少ない可能性が高く、Abortしたときに捨てる作業量も小さく済みます。
 もちろんこれは正確な見積もりではありません(後から始まって大量の書き込みをすでに終えているトランザクションもありえます)が、実際に費やした作業量を計測する仕組みをこのクレートは持たないため、`TransactionId`という手元にある情報だけで決定的に選べる規則として、この単純な指標を選びました。
 
-Victimは`abort_transaction`で即座に強制Abortされます。
+Victimは`src/database.rs`の`abort_transaction`で即座に強制Abortされます。
 
 ```rust
 fn abort_transaction(&mut self, victim: TransactionId) -> DbResult<()> {
@@ -620,7 +630,8 @@ fn abort_transaction(&mut self, victim: TransactionId) -> DbResult<()> {
 Victimが手放したロックの待ち行列は`promote_waiters`によって即座に再評価され、循環の中で次に並んでいた要求(あるいは循環とは無関係にたまたま同じロックを待っていた要求)がそのまま昇格することもあります。
 
 `TransactionContext`自体は、`self.tx`や`harness_contexts`のスロットからは取り除きません。
-`state`を`Aborted`に、新しく追加した`victim_of_deadlock`を`true`にするだけです。
+`state`を`Aborted`に、`victim_of_deadlock`を`true`にするだけです。
+`src/transaction.rs`に定義された`TransactionContext`へ、この`victim_of_deadlock`フィールドを追加します。
 
 ```rust
 pub(crate) struct TransactionContext {
@@ -636,6 +647,7 @@ pub(crate) struct TransactionContext {
 ```
 
 このフラグが、呼び出し側に返すエラーを選び分けます。
+`src/database.rs`に次の`aborted_error`を追加します。
 
 ```rust
 fn aborted_error(victim_of_deadlock: bool) -> DbError {
@@ -648,7 +660,7 @@ Victimになったトランザクションへ以後触れるたびに`DbError::D
 
 ### 要求元自身がVictimになる場合、ならない場合
 
-ロックの獲得を試みる箇所(`acquire_scan_locks`、`acquire_write_locks`、`Serializable`のINSERT)は、すべて次の1個の関数を経由します。
+ロックの獲得を試みる箇所(`acquire_scan_locks`、`acquire_write_locks`、`Serializable`のINSERT)は、すべて`src/database.rs`の次の1個の関数を経由します。
 
 ```rust
 fn acquire_lock_or_detect_deadlock(&mut self, owner: TransactionId, key: LockKey, mode: LockMode) -> DbResult<()> {
@@ -682,6 +694,7 @@ Victimが要求元とは**別のトランザクション**であることもあ�
 Victimが手放したロックを要求元が待ち行列の中で引き継いでいれば、2回目の`acquire`がその場で`Granted`を返すからです。
 要求元は、自分の要求がデッドロック解決に巻き込まれたことにすら気づかず、ただ`Ok`を受け取って処理を続けます。
 Victimにされた側は、次に自分のトランザクションへ触れたとき(次の文の実行、または`COMMIT`)に初めて`DeadlockDetected`を受け取ります。
+`tests/deadlock.rs`に書いた次のテストが、それを確認します。
 
 ```rust
 #[test]
@@ -702,7 +715,7 @@ fn a_different_transaction_can_be_chosen_as_the_victim() {
 ```
 
 3本以上のトランザクションが環状に待ち合う場合も、同じ仕組みでそのまま検出できます。
-DFSは辺をたどって`owner`へ戻る経路を探すだけなので、循環の長さは2に限定されません。
+DFSは辺をたどって`owner`へ戻る経路を探すだけなので、循環の長さは2に限定されないことを、`tests/deadlock.rs`の次のテストで確認します。
 
 ```rust
 #[test]

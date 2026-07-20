@@ -81,7 +81,7 @@ Projection(name)
 ## `Rule`トレイトと固定点まで反復するドライバ
 
 書き換えの種類は複数あり、この先の章でも増えていく見込みです(第27章以降、統計情報を使う書き換えが加わります)。
-`src/rules.rs`は、個々の書き換えを`Rule`という1つのインターフェースの実装として登録できるようにしました。
+この章では`src/rules.rs`をモジュールとして新規作成し、個々の書き換えを`Rule`という1つのインターフェースの実装として登録できるようにします。
 
 ```rust
 pub trait Rule {
@@ -92,8 +92,14 @@ pub trait Rule {
 }
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod rules;
+```
+
 `apply`は`plan`を受け取り、書き換え後の`plan`と「実際に何か変えたか」を表す`bool`を返します。
-戻り値を新しい`plan`にせず`bool`も添えているのは、ドライバが「もうこれ以上変化が起きない」ことを判定できるようにするためです。
+戻り値を新しい`plan`にせず`bool`も添えているのは、`src/rules.rs`に定義するドライバが「もうこれ以上変化が起きない」ことを判定できるようにするためです。
 
 ```rust
 pub fn optimize(mut plan: LogicalPlan, functions: &FunctionRegistry) -> LogicalPlan {
@@ -119,7 +125,7 @@ pub fn optimize(mut plan: LogicalPlan, functions: &FunctionRegistry) -> LogicalP
 この章のルールはどれも式や木を単調に小さくする性質を持ち、通常はクエリの構文要素数のオーダーで収束するため、正常な実行でこの上限に達することはありません。
 上限は、将来ルールを追加した際に互いを無限に行き来させてしまうバグへの安全弁として置いてあります。
 
-`Database::execute_select`と`execute_explain`は、`logical_plan::build_select`が返した木を`physical_plan::optimize`へ渡す前に、この`rules::optimize`を通します。
+`src/database.rs`の`Database::execute_select`と`execute_explain`は、`logical_plan::build_select`が返した木を`physical_plan::optimize`へ渡す前に、この`rules::optimize`を通します。
 
 ```rust
 fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {
@@ -139,6 +145,7 @@ fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {
 `Constant Folding`は、こうした部分式を実行前に一度だけ評価し、結果のリテラルへ置き換えます。
 
 畳み込んでよい対象は、列参照(`ColumnRef`)も集約(`Aggregate`)も含まない式に限ります。
+`src/rules.rs`に次の`is_constant`を定義します。
 
 ```rust
 fn is_constant(expr: &BoundExpr) -> bool {
@@ -162,7 +169,7 @@ fn is_constant(expr: &BoundExpr) -> bool {
 この前提がある限り、`ABS(-1)`のような関数呼び出しも安全に畳み込めます。
 将来、時刻や乱数を返す非決定的な関数を`FunctionRegistry::register`で追加する場合、この前提が崩れることに注意が必要ですが、この章の時点ではそのような関数を持ちません。
 
-畳み込みの本体は子から先に評価する`post-order`の再帰です。
+畳み込みの本体は、`src/rules.rs`に定義する、子から先に評価する`post-order`の再帰`fold_expr`です。
 
 ```rust
 fn fold_expr(expr: BoundExpr, functions: &FunctionRegistry) -> (BoundExpr, bool) {
@@ -184,7 +191,7 @@ fn fold_expr(expr: BoundExpr, functions: &FunctionRegistry) -> (BoundExpr, bool)
 }
 ```
 
-子を畳み込んでから自分自身を`try_fold`に渡すのは、`(1 + 1) = 2`のように、子同士が定数になって初めて親も定数だと判明する式があるからです。
+子を畳み込んでから自分自身を、`src/rules.rs`に定義する`try_fold`に渡すのは、`(1 + 1) = 2`のように、子同士が定数になって初めて親も定数だと判明する式があるからです。
 
 ```rust
 fn try_fold(expr: BoundExpr, functions: &FunctionRegistry, children_changed: bool) -> (BoundExpr, bool) {
@@ -223,7 +230,7 @@ fn try_fold(expr: BoundExpr, functions: &FunctionRegistry, children_changed: boo
 ## Boolean Simplification: 三値論理のもとでの簡約
 
 `TRUE AND status = 1`のような式は、`AND`の片方が定数の`TRUE`か`FALSE`だと分かった時点で簡約できます。
-`Boolean Simplification`が行うのは次の8通りの書き換えです。
+`Boolean Simplification`が行うのは次の8通りの書き換えで、`src/rules.rs`の`simplify_expr`に実装します。
 
 ```rust
 fn simplify_expr(expr: BoundExpr) -> (BoundExpr, bool) {
@@ -259,7 +266,7 @@ fn simplify_expr(expr: BoundExpr) -> (BoundExpr, bool) {
 見た目はブール代数の教科書どおりですが、この式が扱う`AND`と`OR`は二値論理ではなく、`UNKNOWN`(`NULL`)を含む三値論理(第8章)です。
 `FALSE AND x`を`FALSE`へ、`TRUE AND x`を`x`へ書き換えてよいのは、`x`が`TRUE`、`FALSE`、`UNKNOWN`のどの値であっても、書き換え前後で同じ値になると確かめられるからです。
 
-`crate::eval`の`tri_and`はこう定義されています。
+`src/eval.rs`の`tri_and`はこう定義されています。
 
 ```rust
 fn tri_and(l: Tri, r: Tri) -> Tri {
@@ -279,7 +286,7 @@ fn tri_and(l: Tri, r: Tri) -> Tri {
 `OR`の4パターンも`tri_or`の定義から同じように確かめられ、`NOT NOT x → x`は`Tri`の`Not`実装が`Unknown`を`Unknown`のまま据え置くことから従います。
 
 正しさの証明は式の値についてのものであり、式の**評価そのもの**についてではないことに注意が必要です。
-`crate::eval::eval_binary_bound`の`AND`と`OR`は、短絡評価をせず両辺を必ず評価してから`tri_and`と`tri_or`を適用します。
+`src/eval.rs`の`eval_binary_bound`の`AND`と`OR`は、短絡評価をせず両辺を必ず評価してから`tri_and`と`tri_or`を適用します。
 
 ```rust
 BinaryOperator::And => {
@@ -293,7 +300,7 @@ BinaryOperator::And => {
 `Boolean Simplification`がこれを`FALSE`へ書き換えたあとは、右辺を評価すること自体がなくなり、エラーにならず0行を返します。
 どちらの場合も「この式が`WHERE`に現れた行が結果に残ることはない」という点では変わらないので、返す行の集合という意味では書き換えは正しいと言えますが、エラーになるか成功するかという**振る舞い**までは保存していません。
 実際のRDBMSの多くも、こうしたデッドブランチを畳み込んで消すのが一般的な挙動です。
-この章もその慣行に合わせ、テストではこの振る舞いの変化そのものを確認します。
+この章もその慣行に合わせ、`src/rules.rs`の`mod tests`でこの振る舞いの変化そのものを確認します。
 
 ```rust
 for predicate in [
@@ -316,6 +323,7 @@ for predicate in [
 
 `Filter(Filter(x, p1), p2)`という連続する2つの`Filter`は、`Filter(x, p1 AND p2)`という1つの`Filter`にまとめられます。
 `p1`と`p2`をそれぞれ独立に評価しても、`p1 AND p2`を1回評価しても、三値論理のもとで結果は変わりません。
+この事実を使う`merge_filters`を、`src/rules.rs`に定義します。
 
 ```rust
 fn merge_filters(plan: LogicalPlan) -> (LogicalPlan, bool) {
@@ -346,7 +354,7 @@ fn merge_filters(plan: LogicalPlan) -> (LogicalPlan, bool) {
 
 章の冒頭で見た`customers.id = 1`が`Join`の真上に居座る例に戻ります。
 `WHERE`の中には、`customers`だけを参照する項、`orders`だけを参照する項、両方を参照する項が混在しえます。
-`Predicate Pushdown`は、`Filter`の述語をANDの連言に分解し、片側だけを参照する項をそのテーブルの`Scan`の直前まで運びます。
+`Predicate Pushdown`は、`Filter`の述語をANDの連言に分解し、片側だけを参照する項をそのテーブルの`Scan`の直前まで運ぶ、次の`pushdown_plan`を`src/rules.rs`に実装します。
 
 ```rust
 fn pushdown_plan(plan: LogicalPlan) -> (LogicalPlan, bool) {
@@ -417,7 +425,7 @@ Heap Fileは行志向のストレージで、部分列だけを読み出す手�
 
 ### 適用範囲を絞る: 索引アクセスパスとの衝突を避ける
 
-このルールが列を削るのは、`Aggregate`または`Projection`の直下が`Filter`や`Join`を経由して`Scan`へ至る場合に限ります。
+このルールが列を削るのは、`Aggregate`または`Projection`の直下が`Filter`や`Join`を経由して`Scan`へ至る場合に限られ、この判定を`src/rules.rs`の`is_from_where_subtree`が担います。
 
 ```rust
 fn is_from_where_subtree(plan: &LogicalPlan) -> bool {
@@ -434,7 +442,7 @@ fn is_from_where_subtree(plan: &LogicalPlan) -> bool {
 第18章から第21章で見てきた大半の単一テーブル`SELECT`はこの形であり、このルールはほとんど何もしません。
 これは手落ちではなく、単一テーブルの計画では`Scan`が返す行を読むのは`Filter`か`Projection`のうち高々1つずつであり、削って得をする「使われない列を持ったまま何段も運ばれる行」がそもそも存在しないからです。
 
-もっと大きな理由が、`Filter`直下の`Scan`と`Join`の`right`直下の`Scan`をそれぞれ剪定の対象から外していることです。
+もっと大きな理由が、`Filter`直下の`Scan`と`Join`の`right`直下の`Scan`をそれぞれ剪定の対象から外していることで、`src/rules.rs`の`prune_scope`は次のように書きます。
 
 ```rust
 LogicalPlan::Filter(filter) => {
@@ -455,7 +463,7 @@ LogicalPlan::Filter(filter) => {
 
 第25章の`choose_access_path`は、`Filter`の直下が`Scan`そのものであることを前提に索引アクセスパスを選びます。
 この位置に剪定用の`Projection`を挟むと、`Filter`の直下は`Scan`ではなく`Projection`になり、`choose_access_path`のパターンマッチが素通りされ、索引が二度と選ばれなくなってしまいます。
-`Join`の`right`(内側テーブル)が剥き出しの`Scan`である場合も同じ理由で対象から外します。
+`Join`の`right`(内側テーブル)が剥き出しの`Scan`である場合も同じ理由で対象から外し、`src/rules.rs`の`prune_scope`では次のように扱います。
 
 ```rust
 let (new_right, map_right, c2) = if matches!(join.right.as_ref(), LogicalPlan::Scan(_)) {
@@ -481,7 +489,7 @@ let (new_right, map_right, c2) = if matches!(join.right.as_ref(), LogicalPlan::S
 
 ### 剪定の本体: 必要な列を上から下へ運ぶ
 
-`Aggregate`か`Projection`が対象になったとき、まずその式が参照する列を集めます。
+`Aggregate`か`Projection`が対象になったとき、まずその式が参照する列を集める処理を、`src/rules.rs`の`prune_scope`に次のように書きます。
 
 ```rust
 LogicalPlan::Aggregate(mut aggregate) => {
@@ -504,7 +512,7 @@ LogicalPlan::Aggregate(mut aggregate) => {
 ```
 
 `prune_scope`は、`required`(この部分木の出力のうち上位で実際に必要とされる列の添字の集合)を受け取り、`Scan`、`Filter`、`Join`だけからなる部分木を剪定します。
-`Join`のケースでは、`required`を`left_len`を境に左側と右側へ振り分け、`Join`の結合条件自身が参照する列も同じように振り分けたうえで、両側を再帰的に剪定します。
+`Join`のケースでは、`required`を`left_len`を境に左側と右側へ振り分け、`Join`の結合条件自身が参照する列も同じように振り分けたうえで、両側を再帰的に剪定する処理を、`src/rules.rs`の`prune_scope`に次のように書きます。
 
 ```rust
 LogicalPlan::Join(join) => {
@@ -532,7 +540,7 @@ LogicalPlan::Join(join) => {
 `Join`条件そのものが参照する列を`required`に加えているのが要点です。
 `customers JOIN orders ON customers.id = orders.customer_id`で`SELECT orders.amount`しか使わなくても、`customers.id`は結合を成立させるために必要であり、勝手に落とすと結合そのものができなくなります。
 
-葉である`Scan`では、`required`に含まれる列だけを残した`Projection`を新しく挟みます。
+葉である`Scan`では、`required`に含まれる列だけを残した`Projection`を新しく挟む処理を、`src/rules.rs`の`prune_scan`に実装します。
 
 ```rust
 fn prune_scan(scan: ScanNode, required: &BTreeSet<usize>) -> (LogicalPlan, BTreeMap<usize, usize>, bool) {
@@ -626,7 +634,7 @@ Projection(id)
 `Predicate Pushdown`が新しく作った`Filter`同士を`Filter Merge`がまとめる、`Filter Merge`がまとめた結果を`Constant Folding`がさらに畳み込む、といった連鎖は、ルールの数が増えるほど「これで全部畳み込みきった」と1回のパスの並び順だけで保証するのが難しくなります。
 `optimize`がどのルールも変化を起こさなくなるまでループするのは、この順序依存を個々のルールの並べ方ではなく「収束するまで回す」という一律の手段で消すためです。
 
-固定点まで回した結果が、それ以上ルールを適用しても変わらないことは、`optimize`を2回続けて呼んでも同じ木になるという形でテストしています。
+固定点まで回した結果が、それ以上ルールを適用しても変わらないことは、`optimize`を2回続けて呼んでも同じ木になるという形で、`src/rules.rs`の`mod tests`でテストしています。
 
 ```rust
 let once = optimize(logical, &functions);

@@ -57,7 +57,7 @@ SQLサブセットの実行、ディスクへの永続化、Join、集約、コ�
 
 `Xorshift64`という決定的な疑似乱数生成器は、実は本書に初めて出てくるものではありません。
 第23章の`src/btree.rs`、第12章の`src/slotted_page.rs`のテストモジュールが、ランダムな挿入順序を再現可能に作るためすでに使っています。
-この章はその実装を`tests/common/mod.rs`へ集約し、Fuzzing、Property-based Test、Crash Injection Loop、決定的Random Concurrencyの4つの新しいテストファイルで共有します。
+この章はその実装を、新規に作成する`tests/common/mod.rs`へ集約し、Fuzzing、Property-based Test、Crash Injection Loop、決定的Random Concurrencyの4つの新しいテストファイルで共有します。
 
 ```rust
 pub struct Xorshift64(pub u64);
@@ -87,13 +87,14 @@ impl Xorshift64 {
 }
 ```
 
-`tests/fuzz_parser.rs`は、この乱数を使う2種類の生成器で`tokenize`と`parse_statement`に入力を投げ込みます。
+新規に作成する`tests/fuzz_parser.rs`は、この乱数を使う2種類の生成器で`tokenize`と`parse_statement`に入力を投げ込みます。
 
 **バイト列ファザー**は、完全にランダムなバイト列を`String::from_utf8_lossy`で文字列化するだけです。
 不正なUTF-8由来の置換文字や制御文字、突然終わる入力など、字句解析器の境界を無差別に突きます。
 
 **トークン列ファザー**は、キーワード、識別子、数値、文字列リテラル、記号の辞書からランダムに選んで並べます。
 文法として正しい保証はありませんが、バイト列ファザーより構文解析器の奥(式、`JOIN`、`CAST`、`PREPARE`/`EXECUTE`)まで届きやすくなります。
+`tests/fuzz_parser.rs`に次の`generate_token_soup`を定義します。
 
 ```rust
 fn generate_token_soup(rng: &mut Xorshift64, len: usize) -> String {
@@ -139,7 +140,7 @@ fn generate_token_soup(rng: &mut Xorshift64, len: usize) -> String {
 章末の演習で扱います。
 
 判定はどちらの生成器でも同じで、`catch_unwind`で包んで`panic`しないことだけを見ます。
-`Err`を返すのは正常系(壊れた入力を拒否できた)として扱います。
+`Err`を返すのは正常系(壊れた入力を拒否できた)として扱う`assert_no_panic`を、`tests/fuzz_parser.rs`に次のように定義します。
 
 ```rust
 fn assert_no_panic(input: &str) {
@@ -174,7 +175,7 @@ Fuzzingが「壊れないこと」だけを見るのに対し、Property-based T
 木の中身が挿入と削除の混在で絶えず変化し続ける状態そのものは、どちらのテストも再現していません。
 分割、併合、借用の実装が、ある特定の挿入と削除の混在パターンの直後だけ壊れるという種類のバグは、フェーズを分けたテストでは踏めません。
 
-そこでこの章は、`insert`と`delete`と`range`を1ステップごとにランダムへ混ぜ、**すべてのステップの直後**に`BTreeMap`と一致することを確認するテストを追加しました。
+そこでこの章は、`insert`と`delete`と`range`を1ステップごとにランダムへ混ぜ、**すべてのステップの直後**に`BTreeMap`と一致することを確認するテストを、`src/btree.rs`の`#[cfg(test)]`モジュールに追加します。
 
 ```rust
 for step in 0..3_000usize {
@@ -222,7 +223,7 @@ for step in 0..3_000usize {
 
 もう1つのPropertyは、B+Treeという1層ではなく、SQL文を積み重ねた結果に対するものです。
 個々のSQL文が正しくても、束ねたときに崩れる不変条件はありえます。
-`tests/property_sql.rs`は2つのPropertyを確認します。
+新規に作成する`tests/property_sql.rs`は2つのPropertyを確認します。
 
 1つ目は行数の不変条件です。
 `INSERT`した行数と`DELETE`した行数の差は、常に`COUNT(*)`と一致するはずです。
@@ -230,6 +231,7 @@ for step in 0..3_000usize {
 
 2つ目は合計の不変条件です。
 口座間の送金(ある行から引いた分だけ別の行へ足す)を何回繰り返しても、`SUM(balance)`は変わらないはずです。
+この送金を1回分実行する次のコードを、`tests/property_sql.rs`に書きます。
 
 ```rust
 db.execute("BEGIN").unwrap();
@@ -252,13 +254,15 @@ if will_rollback {
 第34章の`tests/crash_recovery.rs`シナリオ(c)は、`crate::failpoint`を使い「1つ目のloserトランザクションをUndoし終えた直後」という1つの決まった位置でRecovery自身を失敗させ、2回目の`Database::open`が最初からやり直して完走することを確認していました。
 決まった位置は1つしかないので、Redoの1件目で死んだ場合、5件目で死んだ場合、Undoの直前で死んだ場合をそれぞれ試そうとすると、シナリオを増やすたびにテストを書き足す必要があります。
 
-`tests/crash_loop.rs`は、この位置をシードから決定的に選び直す形へ一般化します。
+新規に作成する`tests/crash_loop.rs`は、この位置をシードから決定的に選び直す形へ一般化します。
 1回のイテレーションは次の手順を踏みます。
 
 1. シードから決定的な送金ワークロード(コミット済みの送金を何本かと、最後に1本だけ残す未コミットの送金)を組み立て、`flush`しないまま`Database`を`drop`してクラッシュを模す。
 2. 同じシードでもう一度同じワークロードを別のファイルへ組み立て、今度は`crate::failpoint`で`recovery_redo_step`か`recovery_undo_step`のどちらか一方に、実際に踏まれる回数の範囲内でランダムな発火位置を仕込む。
 3. 1回目の`Database::open`がその位置で失敗することを確認する。
 4. 2回目の`Database::open`(failpointは発火すると自動でdisarmされる)が完走し、コミット済みの送金だけが反映され、未コミットの送金は跡形もなくUndoされていて、口座の合計金額(送金では変わらないはずの不変条件)が保存されていることを確認する。
+
+`tests/crash_loop.rs`の該当部分は次のようになります。
 
 ```rust
 let (failpoint_name, count) = if rng.chance(1, 2) {
@@ -283,13 +287,14 @@ let db = Database::open(&armed_path).unwrap();
 ## 決定的Random Concurrency: ランダムなインターリーブでも直列化可能性は保たれるか
 
 第30〜32章の決定的インターリーブテストは、2本のトランザクションの操作順を著者が手で1通り選び、その1通りについて異常の有無を確認するものでした。
-`tests/concurrent_random.rs`はその手作業を、シードから決定的に選んだランダムな操作順へ置き換えます。
+新規に作成する`tests/concurrent_random.rs`はその手作業を、シードから決定的に選んだランダムな操作順へ置き換えます。
 狙いは異常の有無ではありません。
 Strict 2PL(第31章)が主張する性質そのもの、実際にどう入り組んで実行されても結果はどれかの直列実行と一致するという直列化可能性が、たくさんの順序を試しても崩れないことです。
 
 2本のトランザクションT1とT2が、2行(`id=1`、`id=2`)の`tag`列に自分の名前を書き込みます。
 上書きなので、最後にどちらが書いたかで結果が変わる非可換な操作です。
 書き込み先の行の順序も、どちらを先に試すかも、シードごとにランダムなスケジューラが決めます。
+`tests/concurrent_random.rs`のスケジューラは、次のように各Runnerの実行結果で分岐します。
 
 ```rust
 match db.execute_in_tx(&runner.handle, &runner.next_sql()) {
@@ -368,8 +373,8 @@ oltp_transfer accounts=100 transfers=2000 total=6.6200069s avg=3.310003ms tps=30
 ## サンプルアプリケーション: ToDoリストで一通り使う
 
 テストは実装の正しさを確認しますが、実装の使い方そのものは示しません。
-`examples/todo.rs`は、この教材が積み上げてきたEmbedded APIを、1つのToDoリストアプリケーションとして動かします。
-`cargo run --example todo`で実行できます。
+新規に作成する`examples/todo.rs`は、この教材が積み上げてきたEmbedded APIを、1つのToDoリストアプリケーションとして動かします。
+`examples/todo.rs`は`cargo run --example todo`で実行でき、次のように書き始めます。
 
 ```rust
 let shared = Arc::new(SharedDatabase::new(Database::memory()));

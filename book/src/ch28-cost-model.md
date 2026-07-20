@@ -42,6 +42,9 @@ Projection(customers.name, orders.item) rows=5000
 
 候補プランを`SeqScan`、`IndexScan`、`HashJoin`、`IndexNestedLoopJoin`という具体的な演算子の木として組み立てたあと、その木がどれだけの「仕事」をするかを、3種類の重みの合成として見積もります。
 
+このコストモデルは、新規作成する`src/cost_model.rs`に置きます。
+まず3つの重みを次のように定義します。
+
 ```rust
 /// 1ページぶんのSequential I/O(順読み)のコスト。PostgreSQLの
 /// `seq_page_cost`のデフォルト値(1.0)を採用する。他の重みはすべて
@@ -66,9 +69,15 @@ pub const RANDOM_PAGE_COST: f64 = 4.0;
 pub const CPU_TUPLE_COST: f64 = 0.01;
 ```
 
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod cost_model;
+```
+
 出典はPostgreSQLの`postgresql.conf.sample`が定めるデフォルト値です。`seq_page_cost`を1として、`random_page_cost`はその4倍、`cpu_tuple_cost`は2桁小さいという比率そのものに意味があります。ページを1枚読むだけの`SeqScan`と、`Storage::get`を1行ごとに呼ぶ`IndexScan`(第25章)とでは、同じ1行を取り出すのにまったく違う量の仕事を払うということを、この3つの定数が表現しています。
 
-これらの重みを掛け合わせた値を、この章では`Cost`という専用の型で持ち回ります。
+これらの重みを掛け合わせた値は、`src/cost_model.rs`に定義する`Cost`という専用の型で持ち回ります。
 
 ```rust
 /// 単位を持たない相対コスト。
@@ -95,7 +104,8 @@ pub struct Cost(f64);
 
 ## 演算子ごとのコスト式
 
-重みが決まれば、あとは演算子ごとに「何ページ読むか」「何行処理するか」を数え上げるだけです。`SeqScan`は素直な式から始まります。
+重みが決まれば、あとは演算子ごとに「何ページ読むか」「何行処理するか」を数え上げるだけです。
+`src/cost_model.rs`に置く`SeqScan`の式は素直な形から始まります。
 
 ```rust
 /// `SeqScan`のコスト。ページ数ぶんのSequential I/Oと、行数ぶんのCPUコスト
@@ -106,6 +116,7 @@ pub fn seq_scan_cost(pages: u64, rows: u64) -> Cost {
 ```
 
 `IndexScan`は、B+Treeの根から葉までを降りる部分と、一致した行をHeapから`fetch`する部分に分かれます(第25章の`IndexScanExec::next`)。
+同じ`src/cost_model.rs`に、続けてこのコストを定義します。
 
 ```rust
 /// `IndexScan`のコスト。Rootから葉までの`height`段はどの段も1ページの
@@ -119,7 +130,7 @@ pub fn index_scan_cost(height: u64, matched_rows: u64) -> Cost {
 }
 ```
 
-`Filter`と`Projection`は、子から受け取った行それぞれに対して式を1回評価するだけの演算子なので、同じ形の式で見積もります。
+`Filter`と`Projection`は、子から受け取った行それぞれに対して式を1回評価するだけの演算子なので、`src/cost_model.rs`では同じ形の式で見積もります。
 
 ```rust
 /// `Filter`・`Projection`のコスト。どちらも子から受け取った`input_rows`件
@@ -129,7 +140,9 @@ pub fn cpu_pass_cost(input_rows: u64) -> Cost {
 }
 ```
 
-`NestedLoopJoin`(第22章)は、`right`をコンストラクタで1回だけ`Vec<Tuple>`へ読み切ってから、`left`の行ごとに`right`の全行と組み合わせを試します。I/Oのコストは`left`と`right`それぞれの子のコストにすでに含まれているので、この演算子自身が追加で払うのは組み合わせの評価だけです。
+`NestedLoopJoin`(第22章)は、`right`をコンストラクタで1回だけ`Vec<Tuple>`へ読み切ってから、`left`の行ごとに`right`の全行と組み合わせを試します。
+I/Oのコストは`left`と`right`それぞれの子のコストにすでに含まれているので、この演算子自身が追加で払うのは組み合わせの評価だけです。
+この式も`src/cost_model.rs`に置きます。
 
 ```rust
 /// `NestedLoopJoin`のコスト。`right`は`NestedLoopJoinExec::new`(第22章)が
@@ -143,7 +156,9 @@ pub fn nested_loop_join_cost(left_rows: u64, right_rows: u64) -> Cost {
 }
 ```
 
-`HashJoin`(第22章)は、Build(`right`の全行をハッシュテーブルへ挿入する)とProbe(`left`の行ごとにハッシュテーブルを引く)という2段階を持ちます。どちらも1行あたりの処理はCPUコストだけで、I/Oはやはり子のコストに含まれています。
+`HashJoin`(第22章)は、Build(`right`の全行をハッシュテーブルへ挿入する)とProbe(`left`の行ごとにハッシュテーブルを引く)という2段階を持ちます。
+どちらも1行あたりの処理はCPUコストだけで、I/Oはやはり子のコストに含まれています。
+続けて`src/cost_model.rs`に定義します。
 
 ```rust
 /// `HashJoin`のコスト。Build(`right`の`right_rows`行をハッシュテーブルへ
@@ -158,7 +173,9 @@ pub fn hash_join_cost(left_rows: u64, right_rows: u64) -> Cost {
 }
 ```
 
-`IndexNestedLoopJoin`(第25章)は、`left`の行ごとに内側テーブルの索引を1回`lookup`します。1回の`lookup`は`index_scan_cost`とまったく同じ形("木を`height`段降りてから一致行をHeapから`fetch`する")のコストを持ちますが、一致行数は`col = 定数`のような特定の値に対するものではなく、「平均的な外側の値が何行と一致するか」という見積もりになります。
+`IndexNestedLoopJoin`(第25章)は、`left`の行ごとに内側テーブルの索引を1回`lookup`します。
+1回の`lookup`は`index_scan_cost`とまったく同じ形("木を`height`段降りてから一致行をHeapから`fetch`する")のコストを持ちますが、一致行数は`col = 定数`のような特定の値に対するものではなく、「平均的な外側の値が何行と一致するか」という見積もりになります。
+この式も`src/cost_model.rs`に置きます。
 
 ```rust
 /// `IndexNestedLoopJoin`のコスト。`left`の`left_rows`行それぞれについて、
@@ -174,7 +191,8 @@ pub fn index_nested_loop_join_cost(left_rows: u64, height: u64, avg_matches: f64
 }
 ```
 
-最後に`Sort`(第21章)です。比較回数のオーダーである`n log n`に、比較1回ぶんのCPUコストを掛けます。
+最後に`Sort`(第21章)です。
+`src/cost_model.rs`のこの式は、比較回数のオーダーである`n log n`に、比較1回ぶんのCPUコストを掛けます。
 
 ```rust
 /// `Sort`のコスト。比較回数のオーダーである`n log n`に、比較1回ぶんの
@@ -195,6 +213,9 @@ pub fn sort_cost(rows: u64) -> Cost {
 ## 候補を列挙してコスト最小を選ぶ
 
 コストの計算式が揃ったところで、`physical_plan::optimize`の中身を書き換えます。第25章までの`optimize`は`storage`と`predicate`から1つの`AccessPath`をルールで決め打っていましたが、この章はまず候補をすべて`PhysicalPlan`として組み立ててから、コストで比較します。
+
+ここからは`src/physical_plan.rs`への追記です。
+まず、複数の候補から最小コストのものを選ぶ`cheapest`を追加します。
 
 ```rust
 /// 複数の候補`PhysicalPlan`から、[`crate::cost_model::plan_cost`]が最小になる
@@ -225,7 +246,9 @@ fn choose_scan_plan(storage: &Storage, scan: logical_plan::ScanNode, predicate: 
 }
 ```
 
-Join方式の選択も同じ形です。等値結合の鍵が取り出せれば`HashJoin`は常に候補になり、内側テーブルの結合列に索引があれば`IndexNestedLoopJoin`も候補に加わります。
+Join方式の選択も同じ形です。
+等値結合の鍵が取り出せれば`HashJoin`は常に候補になり、内側テーブルの結合列に索引があれば`IndexNestedLoopJoin`も候補に加わります。
+同じ`src/physical_plan.rs`に、続けてこの選択を書きます。
 
 ```rust
 /// 等値結合の鍵`keys`が取り出せた場合の候補を組み立て、
@@ -271,7 +294,8 @@ fn choose_join_plan(
 
 `NestedLoopJoin`だけは、この章でもコストで他候補と比較しません。等値条件が1つも取り出せない結合(`ON true`のような実質的な直積や、`a.x < b.y`のような不等号条件)は、`HashJoin`と`IndexNestedLoopJoin`のどちらの実行アルゴリズムにも要求する「等値の鍵」を持たないため、比較する候補がそもそも`NestedLoopJoin`しかありません。
 
-これらを束ねる`optimize`本体は、`storage`に加えて`stats: &dyn StatsLookup`(第27章)を受け取るようになりました。行数の推定にはこの`stats`を使います。
+これらを束ねる`src/physical_plan.rs`の`optimize`本体は、`storage`に加えて`stats: &dyn StatsLookup`(第27章)を受け取るようになりました。
+行数の推定にはこの`stats`を使います。
 
 ```rust
 pub fn optimize(plan: LogicalPlan, storage: Option<&Storage>, stats: &dyn StatsLookup) -> PhysicalPlan {

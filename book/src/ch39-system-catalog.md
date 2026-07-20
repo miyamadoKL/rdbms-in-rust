@@ -55,7 +55,7 @@ psqlの`\d`はメタコマンドであり、SQLではありません。
 PostgreSQLのSystem Catalogは、テーブル定義、列定義、索引定義それぞれが、他のテーブルと何ら変わらない行として`pg_class`、`pg_attribute`、`pg_index`に格納されています。
 
 この章はその方式を採りません。
-`SHOW TABLES`、`DESCRIBE <table>`、`SHOW INDEXES`、`SHOW STATS`という4つの専用構文を追加し、それぞれの実行結果を`QueryResult`として直接組み立てます。
+`SHOW TABLES`、`DESCRIBE <table>`、`SHOW INDEXES`、`SHOW STATS`という4つの専用構文を追加し、それぞれの実行結果を`src/database.rs`で`QueryResult`として直接組み立てます。
 
 ```rust
 /// `SHOW TABLES`・`DESCRIBE`・`SHOW INDEXES`・`SHOW STATS`(第39章)が
@@ -124,7 +124,7 @@ orders_id_idx | orders | id | true | true | 0
 (2 rows)
 ```
 
-`uses`列は、`Storage`に新しく持たせた1つのカウンタが支えています。
+`uses`列は、`src/storage.rs`の`Storage`に新しく持たせた1つのカウンタが支えています。
 
 ```rust
 /// 索引名ごとの`BTree::lookup`・`BTree::range`の呼び出し回数(第39章、
@@ -133,7 +133,9 @@ index_usage: RefCell<HashMap<String, u64>>,
 ```
 
 `&mut Storage`ではなく`&Storage`のまま増やせる必要があるのは、この値を増やす場所が`IndexScanExec`、`IndexNestedLoopJoinExec`(第25章)という、`Storage`を`&'a Storage`としてしか借用していない`Executor`の内部だからです。
-`RefCell`による内部可変性を使い、`BTree::lookup`、`BTree::range`を呼ぶ直前にそれぞれ1箇所ずつ数えるだけに絞ります。
+`RefCell`による内部可変性を使い、`src/physical_plan.rs`の2つの`Executor`で記録します。
+`IndexScanExec`ではPointまたはRangeの実行を開始する時に1回、`IndexNestedLoopJoinExec`では外側の行ごとに内側の`lookup`を呼ぶ直前に記録します。
+`IndexScanExec`側では、次のように呼びます。
 
 ```rust
 storage.record_index_use(index_name);
@@ -160,7 +162,7 @@ amount | 0 | 3 | 300 | 900 | 0 | 3
 これまで統計情報は`EXPLAIN`の`rows=`という1個の数字を通してしか観測できませんでした。
 `mcv_count`、`histogram_buckets`という列は、`ColumnStats`の`mcv`、`histogram`(第27章)の**長さ**をそのまま表示しています。
 `customer_id`の`mcv_count`が`1`なのは、`100`が2回、`200`が1回という分布で、`100`のほうが平均バケツ行数を上回りMCVへ移った結果です(`extract_mcv`の固定点抽出、第27章)。
-`ANALYZE`を1度も実行していないテーブルを指定すると、空の結果を黙って返す代わりにエラーにします。
+`ANALYZE`を1度も実行していないテーブルを指定すると、空の結果を黙って返す代わりに`src/database.rs`でエラーにします。
 
 ```rust
 let stats = self.table_stats(info.id).ok_or_else(|| DbError::TableNotAnalyzed(table_name.to_string()))?;
@@ -172,7 +174,7 @@ let stats = self.table_stats(info.id).ok_or_else(|| DbError::TableNotAnalyzed(ta
 
 `VACUUM [テーブル名]`は、この章がここまで温存してきたLazy Deleteの後始末を1つの文にまとめます。
 テーブル名を省略すると、カタログに登録されている全テーブルが対象になります。
-`Storage::vacuum_table`が、対象テーブル1つぶんの回収を担います。
+`src/storage.rs`の`Storage::vacuum_table`が、対象テーブル1つぶんの回収を担います。
 
 ```rust
 pub fn vacuum_table(&mut self, table_id: TableId) -> DbResult<VacuumReport> {
@@ -218,7 +220,7 @@ pub fn vacuum_table(&mut self, table_id: TableId) -> DbResult<VacuumReport> {
 
 ### 空ページの判定には新しいメソッドが1つだけ要る
 
-1段階目と2段階目の境目にあるのが、`SlottedPage::is_empty`という新しいメソッドです。
+1段階目と2段階目の境目にあるのが、`src/slotted_page.rs`に加える`SlottedPage::is_empty`という新しいメソッドです。
 
 ```rust
 /// Occupiedなスロットが1つも無いかどうか(第39章、`VACUUM`)。
@@ -247,7 +249,7 @@ Redistribution、Mergeを実装する道も検討しましたが、隣接ペー�
 ### VACUUMの排他
 
 `VACUUM`が物理的にページを動かしている間、他のトランザクションが同じテーブルの行を書き換えていたらどうなるでしょうか。
-この章は、`SELECT`、`UPDATE`、`DELETE`(第31章)がすでに使っているLock Managerへ、そのまま相乗りします。
+この章は、`SELECT`、`UPDATE`、`DELETE`(第31章)がすでに使っているLock Managerへ、`src/database.rs`からそのまま相乗りします。
 
 ```rust
 for &table_id in &targets {
@@ -338,7 +340,7 @@ index_uses:orders_id_idx | 0
 `metric`、`value`という2列の形式を選んだのは、Buffer Poolのヒット率、索引ごとの利用回数、Query Timingという性質の異なる指標を、テーブルの列数を増やさずに同じ結果へ積み増せるからです。
 索引が1本増えても`SHOW STATS`の列構成を変える必要はなく、`index_uses:<索引名>`という行が1つ増えるだけです。
 
-Buffer Poolのヒット率は、第14章から存在していた`BufferPool::stats`をそのまま公開しただけです。
+Buffer Poolのヒット率は、第14章から存在していた`BufferPool::stats`を`src/storage.rs`でそのまま公開しただけです。
 
 ```rust
 pub fn buffer_pool_stats(&self) -> BufferPoolStats {
@@ -346,7 +348,7 @@ pub fn buffer_pool_stats(&self) -> BufferPoolStats {
 }
 ```
 
-Query Timingは、この章で新しく足した唯一のカウンタです。
+Query Timingは、`src/database.rs`にこの章で新しく足す唯一のカウンタです。
 
 ```rust
 struct QueryTimingStats {
@@ -356,6 +358,7 @@ struct QueryTimingStats {
 ```
 
 `Database::run_bound_statement`(束縛済みの文を実際に実行する共通の本体、第31章から`lock_owner`とともにこの形です)が、文を1本実行するたびに`Instant::now()`から`elapsed()`までを足し込みます。
+`src/database.rs`のこのメソッドに、次のように書き加えます。
 
 ```rust
 fn run_bound_statement(&mut self, bound: BoundStatement, ctx: &ExecutionContext) -> DbResult<QueryResult> {
@@ -380,6 +383,7 @@ fn run_bound_statement(&mut self, bound: BoundStatement, ctx: &ExecutionContext)
 
 Query Timingが累積の平均を返すのに対し、Slow Query Logは個々の遅い文を名指しします。
 サーバー起動時に`--slow-query-threshold-ms`を指定すると、その閾値を超えた文をSQL文、実行時間、行数つきでstderrへ記録します。
+この章はこの仕組みのために`src/slow_query_log.rs`を新規に作成します。
 
 サーバー側の端末です。
 
@@ -407,6 +411,7 @@ INSERT 1
 呼び出し箇所は2つあります。
 `Database::execute_bound_statement`(REPL、埋め込み用途、大半のテストが使う低レベルAPI)と、`Session::execute`(第37章、Server、REPLが実際に使う経路)です。
 この2つは同じSQL文字列に対して同時に呼ばれることのない、独立した実行経路です(`Session`は`Database::execute_bound_statement`を経由しません)。
+どちらの経路も最終的に呼ぶ`src/slow_query_log.rs`の`log_to`は、次のとおりです。
 
 ```rust
 fn log_to(out: &mut impl Write, threshold: Option<Duration>, sql: &str, elapsed: Duration, result: &DbResult<QueryResult>) {
@@ -418,6 +423,12 @@ fn log_to(out: &mut impl Write, threshold: Option<Duration>, sql: &str, elapsed:
     let outcome = if result.is_ok() { "ok" } else { "error" };
     let _ = writeln!(out, "[slow query] {:.3}ms rows={rows} outcome={outcome} sql={}", elapsed.as_secs_f64() * 1000.0, sql.trim());
 }
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod slow_query_log;
 ```
 
 書き込み先を`impl Write`として受け取れるようにしてあるのは、実プロセスのstderrを奪い合わずにテストが出力内容を確認できるようにするためです。
