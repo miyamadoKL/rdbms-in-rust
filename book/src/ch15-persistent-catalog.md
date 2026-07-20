@@ -63,7 +63,7 @@ const CATALOG_PAGE_ID: PageId = PageId(1);
 pub mod storage;
 ```
 
-Catalogページは、第11章の`PageType`に新しく加えた種類のページとして扱います。
+Catalogページは、第11章の`PageType`に新しく加える種類のページとして扱います。
 この列挙型は`src/page.rs`にあり、そこへ`Catalog`を1つ加えます。
 
 ```rust

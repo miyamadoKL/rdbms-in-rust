@@ -348,7 +348,7 @@ pub fn buffer_pool_stats(&self) -> BufferPoolStats {
 }
 ```
 
-Query Timingは、`src/database.rs`にこの章で新しく足した唯一のカウンタです。
+Query Timingは、`src/database.rs`にこの章で新しく足す唯一のカウンタです。
 
 ```rust
 struct QueryTimingStats {

@@ -392,7 +392,7 @@ pub(crate) fn apply_wal_undo_disk(storage: &mut Storage, last_lsn: Option<Lsn>) 
 ### `UndoRecord`はMemoryバックエンド専用になった
 
 Diskバックエンドが`apply_wal_undo_disk`へ切り替わったことで、第30章の`apply_undo_disk`はもう誰からも呼ばれません。
-`UndoRecord`という型自体は、`src/transaction.rs`に、`Vec<Tuple>`の並びでしかなくディスクに何も書かないMemoryバックエンド向けの実装として残しました。
+`UndoRecord`という型自体は、`src/transaction.rs`に、`Vec<Tuple>`の並びでしかなくディスクに何も書かないMemoryバックエンド向けの実装として残します。
 
 ```rust
 #[derive(Debug, Clone)]

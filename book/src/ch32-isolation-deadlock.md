@@ -630,7 +630,7 @@ fn abort_transaction(&mut self, victim: TransactionId) -> DbResult<()> {
 Victimが手放したロックの待ち行列は`promote_waiters`によって即座に再評価され、循環の中で次に並んでいた要求(あるいは循環とは無関係にたまたま同じロックを待っていた要求)がそのまま昇格することもあります。
 
 `TransactionContext`自体は、`self.tx`や`harness_contexts`のスロットからは取り除きません。
-`state`を`Aborted`に、新しく追加した`victim_of_deadlock`を`true`にするだけです。
+`state`を`Aborted`に、新しく追加する`victim_of_deadlock`を`true`にするだけです。
 `src/transaction.rs`に定義された`TransactionContext`へ、この`victim_of_deadlock`フィールドを追加します。
 
 ```rust

@@ -368,7 +368,7 @@ pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
 `Binder`がすでに名前、型を確定させているため、`BoundStatement`から`LogicalPlan`への変換は形を組み替えるだけで、新たに検出すべき誤りが無いからです。
 `CREATE TABLE`、`DROP TABLE`は`LogicalPlan`を経由せず、これまでどおりテーブル定義を直接登録または削除します。
 
-`src/database.rs`の`execute_select`は、`eval_query_plan`という1つの再帰関数へ木を渡すだけになりました。
+`src/database.rs`の`execute_select`は、`eval_query_plan`という1つの再帰関数へ木を渡すだけになります。
 
 ```rust
 fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {

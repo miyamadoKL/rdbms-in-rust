@@ -283,7 +283,7 @@ pub fn decode(bytes: &[u8]) -> DbResult<Self> {
 `page_id`や`page_type`もchecksumの計算対象に含めているのは、`payload`だけでなくヘッダー部分の破損も同じ仕組みで検出するためです。
 
 一致しなければ`DbError::CorruptPage`を返します。
-この章で`DbError`に追加した唯一の新しいバリアントで、Magic Number不一致、Format Version不一致、checksum不一致、バイト数不一致、未知のPage Typeという、この章で起こりうる全ての壊れ方をまとめて表します。
+この章で`DbError`に追加する唯一の新しいバリアントで、Magic Number不一致、Format Version不一致、checksum不一致、バイト数不一致、未知のPage Typeという、この章で起こりうる全ての壊れ方をまとめて表します。
 
 `src/error.rs`の`DbError`に、次のバリアントを追加します。
 

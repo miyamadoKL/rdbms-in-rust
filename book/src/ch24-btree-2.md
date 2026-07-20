@@ -492,7 +492,7 @@ fn bind_create_index(&self, create: CreateIndexStatement) -> DbResult<BoundState
 }
 ```
 
-`index_exists`は、`src/binder.rs`の`CatalogLookup`(第17章)に加えた新しいメソッドで、既定の実装は常に`false`を返します。
+`index_exists`は、`src/binder.rs`の`CatalogLookup`(第17章)に加える新しいメソッドで、既定の実装は常に`false`を返します。
 
 ```rust
 pub trait CatalogLookup {
@@ -583,7 +583,7 @@ for info in decoded.indexes {
 `Storage::flush`と`Storage::sync`は、テーブル本体の`BufferPool`だけを対象にしていました(第15章)。
 索引はそれぞれ独自の`BufferPool`を持つ別ファイルなので、本体だけをflushしても索引側のキャッシュはディスクへ渡らず、プロセスを再起動すると`CREATE INDEX`や後述のIndex Maintenanceで加えた変更が消えてしまいます。
 実際、この章のために書いた「索引付きテーブルの再起動テスト」は、この見落としのせいで最初は失敗しました。
-`src/storage.rs`の`Storage::flush`と`sync`を、保持している索引の数だけ`BTree::flush`と`sync`も呼ぶよう直してから、テストは通るようになりました。
+`src/storage.rs`の`Storage::flush`と`sync`を、保持している索引の数だけ`BTree::flush`と`sync`も呼ぶよう直すと、テストは通るようになります。
 
 ```rust
 pub fn flush(&self) -> DbResult<()> {

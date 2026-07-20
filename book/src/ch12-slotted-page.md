@@ -574,7 +574,7 @@ pub fn decode_tuple(schema: &Schema, bytes: &[u8]) -> DbResult<Tuple> {
 `Tuple::new`自身が`Schema`との適合を検査する第4章の関数なので、`decode_tuple`が組み立てた値の並びが本当に`schema`へ適合しているかどうかは、ここでもう一度確認されます。
 
 `bytes`が短すぎる場合や、`TEXT`の長さプレフィックスが実際の残りバイト数を超えている場合、`decode_tuple`は`DbError::CorruptTuple`を返します。
-`bytes.get(range)`のように範囲外アクセスを`Option`として受け取る形で境界チェックを行っているため、不正な`bytes`を渡してもパニックせず、この章で追加したエラーとして呼び出し側に伝わります。
+`bytes.get(range)`のように範囲外アクセスを`Option`として受け取る形で境界チェックを行っているため、不正な`bytes`を渡してもパニックせず、この章で追加するエラーとして呼び出し側に伝わります。
 
 この`CorruptTuple`は、既存の`src/error.rs`の`DbError`に追記します。
 

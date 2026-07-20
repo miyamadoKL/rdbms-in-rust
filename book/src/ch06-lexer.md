@@ -546,7 +546,7 @@ minidb> SELECT 1abc;
 
 ### DbError::Lex
 
-字句解析のエラーは、`DbError`に新しく追加した`Lex`バリアントで表します。
+字句解析のエラーは、`DbError`に新しく追加する`Lex`バリアントで表します。
 `src/error.rs`の`DbError`に、次のバリアントを追加します。
 
 ```rust

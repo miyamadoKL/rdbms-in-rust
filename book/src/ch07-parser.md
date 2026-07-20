@@ -439,7 +439,7 @@ TokenKind::Ident(name) => {
 ## 位置情報付き構文エラー
 
 構文解析が失敗したときのエラーは、前章の`DbError::Lex`と表示形式を揃えます。
-これまでの`DbError::Parse`はメッセージだけを持つ`String`1個のバリアントでしたが、この章で`Lex`と同じ形の構造体バリアントに変えました。
+これまでの`DbError::Parse`はメッセージだけを持つ`String`1個のバリアントでしたが、この章で`Lex`と同じ形の構造体バリアントに変えます。
 `src/error.rs`の`DbError::Parse`を、次の形に書き換えます。
 
 ```rust
@@ -490,7 +490,7 @@ minidb> SELECT 1 +
 
 ## Database::executeをParserへ置き換える
 
-`Database::execute`は、これまで`toy_sql::parse_select`を呼んでいた箇所を`parser::parse_statement`に置き換え、`toy_sql`モジュール自体を削除しました。
+`Database::execute`は、これまで`toy_sql::parse_select`を呼んでいた箇所を`parser::parse_statement`に置き換え、`toy_sql`モジュール自体を削除します。
 戻り値が`Statement`という3種類のバリアントを持つ列挙型になったので、`execute`はまず文の種類で分岐します。
 `src/database.rs`の`execute`を、次のように書き換えます。
 

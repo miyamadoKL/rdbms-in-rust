@@ -320,8 +320,8 @@ Expr::IsNull { expr, negated, .. } => {
 
 ## CAST：明示的な型変換だけを許す
 
-`CAST(expr AS type)`は、この章で新しくASTに追加した構文です。
-第7章時点の`Expr`にはこの構文が無かったので、`src/ast.rs`の`Expr`に`Cast`バリアントを足しました。
+`CAST(expr AS type)`は、この章で新しくASTに追加する構文です。
+第7章時点の`Expr`にはこの構文が無かったので、`src/ast.rs`の`Expr`に`Cast`バリアントを足します。
 
 ```rust
 Cast {

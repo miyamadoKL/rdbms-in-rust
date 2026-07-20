@@ -111,7 +111,7 @@ let scanned = match &self.backend {
 ```
 
 `executor::seq_scan(table: &MemTable) -> Vec<Tuple>`は`MemTable`が持つ`Tuple`をそのまま複製するだけでした。
-新しく加えた`executor::storage_seq_scan`は、`Storage::scan`(第15章)が返す`(RecordId, バイト列)`から`RecordId`を捨て、バイト列だけを`decode_tuple`(第12章)で`Tuple`へ復元します。
+新しく加える`executor::storage_seq_scan`は、`Storage::scan`(第15章)が返す`(RecordId, バイト列)`から`RecordId`を捨て、バイト列だけを`decode_tuple`(第12章)で`Tuple`へ復元します。
 `seq_scan`と同じ`src/executor.rs`に、次の関数を追記します。
 
 ```rust

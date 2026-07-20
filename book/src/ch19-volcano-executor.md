@@ -438,7 +438,7 @@ fn build_query_executor<'a>(&'a self, plan: &'a PhysicalPlan) -> DbResult<Box<dy
 
 `SeqScan`だけが`&self.backend`を見ます。
 `Filter`、`Projection`は供給源を意識せず、`Box<dyn Executor>`という共通のインターフェースだけを相手にします。
-`src/database.rs`の`execute_select`は、この関数が組み立てた木の根に対して`next()`を呼び続けるだけになりました。
+`src/database.rs`の`execute_select`は、この関数が組み立てた木の根に対して`next()`を呼び続けるだけになります。
 
 ```rust
 fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {

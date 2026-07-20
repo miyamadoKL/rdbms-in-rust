@@ -321,7 +321,7 @@ SelectItem::Wildcard { span } => {
 展開の順序は「テーブルの登場順、各テーブル内は列の宣言順」と決めてあります。
 この章では`tables`が高々1個なので実質的には「列の宣言順」と同じ結果にしかなりませんが、この順序規則自体は複数テーブルを前提にして書いてあるので、第22章で`JOIN`が入っても書き直しは要りません。
 
-式の型検査は、`bind_expr`という1つの再帰関数に集約しました。
+式の型検査は、`bind_expr`という1つの再帰関数に集約します。
 規則そのものは第10章の`executor::infer_type`と同一で、算術演算は両辺が`BIGINT`か型未定の`NULL`であること、比較演算は両辺が同じ型であること、論理演算は両辺が`BOOLEAN`か`NULL`であること、関数呼び出しは`FunctionRegistry`に登録された引数の型と一致することを、式木全体にわたって再帰的に検査します。
 `WHERE`句には、この検査に加えて「最終的な型が`BOOLEAN`または型未定の`NULL`であること」をもう1段検査する、`src/binder.rs`の`bind_predicate`を通します。
 
@@ -352,18 +352,18 @@ minidb> SELECT id FROM users WHERE 1;
 このエラーは、`users`が空でも、行を何件持っていても同じ文言、同じ位置で返ります。
 第10章の`check_predicate_type`が持っていた「行の有無に関わらず同じ検査結果になる」という不変条件は、検査の場所を`Binder`に変えても、束縛が実行より必ず先に走るという順序によってそのまま保たれています。
 
-`executor::predicate_matches`(`WHERE`の評価結果を`bool`へ変換する関数)だけは、`BOOLEAN`でも`NULL`でもない値に出会った場合の分岐を消さずに残しました。
+`executor::predicate_matches`(`WHERE`の評価結果を`bool`へ変換する関数)だけは、`BOOLEAN`でも`NULL`でもない値に出会った場合の分岐を消さずに残します。
 `Binder`を経由しない呼び出し経路を想定した保険ではありません。
 `Database::execute`は必ず`Binder`を経由するため、そのような経路はこの章にはありません。
 残しているのは、「`BoundExpr::data_type()`が`Some(Boolean)`または`None`である」という事実を、Rustの型システムがコンパイル時に保証してはくれないからです。
-仮に`Binder`側にバグがあって型検査をすり抜けたとしても、`executor`が`BOOLEAN`でない値を暗黙に「マッチしない」側へ丸めてしまう(誤りを隠してしまう)ことだけは避けたい、という最終防衛線としてこの分岐を残しました。
+仮に`Binder`側にバグがあって型検査をすり抜けたとしても、`executor`が`BOOLEAN`でない値を暗黙に「マッチしない」側へ丸めてしまう(誤りを隠してしまう)ことだけは避けたい、という最終防衛線としてこの分岐を残します。
 
 `Aggregate`(`COUNT`、`SUM`等)の使用位置の検査は、この章では行いません。
 `SELECT`の対象式にだけ許し、`GROUP BY`の無い列との共存を禁じるといった規則は、`Aggregate`という式の種類自体が第21章まで実装されないため、検査する対象がまだ存在しません。
 
 ## Database::executeをparse→bind→executeへ再編する
 
-`src/database.rs`の`Database::execute`は、構文解析の直後に束縛を挟む1行が増えました。
+`src/database.rs`の`Database::execute`には、構文解析の直後に束縛を挟む1行を加えます。
 
 ```rust
 pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
@@ -396,7 +396,7 @@ fn bind(&self, statement: Statement, sql: &str) -> DbResult<BoundStatement> {
 `CREATE TABLE`だけは`Binder`を素通りします。
 `BoundStatement::CreateTable`はASTの`CreateTableStatement`をそのまま持ち回るバリアントで、`Binder`が行う名前解決とは性質が違う仕事をする文だからです。
 `Binder`が解決するのは、すでにカタログにある名前を指す参照(`SELECT`の列、`INSERT`の行き先、`WHERE`の述語)ですが、`CREATE TABLE`が持つ名前(テーブル名、列名)はこれから新しく作る名前であり、突き合わせるべき既存のエントリがありません。
-列の型名(`BIGINT`等)をテキストから`DataType`へ解決する処理も、`Database::execute_create_table`にそのまま残しました。
+列の型名(`BIGINT`等)をテキストから`DataType`へ解決する処理も、`Database::execute_create_table`にそのまま残します。
 これは既存の列への参照ではなく、新しい`Schema`を組み立てる作業の一部であり、`Binder`の名前解決とは扱う対象が異なります。
 `DROP TABLE`は、テーブルが存在することだけを`Binder`(`bind_drop_table`)が事前に検査し、位置情報付きの`DbError::Bind`にします。
 実行(`Catalog::drop_table`、`Storage::drop_table`)は引き続き名前で削除するので、`BoundStatement::DropTable`もASTのバリアントをそのまま返します。
@@ -450,7 +450,7 @@ fn bind_assignment(&self, assignment: &Assignment, tables: &[BoundTableRef]) -> 
 `Database::execute_insert`が受け取る`BoundInsert`はすでに独立した値なので、`&mut self.backend`をいつ借りても構いません。
 借用の都合に合わせて複製のタイミングを呼び出し側ごとに調整する、という同じ形のコードが3箇所に散らばっていた状態が、この章で1箇所に集まりました。
 
-`src/executor.rs`側の関数は、生の`Expr`ではなく`BoundExpr`、`BoundSelectItem`、`BoundAssignment`を受け取るようになりました。
+`src/executor.rs`側の関数も、生の`Expr`ではなく`BoundExpr`、`BoundSelectItem`、`BoundAssignment`を受け取る形に変えます。
 
 ```rust
 pub fn filter(
@@ -506,7 +506,7 @@ fn unknown_column_is_rejected_with_position() {
 ```
 
 未知のテーブル、未知の列、`WHERE`句の型不一致は、いずれも発生位置の行、列を固定するテストにしてあります。
-曖昧な列参照は、`src/binder.rs`のテストモジュールで`resolve_column`を`Binder`の外から直接呼び、2つのテーブルが同じ列名を持つ状況を人工的に作って検証しました(この章の`Parser`では`FROM`に複数テーブルを書けないため、SQL文からこの分岐を踏むことはまだできません)。
+曖昧な列参照は、`src/binder.rs`のテストモジュールで`resolve_column`を`Binder`の外から直接呼び、2つのテーブルが同じ列名を持つ状況を人工的に作って検証します(この章の`Parser`では`FROM`に複数テーブルを書けないため、SQL文からこの分岐を踏むことはまだできません)。
 
 ```rust
 #[test]

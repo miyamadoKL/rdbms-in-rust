@@ -464,7 +464,7 @@ fn encode_value(value: &Value, out: &mut Vec<u8>) {
 `min`と`max`は`Option<Value>`ですが、`StatsCollector`はそもそも`NULL`値を`min`/`max`の対象に含めないため、「値が1件も無い」(`None`)と`Value::Null`が同時に起こることはありません。
 この不変条件を使い、`None`を`Value::Null`と同じタグ(`0`)で表すことで、存在を示す専用のフラグバイトを別に持たずに済ませています。
 
-このセクションを追加したことに伴い、`CATALOG_LAYOUT_VERSION`を`1`から`2`へ上げました。
+このセクションを追加することに伴い、`CATALOG_LAYOUT_VERSION`を`1`から`2`へ上げます。
 モジュール冒頭のドキュメントコメント(第24章までの節と同じ形式)にも、この変更を書き残してあります。
 章をまたいだファイル互換性を約束しない方針(第15章から一貫)はそのままで、`CATALOG_MAGIC`と`CATALOG_LAYOUT_VERSION`による判定が、レイアウトの変わった古いカタログを確実に拒否します(`mcv`セクションを列の途中へ挿入した第4部レビュー対応で、`CATALOG_LAYOUT_VERSION`はさらに`2`から`3`へ上がっています)。
 
