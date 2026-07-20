@@ -419,8 +419,8 @@ pub fn execute_sql(sql: &str) -> DbResult<QueryResult> {
 
 ### 単体テスト
 
-`src/toy_sql.rs`と`src/database.rs`のそれぞれに、単体テストを追加しました。
-構文解析が受理すべき入力と拒否すべき入力の両方(`src/toy_sql.rs`)、そして`Database::execute`が返す`Tuple`の値と列名(`src/database.rs`)を確認します。
+`src/toy_sql.rs`の`#[cfg(test)] mod tests`には、構文解析が受理すべき入力と拒否すべき入力を確認するテストを追加しました。
+加算の右辺に整数以外を置いた式が`DbError::Parse`として拒否されることを、次のように確認します。
 
 ```rust
     #[test]
@@ -428,7 +428,12 @@ pub fn execute_sql(sql: &str) -> DbResult<QueryResult> {
         let result = parse_select("SELECT true + 1;");
         assert!(matches!(result, Err(DbError::Parse(_))));
     }
+```
 
+`src/database.rs`の`#[cfg(test)] mod tests`には、`Database::execute`が返す`Tuple`の値と列名を確認するテストを追加しました。
+`SELECT 1;`の結果が`Value::BigInt(1)`を1件返し、列名が`1`になることを、次のように確認します。
+
+```rust
     #[test]
     fn executes_integer_literal() {
         let mut db = Database::memory();
