@@ -537,9 +537,8 @@ PostgreSQLはこの状況に`unknown`という専用の型を割り当てます�
 
 ## テストで確認する
 
-`eval`モジュールには、三値論理の真理値表を網羅するテスト、ゼロ除算とオーバーフローのテスト、`CAST`の対応表を1行ずつ確認するテスト、Scalar Functionの呼び出しと引数検査のテストを追加します。
+`src/eval.rs`の`mod tests`には、三値論理の真理値表を網羅するテスト、ゼロ除算とオーバーフローのテスト、`CAST`の対応表を1行ずつ確認するテスト、Scalar Functionの呼び出しと引数検査のテストを追加します。
 真理値表のテストは、9通りの組み合わせをすべて1つの関数にまとめて書いています。
-`src/eval.rs`の`mod tests`に追加します。
 
 ```rust
 #[test]
@@ -557,8 +556,7 @@ fn and_truth_table() {
 ```
 
 `false AND NULL`と`NULL AND false`の両方を書いているのは、`FALSE`がどちらの位置にあっても結果を決定づけるという規則が、実装の対称性だけでなくテストの対称性としても保たれているかを確かめるためです。
-`database`側には、`SELECT 1 = 1;`、`SELECT NULL AND FALSE;`、`SELECT CAST(42 AS TEXT);`のように、`Database::execute`が最後まで実行できることを確認するテストを加えています。
-`src/database.rs`の`mod tests`に追加します。
+`database`側には、`SELECT 1 = 1;`、`SELECT NULL AND FALSE;`、`SELECT CAST(42 AS TEXT);`のように、`Database::execute`が最後まで実行できることを確認するテストを、`src/database.rs`の`mod tests`に加えています。
 
 ```rust
 #[test]

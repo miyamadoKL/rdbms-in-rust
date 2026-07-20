@@ -121,7 +121,7 @@ fn parse_column_def(&mut self) -> DbResult<ColumnDef> {
 どちらの順序で書くかは利用者の好みの問題であり、構文としてどちらか一方に決め打つ理由がありません。
 
 `src/types.rs`の`Column`(第4章)にも同じ2つのフラグを追加します。
-既存の呼び出し箇所(`Column::new(name, data_type, nullable)`という3引数の呼び出しが、このクレートだけで30箇所以上あります)を1つも壊さないよう、`new`のシグネチャ自体は変えず、追加のフラグはビルダーメソッドで立てる形にします。
+既存の呼び出し箇所(`Column::new(name, data_type, nullable)`という3引数の呼び出しが、このクレートだけで30箇所以上あります)を1つも壊さないよう、`new`のシグネチャ自体は変えず、これらのフラグはビルダーメソッドで立てる形にします。
 
 ```rust
 pub struct Column {

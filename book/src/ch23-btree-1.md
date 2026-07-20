@@ -182,8 +182,7 @@ offset 0        2                10                   10+4n
 | Directory | `4 * n` | `n`個の`(key_offset: u16, key_len: u16)`の並び(LE) |
 
 Directoryの`i`番目のエントリが指す位置には、キーに続けて`(i + 1)`番目の子を指す`child_page_id: u64`(8バイト)が置かれます。
-この章では新しい`PageType`を2つ追加し、ページの外枠(第11章)だけからLeafとInternalを区別できるようにします。
-`src/page.rs`の`PageType`に、次の2つのバリアントを追加します。
+この章では、`src/page.rs`の`PageType`に次の2つのバリアントを追加し、ページの外枠(第11章)だけからLeafとInternalを区別できるようにします。
 
 ```rust
 pub enum PageType {

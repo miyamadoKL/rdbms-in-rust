@@ -189,8 +189,7 @@ pub struct FromClause {
 `AS`というキーワードは第8章の`CAST(expr AS type)`ですでにLexerが認識しているので、`FROM`の直後に`AS`が続けば`Alias`を読む、という分岐を1つ足すだけで済みます。
 `u.id`のような修飾列参照には、もう1つ構文上の穴がありました。
 第7章の`Lexer`は`.`をどのTokenにも対応させておらず、`ast.rs`のコメントにも「`users.id`のような修飾名は、Lexerが`.`を扱わないため対象外」と明記されていました。
-この章で`TokenKind::Dot`を追加し、識別子の直後に`.`が続けば、もう1つ識別子を読んで`Expr::ColumnRef`の`qualifier`に詰めます。
-この分岐は`src/parser.rs`に追加します。
+この章で`TokenKind::Dot`を追加し、識別子の直後に`.`が続けば、もう1つ識別子を読んで`Expr::ColumnRef`の`qualifier`に詰める分岐を、`src/parser.rs`に加えます。
 
 ```rust
 if *self.peek_kind() == TokenKind::Dot {
@@ -205,8 +204,7 @@ if *self.peek_kind() == TokenKind::Dot {
 }
 ```
 
-`resolve_table`が返す`BoundTableRef`は、`qualifier()`という補助メソッドを持ちます。
-`src/binder.rs`の`BoundTableRef`に、次のメソッドを定義します。
+`resolve_table`が返す`BoundTableRef`の`qualifier()`という補助メソッドを、`src/binder.rs`に次のように定義します。
 
 ```rust
 pub fn qualifier(&self) -> &str {

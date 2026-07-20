@@ -38,7 +38,7 @@ minidb> SELECT customers.name, orders.item FROM customers JOIN orders ON custome
 
 `INNER JOIN`と`JOIN`単独はどちらも同じ意味です。
 標準SQLも`JOIN`だけを書いた場合は`INNER JOIN`とみなす規則を定めており、Lexerに`Inner`、`Join`、`On`という3つの予約語を追加したうえで、この2つの書き方を`Parser`の時点で1つの`JoinKind::Inner`へ統一してしまいます。
-この列挙は`src/ast.rs`に追加します。
+この列挙は`src/ast.rs`に定義します。
 
 ```rust
 pub enum JoinKind {

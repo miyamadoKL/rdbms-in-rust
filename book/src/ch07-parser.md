@@ -439,8 +439,7 @@ TokenKind::Ident(name) => {
 ## 位置情報付き構文エラー
 
 構文解析が失敗したときのエラーは、前章の`DbError::Lex`と表示形式を揃えます。
-これまでの`DbError::Parse`はメッセージだけを持つ`String`1個のバリアントでしたが、この章で`Lex`と同じ形の構造体バリアントに変えます。
-`src/error.rs`の`DbError::Parse`を、次の形に書き換えます。
+これまでの`DbError::Parse`はメッセージだけを持つ`String`1個のバリアントでしたが、この章で`src/error.rs`の`DbError::Parse`を`Lex`と同じ形の構造体バリアントに書き換えます。
 
 ```rust
 #[error("行{line}列{column}: 構文エラー: {message}")]
@@ -567,9 +566,8 @@ fn eval_expr(expr: &Expr) -> DbResult<Value> {
 
 ## テストで確認する
 
-`parser`モジュールには、優先順位、結合性、括弧、`NOT`と`IS NULL`、各文、構文エラーの位置を確認する単体テストを追加します。
+`src/parser.rs`の`mod tests`には、優先順位、結合性、括弧、`NOT`と`IS NULL`、各文、構文エラーの位置を確認する単体テストを追加します。
 優先順位は、`Span`を比較対象から外した`Expr`どうしの構造比較で検証します。
-`src/parser.rs`の`mod tests`に追加します。
 
 ```rust
 #[test]

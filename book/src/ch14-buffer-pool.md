@@ -386,7 +386,7 @@ pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
 `HeapFile`の内部専用だからと言って、crateの外から見えないだけでこの抜け道を空けてよい理由にはなりません。
 crateの中には`get`、`scan`だけでなく、将来のB+Treeの検索のような、同じく読み取り専用のまま`SlottedPage`相当の構造を読みたいコードが他にも増えていくからです。
 
-この壁を壊す方法は、`PageReadGuard`側に抜け道を空けることではなく、`SlottedPage`(第12章)の側に読み取り専用の入口を追加することでした。
+この壁を壊す方法は、`PageReadGuard`側に抜け道を空けることではなく、`SlottedPage`(第12章)の側に読み取り専用の入口を設けることです。
 `src/slotted_page.rs`に、次の`SlottedPageRef`を追加します。
 
 ```rust

@@ -475,8 +475,7 @@ fn encode_value(value: &Value, out: &mut Vec<u8>) {
 検査項目(列数と型の一致、`null_count <= row_count`、`distinct_count <= 非NULL行数`、MCVとバケツそれぞれの上限件数、バケツの境界順序、MCVの値やバケツ境界がMin/Maxの範囲や型に収まること、MCVとバケツの行数合計が非NULL行数に一致すること)の詳細は`src/storage.rs`の`validate_stats_metadata`のドキュメントコメントを参照してください。
 
 `ANALYZE`を一度も実行していないテーブルは、統計を持ちません。
-この場合の推定は、選択率の慣用定数にフォールバックします。
-この定数は、新規作成する`src/estimator.rs`に置きます。
+この場合の推定は、新規作成する`src/estimator.rs`に置く選択率の慣用定数にフォールバックします。
 
 ```rust
 /// 等値述語のデフォルト選択率(統計が無い場合)。出典は本文を参照。

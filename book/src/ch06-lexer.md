@@ -546,8 +546,7 @@ minidb> SELECT 1abc;
 
 ### DbError::Lex
 
-字句解析のエラーは、`DbError`に新しく追加する`Lex`バリアントで表します。
-`src/error.rs`の`DbError`に、次のバリアントを追加します。
+字句解析のエラーは、`src/error.rs`の`DbError`に新しく追加する`Lex`バリアントで表します。
 
 ```rust
     /// SQL文字列をToken列へ変換できなかったエラー。発生位置の行・列を持つ。
@@ -667,7 +666,7 @@ fn parse_expr(tokens: &[&Token]) -> DbResult<ToyExpr> {
 
 `Lexer`と`toy_sql`のそれぞれに単体テストを追加します。
 キーワード、識別子、リテラル、演算子、コメント、そして位置情報付きのエラーを確認します。
-`src/lexer.rs`の末尾の`mod tests`に、次のテストを追加します。
+`Lexer`のテストは、`src/lexer.rs`の末尾の`mod tests`に置きます。
 
 ```rust
     #[test]
@@ -717,8 +716,7 @@ fn parse_expr(tokens: &[&Token]) -> DbResult<ToyExpr> {
     }
 ```
 
-`database`側にも、`Database::execute`まで通した結合的なテストを1件追加しています。
-`src/database.rs`の`mod tests`に追加します。
+`database`側にも、`Database::execute`まで通した結合的なテストを1件、`src/database.rs`の`mod tests`に追加します。
 
 ```rust
     #[test]

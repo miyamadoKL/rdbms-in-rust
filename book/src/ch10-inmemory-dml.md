@@ -895,8 +895,7 @@ pub fn delete(
 
 第9章の`QueryResult`は、DDL文の完了を`command_tag: Option<&'static str>`という、種類の名前だけの文字列で表していました。
 `INSERT`、`UPDATE`、`DELETE`は、それに加えて「何行に影響したか」を報告したいところです。
-`command_tag`を`Option<String>`に変え、影響行数を持つ完了を作る関数を追加します。
-`src/database.rs`の`QueryResult`に追加します。
+`command_tag`を`Option<String>`に変え、影響行数を持つ完了を作る関数を、`src/database.rs`の`QueryResult`に追加します。
 
 ```rust
 fn command_with_count(tag: &'static str, count: usize) -> Self {
@@ -914,8 +913,7 @@ psqlは`INSERT 0 1`のように、行の挿入先を表す2つ目の数値(OID�
 ## テストで確認する
 
 `executor`モジュールには、SeqScan、Filter、Projection、Insert、Update、Deleteそれぞれの単体テストを追加します。
-`database`モジュールには、`INSERT`→`SELECT`→`UPDATE`→`SELECT`→`DELETE`→`SELECT`という一連の流れを1つのテストとして確認するものも加えています。
-`src/database.rs`の`mod tests`に追加します。
+`database`モジュールには、`INSERT`→`SELECT`→`UPDATE`→`SELECT`→`DELETE`→`SELECT`という一連の流れを1つのテストとして確認するものも、`src/database.rs`の`mod tests`に加えています。
 
 ```rust
 #[test]
