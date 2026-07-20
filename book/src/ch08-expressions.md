@@ -79,6 +79,8 @@ Rustの`&&`は左辺が`false`のとき右辺を評価しない短絡評価を�
 ## 真理値表をコードに落とす
 
 この章の`eval`モジュールでは、`Value`とは別に`Tri`という3値の列挙型を評価の内部でだけ使います。
+この章では`src/eval.rs`を新規に作成し、評価器の実装をまとめて置きます。
+`src/lib.rs`には`pub mod eval;`を追加します。
 
 ```rust
 enum Tri {
@@ -314,7 +316,7 @@ Expr::IsNull { expr, negated, .. } => {
 ## CAST：明示的な型変換だけを許す
 
 `CAST(expr AS type)`は、この章で新しくASTに追加した構文です。
-第7章時点の`Expr`にはこの構文が無かったので、`ast::Expr`に`Cast`バリアントを足しました。
+第7章時点の`Expr`にはこの構文が無かったので、`src/ast.rs`の`Expr`に`Cast`バリアントを足しました。
 
 ```rust
 Cast {
@@ -327,6 +329,7 @@ Cast {
 `type_name`を`CreateTableStatement`の`ColumnDef`と同じ`Ident`のまま持たせているのは、Parserが型名の一覧を知らなくてよいという第7章の設計をそのまま踏襲しているためです。
 `Parser`はこの構文を`CAST` `(` 式 `AS` 型名 `)`という並びとして受理するだけで、`type_name`が本当に妥当な型かどうかは見ません。
 その判定は評価器の`resolve_data_type`に任せます。
+`src/eval.rs`に戻り、次の関数を定義します。
 
 ```rust
 fn resolve_data_type(type_name: &str) -> DbResult<DataType> {
@@ -497,7 +500,7 @@ Expr::ColumnRef { name, .. } => Err(DbError::NotImplemented(format!(
 
 ## `Database::execute`を差し替える
 
-`eval::eval_expr`が揃ったので、`database.rs`にあった第7章までの`eval_expr`(リテラルと整数の加算しか対応していなかったもの)は丸ごと削除し、`execute_select`から`eval`モジュールを呼ぶように変えます。
+`eval::eval_expr`が揃ったので、`src/database.rs`にあった第7章までの`eval_expr`(リテラルと整数の加算しか対応していなかったもの)は丸ごと削除し、`execute_select`から`eval`モジュールを呼ぶように変えます。
 
 ```rust
 for item in &select.items {
@@ -531,6 +534,7 @@ PostgreSQLはこの状況に`unknown`という専用の型を割り当てます�
 
 `eval`モジュールには、三値論理の真理値表を網羅するテスト、ゼロ除算とオーバーフローのテスト、`CAST`の対応表を1行ずつ確認するテスト、Scalar Functionの呼び出しと引数検査のテストを追加しました。
 真理値表のテストは、9通りの組み合わせをすべて1つの関数にまとめて書いています。
+`src/eval.rs`の`mod tests`に追加します。
 
 ```rust
 #[test]
@@ -549,6 +553,7 @@ fn and_truth_table() {
 
 `false AND NULL`と`NULL AND false`の両方を書いているのは、`FALSE`がどちらの位置にあっても結果を決定づけるという規則が、実装の対称性だけでなくテストの対称性としても保たれているかを確かめるためです。
 `database`側には、`SELECT 1 = 1;`、`SELECT NULL AND FALSE;`、`SELECT CAST(42 AS TEXT);`のように、`Database::execute`が最後まで実行できることを確認するテストを加えています。
+`src/database.rs`の`mod tests`に追加します。
 
 ```rust
 #[test]

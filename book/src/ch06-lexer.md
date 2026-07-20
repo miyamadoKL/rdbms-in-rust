@@ -109,6 +109,8 @@ Lexerは元の文字列をそのまま渡すだけにしておき、畳み込む
 ### SpanとToken
 
 `Token`は種類(`TokenKind`)と、ソース中のバイト範囲(`Span`)の組です。
+この章では`src/lexer.rs`を新規に作成し、`Lexer`とその周辺の型をすべてここへ置きます。
+`src/lib.rs`には`pub mod lexer;`を追加します。
 
 ```rust
 /// ソースコード中のバイト範囲。`start`を含み`end`を含まない半開区間。
@@ -538,6 +540,7 @@ minidb> SELECT 1abc;
 ### DbError::Lex
 
 字句解析のエラーは、`DbError`に新しく追加した`Lex`バリアントで表します。
+`src/error.rs`の`DbError`に、次のバリアントを追加します。
 
 ```rust
     /// SQL文字列をToken列へ変換できなかったエラー。発生位置の行・列を持つ。
@@ -560,6 +563,7 @@ minidb> SELECT 1abc;
 
 `toy_sql`の構文自体(`SELECT <式>`しか読めない、という制限)はこの章では変えません。
 変えるのは、その構文を文字列から直接読み取っていた部分を、`Lexer`が返す`Token`列を読む形に置き換えることです。
+`src/toy_sql.rs`の`parse_select`を、次のように書き換えます。
 
 ```rust
 /// `SELECT <式> [;]`を解析する。
@@ -656,6 +660,7 @@ fn parse_expr(tokens: &[&Token]) -> DbResult<ToyExpr> {
 
 `Lexer`と`toy_sql`のそれぞれに単体テストを追加しました。
 キーワード、識別子、リテラル、演算子、コメント、そして位置情報付きのエラーを確認します。
+`src/lexer.rs`の末尾の`mod tests`に、次のテストを追加します。
 
 ```rust
     #[test]
@@ -706,6 +711,7 @@ fn parse_expr(tokens: &[&Token]) -> DbResult<ToyExpr> {
 ```
 
 `database`側にも、`Database::execute`まで通した結合的なテストを1件追加しています。
+`src/database.rs`の`mod tests`に追加します。
 
 ```rust
     #[test]

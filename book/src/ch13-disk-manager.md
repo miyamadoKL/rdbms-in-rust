@@ -1,6 +1,7 @@
 # 第13章 Disk ManagerとHeap File
 
 前章のテストをもう一度眺めてみます。
+`src/slotted_page.rs`の`#[cfg(test)] mod tests`に置かれている、次のテストです。
 
 ```rust
 #[test]
@@ -46,6 +47,8 @@ offset 0                 PAGE_SIZE               2*PAGE_SIZE
 正常なファイルのバイト数は、常に`page_count * PAGE_SIZE`と一致します。
 
 この構造を、`DiskManager`という1つの構造体にまとめます。
+新しく`src/disk_manager.rs`を作り、`src/lib.rs`に`pub mod disk_manager;`を追加します。
+まずは`Inner`という補助的な構造体を、この`src/disk_manager.rs`に定義します。
 
 ```rust
 struct Inner {
@@ -316,6 +319,8 @@ fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
 
 `DiskManager`はページ1枚を読み書きできますが、「`users`というテーブルはどのページに入っているか」を知りません。
 この対応関係を管理するのがHeap Fileです。
+新しく`src/heap_file.rs`を作り、`src/lib.rs`に`pub mod heap_file;`を追加します。
+`HeapFile`本体は、この`src/heap_file.rs`に次のように定義します。
 
 ```rust
 pub struct HeapFile {
@@ -514,6 +519,8 @@ impl Iterator for Scan<'_> {
 ## テストで確認する
 
 `disk_manager`と`heap_file`のテストは、`tempfile`のような外部クレートを新たに依存に加えず、`std::env::temp_dir()`にプロセスIDと現在時刻を組み込んだ一意な名前を組み合わせて一時ファイルのパスを作っています。
+同じ形の`temp_path`関数を、`src/disk_manager.rs`と`src/heap_file.rs`のそれぞれの`#[cfg(test)] mod tests`が個別に持っています。
+次に示すのは`src/heap_file.rs`側です。
 
 ```rust
 fn temp_path(name: &str) -> std::path::PathBuf {
@@ -536,6 +543,7 @@ fn temp_path(name: &str) -> std::path::PathBuf {
 テストの最後で明示的に`std::fs::remove_file`を呼べば済む範囲であれば、新しい依存を増やす理由はありません。
 
 `DiskManager`のテストでは、まず素朴なラウンドトリップを確認します。
+ここからは`src/disk_manager.rs`の`#[cfg(test)] mod tests`に置くテストです。
 
 ```rust
 #[test]
@@ -621,6 +629,7 @@ fn corrupting_a_byte_on_disk_is_detected_on_read() {
 Disk Managerの層では、その検証を自分で書き直さず、`Page::decode`が返すエラーをそのまま呼び出し元へ伝えるだけで、この検出が実現できています。
 
 `heap_file`のテストでは、複数ページにまたがる挿入と走査を確認します。
+ここからは`src/heap_file.rs`の`#[cfg(test)] mod tests`に置くテストです。
 
 ```rust
 #[test]

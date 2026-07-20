@@ -55,6 +55,8 @@ Latchが無ければ、書き換えている途中の半端なバイト列を誰
 `Mutex`はExclusiveの区別しか持たないため、同じページを読むだけの`PageReadGuard`が2つあっても、片方が生きている間はもう片方の`read_page`がロック待ちで止まります。
 これが第14章の演習問題2で予告されていた限界です。
 
+`src/buffer_pool.rs`の`BufferPool`を、次のように変えます。
+
 ```rust
 pub struct BufferPool {
     disk: DiskManager,
@@ -90,7 +92,7 @@ impl Drop for PageReadGuard<'_> {
 これはモジュール冒頭の規律が禁じている逆順そのものであり、単一スレッドの間は誰も気づけません(同じスレッドの中で複数のGuardが同時に生きて競合することがないため)。
 複数スレッドがBuffer Poolを本当に共有した瞬間、この逆順はデッドロックの芽になります。
 
-この章では`guard`フィールドを`std::mem::ManuallyDrop`で包み、`Drop::drop`の中で明示的に順序を固定しました。
+この章では、`src/buffer_pool.rs`の`PageReadGuard`の`guard`フィールドを`std::mem::ManuallyDrop`で包み、`Drop::drop`の中で明示的に順序を固定しました。
 
 ```rust
 pub struct PageReadGuard<'a> {
@@ -130,6 +132,7 @@ impl Drop for PageReadGuard<'_> {
 ### 探索: 子のLatchを取ってから親を放す
 
 `lookup`と`range`が使う探索(`find_leaf`と`find_leaf_for_lower_bound`)は、親のRead Latchを持ったまま子のRead Latchを取り、子を取ってから親を放します。
+以下は`src/btree.rs`の`find_leaf`です。
 
 ```rust
 fn find_leaf(&self, key_bytes: &[u8]) -> DbResult<PageReadGuard<'_>> {
@@ -156,6 +159,7 @@ fn find_leaf(&self, key_bytes: &[u8]) -> DbResult<PageReadGuard<'_>> {
 
 `insert`は、根からWrite Latchを取りながら降り、通過したページを`ancestors`にスタックとして積みます。
 各ノードに着いた時点で、このキーを収めても**そのノード自身がSplitして親へ伝播しないか**を判定し、安全だと分かればそれより上の祖先のLatchを全て解放します。
+次の一連のコードは、`src/btree.rs`の`insert`の本体です。
 
 ```rust
 let mut ancestors: Vec<PageWriteGuard<'_>> = Vec::new();
@@ -288,7 +292,7 @@ Latchの取得順序は、常に**上から下、左から右**に固定して�
 ## Database層のスレッド対応: `SharedDatabase`と「待機」に変わったBlocked
 
 `BufferPool`とB+Treeが本物のLatchを持つようになった一方で、`Database`自身(`Catalog`、`Backend`、`LockManager`等)はスレッドセーフになっていません。
-この章では、`Database`全体を`Mutex`1本で包む最小限のラッパー`SharedDatabase`を追加しました。
+この章では、`Database`全体を`Mutex`1本で包む最小限のラッパー`SharedDatabase`を、`src/database.rs`に追加しました。
 
 ```rust
 pub struct SharedDatabase {
@@ -339,6 +343,7 @@ pub fn execute_in_tx(&self, handle: &TxHandle, sql: &str) -> DbResult<QueryResul
 スレッドの実行順序そのものをアサートするテストは1つもありません。
 
 複数スレッドが`Arc<BTree>`へ、互いに素なキー集合を同時に`insert`するテストは、`Barrier`で全スレッドの開始を揃え、木がまだ浅い段階から並行アクセスを集中させます。
+`tests/concurrent_threads.rs`から抜粋します。
 
 ```rust
 let handles: Vec<_> = (0..THREADS)

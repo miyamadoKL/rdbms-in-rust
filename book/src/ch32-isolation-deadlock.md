@@ -1,6 +1,6 @@
 # 第32章 Isolation LevelとDeadlock
 
-第31章の最後に書いたテストを、もう一度見てみます。
+第31章の最後に`src/lock_manager.rs`へ書いたテスト`mutual_wait_leaves_both_transactions_blocked_without_detection`を、もう一度見てみます。
 
 ```rust
 assert_eq!(lm.acquire(T1, table(1), LockMode::Exclusive), LockResult::Granted);
@@ -29,6 +29,7 @@ T2も同じ立場です。
 
 2つ目は`Backend::Disk`(Tuple Lock)に残ったPhantomです。
 第31章は`SELECT`のロックを「その時点で存在する行」だけに掛けました。
+`tests/interleave_disk.rs`に書いた次のテストが、それを示しています。
 
 ```rust
 #[test]
@@ -75,6 +76,7 @@ SQL標準は各レベルを「どの異常を許すか」で定義しており�
 ## BEGIN文に分離レベルを持たせる
 
 `BEGIN`単体しか受理していなかった構文に、`BEGIN ISOLATION LEVEL <level>`を追加します。
+`src/ast.rs`に次の`BeginStatement`と`IsolationLevel`を定義します。
 
 ```rust
 /// `BEGIN`文(第30章)。`BEGIN TRANSACTION`のような修飾は持たず、`BEGIN`
@@ -110,6 +112,7 @@ pub enum IsolationLevel {
 構文を1つ増やす代わりに、状態遷移の分岐を1つ減らせる選択です。
 
 `Parser`はこの1個のオプション句を読み取るだけです。
+`src/parser.rs`に次の`parse_begin_statement`を書きます。
 
 ```rust
 fn parse_begin_statement(&mut self) -> DbResult<BeginStatement> {
@@ -131,6 +134,7 @@ fn parse_begin_statement(&mut self) -> DbResult<BeginStatement> {
 ### 分離レベルの既定値
 
 `BEGIN`単体(`ISOLATION LEVEL`を省略した場合)がどのレベルになるかは、この章が新しく決める必要がある設計判断です。
+`src/database.rs`の`execute_begin`を次のように書きます。
 
 ```rust
 fn execute_begin(&mut self, begin: BeginStatement) -> DbResult<QueryResult> {
@@ -245,6 +249,7 @@ fn acquire_scan_locks(&mut self, owner: TransactionId, table_ids: &[TableId], mo
 「獲得する前に尋ねる」というやり方は、獲得(または待ち行列からの昇格)が実際に起きた**タイミング**と、それを尋ねる**タイミング**が一致している前提に頼っており、`WouldBlock`をまたぐ再試行ではその前提が崩れるのです。
 
 採用したのは、「新規に獲得した」という事実そのものを、獲得が実際に起きた瞬間に`LockManager`自身に記録させる方式です。
+`src/lock_manager.rs`に次の`take_pending_shared_grants`を追加します。
 
 ```rust
 pub(crate) fn take_pending_shared_grants(&mut self, txn: TransactionId) -> Vec<K> {
@@ -330,6 +335,7 @@ Key Range Lockは範囲外の`INSERT`まで巻き込まないぶん並行度が�
 捨てたのは、`Serializable`のSELECTと無関係な範囲への`INSERT`まで一律にブロックしてしまうという並行度です。
 
 この追加のTable Lockが刺さる相手が、`INSERT`側の変更です。
+`src/database.rs`の`run_insert`を次のように変更します。
 
 ```rust
 fn run_insert(&mut self, plan: LogicalPlan, owner: TransactionId) -> DbResult<usize> {
@@ -374,6 +380,7 @@ Memoryバックエンド(テーブル単位のロック)でのマトリクスは
 
 Lost Updateがこのマトリクスの中で唯一、「読み取りロックを一瞬でも取るかどうか」と「その読み取りロックをいつまで保持するか」の両方に左右される異常だという点に注意してください。
 `Read Committed`はSELECTの瞬間にはShared Lockを取りますが、直後に手放します。
+`tests/isolation_levels.rs`に書いた次のテストが、それを示します。
 
 ```rust
 #[test]
@@ -458,6 +465,7 @@ Timeoutは`std::time`のような実時間に依存する方式であり、決�
 この辺の集合に閉路(サイクル)があれば、それがそのままデッドロックです。
 
 この辺を組み立てるための生データを、`LockManager`が新しく提供します。
+`src/lock_manager.rs`に次の`wait_for_edges`を追加します。
 
 ```rust
 pub(crate) fn wait_for_edges(&self) -> Vec<(TransactionId, TransactionId)> {
@@ -510,6 +518,7 @@ T1の持つSharedとは両立するのですが、待ち行列にはすでにT2�
 これは「モードが衝突する保持者」への辺とは別の、待ち行列の位置そのものによる依存です。
 
 `Database`側は、この辺からトランザクションIDごとの隣接表を組み立て、要求元(`owner`)を起点にDFSで自分自身へ戻ってくる経路を探します。
+`src/database.rs`に次の`detect_deadlock`を書きます。
 
 ```rust
 fn detect_deadlock(&mut self, owner: TransactionId) -> DbResult<Option<TransactionId>> {
@@ -621,6 +630,7 @@ Victimが手放したロックの待ち行列は`promote_waiters`によって即
 
 `TransactionContext`自体は、`self.tx`や`harness_contexts`のスロットからは取り除きません。
 `state`を`Aborted`に、新しく追加した`victim_of_deadlock`を`true`にするだけです。
+`src/transaction.rs`に定義された`TransactionContext`へ、この`victim_of_deadlock`フィールドを追加します。
 
 ```rust
 pub(crate) struct TransactionContext {
@@ -636,6 +646,7 @@ pub(crate) struct TransactionContext {
 ```
 
 このフラグが、呼び出し側に返すエラーを選び分けます。
+`src/database.rs`に次の`aborted_error`を追加します。
 
 ```rust
 fn aborted_error(victim_of_deadlock: bool) -> DbError {
@@ -682,6 +693,7 @@ Victimが要求元とは**別のトランザクション**であることもあ�
 Victimが手放したロックを要求元が待ち行列の中で引き継いでいれば、2回目の`acquire`がその場で`Granted`を返すからです。
 要求元は、自分の要求がデッドロック解決に巻き込まれたことにすら気づかず、ただ`Ok`を受け取って処理を続けます。
 Victimにされた側は、次に自分のトランザクションへ触れたとき(次の文の実行、または`COMMIT`)に初めて`DeadlockDetected`を受け取ります。
+`tests/deadlock.rs`に書いた次のテストが、それを確認します。
 
 ```rust
 #[test]

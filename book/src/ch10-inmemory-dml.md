@@ -34,6 +34,8 @@ minidb> SELECT id FROM users;
 `TableInfo`に`rows: Vec<Tuple>`のようなフィールドを足すと、「名前から定義を引く場所」と「名前から中身を引く場所」が同じ構造体に同居することになり、ディスクへの永続化が入る第2部で、定義と中身をそれぞれ別のファイル、別のページに分けて書き出したくなったときに、両者が絡み合ったままのコードを解きほぐす作業から始めることになります。
 
 そこで、行の集まりは`storage_mem`という新しいモジュールに置きます。
+この章では`src/storage_mem.rs`を新規に作成します。
+`src/lib.rs`には`pub mod storage_mem;`を追加します。
 
 ```rust
 pub struct MemTable {
@@ -58,6 +60,7 @@ pub struct MemStorage {
 値を名前から引く環境がまだ存在しなかったからです。
 
 その環境を`Row`という型で導入します。
+`src/types.rs`に追加します。
 
 ```rust
 pub struct Row<'a> {
@@ -81,6 +84,7 @@ impl<'a> Row<'a> {
 `Schema`と`Tuple`をペアで持ち回らずに済むよう1つの型にまとめておくと、`eval_expr`の引数が1個で済み、呼び出し側も「今どの行を処理しているか」を`Row`という1つの値で受け渡せます。
 
 `eval_expr`のシグネチャに、この`Row`を`Option`で受け取る引数を追加します。
+`src/eval.rs`の`eval_expr`を、次のように書き換えます。
 
 ```rust
 pub fn eval_expr(expr: &Expr, functions: &FunctionRegistry, row: Option<&Row>) -> DbResult<Value> {
@@ -149,6 +153,7 @@ pub fn eval_expr(expr: &Expr, functions: &FunctionRegistry, row: Option<&Row>) -
 
 第7章の`InsertStatement`は、`INSERT INTO name VALUES (...)`という1行分の挿入にしか対応していませんでした。
 この章では、複数行の`VALUES (...), (...)`と、列名を明示する`INSERT INTO name (col, ...)`の両方に対応させます。
+`src/ast.rs`の`InsertStatement`を、次の形に変えます。
 
 ```rust
 pub struct InsertStatement {
@@ -160,6 +165,7 @@ pub struct InsertStatement {
 ```
 
 `Parser`側は、`(`が続けば列名の並びを読み、`VALUES`に続く行を`,`区切りで読めるだけ読みます。
+`src/parser.rs`の`parse_insert_statement`に、次の読み取りを追加します。
 
 ```rust
 let columns = if *self.peek_kind() == TokenKind::LParen {
@@ -188,6 +194,8 @@ while *self.peek_kind() == TokenKind::Comma {
 ```
 
 実行側の`executor::insert`は、Values演算子(各行の式を評価する部分)とInsert演算子(評価済みの行を書き込む部分)を1つの関数にまとめています。
+この章では`src/executor.rs`も新規に作成し、実行演算子の関数をまとめて置きます。
+`src/lib.rs`には`pub mod executor;`を追加します。
 
 ```rust
 pub fn insert(
@@ -267,6 +275,7 @@ fn expand_to_schema(
 `SELECT`の対象式リストに`*`を書けるようにするには、まずASTを拡張する必要があります。
 `*`はLexerの上では乗算のToken(`TokenKind::Star`)と同じもので、これまでの`SelectItem`は式1個を持つ構造体でした。
 `*`を式として扱うのではなく、`SelectItem`自体を列挙型にします。
+`src/ast.rs`の`SelectItem`を、次の形に変えます。
 
 ```rust
 pub enum SelectItem {
@@ -276,6 +285,7 @@ pub enum SelectItem {
 ```
 
 `Parser`は、対象式リストの要素を読む直前に`*`かどうかを先読みして振り分けます。
+`src/parser.rs`の`parse_select_item`を、次のように書き換えます。
 
 ```rust
 fn parse_select_item(&mut self) -> DbResult<SelectItem> {
@@ -290,6 +300,7 @@ fn parse_select_item(&mut self) -> DbResult<SelectItem> {
 ```
 
 実行側は、`FROM`が無ければ第9章までと同じ経路(その場で式を評価し、1行だけ返す)を使い、`FROM`があればSequential Scan、Filter、Projectionの3演算子を順に適用します。
+`src/database.rs`の`execute_select_with_from`に、次の配線を書きます。
 
 ```rust
 let table_info = self
@@ -321,6 +332,7 @@ let (schema, rows) = executor::project(
 `predicate`には`WHERE id = 1`のような`BOOLEAN`を返す式が書かれているのが普通ですが、`WHERE 1`のように`BIGINT`を返す式を書き誤ることもありえます。
 そのような値を、`TRUE`でないというだけで黙って「一致しなかった」側に丸めてしまうと、書き誤りに気づけないまま0行という結果を正常応答として返してしまいます。
 そこで、この変換は`predicate_matches`という1つの関数にまとめ、`filter`、`update`、`delete`の3箇所から共通して呼びます。
+`src/executor.rs`に定義します。
 
 ```rust
 fn predicate_matches(value: Value) -> DbResult<bool> {
@@ -413,7 +425,7 @@ minidb> SELECT id FROM users WHERE 1;
 PostgreSQLやSQLiteは、`FROM`が無い`SELECT`を、0列1行の暗黙の入力に対する`SELECT`とみなし、`WHERE`はその1行を通常どおり絞り込みます。
 `SELECT 1 WHERE FALSE`は0行、`SELECT 1 WHERE TRUE`は1行になるべきで、`WHERE`を無視して常に1行返す実装は誤りです。
 
-これらをまとめて直すため、`execute_select_without_from`を次のように書き直しました。
+これらをまとめて直すため、`src/database.rs`の`execute_select_without_from`を次のように書き直しました。
 
 ```rust
 fn execute_select_without_from(
@@ -508,6 +520,7 @@ minidb> SELECT 1 WHERE NULL;
 逆に`SELECT NULL + 1`のように両辺が`BigInt`か`None`(型未定の`NULL`)であれば`infer_type`の検査を正しく通過するので、型として正しい式に対する`eval_arith`の`NULL`伝播(前章で述べたとおり)はそのまま働き、結果は`NULL`のまま成功し、列の型は`FROM`の有無によらず`BIGINT`になります。
 
 Filter演算子は、`守るべき不変条件`の1番目を、`check_predicate_type`と`predicate_matches`の2段構えでコードにしています。
+`src/executor.rs`に戻り、次の関数を定義します。
 
 ```rust
 pub fn filter(
@@ -759,6 +772,7 @@ fn infer_type(
 ## `UPDATE`と`DELETE`を実装する
 
 `UPDATE users SET name = 'Bob' WHERE id = 1`のASTは、`SET`のカンマ区切りリストを`Assignment`の並びとして持ちます。
+`src/ast.rs`に追加します。
 
 ```rust
 pub struct UpdateStatement {
@@ -777,6 +791,7 @@ pub struct Assignment {
 
 Update演算子は、`WHERE`に一致した行(`predicate`が無ければ全行)それぞれに`assignments`を適用します。
 `filter`と同じ理由で、`table`が空でも`WHERE 1`のような書き誤りを見逃さないよう、行ループへ入る前に`predicate`が`Some`なら`check_predicate_type`を呼びます。
+`src/executor.rs`に戻ります。
 
 ```rust
 pub fn update(
@@ -866,6 +881,7 @@ pub fn delete(
 第9章の`QueryResult`は、DDL文の完了を`command_tag: Option<&'static str>`という、種類の名前だけの文字列で表していました。
 `INSERT`、`UPDATE`、`DELETE`は、それに加えて「何行に影響したか」を報告したいところです。
 `command_tag`を`Option<String>`に変え、影響行数を持つ完了を作る関数を追加します。
+`src/database.rs`の`QueryResult`に追加します。
 
 ```rust
 fn command_with_count(tag: &'static str, count: usize) -> Self {
@@ -884,6 +900,7 @@ psqlは`INSERT 0 1`のように、行の挿入先を表す2つ目の数値(OID�
 
 `executor`モジュールには、SeqScan、Filter、Projection、Insert、Update、Deleteそれぞれの単体テストを追加しました。
 `database`モジュールには、`INSERT`→`SELECT`→`UPDATE`→`SELECT`→`DELETE`→`SELECT`という一連の流れを1つのテストとして確認するものも加えています。
+`src/database.rs`の`mod tests`に追加します。
 
 ```rust
 #[test]
@@ -947,6 +964,7 @@ Golden Testは、これまで1ファイルにつき1文しか置けませんで�
 文を分ける実装は、`;`という文字だけを見て`str::split`する素朴な形にはしません。
 `SELECT 'a;b'`のような文字列リテラルや、`-- a;b`のようなコメントの内側にも`;`は現れるため、その`;`まで文の区切りとして誤認してしまうからです。
 そこで`split_statements`は、字句解析器の`tokenize`を一度通し、`TokenKind::Semicolon`のトークンだけを区切りとして扱います。
+`tests/golden.rs`の`run_sql`を、次のように書き換えます。
 
 ```rust
 fn split_statements(sql: &str) -> Vec<&str> {
@@ -1086,6 +1104,7 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 開発環境にSQLiteの共有ライブラリが入っているかどうかに関係なく、`cargo test`がそのまま動きます。
 
 比較の基本形は、同じ`setup`(`CREATE TABLE`、`INSERT`、`UPDATE`、`DELETE`)をminidbと`rusqlite`の両方に流し、最後に1本の`SELECT`を実行して結果を突き合わせる、というものです。
+この章では`tests/differential.rs`を新規に作成し、Differential Testのハーネスをまとめて置きます。
 
 ```rust
 fn assert_same_result(setup: &[&str], query: &str) {

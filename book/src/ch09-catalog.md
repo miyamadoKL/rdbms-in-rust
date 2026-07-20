@@ -45,6 +45,8 @@ PostgreSQLの`pg_class`やMySQLの`information_schema`は、テーブルだけ�
 この章の`Catalog`はその最小部分、つまりテーブル名と列構成の対応だけを持ちます。
 インデックスや制約、統計情報は、それぞれの機能が実装として固まった章で`Catalog`に載せていく計画で、最初から全部を見込んだ大きな構造体を先に設計することはしません。
 必要になった機能の分だけ持ち場を広げていく、というこれまでの章と同じ育て方をここでも採ります。
+この章では`src/catalog.rs`を新規に作成し、`Catalog`と`TableInfo`をここへ置きます。
+`src/lib.rs`には`pub mod catalog;`を追加します。
 
 ```rust
 pub struct TableInfo {
@@ -176,7 +178,7 @@ pub fn table(&self, name: &str) -> Option<&TableInfo> {
 
 ## `CREATE TABLE`を`Database::execute`に配線する
 
-`Database`に`catalog: Catalog`というフィールドを追加し、`Database::memory()`が空の`Catalog`を用意します。
+`src/database.rs`の`Database`に`catalog: Catalog`というフィールドを追加し、`Database::memory()`が空の`Catalog`を用意します。
 
 ```rust
 pub struct Database {
@@ -228,7 +230,7 @@ minidb> CREATE TABLE dup (id BIGINT, id TEXT);
 3列目の型名が未知だった場合や、列名が途中で重複していた場合、それより前の列の解決がどれだけ成功していても、`?`または明示的な`return Err(...)`によってループはその場で打ち切られ、`Catalog`には何も登録されません。
 「一部だけ登録されたテーブル」という中途半端な状態が生まれないのは、`columns`という`Vec`をローカルに組み立て切ってから、最後に1回だけ`create_table`を呼ぶという順序そのものが保証しています。
 
-型名の解決に使っている`DataType::from_sql_name`は、この章で新しく`types.rs`に追加した関数です。
+型名の解決に使っている`DataType::from_sql_name`は、この章で新しく`src/types.rs`に追加した関数です。
 
 ```rust
 impl DataType {
@@ -246,6 +248,7 @@ impl DataType {
 第8章の`eval`モジュールには、`CAST(expr AS type)`の型名を解決する`resolve_data_type`という、ほぼ同じ内容の関数がすでにありました。
 `BIGINT` / `TEXT` / `BOOLEAN`という3つの型名の一覧をこのクレートの2箇所に別々に書いてしまうと、型を1つ追加するたびに両方を直しそびれる不整合の芽になります。
 この章では`resolve_data_type`の中身を`DataType::from_sql_name`へ移し、`eval`モジュール側は結果を`DbError::Eval`に包むだけの薄いラッパーに変えました。
+`src/eval.rs`の`resolve_data_type`を、次のように書き換えます。
 
 ```rust
 fn resolve_data_type(type_name: &str) -> DbResult<DataType> {
@@ -260,7 +263,7 @@ fn resolve_data_type(type_name: &str) -> DbResult<DataType> {
 ## `DROP TABLE`の構文を追加する
 
 `DROP`と`TABLE`はどちらも第6章のLexerがすでに予約語として持っていましたが、`Parser`側は`DROP`から始まる文をまだ受理しません。
-`CreateTableStatement`と対になる`DropTableStatement`をASTに追加します。
+`CreateTableStatement`と対になる`DropTableStatement`を`src/ast.rs`に追加します。
 
 ```rust
 pub struct DropTableStatement {
@@ -271,6 +274,7 @@ pub struct DropTableStatement {
 
 `parse_drop_table_statement`は`parse_create_table_statement`よりずっと単純です。
 `DROP TABLE`に続く列定義の並びが無く、テーブル名を1つ読むだけで終わります。
+`src/parser.rs`に追加します。
 
 ```rust
 fn parse_drop_table_statement(&mut self) -> DbResult<DropTableStatement> {
@@ -287,7 +291,7 @@ fn parse_drop_table_statement(&mut self) -> DbResult<DropTableStatement> {
 ```
 
 `parse_statement`の分岐に`TokenKind::Keyword(Keyword::Drop)`を追加すれば、`DROP TABLE users`は`Statement::DropTable`として構文解析を通るようになります。
-`Database::execute`側の`execute_drop_table`は、`Catalog::drop_table`をそのまま呼ぶだけです。
+`src/database.rs`の`execute_drop_table`は、`Catalog::drop_table`をそのまま呼ぶだけです。
 
 ```rust
 fn execute_drop_table(&mut self, drop: &DropTableStatement) -> DbResult<QueryResult> {
@@ -344,6 +348,7 @@ psqlをはじめ多くのクライアントが、DDL文の完了を`CREATE TABLE
 ## テストで確認する
 
 `catalog`モジュールには、登録、重複拒否、大文字小文字の区別、削除、不存在の拒否、`TableId`が使い回されないことを確認する単体テストを追加しました。
+`src/catalog.rs`の`mod tests`に追加します。
 
 ```rust
 #[test]
@@ -360,6 +365,7 @@ fn table_id_is_not_reused_after_drop() {
 
 `database`側には、`CREATE TABLE`がカタログへ正しい`Schema`を登録すること、`NOT NULL`の有無が`nullable`へ正しく反転すること、テーブル名の重複と不存在がそれぞれ`DbError::DuplicateTable`、`DbError::TableNotFound`になること、列名の重複が`DbError::DuplicateColumn`になり、その場合はカタログに何も登録されないことを確認するテストを加えています。
 削除してから同じ名前で作り直す一連の流れも、1つのテストにまとめました。
+`src/database.rs`の`mod tests`に追加します。
 
 ```rust
 #[test]

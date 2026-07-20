@@ -72,6 +72,7 @@ B+Treeはキーを挿入するたびに、次の3つの性質を保ち続けま�
 
 Leaf PageとInternal Pageの探索は、キーを`Value`へ戻さずバイト列のまま大小比較できるほうが単純です。
 そこでこの章のキーは、**順序を保存するバイト列**へエンコードします。
+この章では新しく`src/btree.rs`を作り、`src/lib.rs`に`pub mod btree;`を追加します。`encode_key`はこのファイルに置きます。
 
 ```rust
 fn encode_key(value: &Value) -> DbResult<Vec<u8>> {
@@ -174,6 +175,7 @@ offset 0        2                10                   10+4n
 
 Directoryの`i`番目のエントリが指す位置には、キーに続けて`(i + 1)`番目の子を指す`child_page_id: u64`(8バイト)が置かれます。
 この章では新しい`PageType`を2つ追加し、ページの外枠(第11章)だけからLeafとInternalを区別できるようにします。
+`src/page.rs`の`PageType`に、次の2つのバリアントを追加します。
 
 ```rust
 pub enum PageType {
@@ -190,6 +192,7 @@ pub enum PageType {
 ```
 
 書き込み側の`write_entries`は、`entries`が収まりきらなければ`payload`を一切変更せず`false`を返します。
+この章では新しく`src/btree_page.rs`を作り、`src/lib.rs`に`pub mod btree_page;`を追加します。`write_entries`はこのファイルに置きます。
 
 ```rust
 pub fn write_entries(&mut self, entries: &[(Vec<u8>, RecordId)]) -> bool {
@@ -270,6 +273,7 @@ pub fn find(&self, key: &[u8]) -> Result<usize, usize> {
 `BTree`はページ1(ページ0はDiskManagerのFile Headerが占有します)をMetaページとして使い、現在のRootの`PageId`とキー型を持たせます。
 `Storage`(第15章)がCatalogページ専用に`PageType::Catalog`を新設したのとは対照的に、この章では新しいPage Typeを追加せず、既存の`PageType::Data`を転用します。
 Metaページが持つ情報は「Rootの`PageId`(8バイト)」と「キー型(1バイト)」の2値だけで、複数テーブルの定義という可変長のコレクションを持っていたCatalogページとは事情が異なるからです。
+`src/btree.rs`に、次の`BTree::create`を定義します。
 
 ```rust
 pub fn create(pool: BufferPool, key_type: DataType, unique: bool) -> DbResult<Self> {
@@ -317,7 +321,7 @@ fn find_leaf(&self, key_bytes: &[u8]) -> DbResult<PageId> {
 }
 ```
 
-`InternalPageRef::child_for`が、区切りキーとの二分探索で「`key`未満の区切りキーの本数」を数え、その本数に応じて`leftmost_child`かいずれかの`child_after(i)`を返します。
+`src/btree_page.rs`の`InternalPageRef::child_for`が、区切りキーとの二分探索で「`key`未満の区切りキーの本数」を数え、その本数に応じて`leftmost_child`かいずれかの`child_after(i)`を返します。
 
 ```rust
 pub fn child_for(&self, key: &[u8]) -> PageId {
@@ -337,6 +341,7 @@ pub fn child_for(&self, key: &[u8]) -> PageId {
 
 葉に着いたら、その葉の中を`LeafPageRef::find`で二分探索します。
 重複キーが許されている(次の節で決めます)ため、一致した1件の前後にも同じキーが続いていないかを確認してから、一致した全件をまとめて返す必要があります。
+`src/btree.rs`に、次の`BTree::lookup`を定義します。
 
 ```rust
 pub fn lookup(&self, key: &Value) -> DbResult<Vec<RecordId>> {

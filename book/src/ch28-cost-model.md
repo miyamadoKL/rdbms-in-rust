@@ -42,6 +42,8 @@ Projection(customers.name, orders.item) rows=5000
 
 候補プランを`SeqScan`、`IndexScan`、`HashJoin`、`IndexNestedLoopJoin`という具体的な演算子の木として組み立てたあと、その木がどれだけの「仕事」をするかを、3種類の重みの合成として見積もります。
 
+このコストモデルは、新規作成する`src/cost_model.rs`に置きます。`src/lib.rs`には`pub mod cost_model;`を追加します。まずは3つの重みを、次のように定義します。
+
 ```rust
 /// 1ページぶんのSequential I/O(順読み)のコスト。PostgreSQLの
 /// `seq_page_cost`のデフォルト値(1.0)を採用する。他の重みはすべて
@@ -195,6 +197,8 @@ pub fn sort_cost(rows: u64) -> Cost {
 ## 候補を列挙してコスト最小を選ぶ
 
 コストの計算式が揃ったところで、`physical_plan::optimize`の中身を書き換えます。第25章までの`optimize`は`storage`と`predicate`から1つの`AccessPath`をルールで決め打っていましたが、この章はまず候補をすべて`PhysicalPlan`として組み立ててから、コストで比較します。
+
+ここからは`src/physical_plan.rs`への追記です。まず、複数の候補から最小コストのものを選ぶ`cheapest`を追加します。
 
 ```rust
 /// 複数の候補`PhysicalPlan`から、[`crate::cost_model::plan_cost`]が最小になる

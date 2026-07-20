@@ -41,7 +41,7 @@ minidb> SELECT age FROM users;
 
 ## ASTとBound ASTを分離する
 
-`Binder`が変換の入り口で最初に手にするのは、第7章の`Expr::ColumnRef`です。
+`Binder`が変換の入り口で最初に手にするのは、`src/ast.rs`に定義された第7章の`Expr::ColumnRef`です。
 
 ```rust
 /// 列参照。`users.id`のような修飾名も、`qualifier`に`users`を持つことで
@@ -55,6 +55,8 @@ ColumnRef {
 
 `name`は文字列でしかなく、それが`users`の列を指すのか、単なる書き誤りなのかは、この型からは何も分かりません。
 これに対応する`Binder`側の型が`BoundExpr::ColumnRef`です。
+新規ファイル`src/binder.rs`を作り、次のように定義します。
+`src/lib.rs`には、`pub mod ast;`と`pub mod btree;`の間に`pub mod binder;`を追加します。
 
 ```rust
 ColumnRef {
@@ -168,6 +170,7 @@ minidb> SELECT id FROM does_not_exist;
 
 `Alias`(`FROM users AS u`)に対応するには、まずParserにその構文を追加する必要があります。
 `SelectStatement`の`from`フィールドは、これまで`Option<Ident>`(テーブル名だけ)でしたが、この章から`Option<FromClause>`に変えます。
+`src/ast.rs`に次の`FromClause`を追加します。
 
 ```rust
 pub struct FromClause {
@@ -181,6 +184,7 @@ pub struct FromClause {
 `u.id`のような修飾列参照には、もう1つ構文上の穴がありました。
 第7章の`Lexer`は`.`をどのTokenにも対応させておらず、`ast.rs`のコメントにも「`users.id`のような修飾名は、Lexerが`.`を扱わないため対象外」と明記されていました。
 この章で`TokenKind::Dot`を追加し、識別子の直後に`.`が続けば、もう1つ識別子を読んで`Expr::ColumnRef`の`qualifier`に詰めます。
+この分岐は`src/parser.rs`に追加します。
 
 ```rust
 if *self.peek_kind() == TokenKind::Dot {
@@ -196,6 +200,7 @@ if *self.peek_kind() == TokenKind::Dot {
 ```
 
 `resolve_table`が返す`BoundTableRef`は、`qualifier()`という補助メソッドを持ちます。
+`src/binder.rs`の`BoundTableRef`に、次のメソッドを定義します。
 
 ```rust
 pub fn qualifier(&self) -> &str {
@@ -352,7 +357,7 @@ minidb> SELECT id FROM users WHERE 1;
 
 ## Database::executeをparse→bind→executeへ再編する
 
-`Database::execute`は、構文解析の直後に束縛を挟む1行が増えました。
+`src/database.rs`の`Database::execute`は、構文解析の直後に束縛を挟む1行が増えました。
 
 ```rust
 pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
@@ -391,6 +396,7 @@ fn bind(&self, statement: Statement, sql: &str) -> DbResult<BoundStatement> {
 実行(`Catalog::drop_table`、`Storage::drop_table`)は引き続き名前で削除するので、`BoundStatement::DropTable`もASTのバリアントをそのまま返します。
 
 `INSERT`、`UPDATE`、`DELETE`は、それぞれ専用の`Bound`型を持ちます。
+`src/binder.rs`に、次の`BoundInsert`を定義します。
 
 ```rust
 pub struct BoundInsert {
@@ -437,7 +443,7 @@ fn bind_assignment(&self, assignment: &Assignment, tables: &[BoundTableRef]) -> 
 `Database::execute_insert`が受け取る`BoundInsert`はすでに独立した値なので、`&mut self.backend`をいつ借りても構いません。
 借用の都合に合わせて複製のタイミングを呼び出し側ごとに調整する、という同じ形のコードが3箇所に散らばっていた状態が、この章で1箇所に集まりました。
 
-`executor`側の関数は、生の`Expr`ではなく`BoundExpr`、`BoundSelectItem`、`BoundAssignment`を受け取るようになりました。
+`src/executor.rs`側の関数は、生の`Expr`ではなく`BoundExpr`、`BoundSelectItem`、`BoundAssignment`を受け取るようになりました。
 
 ```rust
 pub fn filter(
@@ -458,7 +464,7 @@ pub fn filter(
 }
 ```
 
-`BoundExpr`を評価する`eval::eval_bound_expr`は、列参照を名前ではなく`column_index`で引きます。
+`BoundExpr`を評価する`eval::eval_bound_expr`は`src/eval.rs`に定義されており、列参照を名前ではなく`column_index`で引きます。
 
 ```rust
 BoundExpr::ColumnRef { table_ordinal, column_index, name, .. } => {
@@ -481,7 +487,7 @@ BoundExpr::ColumnRef { table_ordinal, column_index, name, .. } => {
 
 ## テストで確認する
 
-`binder`モジュールには、この章が扱う名前解決、型検査のそれぞれについて単体テストを追加しました。
+`src/binder.rs`のテストモジュールには、この章が扱う名前解決、型検査のそれぞれについて単体テストを追加しました。
 
 ```rust
 #[test]

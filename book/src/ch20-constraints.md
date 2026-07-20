@@ -50,7 +50,7 @@ CREATE TABLE
 `ColumnDef`という型自体が「1つの列に対する制約」という形をすでに持っているため、単一列の制約はその型にフィールドを足すだけで表現できますが、複合キーは列をまたぐ制約なので、`CreateTableStatement`にテーブルレベルの制約リストを別途持たせる設計変更が要ります。
 この設計変更は章末の演習で扱います。
 
-第6章のLexerに`PRIMARY`、`KEY`、`UNIQUE`という3つの予約語を追加します。
+第6章の`src/lexer.rs`にある`Keyword`に、`PRIMARY`、`KEY`、`UNIQUE`という3つの予約語を追加します。
 
 ```rust
 pub enum Keyword {
@@ -61,7 +61,7 @@ pub enum Keyword {
 }
 ```
 
-`ColumnDef`(第7章のAST)に、`PRIMARY KEY`と`UNIQUE`が指定されていたかどうかを持たせます。
+`src/ast.rs`の`ColumnDef`(第7章のAST)に、`PRIMARY KEY`と`UNIQUE`が指定されていたかどうかを持たせます。
 
 ```rust
 pub struct ColumnDef {
@@ -74,7 +74,7 @@ pub struct ColumnDef {
 }
 ```
 
-`Parser`の`parse_column_def`は、型名の後ろに`NOT NULL`、`PRIMARY KEY`、`UNIQUE`が任意の順序、任意の個数だけ並ぶ列として読みます。
+`src/parser.rs`にある`Parser::parse_column_def`は、型名の後ろに`NOT NULL`、`PRIMARY KEY`、`UNIQUE`が任意の順序、任意の個数だけ並ぶ列として読みます。
 
 ```rust
 fn parse_column_def(&mut self) -> DbResult<ColumnDef> {
@@ -120,7 +120,7 @@ fn parse_column_def(&mut self) -> DbResult<ColumnDef> {
 `id BIGINT NOT NULL PRIMARY KEY`のように書いても、`id BIGINT PRIMARY KEY NOT NULL`のように書いても、同じ3つのフラグに解決されます。
 どちらの順序で書くかは利用者の好みの問題であり、構文としてどちらか一方に決め打つ理由がありません。
 
-`Column`(第4章)にも同じ2つのフラグを追加します。
+`src/types.rs`の`Column`(第4章)にも同じ2つのフラグを追加します。
 既存の呼び出し箇所(`Column::new(name, data_type, nullable)`という3引数の呼び出しが、このクレートだけで30箇所以上あります)を1つも壊さないよう、`new`のシグネチャ自体は変えず、追加のフラグはビルダーメソッドで立てる形にしました。
 
 ```rust
@@ -159,7 +159,7 @@ impl Column {
 `with_primary_key`が`nullable`を`false`へ強制しているのが、`PRIMARY KEY`は`NOT NULL`を含意するというこの章の設計判断そのものです。
 `id BIGINT PRIMARY KEY`のように`NOT NULL`を明示しなくても、`PRIMARY KEY`だけで`NULL`を拒否できます。
 
-`Database::execute_create_table`(第9章)は、`ColumnDef`のフラグを`Column`のビルダーメソッドへ橋渡しし、あわせて`PRIMARY KEY`が2列以上に指定されていないかを検査します。
+`src/database.rs`の`Database::execute_create_table`(第9章)は、`ColumnDef`のフラグを`Column`のビルダーメソッドへ橋渡しし、あわせて`PRIMARY KEY`が2列以上に指定されていないかを検査します。
 
 ```rust
 let mut primary_key_count = 0;
@@ -193,7 +193,8 @@ if primary_key_count > 1 {
 この章の時点で、テーブルの行を高速に検索できる索引はまだ存在しません。
 索引が無い以上、この章の一意性検査は「これから書き込もうとしている値を、テーブルの全行と1つずつ比較する」という線形走査で実装するしかありません。
 
-この走査を`constraints`という新しいモジュールに`check_uniqueness`という関数としてまとめます。
+この走査を、新規作成する`src/constraints.rs`に`check_uniqueness`という関数としてまとめます。
+`src/lib.rs`にも`pub mod constraints;`を追加し、`constraints`モジュールとして公開します。
 
 ```rust
 pub fn check_uniqueness<'a>(
@@ -255,6 +256,7 @@ INSERT 2
 `others.clone().any(...)`という部分が、この章のコストの正体です。
 `others`は`Clone`を要求されたイテレータで、`candidates`の各行ごとに`others`全体を1回ずつなめ直します。
 実際にどれくらいのコストがかかるか、`PRIMARY KEY`を持つテーブルへの`INSERT`を1件だけ測ってみます。
+次のコードはクレートのファイルには組み込まず、手元で書いて実行するだけの一時的な測定コードです。
 
 ```rust
 for &n in &[1_000, 2_000, 4_000, 8_000, 16_000] {
@@ -291,7 +293,7 @@ n= 16000 elapsed=349.193µs
 
 この章では、書き込む前に済ませる検査の対象へ、一意性検査(`check_uniqueness`)も加えます。
 検査の種類が増えるだけで、「検査をすべて終えるまで書き込みを一切始めない」という順序自体は変わりません。
-`executor::insert`(第10章、インメモリ版)は次のようになります。
+`src/executor.rs`の`insert`(第10章、インメモリ版)は次のようになります。
 
 ```rust
 pub fn insert(
@@ -383,7 +385,7 @@ data_type:    u8 (0=BOOLEAN, 1=BIGINT, 2=TEXT)
 nullable:     u8 (0 または 1)
 ```
 
-この章では、`nullable`の直後に`primary_key`と`unique`という2バイトを追加します。
+この章では、`src/storage.rs`のエンコード処理で`nullable`の直後に`primary_key`と`unique`という2バイトを追加します。
 
 ```rust
 out.push(data_type_to_u8(column.data_type));
@@ -424,7 +426,7 @@ Catalogページの`payload`の中身がどうエンコードされているか�
 
 ## テストで確認する
 
-`constraints`モジュールには、既存行との重複検出、文内の重複検出、`NULL`同士が衝突しないこと、制約を持たないテーブルでは何も検査しないことを確認する単体テストを追加しました。
+`src/constraints.rs`には、既存行との重複検出、文内の重複検出、`NULL`同士が衝突しないこと、制約を持たないテーブルでは何も検査しないことを確認する単体テストを追加しました。
 
 ```rust
 #[test]
@@ -436,7 +438,7 @@ fn detects_duplicate_among_candidates_themselves() {
 }
 ```
 
-`database`モジュールには、`PRIMARY KEY`と`UNIQUE`の挿入時と更新時の違反、文内重複、`NULL`と`UNIQUE`の共存に加えて、Statement Rollbackを直接狙ったテストを追加しています。
+`src/database.rs`には、`PRIMARY KEY`と`UNIQUE`の挿入時と更新時の違反、文内重複、`NULL`と`UNIQUE`の共存に加えて、Statement Rollbackを直接狙ったテストを追加しています。
 
 ```rust
 #[test]

@@ -62,6 +62,9 @@ OSのファイルI/Oも、この素朴な案とは相性がよくありません
 固定長のページを採用すると決めたら、次はその長さを決めなければなりません。
 この章では**4096バイト(4KiB)**をページサイズに選びます。
 
+この章から新しいモジュール`page`を追加するため、`src/page.rs`を新規に作成し、`src/lib.rs`に`pub mod page;`という宣言を加えます。
+ページサイズは、`src/page.rs`に定数として次のように定義します。
+
 ```rust
 pub const PAGE_SIZE: usize = 4096;
 ```
@@ -95,6 +98,8 @@ Rustでバイト列と構造体を相互変換するだけなら、`serde`で構
 ページという固定長区画に加えて、ファイル全体としてもう1つ管理すべき情報があります。
 「このファイルは本当に`minidb`が作ったファイルなのか」「このファイルは何ページ分のデータを持っているのか」といった、個々のページの中身ではなくファイル全体に関わる情報です。
 この情報を持つ場所を**File Header**と呼び、ファイルの先頭に固定長で置きます。
+
+`src/page.rs`に次の`FileHeader`を定義します。
 
 ```rust
 pub struct FileHeader {
@@ -204,6 +209,8 @@ pub fn encode(&self) -> [u8; PAGE_SIZE] {
 `encode`の最後で計算している`checksum`は、そのページのバイト列が書き込まれてから読み込まれるまでの間に、意図しない変化を受けていないかを確かめるための値です。
 `crc32`という関数は、任意のバイト列を受け取り、32ビットの数値1つに要約します。
 
+`src/page.rs`に次の`crc32`関数を定義します。
+
 ```rust
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
@@ -267,6 +274,8 @@ pub fn decode(bytes: &[u8]) -> DbResult<Self> {
 一致しなければ`DbError::CorruptPage`を返します。
 この章で`DbError`に追加した唯一の新しいバリアントで、Magic Number不一致、Format Version不一致、checksum不一致、バイト数不一致、未知のPage Typeという、この章で起こりうる全ての壊れ方をまとめて表します。
 
+`src/error.rs`の`DbError`に、次のバリアントを追加します。
+
 ```rust
 /// File HeaderまたはPageのバイト列が壊れているエラー(Magic Number不一致、
 /// Format Version不一致、checksum不一致、バイト数不一致、未知のPage Typeなど)。
@@ -274,7 +283,7 @@ pub fn decode(bytes: &[u8]) -> DbResult<Self> {
 CorruptPage(String),
 ```
 
-`FileHeader::decode`も同じ考え方で、Magic Number、Format Version、checksumの3つを順に検証してから`FileHeader`を返します。
+`src/page.rs`に戻り、`FileHeader::decode`も同じ考え方で、Magic Number、Format Version、checksumの3つを順に検証してから`FileHeader`を返します。
 
 ```rust
 pub fn decode(bytes: &[u8]) -> DbResult<Self> {
@@ -334,6 +343,7 @@ checksumが検出できるのは、あくまで「書き込んだ時点のバイ
 ## テストで確認する
 
 `page`モジュールには、`FileHeader`と`Page`それぞれについて、`encode`してから`decode`すると元の値に戻ることを確認するラウンドトリップのテストを用意しています。
+これらのテストは`src/page.rs`内の`#[cfg(test)] mod tests`に置きます。
 
 ```rust
 #[test]

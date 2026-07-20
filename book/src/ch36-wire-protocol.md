@@ -45,7 +45,8 @@ PostgreSQL Wire Protocolは、認証方式(`SCRAM-SHA-256`等)、メッセージ
 
 ## フレームのレイアウト
 
-`src/protocol.rs`が定義するフレームは、リクエスト・レスポンスのどちらも同じ9バイトのヘッダを持ちます。
+この章で新しく作成する`src/protocol.rs`がフレームを定義します。`src/lib.rs`にも`pub mod protocol;`を追加し、このモジュールを公開します。
+リクエスト・レスポンスのどちらも同じ9バイトのヘッダを持ちます。
 
 ```text
 +----------+----------------+------------------+------------------+
@@ -227,6 +228,8 @@ pub fn from_db_result(result: crate::error::DbResult<crate::database::QueryResul
 
 並行モデルは最も単純な形、接続を受け付けるたびに`std::thread::spawn`でスレッドを1本立てる方式を採ります。
 
+この章で新しく作成する`src/server.rs`に、次の`Server::run`を実装します。`src/lib.rs`にも`pub mod server;`を追加します。
+
 ```rust
 pub fn run(self) -> std::io::Result<()> {
     for stream in self.listener.incoming() {
@@ -260,7 +263,7 @@ pub fn run(self) -> std::io::Result<()> {
 `SharedDatabase`の`TxHandle`API自体が`harness_contexts`の上に実装されているため、後者を選べば前者の仕組みをそのまま使うことになります。
 この章では、`Database`側を一切変更せずに済む後者を採用しました。
 
-問題は、`SharedDatabase::execute_in_tx`が`Database::execute`の先頭で行っている`BEGIN`、`COMMIT`、`ROLLBACK`の分岐を経由しないことです。
+問題は、`src/database.rs`が持つ`SharedDatabase::execute_in_tx`が、`Database::execute`の先頭で行っている`BEGIN`、`COMMIT`、`ROLLBACK`の分岐を経由しないことです。
 
 ```rust
 pub fn execute_in_tx(&mut self, handle: &TxHandle, sql: &str) -> DbResult<QueryResult> {
@@ -414,7 +417,8 @@ match db.execute(input) {
 }
 ```
 
-CLIクライアントは、`Database::execute`の代わりに`Request`をフレームへ詰めて送り、返ってきた`Response`を表示します。
+この章で新しく作成する`src/bin/minidb_client.rs`のCLIクライアントは、`Database::execute`の代わりに`Request`をフレームへ詰めて送り、返ってきた`Response`を表示します。
+バイナリ名を`minidb-client`にするため、`Cargo.toml`にも`name = "minidb-client"`、`path = "src/bin/minidb_client.rs"`という`[[bin]]`エントリを追加します。
 
 ```rust
 fn send(stream: &mut TcpStream, request_id: u32, sql: &str) -> Result<Response, ClientError> {

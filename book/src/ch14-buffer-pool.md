@@ -15,7 +15,7 @@
 同じページが再び必要になっても、`HeapFile`自身はそのページの中身をどこにも覚えていないので、`DiskManager`はそのたびにもう1度ファイルへ`seek`して`read`し直します。
 前章の時点では、これを確かめる手段そのものがありませんでした。
 
-この章ではまず、`DiskManager`にI/O回数を数える`io_count`を1つ加えます。
+この章ではまず、`src/disk_manager.rs`の`DiskManager`にI/O回数を数える`io_count`を1つ加えます。
 
 ```rust
 struct Inner {
@@ -35,6 +35,7 @@ struct Inner {
 
 `read_page`と`write_page`がこのカウンタを1ずつ増やすだけの変更です。
 これを使って、同じページを50回参照するテストを書いてみます。
+この章で新規作成する`src/buffer_pool.rs`に、`lib.rs`へ`pub mod buffer_pool;`を追加したうえで、`#[cfg(test)] mod tests`としてこのテストを置きます。
 
 ```rust
 #[test]
@@ -99,6 +100,7 @@ Buffer Poolの仕組み自体は単純です。
 「今使っていないフレームをどうやって選ぶか」がこの章の主題の1つで、その選び方は後の節で説明する**Clock置換**が担います。
 
 フレームには、ページの中身そのものに加えて、evictしてよいかどうかを判断するためのメタデータが必要です。
+`src/buffer_pool.rs`に、次の`Frame`と`FrameMeta`を定義します。
 
 ```rust
 /// 1フレームが保持するページ本体。`None`は「まだどのページも読み込んでいない
@@ -317,6 +319,7 @@ pub struct BufferPool {
 
 第13章の`HeapFile`は`DiskManager`を直接保持していました。
 この章では、その保持先を`BufferPool`に置き換えます。
+`src/heap_file.rs`の`HeapFile`定義を、次のように書き換えます。
 
 ```rust
 pub struct HeapFile {
@@ -369,6 +372,7 @@ pub fn insert(&mut self, bytes: &[u8]) -> DbResult<RecordId> {
 crateの中には`get`、`scan`だけでなく、将来のB+Treeの検索のような、同じく読み取り専用のまま`SlottedPage`相当の構造を読みたいコードが他にも増えていくからです。
 
 この壁を壊す方法は、`PageReadGuard`側に抜け道を空けることではなく、`SlottedPage`(第12章)の側に読み取り専用の入口を追加することでした。
+`src/slotted_page.rs`に、次の`SlottedPageRef`を追加します。
 
 ```rust
 pub struct SlottedPageRef<'a> {
@@ -392,6 +396,7 @@ pub fn get(&self, slot: SlotId) -> Option<&[u8]> {
 ```
 
 `HeapFile::get`は、`PageReadGuard::data()`が返す`&[u8]`をそのまま`SlottedPageRef::open`に渡すだけになります。
+`src/heap_file.rs`の`get`をこう書き換えます。
 
 ```rust
 pub fn get(&self, rid: RecordId) -> DbResult<Option<Vec<u8>>> {
@@ -471,6 +476,7 @@ pub fn update(&mut self, rid: RecordId, bytes: &[u8]) -> DbResult<Option<RecordI
 `BufferPool`はdirtyなページを明示的に`flush`するまでディスクへ書き戻しません。
 第13章の`HeapFile`は`insert`のたびに`disk.write_page`を呼んでいたので、事実上つねに書き込み済みでしたが、この章の`HeapFile`はそうではありません。
 プロセスの再起動をまたいでデータを残したいコードは、`HeapFile::flush`を呼んでからファイルを閉じる必要があります。
+このテストは`src/heap_file.rs`の`#[cfg(test)] mod tests`に置きます。
 
 ```rust
 #[test]
@@ -512,6 +518,7 @@ fn reopening_the_disk_manager_preserves_the_heap_file_contents() {
 ## dirtyなページはevict時にも書き戻される
 
 `flush`を呼ばなくても、容量を超えてページを参照し続ければ、evictのタイミングで自動的に書き戻しは起こります。
+このテストは`src/buffer_pool.rs`の`#[cfg(test)] mod tests`に戻ります。
 
 ```rust
 #[test]
@@ -613,6 +620,7 @@ fn dropping_a_guard_unpins_and_frees_a_slot_for_eviction() {
 `insert`、`get`、`update`、`delete`、`scan`の挙動、複数ページにまたがる走査、ページをまたぐ`update`によるRecordIdの変化は、第13章と同じ結果になることをそのまま確認しています。
 違うのは、`open_heap`ヘルパーが`DiskManager`を直接ではなく`BufferPool::new(disk, 16)`を経由して`HeapFile::open`に渡す点と、再起動を確認するテストが`heap.flush()`を挟む点だけです。
 Buffer Poolの容量がテーブルのページ数を下回っていても正しく動くことも、別に確認しています。
+このテストも`src/heap_file.rs`の`#[cfg(test)] mod tests`に置きます。
 
 ```rust
 #[test]

@@ -83,6 +83,10 @@ Slot Directoryは先頭から後ろへ、Tuple Dataは末尾から前へ向か�
 `slot_count`番目のスロットは、`payload`のオフセット`SLOTTED_HEADER_SIZE + slot_count * SLOT_ENTRY_SIZE`から8バイトに書かれています。
 スロット番号さえ分かれば、この掛け算1つでSlot Directory内の位置を直接求められ、先頭から順に走査する必要はありません。
 
+ここから先のコードは、この章で新しく作る`src/slotted_page.rs`に置いていきます。
+`src/lib.rs`には`pub mod slotted_page;`を追加します。
+まずこの2つの定数を定義します。
+
 ```rust
 pub const SLOTTED_HEADER_SIZE: usize = 4;
 pub const SLOT_ENTRY_SIZE: usize = 8;
@@ -104,6 +108,7 @@ Slot DirectoryとTuple Dataは、互いに向かい合って伸びる分だけ�
 Slot Directoryの1エントリを指す番号を`SlotId`という型で表します。
 `PageId`と同じくNewtypeで、`u64`ではなく`u16`を包みます。
 4080バイトの`payload`に収まるスロット数は最大でも510件程度なので、`u16`(最大65535)で十分足ります。
+`SlotId`は、既存の`src/ids.rs`に追記します。
 
 ```rust
 pub struct SlotId(pub u16);
@@ -151,6 +156,8 @@ Slot Directoryという間接参照は、この安定性のためにあります
 ところが、Occupiedな範囲を`start`だけをキーにソートしてから隣接する範囲だけを比べるという実装をそのまま使うと、空区間`[4079, 4079)`と、たまたま同じ`start`を持つ非空区間`[4079, 4080)`が並んだときに、ソートの並び順(どちらが先に来るかは`start`だけでは決まりません)次第で「重なっている」と誤判定することがあります。
 この検証は、空区間をそもそも重複検査の対象から除外することでこの落とし穴を避けています。
 読み取り専用の`SlottedPageRef::open`(第14章で登場)も同じ検証を行います。
+
+`init`は`src/slotted_page.rs`に定義します。
 
 ```rust
 pub fn init(payload: &'a mut [u8]) -> Self {
@@ -404,6 +411,10 @@ fn try_relocate(&mut self, slot: SlotId, bytes: &[u8]) -> bool {
 NULLビットマップは、列数を8列単位へ切り上げたバイト数を持ちます。
 列`i`が`NULL`なら、`i / 8`バイト目の`i % 8`ビット目が1になります。
 
+ここから先のコードは、この章で新しく作る`src/tuple_codec.rs`に置いていきます。
+`src/lib.rs`には`pub mod tuple_codec;`を追加します。
+まず、この関数を定義します。
+
 ```rust
 fn null_bitmap_len(column_count: usize) -> usize {
     column_count.div_ceil(8)
@@ -553,6 +564,8 @@ pub fn decode_tuple(schema: &Schema, bytes: &[u8]) -> DbResult<Tuple> {
 `bytes`が短すぎる場合や、`TEXT`の長さプレフィックスが実際の残りバイト数を超えている場合、`decode_tuple`は`DbError::CorruptTuple`を返します。
 `bytes.get(range)`のように範囲外アクセスを`Option`として受け取る形で境界チェックを行っているため、不正な`bytes`を渡してもパニックせず、この章で追加したエラーとして呼び出し側に伝わります。
 
+この`CorruptTuple`は、既存の`src/error.rs`の`DbError`に追記します。
+
 ```rust
 /// Tupleのバイト列が、渡された`Schema`のもとで復元できないエラー
 /// (バイト列がNULLビットマップや値の途中で尽きている、`TEXT`の長さプレフィックス
@@ -566,6 +579,7 @@ CorruptTuple(String),
 `slotted_page`と`tuple_codec`のテストは、大きく5つの観点をカバーしています。
 
 挿入してすぐ`get`すれば同じバイト列が返ることを確認する、最も基本的なラウンドトリップです。
+これらのテストは`src/slotted_page.rs`の`#[cfg(test)] mod tests`に置きます。
 
 ```rust
 #[test]

@@ -28,6 +28,7 @@ REPL(`main.rs`)は`Database::memory()`しか呼んでいないため、`\q`で�
 `Database`にとって、テーブル定義と行をメモリ上に置くかディスク上に置くかは、これから先も両方使い続ける選択です。
 `Database::memory()`は第1部からの読者向けの入口としても、後続の章の単体テストの土台としても、この先ずっと使い続けます。
 つまり`Database`は、1つの型のまま2種類の裏側を持ち続ける必要があります。
+この章では新規モジュールを追加せず、既存の`src/database.rs`に新しい`Backend`を追記し、`Database`をそれを持つ形へ書き換えます。
 
 ```rust
 enum Backend {
@@ -51,6 +52,7 @@ pub struct Database {
 `Memory`側は前章までの2つの部品をそのまま`enum`の1つのバリアントに収め、`Disk`側だけが新しい`Storage`を持つという非対称を、素直に残すことにしました。
 
 `execute_*`の各関数からこの`enum`を使うために、テーブル名からの解決だけを一箇所にまとめておきます。
+同じ`src/database.rs`の`Database`に、次の`table_info`を追記します。
 
 ```rust
 fn table_info(&self, name: &str) -> Option<&TableInfo> {
@@ -67,6 +69,7 @@ fn table_info(&self, name: &str) -> Option<&TableInfo> {
 ## CREATE TABLEとDROP TABLEをつなぐ
 
 `CREATE TABLE`は、列定義を`Schema`へ組み立てる部分(列名の重複検査、型名の解決)を前章までそのまま使い、登録先だけをバックエンドで分けます。
+`execute_create_table`(引き続き`src/database.rs`)は、この部分を次のように書き換えます。
 
 ```rust
 let schema = Schema::new(columns);
@@ -91,6 +94,7 @@ Ok(QueryResult::command("CREATE TABLE"))
 
 `FROM`を伴う`SELECT`は、Sequential Scan→(あれば)Filter→Projectionという順序で`executor`の演算子を適用します(第10章)。
 このうち、行を実際に読み出すSequential Scanだけがバックエンドごとに実装を持ち、Filter(`executor::filter`)とProjection(`executor::project`)は前章までのコードを1行も変えていません。
+`execute_select`(`src/database.rs`)は、Sequential Scanの部分を次のように書き換えます。
 
 ```rust
 let scanned = match &self.backend {
@@ -108,6 +112,7 @@ let scanned = match &self.backend {
 
 `executor::seq_scan(table: &MemTable) -> Vec<Tuple>`は`MemTable`が持つ`Tuple`をそのまま複製するだけでした。
 新しく加えた`executor::storage_seq_scan`は、`Storage::scan`(第15章)が返す`(RecordId, バイト列)`から`RecordId`を捨て、バイト列だけを`decode_tuple`(第12章)で`Tuple`へ復元します。
+`seq_scan`と同じ`src/executor.rs`に、次の関数を追記します。
 
 ```rust
 pub fn storage_seq_scan(storage: &Storage, table_id: TableId, schema: &Schema) -> DbResult<Vec<Tuple>> {
@@ -127,7 +132,7 @@ pub fn storage_seq_scan(storage: &Storage, table_id: TableId, schema: &Schema) -
 ## UPDATEとDELETEをRecordIdベースにする
 
 `SELECT`と違い、`UPDATE`と`DELETE`は「読んだ行のうちどれを書き換えるか、消すか」を特定しなければなりません。
-`MemTable`版の`executor::update`は、この特定を`Vec`の添字で行っています。
+`MemTable`版の`executor::update`(`src/executor.rs`)は、この特定を`Vec`の添字で行っています。
 
 ```rust
 let mut planned = Vec::new();
@@ -145,6 +150,7 @@ for (index, new_tuple) in planned {
 `Storage`にはこの添字に相当するものがありません。
 行はページをまたいで散らばっており、1件を指せる唯一の座標は第13章で導入した`RecordId`(ページ番号とスロット番号の組)です。
 `storage_update`は、添字の代わりに`Storage::scan`が返す`RecordId`をそのまま使い回します。
+`update`と同じ`src/executor.rs`に、次の関数を追記します。
 
 ```rust
 pub fn storage_update(
@@ -188,6 +194,7 @@ pub fn storage_update(
 ## Database::openと明示的なflush
 
 永続モードの入口は`Database::open`です。
+`src/database.rs`の`Database`に、次のコンストラクタを追記します。
 
 ```rust
 pub fn open<P: AsRef<Path>>(path: P) -> DbResult<Self> {
@@ -210,6 +217,7 @@ pub fn open<P: AsRef<Path>>(path: P) -> DbResult<Self> {
 利用側のコードは1行のまま、動作だけが状況に応じて変わります。
 
 書き込んだ内容をファイルへ実際に反映させるには、`flush`を呼ぶ必要があります。
+同じく`Database`に、次の`flush`を追記します。
 
 ```rust
 pub fn flush(&self) -> DbResult<()> {
@@ -238,6 +246,7 @@ pub fn flush(&self) -> DbResult<()> {
 ## REPLをファイルパスに対応させる
 
 `main.rs`は、起動時の引数からファイルパスを受け取れるようにします。
+`src/main.rs`の`fn main`を、次のように書き換えます。
 
 ```rust
 let mut args = env::args();
@@ -282,6 +291,7 @@ id | name
 
 同じ`example.db`を指定して2回目に起動すると、`users`もその中の`Alice`も、SQLを1文も打ち直すことなく残っています。
 テストとしても、このREPLセッションと同じ流れを`Database`の値を作り直す形で確認しています。
+統合テスト`tests/persistence.rs`に、次のテストを追記します。
 
 ```rust
 #[test]

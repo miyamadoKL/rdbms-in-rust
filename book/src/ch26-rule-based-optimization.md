@@ -81,7 +81,8 @@ Projection(name)
 ## `Rule`トレイトと固定点まで反復するドライバ
 
 書き換えの種類は複数あり、この先の章でも増えていく見込みです(第27章以降、統計情報を使う書き換えが加わります)。
-`src/rules.rs`は、個々の書き換えを`Rule`という1つのインターフェースの実装として登録できるようにしました。
+この章では新しいモジュール`src/rules.rs`を新規作成し、個々の書き換えを`Rule`という1つのインターフェースの実装として登録できるようにしました。
+`src/lib.rs`にも`pub mod rules;`を追加します。
 
 ```rust
 pub trait Rule {
@@ -119,7 +120,7 @@ pub fn optimize(mut plan: LogicalPlan, functions: &FunctionRegistry) -> LogicalP
 この章のルールはどれも式や木を単調に小さくする性質を持ち、通常はクエリの構文要素数のオーダーで収束するため、正常な実行でこの上限に達することはありません。
 上限は、将来ルールを追加した際に互いを無限に行き来させてしまうバグへの安全弁として置いてあります。
 
-`Database::execute_select`と`execute_explain`は、`logical_plan::build_select`が返した木を`physical_plan::optimize`へ渡す前に、この`rules::optimize`を通します。
+`src/database.rs`の`Database::execute_select`と`execute_explain`は、`logical_plan::build_select`が返した木を`physical_plan::optimize`へ渡す前に、この`rules::optimize`を通します。
 
 ```rust
 fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {
@@ -139,6 +140,7 @@ fn execute_select(&self, plan: LogicalPlan) -> DbResult<QueryResult> {
 `Constant Folding`は、こうした部分式を実行前に一度だけ評価し、結果のリテラルへ置き換えます。
 
 畳み込んでよい対象は、列参照(`ColumnRef`)も集約(`Aggregate`)も含まない式に限ります。
+`src/rules.rs`に次の`is_constant`を定義します。
 
 ```rust
 fn is_constant(expr: &BoundExpr) -> bool {
@@ -259,7 +261,7 @@ fn simplify_expr(expr: BoundExpr) -> (BoundExpr, bool) {
 見た目はブール代数の教科書どおりですが、この式が扱う`AND`と`OR`は二値論理ではなく、`UNKNOWN`(`NULL`)を含む三値論理(第8章)です。
 `FALSE AND x`を`FALSE`へ、`TRUE AND x`を`x`へ書き換えてよいのは、`x`が`TRUE`、`FALSE`、`UNKNOWN`のどの値であっても、書き換え前後で同じ値になると確かめられるからです。
 
-`crate::eval`の`tri_and`はこう定義されています。
+`src/eval.rs`の`tri_and`はこう定義されています。
 
 ```rust
 fn tri_and(l: Tri, r: Tri) -> Tri {
@@ -293,7 +295,7 @@ BinaryOperator::And => {
 `Boolean Simplification`がこれを`FALSE`へ書き換えたあとは、右辺を評価すること自体がなくなり、エラーにならず0行を返します。
 どちらの場合も「この式が`WHERE`に現れた行が結果に残ることはない」という点では変わらないので、返す行の集合という意味では書き換えは正しいと言えますが、エラーになるか成功するかという**振る舞い**までは保存していません。
 実際のRDBMSの多くも、こうしたデッドブランチを畳み込んで消すのが一般的な挙動です。
-この章もその慣行に合わせ、テストではこの振る舞いの変化そのものを確認します。
+この章もその慣行に合わせ、`src/rules.rs`の`mod tests`でこの振る舞いの変化そのものを確認します。
 
 ```rust
 for predicate in [

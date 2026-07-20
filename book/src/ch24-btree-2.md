@@ -59,6 +59,7 @@ offset 0        2                10                   10+4n
 
 `next_leaf`は右隣のLeaf Pageを指す`PageId`で、右隣が無ければ`0`です。
 `0`を番兵として使えるのは、ページ0が常に`DiskManager`のFile Headerに占有されていて(第11章)、Leaf Pageの`PageId`として現れることが無いからです。
+`src/btree_page.rs`に、次の定数を追加します。
 
 ```rust
 pub const NO_NEXT_LEAF: PageId = PageId(0);
@@ -100,6 +101,7 @@ pub fn write_entries(&mut self, entries: &[(Vec<u8>, RecordId)]) -> bool {
 
 これで「エントリの並び替え」と「右隣への案内」が独立に扱えます。
 `next_leaf`を実際に**書き換える**必要があるのは、右隣そのものが変わる場面、つまりLeaf Splitだけです。
+`src/btree.rs`の`split_leaf`を、次のように変更します。
 
 ```rust
 fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbResult<(Vec<u8>, PageId)> {
@@ -211,6 +213,7 @@ pub fn range<'a>(&'a self, lower: Bound<&Value>, upper: Bound<&Value>) -> DbResu
 
 必要なのは、一致の**最初**の葉から出発することです。
 そこで内部ページ探索にもう1つ、区切りキーと`key`が等しい場合の分岐だけが違う関数を用意しました。
+`src/btree_page.rs`に、次の`child_for_lower_bound`を追加します。
 
 ```rust
 pub fn child_for_lower_bound(&self, key: &[u8]) -> PageId {
@@ -230,7 +233,7 @@ pub fn child_for_lower_bound(&self, key: &[u8]) -> PageId {
 
 `child_for`が「`key`**以下**の区切りキーの本数」を数えるのに対し、`child_for_lower_bound`は「`key`**未満**の区切りキーの本数」を数えます。
 この1文字(`<=`と`<`)の違いだけで、同じ値の区切りキーが並んでいるとき、`child_for`は最後の一致を、`child_for_lower_bound`は最初の一致を選ぶようになります。
-`find_leaf_for_lower_bound`は、この`child_for_lower_bound`を使って`find_leaf`と同じ要領でRootから下るだけの、もう1つの探索経路です。
+`src/btree.rs`の`find_leaf_for_lower_bound`は、この`child_for_lower_bound`を使って`find_leaf`と同じ要領でRootから下るだけの、もう1つの探索経路です。
 
 ```rust
 fn find_leaf_for_lower_bound(&self, key_bytes: &[u8]) -> DbResult<PageId> {
@@ -439,6 +442,7 @@ DROP INDEX
 
 複合キー(複数列にまたがる索引)は、前章から続く「索引キーは単一列に限る」という制約(`crate::btree::BTree`)をそのまま引き継ぎ、この章でも扱いません。
 `Lexer`(第6章)に`INDEX`キーワードを1つ追加し、`Parser`(第7章)は`CREATE`と`DROP`の直後のトークンを覗き見て、既存の`CREATE TABLE`と`DROP TABLE`、新しい`CREATE INDEX`と`DROP INDEX`を振り分けます。
+`src/parser.rs`の`parse_create_statement`を、次のように変更します。
 
 ```rust
 fn parse_create_statement(&mut self) -> DbResult<Statement> {
@@ -452,7 +456,7 @@ fn parse_create_statement(&mut self) -> DbResult<Statement> {
 ```
 
 `CREATE TABLE`が定義するのは新しいテーブル名と列名であるのに対し、`CREATE INDEX`が指定するテーブル名と列名は既存のカタログエントリを指す名前です(`DROP TABLE`の`table`と同じ立場)。
-そのため`Binder`(第17章)が、テーブルと列の存在確認と、`table_id`と`column_index`への解決を担当します。
+そのため`src/binder.rs`の`Binder`(第17章)が、テーブルと列の存在確認と、`table_id`と`column_index`への解決を担当します。
 
 ```rust
 fn bind_create_index(&self, create: CreateIndexStatement) -> DbResult<BoundStatement> {
@@ -493,7 +497,7 @@ pub trait CatalogLookup {
 
 `Database::memory`が使う`Catalog`(第9章)はこの既定のままにし、`Storage`だけが実際の索引一覧を見るよう上書きします。
 `Catalog`はテーブル名と列構成の対応だけを持つ、メモリ上限定の実装であり、索引という概念そのものを持たないからです。
-実行(`Database::execute_create_index`)は、メモリバックエンドに来た場合`DbError::NotImplemented`を返します。
+実行(`src/database.rs`の`execute_create_index`)は、メモリバックエンドに来た場合`DbError::NotImplemented`を返します。
 
 ```rust
 fn execute_create_index(&mut self, create: BoundCreateIndex) -> DbResult<QueryResult> {
@@ -525,6 +529,7 @@ fn execute_create_index(&mut self, create: BoundCreateIndex) -> DbResult<QueryRe
 
 そこでこの章では、**索引ごとに専用のファイル**を持たせます。
 `users`テーブルの`email`列に`idx_email`という索引を作ると、データベース本体のファイル(たとえば`example.db`)とは別に、`example.db.idx.idx_email`というファイルが1つ増えます。
+`src/storage.rs`に、次の`index_file_path`を追加します。
 
 ```rust
 fn index_file_path(db_path: &Path, index_name: &str) -> PathBuf {
@@ -654,7 +659,7 @@ pub fn index_insert_row(&mut self, table_id: TableId, tuple: &Tuple, rid: Record
 どちらも`table_id`が一致する**全索引**(`UNIQUE`かどうかを問わない)を対象にしている点が要です。
 1つのテーブルに複数の索引が付いていても、行が1件変わるたびに呼び出し側(`crate::executor`)がすべての索引を個別に把握しておく必要はありません。
 
-`executor::storage_insert`(第16章から続く、`INSERT`の実装)は、行を書き込んだ直後にこのメソッドを呼びます。
+`src/executor.rs`の`storage_insert`(第16章から続く、`INSERT`の実装)は、行を書き込んだ直後にこのメソッドを呼びます。
 
 ```rust
 for tuple in &planned {
@@ -747,6 +752,7 @@ offset 0        8         9        10
 ```
 
 `unique`が`true`のツリーは、`insert`が既存のキーとの重複を自分で拒否します。
+`src/btree.rs`の`insert`を、次のように変更します。
 
 ```rust
 pub fn insert(&mut self, key: &Value, rid: RecordId) -> DbResult<()> {
@@ -765,7 +771,7 @@ pub fn insert(&mut self, key: &Value, rid: RecordId) -> DbResult<()> {
 
 ### 索引を使った一意性検査
 
-`crate::index::check_uniqueness_with_index`が、`crate::constraints::check_uniqueness`(第20章)の「候補行が既存の行と重複しないか」を確かめる部分を、索引への`lookup`に置き換えます。
+`src/index.rs`の`check_uniqueness_with_index`が、`crate::constraints::check_uniqueness`(第20章)の「候補行が既存の行と重複しないか」を確かめる部分を、索引への`lookup`に置き換えます。
 
 ```rust
 pub fn check_uniqueness_with_index(
@@ -810,6 +816,7 @@ pub fn check_uniqueness_with_index(
 
 候補行**同士**の重複(同じ`INSERT`文の中の2行がどちらも新しい値で、まだ索引のどこにも登録されていない場合)は、索引への`lookup`だけでは検出できません。
 この部分は第20章の`constraints::check_uniqueness`に、比較相手の行を空にした形でそのまま残します。
+`src/executor.rs`に、次の2つの検査を並べます。
 
 ```rust
 if schema.unique_constrained_columns().next().is_some() {
@@ -828,7 +835,7 @@ if schema.unique_constrained_columns().next().is_some() {
 テーブルの登録(`Storage::create_table`)と、対応する制約索引の作成をそれぞれ独立した`persist_catalog`(カタログの永続化)で行うと、後者のどんな理由の失敗であっても「テーブルだけが、対応する制約索引を持たずにカタログへ残る」という状態が生まれてしまいます。
 その状態で`INSERT`すると、`check_uniqueness_with_index`(前節)が「`PRIMARY KEY`や`UNIQUE`の列には自動生成索引が必ずある」という前提で対応する索引を探し、見つからずに`DbError::CorruptCatalog`を返すところまで症状が伝播します。
 
-これを避けるため、`Storage::create_table_with_constraint_indexes`という1つのAPIに、テーブルの登録と全制約索引の作成をまとめます。
+これを避けるため、`src/storage.rs`に`Storage::create_table_with_constraint_indexes`という1つのAPIを追加し、テーブルの登録と全制約索引の作成をまとめます。
 
 ```rust
 pub fn create_table_with_constraint_indexes(
@@ -879,7 +886,7 @@ pub fn create_table_with_constraint_indexes(
 全部の索引が揃って初めて、`persist_catalog`を**1回だけ**呼びます。
 これで、テーブルと全制約索引が「すべて揃った状態」と「(この関数を呼ぶ前の)何も無い状態」のどちらかにしかならず、索引名の衝突以外のどんな理由の失敗であっても、テーブルだけが取り残されることはありません。
 
-`Database::execute_create_table`(ディスクバックエンド)は、この1つのAPIを呼ぶだけです。
+`src/database.rs`の`Database::execute_create_table`(ディスクバックエンド)は、この1つのAPIを呼ぶだけです。
 
 ```rust
 storage.create_table_with_constraint_indexes(&create.table.name, schema, &constraint_columns)?;
@@ -897,7 +904,7 @@ minidb> DROP INDEX users_id_idx;
 ```
 
 この索引を`DROP INDEX`で消せてしまうと、`id`列が`PRIMARY KEY`を宣言しているのに、それを検査する索引(`check_uniqueness_with_index`が探しに行く索引)が無いという、`CREATE TABLE`の失敗経路と同じ不整合が生まれます。
-それを防ぐため、`IndexInfo`(索引のメタデータ)に`is_constraint`というフィールドを持たせ、`Storage::drop_index`(SQLの`DROP INDEX`が呼ぶ入口)がこれを見て拒否します。
+それを防ぐため、`IndexInfo`(索引のメタデータ)に`is_constraint`というフィールドを持たせ、`src/storage.rs`の`Storage::drop_index`(SQLの`DROP INDEX`が呼ぶ入口)がこれを見て拒否します。
 
 ```rust
 pub fn drop_index(&mut self, index_name: &str) -> DbResult<()> {
@@ -990,7 +997,7 @@ n= 16000 elapsed=34.90µs
 `crate::btree`のテストは、Range Scanの境界(`Included`、`Excluded`、`Unbounded`の組み合わせ、空の範囲)、複数ページにまたがる重複キーが取りこぼされないことの回帰、`unique`フラグの動作、Lazy Delete後の`lookup`と`range`の一貫性を確認します。
 `delete_finds_the_target_rid_regardless_of_which_leaf_it_ended_up_in_after_duplicate_key_splits`は、この節で直した`delete`の境界値テストです。
 同じキーで500件のエントリを挿入してLeaf Splitを複数回起こしたうえで、先頭、中間、末尾それぞれの葉に残った`RecordId`を指定して削除できることを確認します。
-5,000件規模のシードつき乱数列を`std::collections::BTreeMap`と突き合わせるモデルベーステスト(第23章から続く手法)は、`range`と`delete`の両方に対しても書きました。
+5,000件規模のシードつき乱数列を`std::collections::BTreeMap`と突き合わせるモデルベーステスト(第23章から続く手法)は、`range`と`delete`の両方に対しても`src/btree.rs`に書きました。
 
 ```rust
 #[test]
@@ -1023,6 +1030,7 @@ fn range_matches_a_btreemap_model() {
 `crate::database`のテストは、SQL文字列を通した統合テストです。
 メモリバックエンドの走査ベース検査とディスクバックエンドの索引ベース検査が、同じ違反に対して同じ種類のエラー(`to_string()`まで一致する同一メッセージ)を返すことも確認します。
 `DROP INDEX`が制約索引を拒否することは、`PRIMARY KEY`と`UNIQUE`の両方について、拒否された後も制約自体は効き続けていること(`INSERT`が引き続き違反を検出すること)まで含めて確認します。
+このテストは`src/database.rs`に書きます。
 
 ```rust
 let mem_err = {

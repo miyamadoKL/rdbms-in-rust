@@ -50,7 +50,7 @@ Aliceの残高は70のまま、Bobの残高は50のままです。
 ## BEGIN、COMMIT、ROLLBACKを実行する
 
 まず、3つの新しい文を構文として受理できるようにします。
-第6章のLexerに`BEGIN`、`COMMIT`、`ROLLBACK`という3つの予約語を追加します。
+`src/lexer.rs`の第6章のLexerに`BEGIN`、`COMMIT`、`ROLLBACK`という3つの予約語を追加します。
 
 ```rust
 pub enum Keyword {
@@ -64,7 +64,7 @@ pub enum Keyword {
 }
 ```
 
-AST(第7章)には、それぞれ`Span`だけを持つ空の文を3つ追加します。
+`src/ast.rs`のAST(第7章)には、それぞれ`Span`だけを持つ空の文を3つ追加します。
 
 ```rust
 /// `BEGIN`文(第30章)。`BEGIN TRANSACTION`のような修飾は持たず、`BEGIN`
@@ -87,7 +87,7 @@ pub struct RollbackStatement {
 }
 ```
 
-`CREATE TABLE`や`ANALYZE`と同じく、この3つは列や式を1つも持たないため、`Parser`側も1個のキーワードを読むだけで済みます。
+`CREATE TABLE`や`ANALYZE`と同じく、この3つは列や式を1つも持たないため、`src/parser.rs`の`Parser`側も1個のキーワードを読むだけで済みます。
 
 ```rust
 fn parse_begin_statement(&mut self) -> DbResult<BeginStatement> {
@@ -97,7 +97,7 @@ fn parse_begin_statement(&mut self) -> DbResult<BeginStatement> {
 ```
 
 `COMMIT`、`ROLLBACK`もまったく同じ形なので、本文では割愛します。
-`Binder`(第17章)は、`ANALYZE`と同じ理由でこの3つをそのまま素通りさせます。
+`src/binder.rs`の`Binder`(第17章)は、`ANALYZE`と同じ理由でこの3つをそのまま素通りさせます。
 
 ```rust
 Statement::Begin(begin) => Ok(BoundStatement::Begin(begin)),
@@ -111,7 +111,7 @@ Statement::Rollback(rollback) => Ok(BoundStatement::Rollback(rollback)),
 
 ## Autocommitと明示的トランザクション
 
-`Database`に、現在進行中のトランザクションを表すフィールドを追加します。
+`src/database.rs`の`Database`に、現在進行中のトランザクションを表すフィールドを追加します。
 
 ```rust
 pub struct Database {
@@ -135,6 +135,8 @@ pub struct Database {
 `tx`が`Some`になっている間だけ、複数の文が1つのトランザクションにまとまります。
 
 `tx`の型`TransactionContext`は、新しいモジュール`transaction`に置きます。
+`src/transaction.rs`を新規作成し、`src/lib.rs`に`pub mod transaction;`を追加します。
+この`src/transaction.rs`に、次の`TransactionState`と`TransactionContext`を定義します。
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,7 +164,7 @@ pub(crate) struct TransactionContext {
 複数のクライアントが同時に別々のトランザクションを開くという状況は、第36章でWire Protocolが、第37章でSessionが導入されるまで登場しません。
 今のところ`TransactionContext`は`Database`自身が直接持つ1個のフィールドで足り、`Session`という層を先取りして導入する理由がありません。
 
-`execute`は、`BEGIN`、`COMMIT`、`ROLLBACK`をここで直接振り分けます。
+`src/database.rs`の`execute`は、`BEGIN`、`COMMIT`、`ROLLBACK`をここで直接振り分けます。
 
 ```rust
 pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
@@ -265,7 +267,7 @@ balance
 
 ## メモリ上のUndo Record
 
-`ROLLBACK`が逆順に適用する`undo_log`の1件が`UndoRecord`です。
+`ROLLBACK`が逆順に適用する`undo_log`の1件が、`src/transaction.rs`に定義する`UndoRecord`です。
 
 ```rust
 #[derive(Debug, Clone)]
@@ -318,7 +320,7 @@ pub(crate) fn apply_undo_memory(storage: &mut MemStorage, undo_log: Vec<UndoReco
 同じトランザクションの中で`id = 1`の行を2回更新していれば、`undo_log`には`Update`が2件、実行した順に並びます。
 `ROLLBACK`はこれを後ろから適用するので、2回目の更新を先に元へ戻し、続けて1回目の更新を元へ戻すという、実際に起きた変更と正反対の順序をたどります。
 
-`INSERT`、`UPDATE`、`DELETE`の各演算子(`executor`モジュール)は、この章から`undo: &mut Vec<UndoRecord>`という引数を追加で受け取ります。
+`INSERT`、`UPDATE`、`DELETE`の各演算子(`src/executor.rs`の`executor`モジュール)は、この章から`undo: &mut Vec<UndoRecord>`という引数を追加で受け取ります。
 
 ```rust
 pub fn insert(
@@ -343,7 +345,7 @@ pub fn insert(
 
 実際に書き込んだ行1件ごとに、その逆操作を`undo`へ積みます。
 `update`、`delete`、およびDiskバックエンド向けの`storage_insert`、`storage_update`、`storage_delete`も同じ形で`undo`を受け取り、書き込みと同時に逆操作を記録します。
-呼び出し元(`Database::run_insert`)は、この`undo`をどう扱うかを自分で決めます。
+呼び出し元である`src/database.rs`の`Database::run_insert`は、この`undo`をどう扱うかを自分で決めます。
 
 ```rust
 fn run_insert(&mut self, plan: LogicalPlan) -> DbResult<usize> {
@@ -397,7 +399,7 @@ Autocommit経路にこの章のUndoを働かせる必要が無いのは、この
 
 ### Diskバックエンドの`RecordId`付け替え
 
-`apply_undo_memory`と対になる`apply_undo_disk`は、単純な逆順適用だけでは済みません。
+`src/transaction.rs`に定義する、`apply_undo_memory`と対になる`apply_undo_disk`は、単純な逆順適用だけでは済みません。
 
 ```rust
 pub(crate) fn apply_undo_disk(storage: &mut Storage, undo_log: Vec<UndoRecord>) -> DbResult<()> {
@@ -448,6 +450,7 @@ pub(crate) fn apply_undo_disk(storage: &mut Storage, undo_log: Vec<UndoRecord>) 
 もう1つは、PostgreSQLが採る設計で、1文でも失敗したらトランザクション全体を「エラー状態」に固定し、`ROLLBACK`以外のすべての文を拒否するというものです。
 
 このSQLサブセットは後者を選びました。
+`src/database.rs`に次の`finish`を定義します。
 
 ```rust
 fn finish(&mut self, result: DbResult<QueryResult>) -> DbResult<QueryResult> {

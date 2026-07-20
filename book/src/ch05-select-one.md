@@ -55,7 +55,12 @@ let value = minidb::???; // "SELECT 1"をどう渡せばいいのか、渡す先
 
 ### 仮の構文解析器
 
-`SELECT`に続く式だけを解析する仮実装を、独立したモジュール`toy_sql`に置きます。
+`SELECT`に続く式だけを解析する仮実装を、新規作成する`src/toy_sql.rs`に置きます。
+`src/lib.rs`には次の行を追加します(公開APIとして外部に見せる必要はないので`pub`は付けません)。
+
+```rust
+mod toy_sql;
+```
 
 ```rust
 /// この仮実装が扱える式。整数リテラル・真偽値リテラル・整数の加算のみを持つ。
@@ -190,6 +195,12 @@ fn parse_expr(src: &str) -> DbResult<ToyExpr> {
 ### `Database`と`QueryResult`
 
 `Database`は、SQL文字列を受け取って結果を返す入り口です。
+新規作成する`src/database.rs`に置きます。
+`src/lib.rs`には次の行を追加します。
+
+```rust
+pub mod database;
+```
 
 ```rust
 /// minidbのデータベース1つを表す。
@@ -404,8 +415,8 @@ pub fn execute_sql(sql: &str) -> DbResult<QueryResult> {
 
 ### 単体テスト
 
-`toy_sql`と`database`のそれぞれに、単体テストを追加しました。
-構文解析が受理すべき入力と拒否すべき入力の両方、そして`Database::execute`が返す`Tuple`の値と列名を確認します。
+`src/toy_sql.rs`と`src/database.rs`のそれぞれに、単体テストを追加しました。
+構文解析が受理すべき入力と拒否すべき入力の両方(`src/toy_sql.rs`)、そして`Database::execute`が返す`Tuple`の値と列名(`src/database.rs`)を確認します。
 
 ```rust
     #[test]
@@ -426,7 +437,7 @@ pub fn execute_sql(sql: &str) -> DbResult<QueryResult> {
 
 ### SQL Golden Test
 
-第3章で用意した`run_sql`は、まだクエリエンジンが無いためSQLをそのままエコーするだけの仮実装でした。
+第3章で用意した`tests/golden.rs`の`run_sql`は、まだクエリエンジンが無いためSQLをそのままエコーするだけの仮実装でした。
 これを`Database::execute`の呼び出しに差し替えます。
 
 ```rust

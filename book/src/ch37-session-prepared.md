@@ -48,6 +48,8 @@ SELECT name FROM users WHERE name = 'x' OR '1'='1'
 ## Session:接続の状態を一元管理する
 
 `Session`は、Embedded、REPL、Serverの3つの利用箇所すべてが使う、接続ひとつぶんの状態です。
+この章から`src/session.rs`を新規作成し、`Session`とその周辺の型をそこへ実装していきます。
+`src/lib.rs`には`pub mod session;`(83行目)を追加します。
 
 ```rust
 pub struct Session {
@@ -105,7 +107,7 @@ pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
 ```
 
 `BEGIN`、`COMMIT`、`ROLLBACK`、`PREPARE`、`EXECUTE`、`DEALLOCATE`のどれでもない文(`other`の分岐)は、`SharedDatabase::bind_statement`でその場で1回だけ束縛し、得られた`BoundStatement`を`run_bound`へ渡します。
-`bind_statement`は、`Database`が第9章以来ずっと使ってきた`bind`という内部関数を、この章で公開しただけの薄いラッパーです。
+`src/database.rs`の`bind_statement`は、`Database`が第9章以来ずっと使ってきた`bind`という内部関数を、この章で公開しただけの薄いラッパーです。
 
 ```rust
 pub fn bind_statement(&self, statement: Statement, sql: &str) -> DbResult<BoundStatement> {
@@ -156,7 +158,7 @@ pub fn execute_in_tx_bound(&mut self, handle: &TxHandle, bound: BoundStatement) 
 
 `execute_in_tx`は「パースしてから実行する」クロージャを`run_in_tx`へ渡し、`execute_in_tx_bound`は「(パースも束縛もせず)そのまま実行する」クロージャを渡すだけの違いです。
 `run_in_tx`自身は、`harness_contexts`(第30章)との出し入れ、`Aborted`状態の検査、`finish`によるAbort遷移という、トランザクション境界の規律をどちらの経路でも同じように適用します。
-`Session::run_bound`は、この`execute_in_tx_bound`(明示的な`BEGIN`の中)と、1文だけのAutocommit(`begin_tx`→`execute_in_tx_bound`→`commit_tx`/`rollback_tx`)を、`self.tx`の有無で振り分けます。
+`src/session.rs`の`Session::run_bound`は、この`execute_in_tx_bound`(明示的な`BEGIN`の中)と、1文だけのAutocommit(`begin_tx`→`execute_in_tx_bound`→`commit_tx`/`rollback_tx`)を、`self.tx`の有無で振り分けます。
 
 ```rust
 fn run_bound(&mut self, bound: BoundStatement) -> DbResult<QueryResult> {
@@ -185,7 +187,7 @@ EXECUTE find_by_name('Alice')
 DEALLOCATE find_by_name
 ```
 
-`$1`という記号(プレースホルダ)は、字句解析器(`crate::lexer`)に新しいトークンとして追加しました。
+`$1`という記号(プレースホルダ)は、字句解析器(`src/lexer.rs`)に新しいトークンとして追加しました。
 
 ```rust
 /// `$`に続く数字列を読み、`TokenKind::Param`にする(第37章、`PREPARE`が
@@ -211,7 +213,7 @@ fn lex_param(&mut self) -> DbResult<TokenKind> {
 }
 ```
 
-AST(`crate::ast`)には、`Expr`の新しいバリアントとして`Param`を追加します。
+AST(`src/ast.rs`)には、`Expr`の新しいバリアントとして`Param`を追加します。
 
 ```rust
 /// `$1`のようなParameter Binding用のプレースホルダ(第37章)。`index`は
@@ -238,7 +240,7 @@ pub struct ExecuteStatement {
 }
 ```
 
-`Parser`は`EXECUTE`の引数を、式の完全な文法(Pratt Parser)ではなく専用の`parse_literal`で読みます。
+`src/parser.rs`の`Parser`は`EXECUTE`の引数を、式の完全な文法(Pratt Parser)ではなく専用の`parse_literal`で読みます。
 
 ```rust
 fn parse_literal(&mut self) -> DbResult<Literal> {
@@ -272,7 +274,7 @@ SQL文字列の`EXECUTE`は、あくまで人間が対話的に`psql`相当の�
 これらは、`$1`という記号だけを見ても分からず、`$1`を包んでいる式(比較演算子、算術演算子、`CAST`、関数呼び出しの引数)を見て初めて分かる情報です。
 
 そこでこの章は、**プレースホルダの型を`PREPARE`実行時、周囲の文脈から推論する**という設計を選びました。
-`BoundExpr`に`Param`という新しいバリアントを追加し、`data_type`を`Option<DataType>`で持たせます。
+`src/binder.rs`の`BoundExpr`に`Param`という新しいバリアントを追加し、`data_type`を`Option<DataType>`で持たせます。
 
 ```rust
 /// `$1`のようなParameter Binding用のプレースホルダ(第37章)。`index`は
@@ -356,7 +358,7 @@ PostgreSQLの`$1::int`という省略記法に相当する書き方を、`CAST`�
 
 `INSERT INTO ... VALUES`の`$n`は少し事情が違います。
 `BoundInsert`の`rows`は`Binder`を経由しない生の`Expr`のまま保持されています(`VALUES`は既存の列を参照しないため、名前解決の必要が無いという第10章以来の設計です)。
-そのため`VALUES`に現れる`$n`の型は、`Binder`ではなく`Session`側の`collect_insert`が、対応する列の`Schema`から直接引きます。
+そのため`VALUES`に現れる`$n`の型は、`Binder`ではなく`src/session.rs`の`collect_insert`が、対応する列の`Schema`から直接引きます。
 
 ```rust
 fn collect_insert(insert: &BoundInsert, types: &mut Vec<Option<DataType>>) -> DbResult<()> {

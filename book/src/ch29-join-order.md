@@ -69,8 +69,10 @@ Left-deep限定とこの最適性の原理は、どちらもSystem R(1979年の�
 
 ## Subset DP: 部分集合ごとに最良の1つだけを覚える
 
-この章の新しいモジュール`join_order`は、この動的計画法(Dynamic Programming、以下DP)を実装します。
+この章は`src/join_order.rs`を新規作成し、この動的計画法(Dynamic Programming、以下DP)を実装します。
+`src/lib.rs`には`pub mod join_order;`が追加されます。
 部分集合は`u32`のビットマスクで表します。
+DPの1状態を、次の`DpEntry`として定義します。
 
 ```rust
 /// DPの1状態(部分集合)が持つ、その部分集合に対する最良の計画。
@@ -200,6 +202,7 @@ if n > MAX_DP_TABLES {
 
 DPが探索するのは、あくまで**3個以上のテーブルを結合するINNER JOINの連鎖**です。
 2テーブルの結合(`JOIN`が1個)には、そもそも順序の選びようがないので、この章でも第22章、第25章、第28章の`choose_join_plan`をそのまま使います。
+この平坦化は`src/physical_plan.rs`に次の`flatten_join_chain`を定義して行います。
 
 ```rust
 fn flatten_join_chain(plan: LogicalPlan, leaves: &mut Vec<LogicalPlan>, conditions: &mut Vec<BoundExpr>) {

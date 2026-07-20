@@ -9,6 +9,7 @@ minidb> COMMIT;
 ```
 
 `db.flush()`を一度も呼ばずにここでプロセスが死んだことにして、WALファイルだけを直接開き直すと、`Insert`と`Commit`のレコードが確かに残っています。
+これは`tests/wal_durability.rs`にある、第33章のテストの一部です。
 
 ```rust
 let wal = minidb::WalWriter::open(wal_path(&path)).unwrap();
@@ -64,6 +65,7 @@ ARIESは3つの段階から成ります。
 Redoが「この変更はもう届いているか」を判定するには、ページの側にも何らかの目印が要ります。
 第33章の`Page LSN`は、この目印そのものでした。
 ただし、その持ち場は`BufferPool`の`FrameMeta`という、プロセスのメモリ上にしかない場所でした。
+`src/buffer_pool.rs`の`FrameMeta`は、次のように`page_lsn`を持っています。
 
 ```rust
 struct FrameMeta {
@@ -79,6 +81,7 @@ struct FrameMeta {
 クラッシュ後に読み直したページが「どこまでの変更をすでに含んでいるか」を、プロセスの寿命をまたいで覚えておく手段が無ければ、Redoは判定のしようがありません。
 
 この章は、`Page LSN`をページのバイト列そのものに埋め込みます。
+`src/page.rs`の`Page`に、次のように`page_lsn`フィールドを追加します。
 
 ```rust
 pub struct Page {
@@ -91,6 +94,7 @@ pub struct Page {
 
 Page Headerに8バイト増えた分、`PAGE_HEADER_SIZE`は16から24へ、`PAGE_PAYLOAD_SIZE`はその分だけ縮み、`FORMAT_VERSION`も1つ上げてあります。
 `BufferPool`は、ページを新しく読み込むとき、ディスクに永続化されていた`page_lsn`をそのままフレームの初期値として引き継ぎます。
+`src/buffer_pool.rs`には、次のように書き加えました。
 
 ```rust
         let page_lsn = page.page_lsn;
@@ -123,6 +127,15 @@ Redoが冪等に振る舞える根拠は、突き詰めればこの1つの永続
 `Storage::open`は、カタログと索引を読み込んだ直後、WALファイルの内容(`WalWriter::open`がすでに全レコードをメモリへ読み込んでいます)を使ってAnalysisを行います。
 やることは単純です。
 WALの記録を先頭から順に見ていき、トランザクションごとに「最後に書いたレコードのLSN」と「`Commit`か`Abort`をすでに見たかどうか」を追跡するだけです。
+
+この章はAnalysis、Redo、Undoをまとめて、新規モジュール`src/recovery.rs`として実装します。
+`src/lib.rs`には、次の宣言を追加しています。
+
+```rust
+pub mod recovery;
+```
+
+`src/recovery.rs`の中身は、次のように`TxState`を組み立てるところから始まります。
 
 ```rust
     for record in scanned {
@@ -165,6 +178,7 @@ Dirty Page Tableに相当するものは、あえて作りません。
 
 Redoは、Analysisが決めた走査範囲のレコードを、LSNの昇順のまま1件ずつ再適用します。
 `Insert`、`Update`、`Delete`のどれであっても、対象ページの現在のPage LSNがそのレコードのLSN以上であれば、もう反映済みなので何もしません。
+`src/storage.rs`に、次の`redo_insert`を定義しました。
 
 ```rust
     pub(crate) fn redo_insert(&mut self, table_id: TableId, rid: RecordId, bytes: &[u8], lsn: Lsn) -> DbResult<()> {
@@ -209,6 +223,7 @@ Redoは1本のWALを昇順にたどり、あるページに対して行う操作
 
 `Update`は、`old_rid`と`rid`が一致するかどうかで処理が分かれます。
 一致すれば同じページ内で完結する更新、食い違えば「新しい位置へ挿入し、古い位置をtombstone化する」という2つの物理操作に分解されます。
+この振り分けは`src/recovery.rs`に書きました。
 
 ```rust
             if old_rid == new_rid {
@@ -305,6 +320,7 @@ Redoが冪等であることはすでに確認したとおりで、Undoも`apply
 Analysisは、WALの先頭からすべてのレコードを見て回ります。
 稼働時間が延びるほどWALは長くなり、Analysisが見て回る範囲も広がっていきます。
 `CHECKPOINT`は、この範囲を短く保つための手段です。
+`src/storage.rs`に、次の`checkpoint`を定義しました。
 
 ```rust
     pub fn checkpoint(&mut self, active: &[(TransactionId, Option<Lsn>)]) -> DbResult<Lsn> {
@@ -324,6 +340,7 @@ Analysisが次にWALを読むとき、`Checkpoint`より前のレコードを1�
 ただし、`Checkpoint`の瞬間にActiveだったトランザクションだけは例外です。
 そのトランザクションが以後1件もWALへ書かず、Checkpointの直後にクラッシュしたなら、Analysisが`Checkpoint`より後ろしか見なければ、そのトランザクションの存在にすら気づけません。
 そこで`Checkpoint`レコードには、その瞬間のActiveトランザクション一覧(**Active Transaction Table**)を埋め込みます。
+このエンコードは、ログレコードの形式を扱う`src/wal.rs`に置きました。
 
 ```rust
 pub(crate) fn encode_active_transactions(active: &[(TransactionId, Option<Lsn>)]) -> Vec<u8> {
@@ -344,6 +361,7 @@ pub(crate) fn encode_active_transactions(active: &[(TransactionId, Option<Lsn>)]
 ```
 
 Analysisは、WALの中から最後の`Checkpoint`レコードを探し、その一覧をTransaction Tableの初期値としてから、`Checkpoint`より後ろだけを走査します。
+これも`src/recovery.rs`の関数です。
 
 ```rust
 fn analysis_start(records: &[LogRecord]) -> (usize, Vec<(TransactionId, Option<Lsn>)>, bool) {
@@ -364,6 +382,7 @@ fn analysis_start(records: &[LogRecord]) -> (usize, Vec<(TransactionId, Option<L
 
 SQLの`CHECKPOINT`文は、現在Activeなトランザクションをすべてこの一覧として渡すだけの薄い入口です。
 通常のSQL経路の`self.tx`(高々1本)だけでなく、決定的インターリーブテストハーネス(第30章)の`harness_contexts`が同時に持ちうる複数のトランザクションも、両方ともこの一覧に含めます。
+`src/database.rs`の`execute_checkpoint`は、次のようになっています。
 
 ```rust
     fn execute_checkpoint(&mut self, _checkpoint: CheckpointStatement) -> DbResult<QueryResult> {
@@ -389,6 +408,13 @@ SQLの`CHECKPOINT`文は、現在Activeなトランザクションをすべて�
 `recover`は`Storage::open`という1回の関数呼び出しの**内部**で最初から最後まで進むため、その内側で止める仕掛けが要ります。
 
 この章は、実プロセスを本当には止めない、テスト専用のcrash point注入機構を自作しました。
+新規モジュール`src/failpoint.rs`として新規作成し、`src/lib.rs`には次の宣言を追加しています。
+
+```rust
+pub mod failpoint;
+```
+
+`src/failpoint.rs`の中身は、次のとおりです。
 
 ```rust
 pub fn arm(name: &'static str, count: usize) {

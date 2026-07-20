@@ -34,6 +34,9 @@ T2が先に120でコミットしますが、T1はそのコミットを知らな�
 ロックには2種類のモードがあります。
 読み取りのための**Shared**ロックと、書き込みのための**Exclusive**ロックです。
 
+この章から`src/lock_manager.rs`を新規作成し、`LockManager`とその周辺の型をそこへ実装していきます。
+`src/lib.rs`には`pub mod lock_manager;`(74行目)を追加します。
+
 ```rust
 pub enum LockMode {
     /// 読み取り用。複数のトランザクションが同じ対象に同時に持てる。
@@ -269,7 +272,7 @@ Growing PhaseとShrinking Phaseの境目を実行の途中に置くと、境目�
 独立したShrinking Phaseを持たないのは省略ではなく、Strict 2PLという規律そのものの定義です。
 
 このクレートでの実装は素直です。
-`execute_bound_statement`が、文を実行する前にこの文のロック保持者(`owner`)を決めます。
+`src/database.rs`の`execute_bound_statement`が、文を実行する前にこの文のロック保持者(`owner`)を決めます。
 
 ```rust
 fn execute_bound_statement(&mut self, statement: Statement, sql: &str) -> DbResult<QueryResult> {
@@ -433,6 +436,7 @@ fn acquire_write_locks(
 `storage_matching_rids`は、`storage_update`、`storage_delete`の冒頭にある走査とまったく同じ絞り込みをもう一度行い、対象の`RecordId`だけを返す関数です。
 `WHERE`を二重に評価することにはなりますが、ロックの獲得と実際の書き込みを1回の走査に統合する配線はこの章の範囲を超えるため見送りました。
 この絞り込みの見返りとして、`id`の異なる行を書き換える2本の`UPDATE`は、Diskバックエンドでは互いにブロックし合いません。
+`tests/interleave_disk.rs`のテストで確認できます。
 
 ```rust
 #[test]
@@ -537,6 +541,7 @@ Phantomをふさぐには、まだ存在しない行の範囲そのものをロ�
 
 この章はデッドロックの**検出**を行いません。
 2本のトランザクションが互いの持つロックを欲しがる状況は、この章のLock Managerでも普通に起こります。
+次のテストは`src/lock_manager.rs`にあり、その状況を再現します。
 
 ```rust
 #[test]

@@ -1,6 +1,7 @@
 # 第15章 永続カタログと空き領域管理
 
 前章末の`reopening_the_disk_manager_preserves_the_heap_file_contents`テストを、もう一度見てみます。
+このテストは`src/heap_file.rs`の`#[cfg(test)] mod tests`にあります。
 
 ```rust
 let disk = DiskManager::open(&path).unwrap();
@@ -10,6 +11,7 @@ let scanned: Vec<_> = heap.scan().collect::<DbResult<Vec<_>>>().unwrap();
 
 `HeapFile::open`は`DiskManager`を渡されただけで、300件のタプルがどのページに散らばっているかを正しく復元します。
 種を明かせば、これは`HeapFile::open`の中身を見ればすぐわかる、ほとんど力任せの方法で動いています。
+同じ`src/heap_file.rs`にある、この関数の定義そのものです。
 
 ```rust
 pub fn open(pool: BufferPool) -> Self {
@@ -46,6 +48,15 @@ File Headerは、ファイルの先頭という**固定位置**(ページ0)に�
 ページ0はすでにFile Headerが占有しているので、空いている次の番号、ページ1をカタログの定位置とします。
 このページを、以降**Catalogページ**と呼びます。
 
+この章から、テーブル定義そのものを1つのファイルへ永続化するストレージエンジンを新しいモジュール`storage`として作ります。
+`src/storage.rs`を新規に作成し、`src/lib.rs`へ次の宣言を加えます。
+
+```rust
+pub mod storage;
+```
+
+以降のコードは、特に断らない限りこの`src/storage.rs`に置きます。
+
 ```rust
 /// Catalogページの定位置。ページ0はFile Header(第11章)が占有しているため、
 /// 空いている最初の番号を使う。
@@ -53,6 +64,7 @@ const CATALOG_PAGE_ID: PageId = PageId(1);
 ```
 
 Catalogページは、第11章の`PageType`に新しく加えた種類のページとして扱います。
+この列挙型は`src/page.rs`にあり、そこへ`Catalog`を1つ加えます。
 
 ```rust
 pub enum PageType {
@@ -66,7 +78,7 @@ pub enum PageType {
 ```
 
 種類をただの整数(`u8`)ではなく`PageType`という列挙型で持たせておく判断は第11章のものですが、その効果はこの章になって初めて実感できます。
-`Storage::open`は、ページ1を読み込んだら、その中身をカタログとして解釈する前に「これは本当にCatalogページか」を確認します。
+`src/storage.rs`の`Storage::open`は、ページ1を読み込んだら、その中身をカタログとして解釈する前に「これは本当にCatalogページか」を確認します。
 
 ```rust
 let guard = pool.read_page(CATALOG_PAGE_ID)?;
@@ -106,7 +118,7 @@ tables × table_count:
 ```
 
 `next_table_id`を先頭に置いているのは偶然ではありません。
-第9章の`Catalog`は、`TableId`を単調増加で払い出し、`DROP TABLE`で番号が空いても再利用しないという方針を持っていました。
+第9章の`Catalog`(`src/catalog.rs`)は、`TableId`を単調増加で払い出し、`DROP TABLE`で番号が空いても再利用しないという方針を持っていました。
 
 ```rust
 let id = TableId(self.next_table_id);
@@ -121,6 +133,7 @@ self.next_table_id += 1;
 ページ番号1つが8バイトなので、テーブルが抱えるページ数が増えるほど、そのテーブルのカタログ上の専有量も線形に増えていきます。
 Catalogページ1枚のバイト数(`PAGE_PAYLOAD_SIZE`、4080バイト)には当然上限があり、テーブルが十分に大きく育てば、いずれこの上限を超えます。
 この章では、超えた場合を複数ページへの分割では解決せず、`DbError::CatalogTooLarge`を返すという単純な割り切りにとどめます。
+`src/storage.rs`の`Storage`にこの`persist_catalog`を定義します。
 
 ```rust
 fn persist_catalog(&self) -> DbResult<()> {
@@ -233,6 +246,7 @@ Free Page Listから取り出したページにも、`BufferPool::allocate_page`
 ## 空きページを探すFree Space Map
 
 `HeapFile::insert`(第13章)は、空きのあるページを`page_ids`の先頭から順に試す線形探索でした。
+この`insert`は`src/heap_file.rs`にあります。
 
 ```rust
 for &page_id in &self.page_ids {
@@ -249,6 +263,15 @@ for &page_id in &self.page_ids {
 テーブルが数百ページに育ち、そのほとんどが埋まっている状態でも、`insert`は毎回この重い手続きを先頭から繰り返すことになります。
 
 この章の**Free Space Map**は、「このページには残りおよそ何バイトの空きがあるか」という整数1つだけをメモリ上に持ち、`BufferPool`にもディスクにも触れずに候補を絞り込めるようにします。
+
+この`FreeSpaceMap`は新しいモジュール`free_space_map`として独立させます。
+`src/free_space_map.rs`を新規に作成し、`src/lib.rs`へ次の宣言を加えます。
+
+```rust
+pub mod free_space_map;
+```
+
+以降のコードはこの`src/free_space_map.rs`に置きます。
 
 ```rust
 pub fn find_candidate(&self, candidates: &[PageId], needed: usize) -> Option<PageId> {
@@ -280,6 +303,7 @@ PostgreSQLのFree Space Mapは、1バイトを256段階に量子化した近似�
 この章の`minidb`が扱うページ数はその最適化を要するほど大きくないため、量子化はせず実測値をそのまま持つ単純な実装を選びました。
 更新のタイミングは、`insert`、`update`、`delete`がページを書き換えた直後です。
 そのとき開いていた`SlottedPage`から`free_space()`を読み直すだけで最新値が手に入るので、追加のページ読み込みは要りません。
+呼び出す側の`try_insert_into_open_page`は`src/storage.rs`にあります。
 
 ```rust
 let mut guard = self.pool.write_page(page_id)?;
@@ -313,6 +337,7 @@ Free Space Mapはこの値をそのまま保持するだけなので、あるペ
 ## Storageエンジンの公開API
 
 ここまでの3つの部品(Catalogページ、Free Page List、Free Space Map)を組み合わせ、`Storage`という1つの入口にまとめます。
+`src/storage.rs`に次の`Storage`を定義します。
 
 ```rust
 pub struct Storage {
@@ -511,6 +536,7 @@ fn attach_page_to_table(&mut self, table_id: TableId, page_id: PageId) -> DbResu
 壊れたファイルを`Storage::open`に渡してみることで、どの層がどの壊れ方を捕まえるのかを確かめます。
 
 1つ目は、Catalogページのバイト列そのものを1バイト反転させる実験です。
+このテストは`src/storage.rs`の`#[cfg(test)] mod tests`にあります。
 
 ```rust
 #[test]

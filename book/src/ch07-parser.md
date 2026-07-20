@@ -39,6 +39,8 @@ minidb> SELECT 1 + 2 * 3
 ## ASTの設計をSQL構文の表現に限定する
 
 構文解析器が組み立てるASTは、`Statement`(文)と`Expr`(式)という2種類のノードからなります。
+この章では`src/ast.rs`を新規に作成し、AST関連の型をまとめて置きます。
+`src/lib.rs`には`pub mod ast;`を追加します。
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
@@ -166,6 +168,8 @@ Parserは「構文として正しい形をしているかどうか」だけを�
 ## Recursive Descentで文を読む
 
 `Parser`は、ソース文字列とToken列、現在の読み取り位置を持つ構造体です。
+この章では`src/parser.rs`を新規に作成し、構文解析器の実装をまとめて置きます。
+`src/lib.rs`には`pub mod parser;`を追加します。
 
 ```rust
 struct Parser<'a> {
@@ -426,6 +430,7 @@ TokenKind::Ident(name) => {
 
 構文解析が失敗したときのエラーは、前章の`DbError::Lex`と表示形式を揃えます。
 これまでの`DbError::Parse`はメッセージだけを持つ`String`1個のバリアントでしたが、この章で`Lex`と同じ形の構造体バリアントに変えました。
+`src/error.rs`の`DbError::Parse`を、次の形に書き換えます。
 
 ```rust
 #[error("行{line}列{column}: 構文エラー: {message}")]
@@ -440,6 +445,7 @@ Parse {
 ```
 
 Parserがエラーを作る場所は`error_at`の1箇所に集約し、`Span`から行番号や列番号への変換は前章で作った`lexer::line_col`をそのまま再利用します。
+`src/parser.rs`に戻り、次の`error_at`を定義します。
 
 ```rust
 fn error_at(&self, span: Span, message: impl Into<String>) -> DbError {
@@ -476,6 +482,7 @@ minidb> SELECT 1 +
 
 `Database::execute`は、これまで`toy_sql::parse_select`を呼んでいた箇所を`parser::parse_statement`に置き換え、`toy_sql`モジュール自体を削除しました。
 戻り値が`Statement`という3種類のバリアントを持つ列挙型になったので、`execute`はまず文の種類で分岐します。
+`src/database.rs`の`execute`を、次のように書き換えます。
 
 ```rust
 pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
@@ -552,6 +559,7 @@ fn eval_expr(expr: &Expr) -> DbResult<Value> {
 
 `parser`モジュールには、優先順位、結合性、括弧、`NOT`と`IS NULL`、各文、構文エラーの位置を確認する単体テストを追加しました。
 優先順位は、`Span`を比較対象から外した`Expr`どうしの構造比較で検証します。
+`src/parser.rs`の`mod tests`に追加します。
 
 ```rust
 #[test]

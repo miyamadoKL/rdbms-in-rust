@@ -113,6 +113,8 @@ Volcanoモデルの`next()`は、子の`next()`を1回呼んで1行受け取る�
 その変換の受け皿を、この章のうちに用意しておきます。
 
 `LogicalPlan`とほぼ同じ形で、実行アルゴリズムを確定した木を`PhysicalPlan`という別の型として定義します。
+この章では新規モジュール`physical_plan`を作り、`src/physical_plan.rs`に置きます。
+`src/lib.rs`には`pub mod physical_plan;`を追加します。
 
 ```rust
 pub enum PhysicalPlan {
@@ -185,6 +187,8 @@ Trait Object方式であれば、演算子ごとに独立した`struct`と`impl 
 この章ではTrait Object方式を選びました。
 今後の章(第21章の`Sort`、`Limit`、`Distinct`、`Aggregate`、第22章の`Join`、第25章の`IndexScan`)で演算子の種類を継続的に増やしていくこのクレートの育て方には、演算子ごとに実装を閉じ込められるTrait Object方式のほうが向いています。
 動的ディスパッチのコストが実際にどれだけ効くかは、この章では測定しません(章末の演習課題で、Enum Dispatch方式を実装して比較します)。
+
+`src/physical_plan.rs`に、次の`Executor` traitを定義します。
 
 ```rust
 pub trait Executor {
@@ -386,7 +390,7 @@ impl<'a> Executor for ProjectionExec<'a> {
 
 ### 組み立て: `Database::build_query_executor`
 
-`PhysicalPlan`の木から`Box<dyn Executor>`の入れ子を組み立てるのは、`Database`のprivateメソッドです。
+`PhysicalPlan`の木から`Box<dyn Executor>`の入れ子を組み立てるのは、`src/database.rs`にある`Database`のprivateメソッドです。
 
 ```rust
 fn build_query_executor<'a>(&'a self, plan: &'a PhysicalPlan) -> DbResult<Box<dyn Executor + 'a>> {
@@ -471,6 +475,7 @@ Volcanoの子として`INSERT`、`UPDATE`、`DELETE`を分解しなかった理�
 
 Lexerには`EXPLAIN`という予約語を1つ追加します(`Keyword::Explain`)。
 Parserは`EXPLAIN`の直後に、`SELECT`、`INSERT INTO`、`UPDATE`、`DELETE FROM`のいずれかだけを許します。
+`src/parser.rs`に次のメソッドを追加します。
 
 ```rust
 fn parse_explain_statement(&mut self) -> DbResult<ExplainStatement> {
@@ -492,7 +497,7 @@ fn parse_explain_statement(&mut self) -> DbResult<ExplainStatement> {
 `CREATE TABLE`、`DROP TABLE`を対象から外したのは、この2つがどちらの計画も経由しない文だからです(`Binder`を素通りする理由は第17章、`LogicalPlan`を経由しない理由は第18章を参照)。
 対象を`SELECT`等4種の解析関数だけに絞ったことで、`EXPLAIN EXPLAIN ...`のような入れ子も、生の`parse_statement`を再帰的に呼ばないこの書き方によって構文の時点で拒否されます。
 
-`Binder`は対象の文をそのまま束縛するだけです。
+`src/binder.rs`の`Binder`は対象の文をそのまま束縛するだけです。
 
 ```rust
 Statement::Explain(explain) => {
@@ -500,7 +505,7 @@ Statement::Explain(explain) => {
 }
 ```
 
-`Database::execute_explain`は、束縛済みの文を`LogicalPlan`、`PhysicalPlan`へ変換し、木を文字列化しただけの`QueryResult`を返します。
+`src/database.rs`の`Database::execute_explain`は、束縛済みの文を`LogicalPlan`、`PhysicalPlan`へ変換し、木を文字列化しただけの`QueryResult`を返します。
 実際には何も実行しません。
 
 ```rust
@@ -552,7 +557,7 @@ Projection(name)
 
 ## テストで確認する
 
-各演算子の`next()`が実際に1行ずつ流れることは、`physical_plan`モジュールに手作りの`CountingExecutor`(`next()`が呼ばれた回数を数える、テスト専用の葉演算子)を使って確認します。
+各演算子の`next()`が実際に1行ずつ流れることは、`src/physical_plan.rs`に手作りの`CountingExecutor`(`next()`が呼ばれた回数を数える、テスト専用の葉演算子)を使って確認します。
 
 ```rust
 #[test]
@@ -580,7 +585,7 @@ fn scan_filter_projection_pipeline_pulls_exactly_as_many_rows_as_requested() {
 1,000行すべてが条件に一致する状況でも、根から3回しか`next()`を呼ばなければ、葉も3回しか`next()`されません。
 これが第18章までの`eval_query_plan`(`Filter`が呼ばれた時点で1,000行すべてを読み切り、`Vec`にまとめてしまう)との違いです。
 
-`database`モジュールには、より大きな規模でこの性質を確認する統合テストを追加しました。
+`src/database.rs`には、より大きな規模でこの性質を確認する統合テストを追加しました。
 
 ```rust
 #[test]

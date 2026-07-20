@@ -50,6 +50,7 @@ Projection(amount)
 `WHERE`にはPointともRangeとも判定できない条件が混じっていることも珍しくありません。
 `id = 2 AND name = 'Bob'`という条件のうち索引で引けるのは`id = 2`だけで、`name = 'Bob'`は索引に無い列への条件です。
 そこでこの章の`optimize`は、`WHERE`をANDの連言に分解し、索引で引ける述語だけを取り出してIndex Scanに渡し、残りは今までどおり`Filter`に残すという役割分担を採ります。
+`src/physical_plan.rs`に、次の`AccessPath`を追加します。
 
 ```rust
 enum AccessPath {
@@ -454,6 +455,7 @@ Projection(customers.name, orders.item)
 
 アクセスパスが変わっても、`SELECT`が返す行は変わってはいけません。
 これを確かめる一番直接的な方法は、同じデータと同じクエリを索引あり(Index Scan)と索引無し(SeqScan)の両方の`Storage`に対して実行し、行集合を突き合わせることです。
+このテストは`src/database.rs`に書きます。
 
 ```rust
         for query in [

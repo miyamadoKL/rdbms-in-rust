@@ -66,6 +66,13 @@ NULLが「無型の値」であることと、「NULLを許すかどうか」が
 
 ## 最小実装
 
+これから定義する型は、新規作成する`src/types.rs`にまとめます。
+`src/lib.rs`には次の行を追加します。
+
+```rust
+pub mod types;
+```
+
 `DataType`から始めます。
 このSQLサブセットが対応する型は、`BOOLEAN`、`BIGINT`、`TEXT`の3種類だけです[^double]。
 
@@ -231,7 +238,7 @@ impl Schema {
 列数の一致を先に検査してから`zip`で1列ずつ`conforms_to`を呼んでいるのは、列数が食い違ったまま`zip`にかけると、短い側に合わせて残りの列が黙って無視されるためです。
 列数の不一致自体が呼び出し側の間違いなので、`zip`の前に弾いておきます。
 
-`DbError`には`SchemaMismatch`バリアントを1つ追加しました。
+`src/error.rs`の`DbError`には`SchemaMismatch`バリアントを1つ追加しました。
 
 ```rust
     /// 値の並びがSchemaの列数・型・nullable制約に適合しないエラー。
@@ -240,7 +247,7 @@ impl Schema {
 ```
 
 最後に`Tuple`です。
-`Tuple`は`Schema`から独立した型にはせず、生成時に必ず`Schema`との適合を検査するコンストラクタだけを公開します。
+`src/types.rs`に戻り、`Tuple`は`Schema`から独立した型にはせず、生成時に必ず`Schema`との適合を検査するコンストラクタだけを公開します。
 
 ```rust
 /// `Schema`に従う値の並び。

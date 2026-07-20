@@ -65,7 +65,8 @@ dense     m= 32000  matches= 32000  IndexNestedLoopJoin=786.240948ms  HashJoin=4
 
 ## 統計収集: 行数、NULL数、NDV、Min/Max、MCV、Histogram
 
-統計情報の型は`src/statistics.rs`に置きます。
+統計情報の型は、新規作成する`src/statistics.rs`に置きます。
+あわせて、`src/lib.rs`に`pub mod statistics;`を追加します。
 集めるのは、テーブルの行数と、列ごとの5種類の値です。
 
 ```rust
@@ -368,7 +369,7 @@ ANALYZE 3
 テーブル名が指定されていれば、その存在だけをここで確認し(未知のテーブル名は位置情報付きの`DbError::Bind`になります)、ASTのバリアントをそのまま`BoundStatement::Analyze`として通します。
 `ANALYZE`は既存のカタログエントリの統計欄を書き換えるだけの操作であり、`CREATE INDEX`、`DROP INDEX`(第24章)と同じく、式の名前解決や型検査を必要としないからです。
 
-実行(`Database::execute_analyze`)は、対象テーブルを`SeqScan`と同じ経路で1回走査します。
+実行(`Database::execute_analyze`、`src/database.rs`)は、対象テーブルを`SeqScan`と同じ経路で1回走査します。
 
 ```rust
 fn collect_table_stats(&self, table_id: TableId, table_name: &str, schema: &Schema) -> DbResult<TableStats> {
@@ -470,6 +471,8 @@ fn encode_value(value: &Value, out: &mut Vec<u8>) {
 
 `ANALYZE`を一度も実行していないテーブルは、統計を持ちません。
 この場合の推定は、選択率の慣用定数にフォールバックします。
+この定数は、新規作成する`src/estimator.rs`に置きます。
+あわせて、`src/lib.rs`に`pub mod estimator;`を追加します。
 
 ```rust
 /// 等値述語のデフォルト選択率(統計が無い場合)。出典は本文を参照。
@@ -846,6 +849,7 @@ Projection(id) rows=150 actual=189
 ```
 
 実測行数は、`Box<dyn Executor>`(第19章)を`CountingExec`という薄いラッパーで包むことで集めます。
+`CountingExec`は`src/physical_plan.rs`に定義します。
 
 ```rust
 pub struct CountingExec<'a> {

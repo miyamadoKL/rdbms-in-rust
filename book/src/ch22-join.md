@@ -38,6 +38,7 @@ minidb> SELECT customers.name, orders.item FROM customers JOIN orders ON custome
 
 `INNER JOIN`と`JOIN`単独はどちらも同じ意味です。
 標準SQLも`JOIN`だけを書いた場合は`INNER JOIN`とみなす規則を定めており、Lexerに`Inner`、`Join`、`On`という3つの予約語を追加したうえで、この2つの書き方を`Parser`の時点で1つの`JoinKind::Inner`へ統一してしまいます。
+この列挙は`src/ast.rs`に追加します。
 
 ```rust
 pub enum JoinKind {
@@ -67,7 +68,7 @@ pub struct JoinClause {
 }
 ```
 
-`Parser::parse_select_statement`は、`FROM`の最初のテーブルを読み終えた直後、`INNER`または`JOIN`が続く限り`parse_join_clause`を呼び続けます。
+`src/parser.rs`の`Parser::parse_select_statement`は、`FROM`の最初のテーブルを読み終えた直後、`INNER`または`JOIN`が続く限り`parse_join_clause`を呼び続けます。
 
 ```rust
 fn parse_join_clause(&mut self) -> DbResult<Option<JoinClause>> {
@@ -117,7 +118,7 @@ fn parse_join_clause(&mut self) -> DbResult<Option<JoinClause>> {
 
 ### `tables`が複数要素になる
 
-`Binder::bind_from`は、`FROM`の最初のテーブルを`resolve_table`で解決したあと、`joins`を先頭から順に処理します。
+`src/binder.rs`の`Binder::bind_from`は、`FROM`の最初のテーブルを`resolve_table`で解決したあと、`joins`を先頭から順に処理します。
 
 ```rust
 fn bind_from(&self, from: Option<&FromClause>) -> DbResult<(Vec<BoundTableRef>, Vec<BoundJoinStep>)> {
@@ -201,7 +202,7 @@ id | name | customer_id | item
 利用者が最終的に受け取る列名は、常に`SELECT`の対象式(`projection`)の`output_name`から決まり、結合後スキーマの列名を直接見ることはありません。
 重複した列名が問題になるのは、`SELECT id FROM customers JOIN orders ON ...`のように、利用者自身が修飾子を付けずに曖昧な参照を書いた場合だけです。
 
-`eval::eval_bound_expr`は、この章から`table_ordinal`を実行時には一切見ません。
+`src/eval.rs`の`eval::eval_bound_expr`は、この章から`table_ordinal`を実行時には一切見ません。
 
 ```rust
 BoundExpr::ColumnRef { column_index, name, .. } => {
@@ -222,6 +223,7 @@ BoundExpr::ColumnRef { column_index, name, .. } => {
 ## Logical Plan: Joinノードと左深い木
 
 `LogicalPlan`に`Join`という新しい演算子を追加します。
+`src/logical_plan.rs`に次の`JoinNode`を定義します。
 
 ```rust
 pub struct JoinNode {
@@ -298,6 +300,7 @@ Projection(customers.name, orders.item)
 `ON`が等値条件でなければ、そもそも「同じキー」という概念が無いためこの手法は使えませんが、使える場面ではBuildに`m`、Probeに`n`というほぼ線形の手間で済み、比較の回数は`n + m`に比例します。
 
 この章の物理選択は、この1点だけを見る単純なルールです。
+`src/physical_plan.rs`の`optimize`に、次の分岐を追加します。
 
 ```rust
 LogicalPlan::Join(join) => {

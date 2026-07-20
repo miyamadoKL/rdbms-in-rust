@@ -12,7 +12,7 @@
 
 ## 計算の順序をどこが決めているか
 
-第17章までの`Database::execute_select_with_from`を見ると、答えが見つかります。
+`src/database.rs`にある、第17章までの`Database::execute_select_with_from`を見ると、答えが見つかります。
 
 ```rust
 fn execute_select_with_from(&self, select: &BoundSelect) -> DbResult<QueryResult> {
@@ -75,6 +75,8 @@ Projection(name)
 ## `LogicalPlan`を設計する
 
 演算子は7種類にとどめます。
+新規ファイル`src/logical_plan.rs`を作り、`LogicalPlan`を次のように定義します。
+`src/lib.rs`には、`pub mod lock_manager;`と`pub mod page;`の間に`pub mod logical_plan;`を追加します。
 
 ```rust
 pub enum LogicalPlan {
@@ -339,7 +341,7 @@ Projection(name)
 
 ## `Database::execute`をparse→bind→plan→executeへ再編する
 
-`Database::execute`は、束縛の直後に計画を組み立てる1行が増えます。
+`src/database.rs`の`Database::execute`は、束縛の直後に計画を組み立てる1行が増えます。
 
 ```rust
 pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
@@ -453,7 +455,7 @@ fn execute_insert(&mut self, plan: LogicalPlan) -> DbResult<QueryResult> {
 
 ## テストで確認する
 
-`logical_plan`モジュールには、各文種が正しい形の木になることを確認するテストを追加しました。
+`src/logical_plan.rs`には、各文種が正しい形の木になることを確認するテストを追加しました。
 木の形の検証は、`to_string()`した結果を期待する文字列と比較する、ゴールデンテストに近いやり方です。
 
 ```rust
