@@ -172,7 +172,7 @@ pub struct UpdateNode {
 ## 各ノードが出力スキーマを答える
 
 演算子の木を組み立てただけでは、各ノードが最終的にどんな列を返すのかが分かりません。
-`LogicalPlan`には、`src/logical_plan.rs`に`output_schema`という、この問いにノード自身が答えるメソッドを持たせます。
+`src/logical_plan.rs`の`LogicalPlan`には、`output_schema`という、この問いにノード自身が答えるメソッドを持たせます。
 
 ```rust
 pub fn output_schema(&self) -> Schema {
