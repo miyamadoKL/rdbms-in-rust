@@ -35,7 +35,7 @@ T2が先に120でコミットしますが、T1はそのコミットを知らな�
 読み取りのための**Shared**ロックと、書き込みのための**Exclusive**ロックです。
 
 この章から`src/lock_manager.rs`を新規作成し、`LockManager`とその周辺の型をそこへ実装していきます。
-`src/lib.rs`には`pub mod lock_manager;`(74行目)を追加します。
+`src/lib.rs`には`pub mod lock_manager;`を追加します。
 
 ```rust
 pub enum LockMode {

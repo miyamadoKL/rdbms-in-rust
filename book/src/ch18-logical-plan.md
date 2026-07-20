@@ -76,7 +76,7 @@ Projection(name)
 
 演算子は7種類にとどめます。
 新規ファイル`src/logical_plan.rs`を作り、`LogicalPlan`を次のように定義します。
-`src/lib.rs`には、`pub mod lock_manager;`と`pub mod page;`の間に`pub mod logical_plan;`を追加します。
+`src/lib.rs`に`pub mod logical_plan;`を追加します。
 
 ```rust
 pub enum LogicalPlan {

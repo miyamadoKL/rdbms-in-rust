@@ -45,8 +45,9 @@ PostgreSQL Wire Protocolは、認証方式(`SCRAM-SHA-256`等)、メッセージ
 
 ## フレームのレイアウト
 
-この章で新しく作成する`src/protocol.rs`がフレームを定義します。`src/lib.rs`にも`pub mod protocol;`を追加し、このモジュールを公開します。
-リクエスト・レスポンスのどちらも同じ9バイトのヘッダを持ちます。
+この章で新しく作成する`src/protocol.rs`がフレームを定義します。
+`src/lib.rs`にも`pub mod protocol;`を追加し、このモジュールを公開します。
+リクエストとレスポンスのどちらも同じ9バイトのヘッダを持ちます。
 
 ```text
 +----------+----------------+------------------+------------------+
@@ -228,7 +229,8 @@ pub fn from_db_result(result: crate::error::DbResult<crate::database::QueryResul
 
 並行モデルは最も単純な形、接続を受け付けるたびに`std::thread::spawn`でスレッドを1本立てる方式を採ります。
 
-この章で新しく作成する`src/server.rs`に、次の`Server::run`を実装します。`src/lib.rs`にも`pub mod server;`を追加します。
+この章で新しく作成する`src/server.rs`に、次の`Server::run`を実装します。
+`src/lib.rs`にも`pub mod server;`を追加します。
 
 ```rust
 pub fn run(self) -> std::io::Result<()> {

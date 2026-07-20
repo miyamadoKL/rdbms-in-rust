@@ -408,7 +408,7 @@ SQLの`CHECKPOINT`文は、現在Activeなトランザクションをすべて�
 `recover`は`Storage::open`という1回の関数呼び出しの**内部**で最初から最後まで進むため、その内側で止める仕掛けが要ります。
 
 この章は、実プロセスを本当には止めない、テスト専用のcrash point注入機構を自作しました。
-新規モジュール`src/failpoint.rs`として新規作成し、`src/lib.rs`には次の宣言を追加しています。
+`src/failpoint.rs`を新しいモジュールとして作成し、`src/lib.rs`には次の宣言を追加しています。
 
 ```rust
 pub mod failpoint;

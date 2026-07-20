@@ -72,7 +72,8 @@ B+Treeはキーを挿入するたびに、次の3つの性質を保ち続けま�
 
 Leaf PageとInternal Pageの探索は、キーを`Value`へ戻さずバイト列のまま大小比較できるほうが単純です。
 そこでこの章のキーは、**順序を保存するバイト列**へエンコードします。
-この章では新しく`src/btree.rs`を作り、`src/lib.rs`に`pub mod btree;`を追加します。`encode_key`はこのファイルに置きます。
+この章では新しく`src/btree.rs`を作り、`src/lib.rs`に`pub mod btree;`を追加します。
+`encode_key`はこのファイルに置きます。
 
 ```rust
 fn encode_key(value: &Value) -> DbResult<Vec<u8>> {
@@ -192,7 +193,8 @@ pub enum PageType {
 ```
 
 書き込み側の`write_entries`は、`entries`が収まりきらなければ`payload`を一切変更せず`false`を返します。
-この章では新しく`src/btree_page.rs`を作り、`src/lib.rs`に`pub mod btree_page;`を追加します。`write_entries`はこのファイルに置きます。
+この章では新しく`src/btree_page.rs`を作り、`src/lib.rs`に`pub mod btree_page;`を追加します。
+`write_entries`はこのファイルに置きます。
 
 ```rust
 pub fn write_entries(&mut self, entries: &[(Vec<u8>, RecordId)]) -> bool {

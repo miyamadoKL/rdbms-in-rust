@@ -771,7 +771,8 @@ pub fn insert(&mut self, key: &Value, rid: RecordId) -> DbResult<()> {
 
 ### 索引を使った一意性検査
 
-`src/index.rs`の`check_uniqueness_with_index`が、`crate::constraints::check_uniqueness`(第20章)の「候補行が既存の行と重複しないか」を確かめる部分を、索引への`lookup`に置き換えます。
+新しく`src/index.rs`を作り、`src/lib.rs`に`pub mod index;`を追加します。
+この`check_uniqueness_with_index`が、`crate::constraints::check_uniqueness`(第20章)の「候補行が既存の行と重複しないか」を確かめる部分を、索引への`lookup`に置き換えます。
 
 ```rust
 pub fn check_uniqueness_with_index(
