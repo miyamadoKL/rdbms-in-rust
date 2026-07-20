@@ -89,16 +89,16 @@
 //! 「決まる場合には決める」だけの片務的な安全網であり、EXECUTE時点の
 //! 実行時エラーへ倒れる余地を最初から許容した設計であることを意味する。
 //!
-//! この章の限界として、`PREPARE`は本体を1回だけ束縛し、以後の`EXECUTE`は
-//! その`BoundStatement`をそのまま(パラメータだけ差し替えて)使い回す。
-//! `PREPARE`した後に`ANALYZE`で統計情報が更新されても、すでに`PREPARE`
-//! 済みの文の実行計画は作り直さない(`Database::execute_select`が
-//! `PREPARE`のたびではなく`EXECUTE`のたびに`physical_plan::optimize`を
-//! 呼ぶため、計画そのものは最新の統計を使って毎回組み直る。ここで
-//! 古いままなのは、あくまで`rules::optimize`が畳み込む定数式や、
-//! 束縛時点で確定した型・列インデックスといった`BoundStatement`の構造で
-//! あり、PostgreSQLが"generic plan"と"custom plan"を使い分けて対処する
-//! 種類の問題を、この章では扱わない)。
+//! この章の限界として、`PREPARE`が1回だけ束縛して使い回すのは
+//! `BoundStatement`だけである。論理計画の構築・`rules::optimize`・
+//! `physical_plan::optimize`は`Database::execute_select`が呼ばれるたび、
+//! つまり`EXECUTE`のたびに実行される。したがって`PREPARE`した後に
+//! `ANALYZE`で統計情報が更新されれば、次の`EXECUTE`はその新しい統計を
+//! 使って計画を組み直す。`EXECUTE`をまたいで古いまま引き継がれるのは、
+//! あくまで`rules::optimize`が畳み込む定数式や、束縛時点で確定した型・
+//! 列インデックスといった`BoundStatement`の構造だけであり、PostgreSQLが
+//! "generic plan"と"custom plan"を使い分けて対処する種類の問題(統計に
+//! 応じて計画の形そのものを変える)を、この章では扱わない。
 //!
 //! # Wire Protocolを拡張しない
 //!
@@ -197,6 +197,27 @@ impl Session {
     /// この文専用の[`crate::cancellation::ExecutionContext`]を作る。呼ぶたびに
     /// `cancel_flag`・`checkpoints`を初期状態へ戻すため、前の文の状態が次の文へ
     /// 漏れることは無い。
+    ///
+    /// # 第6部レビュー対応: なぜ構文解析より前に呼ぶのか
+    ///
+    /// [`Session::execute`]・[`Session::execute_prepared`]は、この関数を
+    /// 構文解析や`PREPARE`済み文の検索より**前**、関数の最初の行で呼ぶ。
+    /// かつては束縛が終わったあとに呼んでいたが、それだと次の問題が起きて
+    /// いた。`crate::server::handle_connection`は`Session::execute`を呼ぶより
+    /// **前**に切断監視スレッド([`Session::cancellation_handle`]が返す
+    /// トークンを共有)を立てる。監視スレッドが構文解析・束縛の**途中**で
+    /// 切断を検知して`cancel`を呼んでも、束縛後に`cancel_flag`を`false`へ
+    /// 戻していたのでは、その要求をそのままリセットで消してしまう。
+    /// 構文解析より前でリセットしておけば、以後(構文解析・束縛・実行の
+    /// どの段階でも)届いた`cancel`はこの[`ExecutionContext`]が正しく
+    /// 観測できる。構文解析・束縛の直後に明示的な`ctx.cancel.check()`も
+    /// 挟んである([`Session::execute`]・[`Session::execute_prepared_with_context`]
+    /// を参照)ため、束縛だけで完結し実行時に一度も`check`されない
+    /// (`Filter`のstreamingループを一度も回らない等の)文でも、束縛中に
+    /// 届いたキャンセル要求を確実に検知できる。
+    ///
+    /// この設計変更は、締切の起点(「`Session::execute`が呼ばれた瞬間」)を
+    /// 文字どおり実装に一致させる副次効果も持つ(第37章・第38章の本文を参照)。
     fn new_execution_context(&self) -> crate::cancellation::ExecutionContext {
         self.cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
         self.checkpoints.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -209,7 +230,15 @@ impl Session {
     /// `Statement`という構造化された値だけを使い、`sql`という文字列を
     /// 再パースする経路には二度と渡さない(モジュール冒頭「ch36の前身から
     /// 何を引き継ぐか」を参照)。
+    ///
+    /// [`Session::new_execution_context`]をこの関数の最初の行で呼ぶ理由は
+    /// そちらのドキュメントを参照。`BEGIN`・`COMMIT`・`ROLLBACK`・
+    /// `CHECKPOINT`・`PREPARE`・`DEALLOCATE`はこの`ctx`を使わずに終わる
+    /// (これらはキャンセル・タイムアウトの対象外、本文の限界節を参照)が、
+    /// `cancel_flag`のリセット自体はどの文でも行う必要があるため、分岐の
+    /// 外側で無条件に作る。
     pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
+        let ctx = self.new_execution_context();
         let statement = crate::parser::parse_statement(sql)?;
         match statement {
             Statement::Begin(begin) => {
@@ -238,12 +267,15 @@ impl Session {
                 Err(DbError::NotImplemented("CHECKPOINTはSession経由では未対応です".to_string()))
             }
             Statement::Prepare(prepare) => self.execute_prepare(prepare, sql),
-            Statement::Execute(execute) => self.execute_execute(&execute),
+            Statement::Execute(execute) => self.execute_execute(&execute, &ctx),
             Statement::Deallocate(deallocate) => self.execute_deallocate(&deallocate),
             other => {
                 let bound = self.shared.bind_statement(other, sql)?;
+                // 構文解析・束縛の間に切断が検知され`cancel`されていれば、
+                // ここで打ち切る(`new_execution_context`のドキュメント参照)。
+                ctx.cancel.check()?;
                 let started = std::time::Instant::now();
-                let result = self.run_bound(bound);
+                let result = self.run_bound(bound, &ctx);
                 crate::slow_query_log::maybe_log(self.shared.slow_query_threshold(), sql, started.elapsed(), &result);
                 result
             }
@@ -254,11 +286,10 @@ impl Session {
     /// `self.tx`があればその中で、無ければAutocommitで実行する(第36章の
     /// 前身が`sql`文字列に対して行っていた分岐を、束縛済みの`BoundStatement`
     /// に対して行う形にそのまま引き継ぐ)。
-    fn run_bound(&mut self, bound: BoundStatement) -> DbResult<QueryResult> {
-        let ctx = self.new_execution_context();
+    fn run_bound(&mut self, bound: BoundStatement, ctx: &crate::cancellation::ExecutionContext) -> DbResult<QueryResult> {
         match &self.tx {
-            Some(handle) => self.shared.execute_in_tx_bound(handle, &bound, &ctx),
-            None => self.run_bound_autocommit(bound, &ctx),
+            Some(handle) => self.shared.execute_in_tx_bound(handle, &bound, ctx),
+            None => self.run_bound_autocommit(bound, ctx),
         }
     }
 
@@ -304,10 +335,14 @@ impl Session {
 
     /// `EXECUTE name [(値, ...)]`を実行する。引数はSQL文字列中の
     /// リテラルとして届くので、`literal_to_value`で`Value`へ変換してから
-    /// [`Session::execute_prepared`]へ委ねる。
-    fn execute_execute(&mut self, execute: &ExecuteStatement) -> DbResult<QueryResult> {
+    /// [`Session::execute_prepared_with_context`]へ委ねる。`ctx`は
+    /// [`Session::execute`]がこの文の構文解析より前にすでに作ったものを
+    /// そのまま受け取る(`Session::new_execution_context`のドキュメント参照。
+    /// ここでもう一度作り直すと、その間のキャンセル要求を取りこぼす窓が
+    /// 復活してしまう)。
+    fn execute_execute(&mut self, execute: &ExecuteStatement, ctx: &crate::cancellation::ExecutionContext) -> DbResult<QueryResult> {
         let values: Vec<Value> = execute.args.iter().map(literal_to_value).collect();
-        self.execute_prepared(&execute.name.name, &values)
+        self.execute_prepared_with_context(&execute.name.name, &values, ctx)
     }
 
     /// `name`で`PREPARE`済みの文を、`args`を`$1`から順に束縛して実行する。
@@ -323,7 +358,24 @@ impl Session {
     /// 経由しないため、値の中身がどんな文字列であってもテキスト連結の
     /// 注入対象にならない。これが、Prepared Statementが実際に
     /// SQLインジェクションを防ぐ経路である。
+    ///
+    /// この関数はSQL文字列の構文解析を経由しない独立したエントリーポイント
+    /// なので、自分専用の[`crate::cancellation::ExecutionContext`]をここで
+    /// 作る([`Session::new_execution_context`]のドキュメント参照)。
     pub fn execute_prepared(&mut self, name: &str, args: &[Value]) -> DbResult<QueryResult> {
+        let ctx = self.new_execution_context();
+        self.execute_prepared_with_context(name, args, &ctx)
+    }
+
+    /// [`Session::execute_prepared`]の本体。`ctx`を外から受け取れる版
+    /// ([`Session::execute_execute`]が、`Session::execute`ですでに作った
+    /// `ctx`をそのまま渡すために使う)。
+    fn execute_prepared_with_context(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        ctx: &crate::cancellation::ExecutionContext,
+    ) -> DbResult<QueryResult> {
         let prepared =
             self.prepared.get(name).ok_or_else(|| DbError::PreparedStatementNotFound(name.to_string()))?;
 
@@ -340,7 +392,11 @@ impl Session {
         }
 
         let bound = substitute_bound_statement(prepared.bound.clone(), args);
-        self.run_bound(bound)
+        // `PREPARE`済みの文を探す・検証する・パラメータを差し込む、という
+        // ここまでの処理中に届いたキャンセル要求があれば、ここで打ち切る
+        // (`Session::new_execution_context`のドキュメント参照)。
+        ctx.cancel.check()?;
+        self.run_bound(bound, ctx)
     }
 
     /// `DEALLOCATE name`を実行する。
@@ -396,10 +452,22 @@ fn collect_param_types(bound: &BoundStatement) -> DbResult<Vec<Option<DataType>>
     Ok(types)
 }
 
+/// `PREPARE`本体が受け付けるプレースホルダ番号(`$n`)の上限(第6部レビュー
+/// 対応)。字句解析器(`crate::lexer::Lexer::lex_param`)自体は`$n`を`u32`の
+/// 範囲でしか制限しないため、`PREPARE p AS SELECT $4294967295`のように入力
+/// そのものは短くても、`record_param`が番号までそのまま`Vec::resize`すれば
+/// 桁外れの確保を試みてしまう。この値は、この教材が想定する1文あたりの
+/// プレースホルダ数を大きく超える、実用上まず埋まらない上限として決め打ちで
+/// 選んだ(この数を超えるプレースホルダを持つSQL文自体が非現実的である)。
+pub const MAX_PARAM_INDEX: u32 = 10_000;
+
 fn record_param(types: &mut Vec<Option<DataType>>, index: u32, hint: Option<DataType>) -> DbResult<()> {
     let position = index as usize;
     if position == 0 {
         return Err(DbError::Eval("プレースホルダの番号は1以上である必要があります: $0".to_string()));
+    }
+    if index > MAX_PARAM_INDEX {
+        return Err(DbError::ParamIndexTooLarge { index, max: MAX_PARAM_INDEX });
     }
     if types.len() < position {
         types.resize(position, None);
@@ -796,6 +864,35 @@ mod tests {
     }
 
     #[test]
+    fn prepare_accepts_a_param_index_exactly_at_the_limit() {
+        let mut session = new_session();
+        let sql = format!("PREPARE p AS SELECT ${MAX_PARAM_INDEX}");
+        session.execute(&sql).unwrap();
+    }
+
+    #[test]
+    fn prepare_rejects_a_param_index_one_over_the_limit() {
+        let mut session = new_session();
+        let sql = format!("PREPARE p AS SELECT ${}", MAX_PARAM_INDEX + 1);
+        let err = session.execute(&sql).unwrap_err();
+        assert!(
+            matches!(err, DbError::ParamIndexTooLarge { index, max } if index == MAX_PARAM_INDEX + 1 && max == MAX_PARAM_INDEX),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_a_sparse_param_index_over_the_limit_without_resizing_for_the_small_ones() {
+        // `$1`という小さい番号と`$(上限+1)`という疎な番号が同じ文に混在しても、
+        // 大きい方が検査に引っかかってエラーになる(`$1`の存在に引きずられて
+        // `resize`が先に走らないことを確認する)。
+        let mut session = new_session();
+        let sql = format!("PREPARE p AS SELECT $1 + ${}", MAX_PARAM_INDEX + 1);
+        let err = session.execute(&sql).unwrap_err();
+        assert!(matches!(err, DbError::ParamIndexTooLarge { index, .. } if index == MAX_PARAM_INDEX + 1), "{err:?}");
+    }
+
+    #[test]
     fn prepare_rejects_non_dml_statement() {
         let mut session = new_session();
         let err = session.execute("PREPARE p AS CREATE TABLE t (id BIGINT)").unwrap_err();
@@ -929,6 +1026,104 @@ mod tests {
         shared.set_resource_limits(ResourceLimits { statement_timeout: Some(Duration::from_millis(1)), ..Default::default() });
         let result = session.execute("SELECT * FROM t AS a JOIN t AS b ON 1 = 1");
         assert!(matches!(result, Err(DbError::QueryTimeout)), "{result:?}");
+    }
+
+    /// 第6部レビュー対応: `ON 1 = 1`(前のテスト)は`left`の1行につき`right`の
+    /// 先頭1件がすぐ一致するため、`NestedLoopJoinExec::next()`は候補の
+    /// 組み合わせをほとんど比較せずに1行返す。`ON 1 = 0`(常に偽)は対照的に、
+    /// `left`の1行につき`right`の全件(700件)を最後まで比較しても一度も
+    /// 一致しない。最上位の駆動ループの`check`は`next()`が1行返すたびにしか
+    /// 効かないため、この形の条件は`NestedLoopJoinExec::next()`の内部で
+    /// `check`していなければ、490,000通りの組み合わせをすべて評価し終えるまで
+    /// 締切に気付けない。
+    #[test]
+    fn statement_timeout_aborts_a_nested_loop_join_whose_condition_never_matches() {
+        let shared = Arc::new(SharedDatabase::new(Database::memory()));
+        let mut session = Session::new(Arc::clone(&shared));
+        seed_table(&mut session, "t", 700);
+
+        shared.set_resource_limits(ResourceLimits { statement_timeout: Some(Duration::from_millis(1)), ..Default::default() });
+        let result = session.execute("SELECT * FROM t AS a JOIN t AS b ON 1 = 0");
+        assert!(matches!(result, Err(DbError::QueryTimeout)), "{result:?}");
+    }
+
+    /// 第6部レビュー対応: `WHERE`が1行も一致しない`Filter`は、子から`None`を
+    /// 受け取るまで`next()`から一度も戻らない。`FilterExec::next()`の内部で
+    /// `check`していなければ、テーブル全体を読み切るまで締切に気付けない。
+    #[test]
+    fn statement_timeout_aborts_a_filter_whose_predicate_never_matches() {
+        let shared = Arc::new(SharedDatabase::new(Database::memory()));
+        let mut session = Session::new(Arc::clone(&shared));
+        session.execute("CREATE TABLE t (id BIGINT)").unwrap();
+        // 個別の`INSERT`を50,000回実行する代わりに、まとめて1文で挿入する
+        // (テストの実行時間を抑えるため)。
+        let values: Vec<String> = (0..50_000i64).map(|i| format!("({i})")).collect();
+        session.execute(&format!("INSERT INTO t VALUES {}", values.join(", "))).unwrap();
+
+        shared.set_resource_limits(ResourceLimits { statement_timeout: Some(Duration::from_millis(1)), ..Default::default() });
+        let result = session.execute("SELECT * FROM t WHERE id = -1");
+        assert!(matches!(result, Err(DbError::QueryTimeout)), "{result:?}");
+    }
+
+    /// 第6部レビュー対応: 構文解析・束縛の**途中**に届いたキャンセル要求を、
+    /// 束縛後の初期化が消してしまわないことを確認する。
+    ///
+    /// `SharedDatabase::execute_in_tx_bound`は、文の実行が終わるまで
+    /// (`Mutex`のガードを1回だけ取り、保持したまま)`SharedDatabase`内部の
+    /// `Mutex`を握り続ける(`crate::database::SharedDatabase`のドキュメント
+    /// 参照)。これを利用し、別のセッション(`session_a`)に長時間かかる
+    /// `JOIN`を実行させて`Mutex`を握らせた状態を作る。その間に別のセッション
+    /// (`session_b`)が`bind_statement`(これも同じ`Mutex`を取る)を試みると、
+    /// `session_a`が`Mutex`を手放すまで確実にブロックされる。この「確実に
+    /// 束縛の途中で止まっている」状態を作ってから`session_b`のハンドルを
+    /// `cancel`し、`session_a`が終わって`session_b`の束縛が先へ進んだときに、
+    /// この`cancel`が消えずに効いていることを確認する。
+    #[test]
+    fn cancel_requested_while_blocked_on_bind_is_not_erased_by_the_post_bind_reset() {
+        let shared = Arc::new(SharedDatabase::new(Database::memory()));
+        let mut session_a = Session::new(Arc::clone(&shared));
+        seed_table(&mut session_a, "t", 700);
+
+        let handle_a = session_a.cancellation_handle();
+        let worker_a = std::thread::spawn(move || {
+            // `ON 1 = 0`(常に偽)は700×700=490,000通りの組み合わせを最後まで
+            // 評価するため、実測で数十ミリ秒以上`SharedDatabase`内部の`Mutex`を
+            // 握り続ける(前出の`statement_timeout`系のテストと同じ規模。
+            // ここでは`statement_timeout`を設定していないので、途中で打ち
+            // 切られず最後まで走る)。
+            session_a.execute("SELECT * FROM t AS a JOIN t AS b ON 1 = 0")
+        });
+        // `session_a`が実際に実行(=`Mutex`を握る側)へ入ったことを、
+        // 同期ポイントの通過回数で確認してから次へ進む(`sleep`による
+        // 時間待ちに頼らない、他のテストと同じ流儀)。490,000通りの評価に
+        // 対して100回はごく早い段階なので、この後もまだ長時間`Mutex`を
+        // 握り続けている。
+        handle_a.wait_for_checkpoints(100);
+
+        let shared_for_b = Arc::clone(&shared);
+        let mut session_b = Session::new(shared_for_b);
+        let handle_b = session_b.cancellation_handle();
+        let worker_b = std::thread::spawn(move || session_b.execute("SELECT 1"));
+
+        // `worker_b`は`new_execution_context`によるリセット(`Mutex`を必要と
+        // しない、ほぼ一瞬で終わる処理)をすでに終え、`bind_statement`の
+        // `Mutex`取得でブロックされているはずである。`session_a`がまだ
+        // 数十ミリ秒残っている(前述)のに対し、`worker_b`が「リセット後、
+        // ブロックされるまで」に必要な時間はマイクロ秒未満なので、この程度の
+        // 待ちを挟めば安全にその間隙へ`cancel`を届けられる(`bind`のブロック
+        // そのものを外から観測するチェックポイントは無いため、ここだけは
+        // 短い待ちに頼る)。
+        std::thread::sleep(Duration::from_millis(20));
+        handle_b.cancel();
+
+        let result_a = worker_a.join().expect("session_aのワーカーがpanicした");
+        assert!(result_a.is_ok(), "session_a自身のクエリはcancelされていないはず: {result_a:?}");
+
+        let result_b = worker_b.join().expect("session_bのワーカーがpanicした");
+        assert!(
+            matches!(result_b, Err(DbError::QueryCancelled)),
+            "束縛の途中に届いたcancelが、束縛後の`run_bound`まで生き残っているはず: {result_b:?}"
+        );
     }
 
     #[test]

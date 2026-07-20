@@ -37,7 +37,7 @@
 //! 駆動する最上位のループ、`Sort`・`Hash Join`・`Hash Aggregate`が子を`None`まで
 //! 読み切る収集ループ)にだけ`check`を差し込む。ロック待ち(`DbError::WouldBlock`
 //! の再試行、`crate::database::SharedDatabase`の`Condvar::wait`)はこの章では
-//! `check`の対象にしていない(本文の限界节を参照)。
+//! `check`の対象にしていない(本文の限界節を参照)。
 //!
 //! # [`ExecutionContext`]: 文1本ぶんの実行制御をまとめる
 //!

@@ -1849,12 +1849,18 @@ pub struct FilterExec<'a> {
     predicate: &'a BoundExpr,
     functions: &'a FunctionRegistry,
     schema: Schema,
+    ctx: &'a ExecutionContext,
 }
 
 impl<'a> FilterExec<'a> {
-    pub fn new(input: Box<dyn Executor + 'a>, predicate: &'a BoundExpr, functions: &'a FunctionRegistry) -> Self {
+    pub fn new(
+        input: Box<dyn Executor + 'a>,
+        predicate: &'a BoundExpr,
+        functions: &'a FunctionRegistry,
+        ctx: &'a ExecutionContext,
+    ) -> Self {
         let schema = input.output_schema().clone();
-        FilterExec { input, predicate, functions, schema }
+        FilterExec { input, predicate, functions, schema, ctx }
     }
 }
 
@@ -1863,11 +1869,19 @@ impl<'a> Executor for FilterExec<'a> {
         &self.schema
     }
 
+    /// 一致しない行を何行読み飛ばしても、この`loop`は`self.input.next()`が
+    /// `None`を返すまで`next()`から一度も戻らない。全行が一致しない
+    /// `WHERE`(常に偽の条件)では、最上位の駆動ループ
+    /// (`Database::execute_select`、`executor.next()`を呼ぶたびに`check`する)
+    /// がこの`next()`呼び出し自体から戻ってこられず、キャンセル・タイムアウトの
+    /// 確認機会を一度も得られない。ここでも候補行1件ごとに`check`する
+    /// (第6部レビュー対応、`crate::cancellation`モジュール冒頭を参照)。
     fn next(&mut self) -> DbResult<Option<Tuple>> {
         loop {
             let Some(tuple) = self.input.next()? else {
                 return Ok(None);
             };
+            self.ctx.cancel.check()?;
             let row = Row::new(&self.schema, &tuple);
             let value = eval_bound_expr(self.predicate, self.functions, Some(&row))?;
             if predicate_matches(value)? {
@@ -1945,6 +1959,7 @@ pub struct NestedLoopJoinExec<'a> {
     schema: Schema,
     current_left: Option<Tuple>,
     right_index: usize,
+    ctx: &'a ExecutionContext,
 }
 
 impl<'a> NestedLoopJoinExec<'a> {
@@ -1953,7 +1968,7 @@ impl<'a> NestedLoopJoinExec<'a> {
         mut right: Box<dyn Executor + 'a>,
         condition: &'a BoundExpr,
         functions: &'a FunctionRegistry,
-        ctx: &ExecutionContext,
+        ctx: &'a ExecutionContext,
     ) -> DbResult<Self> {
         let left_schema = left.output_schema().clone();
         let right_schema = right.output_schema().clone();
@@ -1963,7 +1978,7 @@ impl<'a> NestedLoopJoinExec<'a> {
             right_rows.push(tuple);
         }
         let schema = logical_plan::join_schema(&left_schema, &right_schema);
-        Ok(NestedLoopJoinExec { left, right_rows, condition, functions, schema, current_left: None, right_index: 0 })
+        Ok(NestedLoopJoinExec { left, right_rows, condition, functions, schema, current_left: None, right_index: 0, ctx })
     }
 }
 
@@ -1972,6 +1987,13 @@ impl<'a> Executor for NestedLoopJoinExec<'a> {
         &self.schema
     }
 
+    /// `left`の1行が`right_rows`のどれとも一致しない場合、この`loop`は
+    /// `self.left.next()`から次の行を引くまで`next()`から一度も戻らない。
+    /// `ON`が常に偽の条件では、`left`の全行×`right_rows`の全行という組み合わせを
+    /// 1回の`next()`呼び出しの中で読み切ってしまいかねない。最上位の駆動
+    /// ループの`check`だけでは間に合わないため、候補の組み合わせ1件ごとに
+    /// ここでも`check`する(第6部レビュー対応、`crate::cancellation`モジュール
+    /// 冒頭を参照)。
     fn next(&mut self) -> DbResult<Option<Tuple>> {
         loop {
             if self.current_left.is_none() {
@@ -1981,9 +2003,15 @@ impl<'a> Executor for NestedLoopJoinExec<'a> {
                 self.current_left = Some(tuple);
                 self.right_index = 0;
             }
+            // `right_rows`が空(または現在の`left`行がどれとも一致しない)場合、
+            // 内側の`while`を一度も回らずこの外側の`loop`だけを何周もする。
+            // `right_rows`が空の常に偽の結合条件では、この経路が候補行の
+            // チェックを一度も通らないため、外側の周回自体も数える。
+            self.ctx.cancel.check()?;
             let left_tuple = self.current_left.as_ref().expect("直前にSomeを設定済み");
 
             while self.right_index < self.right_rows.len() {
+                self.ctx.cancel.check()?;
                 let right_tuple = &self.right_rows[self.right_index];
                 self.right_index += 1;
                 let combined = concat_tuple(&self.schema, left_tuple, right_tuple)?;
@@ -2033,6 +2061,7 @@ pub struct HashJoinExec<'a> {
     current_left: Option<Tuple>,
     current_key: Option<Vec<Value>>,
     match_index: usize,
+    ctx: &'a ExecutionContext,
 }
 
 impl<'a> HashJoinExec<'a> {
@@ -2044,7 +2073,7 @@ impl<'a> HashJoinExec<'a> {
         mut right: Box<dyn Executor + 'a>,
         keys: &'a [(BoundExpr, BoundExpr)],
         functions: &'a FunctionRegistry,
-        ctx: &ExecutionContext,
+        ctx: &'a ExecutionContext,
     ) -> DbResult<Self> {
         let left_schema = left.output_schema().clone();
         let right_schema = right.output_schema().clone();
@@ -2065,7 +2094,18 @@ impl<'a> HashJoinExec<'a> {
             ctx.check_row_limit("Hash Join", built_rows)?;
         }
 
-        Ok(HashJoinExec { left, left_schema, build, keys, functions, schema, current_left: None, current_key: None, match_index: 0 })
+        Ok(HashJoinExec {
+            left,
+            left_schema,
+            build,
+            keys,
+            functions,
+            schema,
+            current_left: None,
+            current_key: None,
+            match_index: 0,
+            ctx,
+        })
     }
 }
 
@@ -2074,8 +2114,15 @@ impl<'a> Executor for HashJoinExec<'a> {
         &self.schema
     }
 
+    /// Probe側(`left`)の1行が`build`のどのエントリとも一致しない場合
+    /// (キーがNULL、または一致するBuild側の行が無い場合)、この`loop`は
+    /// `self.current_left`を`None`に戻して次の`left`行へすぐ進む。一致する
+    /// 行が全く現れない結合条件では、`left`の全行を1回の`next()`呼び出しの
+    /// 中で読み切ってしまいかねないため、外側の周回のたびに`check`する
+    /// (第6部レビュー対応、`crate::cancellation`モジュール冒頭を参照)。
     fn next(&mut self) -> DbResult<Option<Tuple>> {
         loop {
+            self.ctx.cancel.check()?;
             if self.current_left.is_none() {
                 let Some(tuple) = self.left.next()? else {
                     return Ok(None);
@@ -2681,7 +2728,8 @@ mod tests {
 
         let predicate = bound_true_predicate();
         let functions = FunctionRegistry::with_builtins();
-        let mut filter = FilterExec::new(Box::new(leaf), &predicate, &functions);
+        let ctx = ExecutionContext::unbounded();
+        let mut filter = FilterExec::new(Box::new(leaf), &predicate, &functions, &ctx);
 
         filter.next().unwrap();
         filter.next().unwrap();
@@ -2701,7 +2749,8 @@ mod tests {
         let predicate = bound_true_predicate();
         let projection = bound_id_projection();
         let functions = FunctionRegistry::with_builtins();
-        let filter = FilterExec::new(Box::new(leaf), &predicate, &functions);
+        let ctx = ExecutionContext::unbounded();
+        let filter = FilterExec::new(Box::new(leaf), &predicate, &functions, &ctx);
         let mut projection_exec = ProjectionExec::new(Box::new(filter), &projection, &functions);
 
         for _ in 0..3 {
@@ -2720,7 +2769,8 @@ mod tests {
         let predicate_select = bind_select("SELECT id FROM users WHERE id = 3");
         let predicate = predicate_select.predicate.unwrap();
         let functions = FunctionRegistry::with_builtins();
-        let mut filter = FilterExec::new(Box::new(leaf), &predicate, &functions);
+        let ctx = ExecutionContext::unbounded();
+        let mut filter = FilterExec::new(Box::new(leaf), &predicate, &functions, &ctx);
 
         let matched = filter.next().unwrap().unwrap();
         assert_eq!(matched.values()[0], Value::BigInt(3));
@@ -3180,11 +3230,11 @@ mod tests {
         let b_rows = vec![b_row(Some(2), "b2"), b_row(None, "bnull"), b_row(Some(2), "b2b"), b_row(Some(9), "bnomatch")];
 
         let functions = FunctionRegistry::with_builtins();
+        let ctx = ExecutionContext::unbounded();
         let mut nlj =
-            NestedLoopJoinExec::new(exec_over_a_rows(a_rows.clone()), exec_over_b_rows(b_rows.clone()), &condition, &functions, &ExecutionContext::unbounded())
+            NestedLoopJoinExec::new(exec_over_a_rows(a_rows.clone()), exec_over_b_rows(b_rows.clone()), &condition, &functions, &ctx)
                 .unwrap();
-        let mut hash =
-            HashJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(b_rows), &keys, &functions, &ExecutionContext::unbounded()).unwrap();
+        let mut hash = HashJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(b_rows), &keys, &functions, &ctx).unwrap();
 
         let nlj_rows = collect_all(&mut nlj);
         let hash_rows = collect_all(&mut hash);
@@ -3202,8 +3252,8 @@ mod tests {
         let b_rows = vec![b_row(Some(1), "b1"), b_row(None, "bnull")];
 
         let functions = FunctionRegistry::with_builtins();
-        let mut hash =
-            HashJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(b_rows), &keys, &functions, &ExecutionContext::unbounded()).unwrap();
+        let ctx = ExecutionContext::unbounded();
+        let mut hash = HashJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(b_rows), &keys, &functions, &ctx).unwrap();
         let rows = collect_all(&mut hash);
         assert_eq!(rows.len(), 1);
     }
@@ -3220,8 +3270,9 @@ mod tests {
         let b_rows = vec![b_row(Some(1), "b1"), b_row(None, "bnull")];
 
         let functions = FunctionRegistry::with_builtins();
-        let mut nlj = NestedLoopJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(b_rows), &condition, &functions, &ExecutionContext::unbounded())
-            .unwrap();
+        let ctx = ExecutionContext::unbounded();
+        let mut nlj =
+            NestedLoopJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(b_rows), &condition, &functions, &ctx).unwrap();
         let rows = collect_all(&mut nlj);
         assert_eq!(rows.len(), 1);
     }
@@ -3235,17 +3286,12 @@ mod tests {
         let a_rows = vec![a_row(1, "a1"), a_row(2, "a2")];
 
         let functions = FunctionRegistry::with_builtins();
+        let ctx = ExecutionContext::unbounded();
         let mut nlj =
-            NestedLoopJoinExec::new(exec_over_a_rows(a_rows.clone()), exec_over_b_rows(Vec::new()), &condition, &functions, &ExecutionContext::unbounded())
+            NestedLoopJoinExec::new(exec_over_a_rows(a_rows.clone()), exec_over_b_rows(Vec::new()), &condition, &functions, &ctx)
                 .unwrap();
-        let mut hash = HashJoinExec::new(
-            exec_over_a_rows(a_rows),
-            exec_over_b_rows(Vec::new()),
-            &keys,
-            &functions,
-            &ExecutionContext::unbounded(),
-        )
-        .unwrap();
+        let mut hash =
+            HashJoinExec::new(exec_over_a_rows(a_rows), exec_over_b_rows(Vec::new()), &keys, &functions, &ctx).unwrap();
         assert!(collect_all(&mut nlj).is_empty());
         assert!(collect_all(&mut hash).is_empty());
     }
@@ -3259,17 +3305,12 @@ mod tests {
         let b_rows = vec![b_row(Some(1), "b1")];
 
         let functions = FunctionRegistry::with_builtins();
+        let ctx = ExecutionContext::unbounded();
         let mut nlj =
-            NestedLoopJoinExec::new(exec_over_a_rows(Vec::new()), exec_over_b_rows(b_rows.clone()), &condition, &functions, &ExecutionContext::unbounded())
+            NestedLoopJoinExec::new(exec_over_a_rows(Vec::new()), exec_over_b_rows(b_rows.clone()), &condition, &functions, &ctx)
                 .unwrap();
-        let mut hash = HashJoinExec::new(
-            exec_over_a_rows(Vec::new()),
-            exec_over_b_rows(b_rows),
-            &keys,
-            &functions,
-            &ExecutionContext::unbounded(),
-        )
-        .unwrap();
+        let mut hash =
+            HashJoinExec::new(exec_over_a_rows(Vec::new()), exec_over_b_rows(b_rows), &keys, &functions, &ctx).unwrap();
         assert!(collect_all(&mut nlj).is_empty());
         assert!(collect_all(&mut hash).is_empty());
     }

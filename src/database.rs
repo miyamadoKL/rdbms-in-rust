@@ -532,7 +532,7 @@ impl Database {
     /// [`Database::execute_bound_statement`]・[`Database::execute_bound_statement_prebound`]
     /// が共有する、束縛済みの文を実際に実行する本体。`ctx`は`SELECT`の実行
     /// (`execute_select`・`execute_explain`)にだけ渡す。DDL・`INSERT`・`UPDATE`・
-    /// `DELETE`はこの章の実行制御の対象外である(本文の限界节を参照)。
+    /// `DELETE`はこの章の実行制御の対象外である(本文の限界節を参照)。
     fn run_bound_statement(&mut self, bound: BoundStatement, ctx: &ExecutionContext) -> DbResult<QueryResult> {
         let owner = self.lock_owner();
         let started = std::time::Instant::now();
@@ -997,11 +997,17 @@ impl Database {
 
         // `Executor::next()`を駆動するこのループが、この章のキャンセル・
         // タイムアウトの主要な同期ポイントである(`crate::cancellation`モジュール
-        // 冒頭を参照)。`Filter`・`Projection`のようなstreaming演算子は子から
-        // 1行引くたびにこのループへ戻ってくるため、`Sort`のように内部で
-        // 全件を読み切るblocking演算子(`build_query_executor`が組み立てる時点で
-        // すでに`ctx.cancel.check()`を挟んでいる)を除けば、ここでの`check`が
-        // 唯一の確認機会になる。
+        // 冒頭を参照)。`Projection`のように、子から1行引けば必ず1行返す
+        // streaming演算子は、このループへ毎回戻ってくるためここでの`check`で
+        // 十分捕捉できる。一方`Filter`・`NestedLoopJoin`・`HashJoin`は、子から
+        // 何行引いても一致しなければ`next()`から一度も戻らない(常に偽の
+        // `WHERE`・`ON`が典型例)。これらの演算子自身が内部の候補行ごとに
+        // `ctx.cancel.check()`を呼ぶ(`physical_plan::FilterExec`・
+        // `NestedLoopJoinExec`・`HashJoinExec`の`next()`を参照)ため、ここでの
+        // `check`はそれを補う二重の確認であり、唯一の確認機会ではない。
+        // `Sort`のように内部で全件を読み切るblocking演算子も、
+        // `build_query_executor`が組み立てる時点ですでに`ctx.cancel.check()`を
+        // 挟んでいる。
         let mut rows = Vec::new();
         while let Some(tuple) = executor.next()? {
             ctx.cancel.check()?;
@@ -1365,7 +1371,7 @@ impl Database {
             }
             PhysicalPlan::Filter(filter) => {
                 let input = self.build_query_executor(&filter.input, child(0), ctx)?;
-                Ok(Box::new(FilterExec::new(input, &filter.predicate, &self.functions)))
+                Ok(Box::new(FilterExec::new(input, &filter.predicate, &self.functions, ctx)))
             }
             PhysicalPlan::NestedLoopJoin(join) => {
                 let left = self.build_query_executor(&join.left, child(0), ctx)?;
@@ -2158,7 +2164,7 @@ impl SharedDatabase {
     /// ロック待ちの再試行ループ(`WouldBlock`・`Condvar::wait`)自体は`ctx`を
     /// 見ない。ロック待ちの間はまだ文の実行が始まっていないため、この章は
     /// ロック待ちそのものをキャンセル・タイムアウトの対象にしていない(本文の
-    /// 限界节を参照)。
+    /// 限界節を参照)。
     pub fn execute_in_tx_bound(&self, handle: &TxHandle, bound: &BoundStatement, ctx: &ExecutionContext) -> DbResult<QueryResult> {
         let mut guard = self.lock();
         loop {

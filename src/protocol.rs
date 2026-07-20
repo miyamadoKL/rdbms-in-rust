@@ -204,10 +204,26 @@ impl Response {
     }
 
     /// `stream`へこのレスポンスを1フレームとして書き出す。
+    ///
+    /// [`Response::Rows`]のペイロードが[`MAX_FRAME_PAYLOAD_LEN`]を超える場合、
+    /// そのまま[`write_raw_frame`]へ渡すと`FrameTooLarge`エラーになり(書き出し側も
+    /// 上限を検査する、モジュール冒頭「フレーム長の上限とDoS防止」を参照)、
+    /// サーバー自身がクエリの実行結果を1つも返せず接続が切れてしまう。
+    /// この章はページングやストリーミングまでは実装せず、上限を超えた場合は
+    /// 結果行を1件も送らず、`STATUS_ERROR`の小さなエラー応答へ差し替える
+    /// 最小限の対処にとどめる(章末の演習課題を参照)。
     pub fn write(&self, stream: &mut impl Write, request_id: u32) -> Result<(), ProtocolError> {
         match self {
             Response::Rows { schema, rows } => {
                 let payload = encode_rows_payload(schema, rows)?;
+                if payload.len() > MAX_FRAME_PAYLOAD_LEN as usize {
+                    let message = format!(
+                        "結果が大きすぎて返せません({}バイト、上限{}バイト)。LIMITで件数を絞るか、絞り込む条件を追加してください。",
+                        payload.len(),
+                        MAX_FRAME_PAYLOAD_LEN
+                    );
+                    return write_raw_frame(stream, STATUS_ERROR, request_id, message.as_bytes());
+                }
                 write_raw_frame(stream, STATUS_OK_ROWS, request_id, &payload)
             }
             Response::Command(tag) => write_raw_frame(stream, STATUS_OK_COMMAND, request_id, tag.as_bytes()),
@@ -273,8 +289,18 @@ const FRAME_HEADER_LEN: usize = 1 + 4 + 4;
 
 /// `tag`・`request_id`・`payload`を、モジュール冒頭のレイアウトに従って
 /// `writer`へ書き出す。
+///
+/// [`read_raw_frame`]が受信側で[`MAX_FRAME_PAYLOAD_LEN`]を検査するのと対称に、
+/// この関数も送信側で同じ上限を検査する。この検査が無いと、サーバーが
+/// 書き出せた大きなフレームを、同じ上限を守る公式クライアント自身が
+/// 読めないという非対称が生まれる(モジュール冒頭「フレーム長の上限とDoS
+/// 防止」を参照)。
 fn write_raw_frame(writer: &mut impl Write, tag: u8, request_id: u32, payload: &[u8]) -> Result<(), ProtocolError> {
-    let payload_len = u32::try_from(payload.len()).expect("この章のペイロードはu32に収まる大きさに制限している");
+    let payload_len = match u32::try_from(payload.len()) {
+        Ok(len) if len <= MAX_FRAME_PAYLOAD_LEN => len,
+        Ok(len) => return Err(ProtocolError::FrameTooLarge { len, max: MAX_FRAME_PAYLOAD_LEN }),
+        Err(_) => return Err(ProtocolError::FrameTooLarge { len: u32::MAX, max: MAX_FRAME_PAYLOAD_LEN }),
+    };
     let mut header = [0u8; FRAME_HEADER_LEN];
     header[0] = tag;
     header[1..5].copy_from_slice(&request_id.to_le_bytes());
@@ -365,30 +391,83 @@ fn encode_rows_payload(schema: &Schema, rows: &[Tuple]) -> Result<Vec<u8>, Proto
     Ok(out)
 }
 
+/// 列メタデータ1件が最低限占めるバイト数(`name_len(4)` + `data_type(1)` +
+/// `nullable(1)`、列名が空文字列の場合の下限)。[`decode_rows_payload`]が
+/// `column_count`を確保する前に、残りバイト数からこの下限を使って
+/// 「この`column_count`は絶対にありえない」ことを検査する。
+const MIN_COLUMN_ENTRY_LEN: usize = 4 + 1 + 1;
+
+/// 行1件が最低限占めるバイト数(`row_len(4)`、行本体が0バイトの場合の下限)。
+/// [`decode_rows_payload`]が`row_count`を確保する前の検査に使う
+/// ([`MIN_COLUMN_ENTRY_LEN`]と同じ理由)。
+const MIN_ROW_ENTRY_LEN: usize = 4;
+
 /// [`encode_rows_payload`]の逆変換。
+///
+/// `column_count`・`row_count`は送信側の自己申告であり、[`read_raw_frame`]が
+/// 検査する`payload_len`とは独立している(モジュール冒頭「フレーム長の上限と
+/// DoS防止」参照)。16MiB以下の短いペイロードに、桁外れに大きな
+/// `column_count`・`row_count`だけを書き込めば、`Vec::with_capacity`が
+/// その値をそのまま信用して過大な確保を試みてしまう。この関数は、確保の前に
+/// 「残りバイト数から見てこの件数はそもそもありえない」ことを検査し、
+/// 検査を通っても確保自体は`try_reserve`で行って失敗を`ProtocolError`へ
+/// 変換する(OSがメモリ確保に失敗した場合にpanicで落ちないようにするため)。
 fn decode_rows_payload(bytes: &[u8]) -> Result<Response, ProtocolError> {
     let mut cursor = 0usize;
     let column_count = read_u32(bytes, &mut cursor)?;
-    let mut columns = Vec::with_capacity(column_count as usize);
+    let remaining = bytes.len() - cursor;
+    if (column_count as usize).saturating_mul(MIN_COLUMN_ENTRY_LEN) > remaining {
+        return Err(ProtocolError::MalformedPayload(format!(
+            "column_countがペイロードの残りバイト数に対して大きすぎます: {column_count}"
+        )));
+    }
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(column_count as usize)
+        .map_err(|_| ProtocolError::MalformedPayload("列メタデータの確保に失敗しました".to_string()))?;
     for _ in 0..column_count {
         let name_len = read_u32(bytes, &mut cursor)?;
         let name = read_utf8(bytes, &mut cursor, name_len as usize)?;
         let data_type = decode_data_type(read_u8(bytes, &mut cursor)?)?;
-        let nullable = read_u8(bytes, &mut cursor)? != 0;
+        let nullable = match read_u8(bytes, &mut cursor)? {
+            0 => false,
+            1 => true,
+            other => {
+                return Err(ProtocolError::MalformedPayload(format!(
+                    "nullableは0または1である必要があります: {other}"
+                )));
+            }
+        };
         columns.push(Column::new(name, data_type, nullable));
     }
     let schema = Schema::new(columns);
 
     let row_count = read_u32(bytes, &mut cursor)?;
-    let mut rows = Vec::with_capacity(row_count as usize);
+    let remaining = bytes.len() - cursor;
+    if (row_count as usize).saturating_mul(MIN_ROW_ENTRY_LEN) > remaining {
+        return Err(ProtocolError::MalformedPayload(format!(
+            "row_countがペイロードの残りバイト数に対して大きすぎます: {row_count}"
+        )));
+    }
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(row_count as usize)
+        .map_err(|_| ProtocolError::MalformedPayload("行の確保に失敗しました".to_string()))?;
     for _ in 0..row_count {
         let row_len = read_u32(bytes, &mut cursor)? as usize;
-        let row_bytes = bytes.get(cursor..cursor + row_len).ok_or_else(|| {
+        let row_end = cursor
+            .checked_add(row_len)
+            .ok_or_else(|| ProtocolError::MalformedPayload("行の長さがオーバーフローしています".to_string()))?;
+        let row_bytes = bytes.get(cursor..row_end).ok_or_else(|| {
             ProtocolError::MalformedPayload("行本体を読む前にペイロードが尽きました".to_string())
         })?;
-        cursor += row_len;
+        cursor = row_end;
         let tuple = crate::tuple_codec::decode_tuple(&schema, row_bytes)?;
         rows.push(tuple);
+    }
+    if cursor != bytes.len() {
+        return Err(ProtocolError::MalformedPayload(
+            "ペイロードの末尾に余剰バイトがあります".to_string(),
+        ));
     }
     Ok(Response::Rows { schema, rows })
 }
@@ -548,6 +627,119 @@ mod tests {
         payload.push(0xFF); // 未知のDataTypeタグ
         payload.push(0);
         let err = decode_rows_payload(&payload).unwrap_err();
+        assert!(matches!(err, ProtocolError::MalformedPayload(_)));
+    }
+
+    // ---- 第6部レビュー対応: 書き出し側の上限検査、decode_rows_payloadの防御 ----
+
+    #[test]
+    fn request_write_accepts_a_payload_exactly_at_the_limit() {
+        let sql = "x".repeat(MAX_FRAME_PAYLOAD_LEN as usize);
+        let request = Request { request_id: 1, sql };
+        let mut buf = Vec::new();
+        request.write(&mut buf).unwrap();
+    }
+
+    #[test]
+    fn request_write_rejects_a_payload_one_byte_over_the_limit() {
+        let sql = "x".repeat(MAX_FRAME_PAYLOAD_LEN as usize + 1);
+        let request = Request { request_id: 1, sql };
+        let mut buf = Vec::new();
+        let err = request.write(&mut buf).unwrap_err();
+        assert!(matches!(err, ProtocolError::FrameTooLarge { .. }), "{err:?}");
+        // 送信前にエラーになり、1バイトも書き出さない。
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn response_write_converts_an_oversized_rows_payload_into_a_small_error_response() {
+        // 1行のTEXTだけで上限を超える巨大な結果セットを組み立てる。
+        let schema = Schema::new(vec![Column::new("s", DataType::Text, false)]);
+        let big_value = Value::Text("x".repeat(MAX_FRAME_PAYLOAD_LEN as usize));
+        let rows = vec![Tuple::new(&schema, vec![big_value]).unwrap()];
+        let response = Response::Rows { schema, rows };
+
+        let mut buf = Vec::new();
+        response.write(&mut buf, 7).unwrap();
+
+        // 書き出したフレーム自体は小さく、`Response::read`でSTATUS_ERRORとして
+        // 読み戻せる(公式クライアントが読める大きさに収まっている)。
+        assert!((buf.len() as u32) < MAX_FRAME_PAYLOAD_LEN);
+        let mut cursor = Cursor::new(buf);
+        let (request_id, decoded) = Response::read(&mut cursor).unwrap();
+        assert_eq!(request_id, 7);
+        assert!(matches!(decoded, Response::Error(_)), "{decoded:?}");
+    }
+
+    #[test]
+    fn response_write_accepts_a_rows_payload_exactly_at_the_limit() {
+        // 空文字列を1行持つペイロードの実測サイズ(schema・row_count・NULL
+        // ビットマップ・長さプレフィックス等、全オーバーヘッドを含む)を基準に、
+        // TEXTの長さを1バイトずつの差分で逆算する(手計算のオフセットに頼らない)。
+        let schema = Schema::new(vec![Column::new("s", DataType::Text, false)]);
+        let base_len = encode_rows_payload(&schema, &[Tuple::new(&schema, vec![Value::Text(String::new())]).unwrap()])
+            .unwrap()
+            .len();
+        let text_len = MAX_FRAME_PAYLOAD_LEN as usize - base_len;
+        let rows = vec![Tuple::new(&schema, vec![Value::Text("x".repeat(text_len))]).unwrap()];
+        let payload_len = encode_rows_payload(&schema, &rows).unwrap().len();
+        assert_eq!(payload_len, MAX_FRAME_PAYLOAD_LEN as usize, "テストの前提: ちょうど上限のペイロードを組み立てられている");
+
+        let response = Response::Rows { schema, rows };
+        let mut buf = Vec::new();
+        response.write(&mut buf, 1).unwrap();
+        let mut cursor = Cursor::new(buf);
+        let (_, decoded) = Response::read(&mut cursor).unwrap();
+        assert!(matches!(decoded, Response::Rows { .. }), "ちょうど上限のペイロードはSTATUS_OK_ROWSのまま読めるはず");
+    }
+
+    #[test]
+    fn decode_rows_payload_rejects_a_column_count_too_large_for_the_remaining_bytes() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32::MAX.to_le_bytes()); // column_count
+        // 残りバイトはほぼ無い。
+        let err = decode_rows_payload(&payload).unwrap_err();
+        assert!(matches!(err, ProtocolError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn decode_rows_payload_rejects_a_row_count_too_large_for_the_remaining_bytes() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes()); // column_count = 0
+        payload.extend_from_slice(&u32::MAX.to_le_bytes()); // row_count
+        // 残りバイトはほぼ無い。
+        let err = decode_rows_payload(&payload).unwrap_err();
+        assert!(matches!(err, ProtocolError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn decode_rows_payload_rejects_a_nullable_byte_that_is_neither_0_nor_1() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes()); // column_count = 1
+        let name = b"c";
+        payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        payload.extend_from_slice(name);
+        payload.push(encode_data_type(DataType::Boolean));
+        payload.push(2); // 0でも1でもないnullableバイト
+        payload.extend_from_slice(&0u32.to_le_bytes()); // row_count = 0
+        let err = decode_rows_payload(&payload).unwrap_err();
+        assert!(matches!(err, ProtocolError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn decode_rows_payload_rejects_trailing_bytes_after_the_last_row() {
+        let schema = sample_schema();
+        let response = Response::Rows { schema: schema.clone(), rows: Vec::new() };
+        let mut buf = Vec::new();
+        response.write(&mut buf, 0).unwrap();
+        // `Response::write`が書いたフレームのペイロード部分の末尾に、
+        // 余剰バイトを1つ足す。
+        let mut header_and_payload = buf;
+        let extra_byte_len = (u32::from_le_bytes(header_and_payload[5..9].try_into().unwrap()) + 1).to_le_bytes();
+        header_and_payload[5..9].copy_from_slice(&extra_byte_len);
+        header_and_payload.push(0xAB);
+        let mut cursor = Cursor::new(header_and_payload);
+        let err = Response::read(&mut cursor).unwrap_err();
         assert!(matches!(err, ProtocolError::MalformedPayload(_)));
     }
 }

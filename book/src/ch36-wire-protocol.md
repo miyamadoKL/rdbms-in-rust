@@ -61,7 +61,11 @@ PostgreSQL Wire Protocolは、認証方式(`SCRAM-SHA-256`等)、メッセージ
 
 ```rust
 fn write_raw_frame(writer: &mut impl Write, tag: u8, request_id: u32, payload: &[u8]) -> Result<(), ProtocolError> {
-    let payload_len = u32::try_from(payload.len()).expect("この章のペイロードはu32に収まる大きさに制限している");
+    let payload_len = match u32::try_from(payload.len()) {
+        Ok(len) if len <= MAX_FRAME_PAYLOAD_LEN => len,
+        Ok(len) => return Err(ProtocolError::FrameTooLarge { len, max: MAX_FRAME_PAYLOAD_LEN }),
+        Err(_) => return Err(ProtocolError::FrameTooLarge { len: u32::MAX, max: MAX_FRAME_PAYLOAD_LEN }),
+    };
     let mut header = [0u8; FRAME_HEADER_LEN];
     header[0] = tag;
     header[1..5].copy_from_slice(&request_id.to_le_bytes());
@@ -72,6 +76,8 @@ fn write_raw_frame(writer: &mut impl Write, tag: u8, request_id: u32, payload: &
     Ok(())
 }
 ```
+
+書き出し側もこの時点で`MAX_FRAME_PAYLOAD_LEN`を検査している点が、後述「フレーム長の上限とDoS防止」の読み取り側の検査と対称になっています。
 
 リクエストのペイロードは、実行するSQL文をそのままUTF-8バイト列にしたものです。
 `tag`には`MSG_QUERY`(`0x01`)という値だけを定義しました。
@@ -110,6 +116,31 @@ fn read_raw_frame(reader: &mut impl Read) -> Result<RawFrame, ProtocolError> {
 16MiBという値そのものに理論的な根拠はありません。
 このSQLサブセットの文や、この章までの結果セットが実用上収まる範囲に、余裕を持たせて選んだ目安です。
 章が進んで大きな結果セットのストリーミングを扱うようになれば、この定数は見直しの対象になります。
+
+読み取り側だけでなく、書き出し側の`write_raw_frame`も同じ`MAX_FRAME_PAYLOAD_LEN`を検査します。
+書き出し側の検査が無いと、サーバーが`payload_len`の上限を超える`Response`を実際に書き出せてしまい、そのバイト列を同じ上限を守る公式クライアント自身が読めないという非対称が生まれます。
+`SELECT`の結果セットが大きくなるほど`Response::Rows`のペイロードは大きくなるため、この非対称は現実に起こりえます。
+
+`Response::write`は、`Response::Rows`のペイロードが上限を超えていたら、`write_raw_frame`が`FrameTooLarge`を返すより前に検査し、行を1件も書き出さずに小さな`STATUS_ERROR`応答へ差し替えます。
+
+```rust
+Response::Rows { schema, rows } => {
+    let payload = encode_rows_payload(schema, rows)?;
+    if payload.len() > MAX_FRAME_PAYLOAD_LEN as usize {
+        let message = format!(
+            "結果が大きすぎて返せません({}バイト、上限{}バイト)。LIMITで件数を絞るか、絞り込む条件を追加してください。",
+            payload.len(),
+            MAX_FRAME_PAYLOAD_LEN
+        );
+        return write_raw_frame(stream, STATUS_ERROR, request_id, message.as_bytes());
+    }
+    write_raw_frame(stream, STATUS_OK_ROWS, request_id, &payload)
+}
+```
+
+結果件数の上限やページング、ストリーミングによる分割送信は、この章の範囲を超える変更になるため導入しません。
+上限を超えた`SELECT`はエラーとして扱う、この章での最小限の対処にとどめ、大きな結果セットを分割して返す設計は章末の演習課題に譲ります。
+`Request::write`(SQLを送る側)も同じ`write_raw_frame`を経由するため、上限を超えるSQL文字列を送ろうとすれば、1バイトも送信せずに`FrameTooLarge`を返します。
 
 ### 不正なフレームの扱い
 
@@ -386,13 +417,22 @@ match db.execute(input) {
 CLIクライアントは、`Database::execute`の代わりに`Request`をフレームへ詰めて送り、返ってきた`Response`を表示します。
 
 ```rust
-fn send(stream: &mut TcpStream, request_id: u32, sql: &str) -> Result<Response, minidb::ProtocolError> {
+fn send(stream: &mut TcpStream, request_id: u32, sql: &str) -> Result<Response, ClientError> {
     let request = Request { request_id, sql: sql.to_string() };
     request.write(stream)?;
-    let (_received_id, response) = Response::read(stream)?;
+    let (received_id, response) = Response::read(stream)?;
+    if received_id != request_id {
+        return Err(ClientError::RequestIdMismatch { sent: request_id, received: received_id });
+    }
     Ok(response)
 }
 ```
+
+受信した`request_id`は捨てず、送信した`request_id`と一致することを検証しています。
+この章のサーバーは1本の接続の中でリクエストを1件ずつ順に処理するため、`request_id`が食い違うことは本来起こらないはずです。
+それでも検証せずに応答をそのまま表示すると、フレームの境界がどこかでずれていた場合(モジュール冒頭「不正なフレームの扱い」を参照)に、別のリクエストの結果を気付かず表示しかねません。
+`ClientError`は`minidb::ProtocolError`(フレームそのものが読み書きできなかったエラー)にこの不一致を追加した、クライアント側だけの型です。
+不一致を検出したら、個別のクエリのエラー(`Response::Error`)とは違い通信そのものの異常として扱い、接続を終了します。
 
 対話UI(標準入力を1行ずつ読み、`\q`で終了し、結果を表示してから次のプロンプトを出す)は2つのバイナリでまったく同じ形をしています。
 違うのはSQLの実行先だけです。
@@ -467,6 +507,6 @@ Prepared StatementやParameter Bindingのような、より本格的なセッシ
 
 ### 発展課題
 
-1. 現在の`request_id`は、サーバーが受け取った順にレスポンスを返すことを前提にしており、クライアント側で`request_id`を積極的に検証してはいません。1本の接続の中で複数のリクエストを応答を待たずに送りつけるパイプライン化を`Request`/`Response`のレイアウトを変えずに実装し、`request_id`を使って対応するレスポンスを正しく突き合わせるクライアントを書いてください。サーバー側が1リクエストずつ順に処理する設計のままで、クライアント側のパイプライン化にどれだけ意味があるか(レイテンシの隠蔽、スループットへの効果)も考察してください。
+1. `minidb_client`は、送信した`request_id`と受信した`request_id`が一致することを検証するだけで、1本の接続の中で複数のリクエストを応答を待たずに送りつけるパイプライン化までは実装していません。`Request`/`Response`のレイアウトを変えずにパイプライン化を実装し、`request_id`を使って(順不同で返ってきうる)対応するレスポンスを正しく突き合わせるクライアントを書いてください。サーバー側が1リクエストずつ順に処理する設計のままで、クライアント側のパイプライン化にどれだけ意味があるか(レイテンシの隠蔽、スループットへの効果)も考察してください。
 2. `encode_rows_payload`は、結果セット全体を1つの`Vec<u8>`に組み立ててから1フレームとして送ります。行数が多いクエリでは、この方式はメモリ上に結果セット全体のコピーを2つ(`QueryResult::rows`と、そこからエンコードした`Vec<u8>`)持つことになります。行を一定件数ごとに分割し、複数のレスポンスフレームに分けて送るストリーミング方式を設計し、実装してください。フレームの最後を示す仕組み(最終フレームであることを示すフラグ、または行数0のフレームを終端とする、等)から設計する必要があります。
 3. この章の`Server::run`は、接続を受け付けるたびに無条件で`std::thread::spawn`します。接続数に上限を設け、上限に達している間は新規接続をすぐには`accept`しない(あるいは`accept`はするが即座にエラー応答を返して切断する)設計に変更し、大量の同時接続に対してサーバープロセスのスレッド数が無限に増え続けないことをテストで確認してください。

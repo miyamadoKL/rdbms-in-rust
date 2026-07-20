@@ -306,6 +306,20 @@ pub enum DbError {
         second: DataType,
     },
 
+    /// `PREPARE`本体のプレースホルダ番号(`$n`)が、実装が許容する上限
+    /// (`crate::session::MAX_PARAM_INDEX`)を超えているエラー(第6部レビュー
+    /// 対応)。字句解析器自体は`$n`を`u32`の範囲でしか制限しないため、
+    /// `$4294967295`のような入力自体は短くても、番号をそのまま
+    /// `Vec::resize`の引数に使うと桁外れの確保を試みてしまう。この上限は
+    /// `resize`する前に検査する。
+    #[error("プレースホルダの番号が上限を超えています: ${index}(上限は${max}です)")]
+    ParamIndexTooLarge {
+        /// SQL文中に現れた`$n`の番号。
+        index: u32,
+        /// 許容する上限(`crate::session::MAX_PARAM_INDEX`)。
+        max: u32,
+    },
+
     /// 実行中の文が、`crate::cancellation::CancellationToken::cancel`による
     /// 明示的なキャンセル要求を受けて打ち切られたエラー(第38章)。クライアントの
     /// 切断検知(`crate::server`)、または`crate::session::Session::cancellation_handle`

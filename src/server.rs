@@ -88,8 +88,25 @@
 //! 制御フローの終わりに直接`flush`を呼ぶだけだが、サーバーは複数の接続
 //! スレッドの終了を`WorkerPool::join`で待ち合わせてから同じことをする点が
 //! 異なる。
+//!
+//! ## 部分フレームを受信した接続の終了処理
+//!
+//! 手順2の「次のフレームを待つ間」は、まだ1バイトも届いていない接続だけの
+//! 話ではない。クライアントがフレームのヘッダーだけ、あるいはペイロードの
+//! 途中までしか送らずに止まった(接続は開いたまま)場合も、[`Server::run`]は
+//! 同じ`POLL_INTERVAL`のうちに終了できなければならない。[`wait_for_request_or_shutdown`]は
+//! `TcpStream::peek`で最初の1バイトが届くまでをポーリングするだけで、
+//! 届いたあとの実際の読み取り([`Request::read`])はこの関数の外で行う。
+//! [`Request::read`]自身は[`std::io::Read::read_exact`]を使うため、
+//! 与えた`Read`実装がタイムアウトを返さない(無期限にブロックする)限り、
+//! ヘッダーやペイロードの途中で相手が止まればそのまま戻ってこない。
+//! [`ShutdownAwareReader`]は、`stream`の読み取りタイムアウトを
+//! `POLL_INTERVAL`のまま外さずに`Request::read`へ渡すためのラッパーで、
+//! タイムアウトのたびにシャットダウンフラグを確認し、立っていなければ
+//! 同じ`read`を再試行する。これにより、フレームのどの位置で相手が止まって
+//! いても、次の`POLL_INTERVAL`以内にシャットダウンへ気付ける。
 
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -263,7 +280,13 @@ fn handle_connection(mut stream: TcpStream, shared: Arc<SharedDatabase>, shutdow
             WaitOutcome::Ready => {}
         }
 
-        let request = match Request::read(&mut stream) {
+        // ヘッダー・ペイロードを読み終えるまで、`stream`の読み取り期限
+        // (`POLL_INTERVAL`、`wait_for_request_or_shutdown`がすでに設定済み)を
+        // 外さずに読む。フレームの途中(ヘッダーの途中、ペイロードの途中)で
+        // 期限に達しても、`ShutdownAwareReader`がシャットダウンフラグを
+        // 確認したうえで同じ`read`を再試行するため、フレーム境界がずれる
+        // 心配は無い(モジュール冒頭「Graceful Shutdown」を参照)。
+        let request = match Request::read(&mut ShutdownAwareReader { stream: &mut stream, shutdown: &shutdown }) {
             Ok(request) => request,
             Err(ProtocolError::Io(err)) if err.kind() == ErrorKind::UnexpectedEof => {
                 // クライアントが次のフレームを送る前にソケットを閉じた
@@ -291,8 +314,9 @@ fn handle_connection(mut stream: TcpStream, shared: Arc<SharedDatabase>, shutdow
 }
 
 enum WaitOutcome {
-    /// 次のフレームの先頭バイトがすでに届いている。`stream`は以後
-    /// ブロッキングモード(読み取りタイムアウト無し)に戻してある。
+    /// 次のフレームの先頭バイトがすでに届いている。`stream`の読み取り
+    /// タイムアウトは`POLL_INTERVAL`のままにしてある(モジュール冒頭
+    /// 「部分フレームを受信した接続の終了処理」を参照)。
     Ready,
     /// シャットダウンが要求された。
     Shutdown,
@@ -305,10 +329,14 @@ enum WaitOutcome {
 ///
 /// `TcpStream::peek`はバイト列を消費しない(`Request::read`が最初から
 /// フレーム全体を読み直せる)ため、ポーリングのタイムアウトがフレームの
-/// 途中で発生しても、次のフレーム境界がずれる心配が無い。1バイト以上
-/// 届いていることを確認できた時点で読み取りタイムアウトを外し、以後の
-/// `Request::read`は(実データが来ていると分かっているので)通常どおり
-/// ブロッキングで読む。
+/// 到着前に発生しても、次のフレーム境界がずれる心配が無い。1バイト以上
+/// 届いていることを確認できたら[`WaitOutcome::Ready`]を返すが、読み取り
+/// タイムアウトは`None`(無期限)へは戻さない。ヘッダー・ペイロードの
+/// 続きがまだ全部届いていない状態(部分フレーム)でも、後続の
+/// `Request::read`(`ShutdownAwareReader`経由)が同じ`POLL_INTERVAL`の期限を
+/// 使って読み進め、期限に達するたびにシャットダウンフラグを再確認できる
+/// ようにするためである(モジュール冒頭「部分フレームを受信した接続の
+/// 終了処理」を参照)。
 fn wait_for_request_or_shutdown(stream: &mut TcpStream, shutdown: &AtomicBool) -> WaitOutcome {
     if stream.set_read_timeout(Some(POLL_INTERVAL)).is_err() {
         return WaitOutcome::Disconnected;
@@ -320,12 +348,44 @@ fn wait_for_request_or_shutdown(stream: &mut TcpStream, shutdown: &AtomicBool) -
         }
         match stream.peek(&mut probe) {
             Ok(0) => return WaitOutcome::Disconnected, // 相手が正常に閉じた(EOF)
-            Ok(_) => {
-                let _ = stream.set_read_timeout(None);
-                return WaitOutcome::Ready;
-            }
+            Ok(_) => return WaitOutcome::Ready,
             Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
             Err(_) => return WaitOutcome::Disconnected,
+        }
+    }
+}
+
+/// [`Request::read`]をシャットダウン要求に応答できる形でラップする
+/// `Read`実装(モジュール冒頭「部分フレームを受信した接続の終了処理」を
+/// 参照)。
+///
+/// `stream`の読み取りタイムアウトは、呼び出し元(`handle_connection`)が
+/// `wait_for_request_or_shutdown`を通じてすでに`POLL_INTERVAL`へ設定済みで
+/// あることを前提にする。`read`がタイムアウト(`WouldBlock`・`TimedOut`)を
+/// 受け取るたびにシャットダウンフラグを確認し、立っていれば
+/// (`Request::read`の内部で`read_exact`が積み上げている途中のバイト列ごと)
+/// エラーとして中断する。立っていなければ同じ`read`を再試行する。
+/// これにより、ヘッダーの途中・ペイロードの途中のどちらでシャットダウンが
+/// 要求されても、次の`POLL_INTERVAL`以内に接続を終えられる。
+struct ShutdownAwareReader<'a> {
+    stream: &'a mut TcpStream,
+    shutdown: &'a AtomicBool,
+}
+
+impl Read for ShutdownAwareReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            match self.stream.read(buf) {
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    if self.shutdown.load(Ordering::Acquire) {
+                        return Err(std::io::Error::other(
+                            "シャットダウン要求によりフレームの読み取りを中断しました",
+                        ));
+                    }
+                    continue;
+                }
+                other => return other,
+            }
         }
     }
 }
@@ -390,7 +450,8 @@ fn watch_for_disconnect(stream: TcpStream, done: &AtomicBool, cancel: &Cancellat
 mod tests {
     use super::*;
     use crate::database::Database;
-    use crate::protocol::{Request, Response};
+    use crate::protocol::{MSG_QUERY, Request, Response};
+    use std::io::Write;
     use std::net::TcpStream;
 
     fn connect_with_retry(addr: SocketAddr) -> TcpStream {
@@ -517,5 +578,74 @@ mod tests {
         assert!(result.rows().is_empty(), "COMMITしていないINSERTはROLLBACKされ、再オープン後も残らないはず");
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// `run`をバックグラウンドスレッドで動かし、その結果を`mpsc`チャネルへ
+    /// 送る。`JoinHandle::join`は無期限にブロックしうるため、テストからは
+    /// `channel`の`recv_timeout`で「`POLL_INTERVAL`の数サイクル以内に確実に
+    /// 戻ってくる」ことを検証する(戻ってこなければ`recv_timeout`が
+    /// `Err`になり、テストがハングする代わりに失敗する)。
+    fn run_in_background(server: Server) -> std::sync::mpsc::Receiver<std::io::Result<()>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(server.run());
+        });
+        rx
+    }
+
+    /// 第6部レビュー対応: フレームのヘッダー9バイトのうち3バイトだけ送って
+    /// 接続を開いたまま止め、その状態からシャットダウンを要求する。
+    ///
+    /// 修正前は、最初の1バイトが届いた時点で`wait_for_request_or_shutdown`が
+    /// 読み取りタイムアウトを`None`(無期限)へ戻していたため、`Request::read`の
+    /// `read_exact`が残り6バイトを待ったまま戻らず、`Server::run`が
+    /// `WorkerPool::join`から永久に戻れなかった。
+    #[test]
+    fn shutdown_completes_while_a_connection_is_stalled_mid_header() {
+        let shared = Arc::new(SharedDatabase::new(Database::memory()));
+        let server = Server::bind_with_config("127.0.0.1:0", shared, ServerConfig::default()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let shutdown = server.shutdown_handle();
+        let rx = run_in_background(server);
+
+        let mut stalled = connect_with_retry(addr);
+        // 9バイトのヘッダーのうち3バイトだけ送る。残りは送らず、接続も
+        // 閉じない。
+        stalled.write_all(&[MSG_QUERY, 0x00, 0x00]).unwrap();
+
+        shutdown.trigger();
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdownがPOLL_INTERVALの数サイクル以内に完了しませんでした(部分ヘッダー状態で接続がstallしたまま)");
+        result.expect("runがErrを返した");
+        drop(stalled);
+    }
+
+    /// 第6部レビュー対応: [`shutdown_completes_while_a_connection_is_stalled_mid_header`]と
+    /// 対になる、ペイロードの途中で止まった接続からのシャットダウン。
+    /// ヘッダーは完全に送り、`payload_len`で100バイトを申告したうえで
+    /// 実際には10バイトしか送らず、接続を開いたまま止める。
+    #[test]
+    fn shutdown_completes_while_a_connection_is_stalled_mid_payload() {
+        let shared = Arc::new(SharedDatabase::new(Database::memory()));
+        let server = Server::bind_with_config("127.0.0.1:0", shared, ServerConfig::default()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let shutdown = server.shutdown_handle();
+        let rx = run_in_background(server);
+
+        let mut stalled = connect_with_retry(addr);
+        let mut header = Vec::new();
+        header.push(MSG_QUERY);
+        header.extend_from_slice(&0u32.to_le_bytes()); // request_id
+        header.extend_from_slice(&100u32.to_le_bytes()); // payload_len(100バイトと申告)
+        stalled.write_all(&header).unwrap();
+        stalled.write_all(&[b'x'; 10]).unwrap(); // 実際には10バイトしか送らない
+
+        shutdown.trigger();
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdownがPOLL_INTERVALの数サイクル以内に完了しませんでした(部分ペイロード状態で接続がstallしたまま)");
+        result.expect("runがErrを返した");
+        drop(stalled);
     }
 }

@@ -855,7 +855,7 @@ impl Storage {
     /// 索引の作り直し(手順3)は、`rebuild_one_index_after_recovery`が返す
     /// 一時ファイルを索引ごとに即座に`rename`する。Crash Recovery(第34章)が
     /// 全索引ぶんの`rename`をAnalysis・Redo・Undoの完了後にまとめて行うのとは
-    /// 違い、`VACUUM`はクラッシュ安全性を主張しない(本文の限界节を参照)。
+    /// 違い、`VACUUM`はクラッシュ安全性を主張しない(本文の限界節を参照)。
     /// 複数の索引を持つテーブルの`VACUUM`中にI/Oエラーが起きた場合、すでに
     /// 作り直し終えた索引と、まだ手つかずの索引が混在した状態で処理が止まる。
     pub fn vacuum_table(&mut self, table_id: TableId) -> DbResult<VacuumReport> {

@@ -100,7 +100,7 @@ while let Some(tuple) = executor.next()? {
 }
 ```
 
-`Filter`や`Projection`のようなstreaming演算子は子から1行引くたびにこのループへ戻ってくるため、`SeqScan`を含む大半の演算子の進捗はここで拾えます。
+`Projection`のように、子から1行引けば必ず1行返すstreaming演算子は、このループへ毎回戻ってくるため、進捗はここで拾えます。
 
 もう1つは、`Sort`、`Hash Join`のBuild側、`Hash Aggregate`のように、子を`None`まで読み切ってから初めて1行返す**blocking演算子**です。
 これらは最上位のループへ戻ってくる前に、内部で何万行も読み進めることがあります。
@@ -120,10 +120,16 @@ while let Some(tuple) = input.next()? {
 
 `Hash Join`のBuild側(`HashJoinExec::new`)、`Hash Aggregate`(`HashAggregateExec::new`)、`Nested Loop Join`の右側の事前収集(`NestedLoopJoinExec::new`)にも、同じ形で`check`を差し込んであります。
 
+3つ目は、`Filter`、`Nested Loop Join`、`Hash Join`の**Probe側**です。
+これらは子から1行ずつ引く点では`Projection`と同じstreaming演算子ですが、「子から引いた1行が条件に一致しない」場合には`next()`から戻らず、内部でもう1行(あるいはもう1組の候補)を試します。
+`WHERE`が1行も一致しない`Filter`、`ON`が常に偽の`JOIN`では、この「戻らない」状態がテーブル全体、組み合わせ全体に及びます。
+そのため`FilterExec::next()`、`NestedLoopJoinExec::next()`、`HashJoinExec::next()`は、候補の行(または組み合わせ)を1件試すたびに、自分自身の中でも`ctx.cancel.check()`を呼びます。
+
 冒頭のクエリ(`a.id = a.id`という常に真の条件を持つ`JOIN`)がキャンセルされる仕組みを、これで説明できます。
 `a.id = a.id`は列参照同士の比較なので等値結合として認識されますが、鍵の値そのものは`orders`側の行ごとに変わるため、`Nested Loop Join`が選ばれるとします。
-右側のテーブルを`NestedLoopJoinExec::new`が事前に読み切る段階、そして最上位の駆動ループが1行返すたびに、`check`が呼ばれます。
-どちらの箇所でキャンセル要求に気付いても、そこで安全に打ち切れます。
+右側のテーブルを`NestedLoopJoinExec::new`が事前に読み切る段階、`NestedLoopJoinExec::next()`が候補の組み合わせを1件試すたび、そして最上位の駆動ループが1行返すたびに、`check`が呼ばれます。
+どの箇所でキャンセル要求に気付いても、そこで安全に打ち切れます。
+`a.id = a.id`は行ごとに高い確率で一致するため実害は小さい例ですが、`ON`の条件がどの組み合わせとも一致しない場合は、`NestedLoopJoinExec::next()`内部の`check`が無ければ、組み合わせを最後まで読み切るまで打ち切れません。
 
 `ctx`は`crate::cancellation::ExecutionContext`という、`CancellationToken`と`max_operator_rows`(メモリ上限、後述)をまとめた型です。
 
@@ -305,8 +311,9 @@ fn new_execution_context(&self) -> crate::cancellation::ExecutionContext {
 
 **時刻をどこで計測するか**は、この章がもう1つ決めた設計判断です。
 締切は「`Session::execute`が呼ばれた瞬間」から数えます。
-構文解析、束縛、計画の最適化(第26〜29章)はすでに済んでいることが多い高速な処理ですが、`PREPARE`済みの文を`EXECUTE`する場合はこれらを一切やり直しません(第37章)。
-実行に無関係な準備段階の時間差を締切へ含めるかどうかで挙動が割れるのを避け、「文の実行を頼んでから、実際に打ち切られるまで」という利用者から見える時間で統一しています。
+そのため`new_execution_context`は、構文解析より前、`Session::execute`の最初の行で呼びます。
+構文解析、束縛、計画の最適化(第26〜29章)はどれもこの締切の対象に含まれることになります(`PREPARE`済みの文を`EXECUTE`する場合も、再利用できるのは束縛結果の`BoundStatement`だけで、計画の構築も最適化もやはり`EXECUTE`のたびに行われます。第37章「この章の限界」を参照)。
+これらは通常すでに済んでいることが多い高速な処理であり、実行時間そのものと比べれば無視できる差ですが、「文の実行を頼んでから、実際に打ち切られるまで」という利用者から見える時間で締切を統一するという判断そのものは、この章を通じて変えていません。
 
 `statement_timeout`をサーバーの起動引数として指定できるようにしてあります(`--statement-timeout-ms`)。
 `SET`文のような実行時のSQL構文は追加しませんでした。
@@ -423,10 +430,7 @@ fn wait_for_request_or_shutdown(stream: &mut TcpStream, shutdown: &AtomicBool) -
         }
         match stream.peek(&mut probe) {
             Ok(0) => return WaitOutcome::Disconnected, // 相手が正常に閉じた(EOF)
-            Ok(_) => {
-                let _ = stream.set_read_timeout(None);
-                return WaitOutcome::Ready;
-            }
+            Ok(_) => return WaitOutcome::Ready,
             Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => continue,
             Err(_) => return WaitOutcome::Disconnected,
         }
@@ -434,8 +438,38 @@ fn wait_for_request_or_shutdown(stream: &mut TcpStream, shutdown: &AtomicBool) -
 }
 ```
 
-`peek`はバイト列を消費しないため、ポーリングのタイムアウトがフレームの途中で発生しても、次の`Request::read`はフレームの先頭から読み直せます。
-1バイト以上届いていることを確認できた時点で読み取りタイムアウトを外し(`set_read_timeout(None)`)、以後は通常どおりブロッキングで読みます。
+`peek`はバイト列を消費しないため、ポーリングのタイムアウトが最初の1バイトの到着前に発生しても、次の`Request::read`はフレームの先頭から読み直せます。
+[`WaitOutcome::Ready`]を返したあとも、読み取りタイムアウト(`POLL_INTERVAL`)は`None`(無期限)へ戻しません。
+クライアントがフレームのヘッダーだけ、あるいはペイロードの途中までしか送らずに接続を開いたまま止まっていた場合、`Request::read`が使う`read_exact`は残りのバイト列を待ち続けます。
+ここで読み取りタイムアウトを外してしまうと、その待ちは無期限になり、シャットダウンフラグを二度と確認できません。
+
+そこで`handle_connection`は、`Request::read`へ`stream`をそのまま渡さず、`ShutdownAwareReader`というラッパー越しに渡します。
+
+```rust
+impl Read for ShutdownAwareReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            match self.stream.read(buf) {
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    if self.shutdown.load(Ordering::Acquire) {
+                        return Err(std::io::Error::other(
+                            "シャットダウン要求によりフレームの読み取りを中断しました",
+                        ));
+                    }
+                    continue;
+                }
+                other => return other,
+            }
+        }
+    }
+}
+```
+
+`read_exact`は内部でこの`read`を繰り返し呼びます。
+`POLL_INTERVAL`ごとにタイムアウトへ達するたびシャットダウンフラグを確認し、立っていなければ同じ`read`を再試行するので、ヘッダーの途中でもペイロードの途中でも、相手がどちらで止まっていても次の`POLL_INTERVAL`以内にシャットダウンへ気付けます。
+気付いた場合は`read`自身がエラーを返し、`Request::read`はそれを`ProtocolError::Io`として呼び出し元へ伝えます。
+`handle_connection`はフレーミングの異常と同じ扱いで、その場で接続を切断します(`crate::protocol`モジュール冒頭「不正なフレームの扱い」を参照)。
+
 文が実行中であれば、その文は打ち切られる(キャンセルされる)か、正常に終わるまで続きます。
 接続の処理ループが戻れば、その接続の`Session`がスコープを抜け、`Drop`実装が保持中のトランザクションを`ROLLBACK`します(手順3)。
 すべての接続がここまで進んで`WorkerPool::join`が戻れば、最後に`SharedDatabase::flush`を呼びます(手順4)。
