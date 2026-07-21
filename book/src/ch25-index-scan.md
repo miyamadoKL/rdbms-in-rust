@@ -50,6 +50,27 @@ Projection(amount)
 `WHERE`にはPointともRangeとも判定できない条件が混じっていることも珍しくありません。
 `id = 2 AND name = 'Bob'`という条件のうち索引で引けるのは`id = 2`だけで、`name = 'Bob'`は索引に無い列への条件です。
 そこでこの章の`optimize`は、`WHERE`をANDの連言に分解し、索引で引ける述語だけを取り出してIndex Scanに渡し、残りは今までどおり`Filter`に残すという役割分担を採ります。
+
+Index Scanに渡す側の情報は、`IndexScanNode`という構造体にまとめます。
+索引名や列名に加えて、探索の種類がPointかRangeかを`kind`フィールドが`IndexScanKind`という`enum`で持ちます。
+`src/physical_plan.rs`にこの2つを定義します。
+
+```rust
+pub enum IndexScanKind {
+    Point(Value),
+    Range { lower: Bound<Value>, upper: Bound<Value> },
+}
+
+pub struct IndexScanNode {
+    pub table_id: TableId,
+    pub table_name: String,
+    pub schema: Schema,
+    pub index_name: String,
+    pub column_name: String,
+    pub kind: IndexScanKind,
+}
+```
+
 `src/physical_plan.rs`に、次の`AccessPath`を追加します。
 
 ```rust
@@ -63,6 +84,16 @@ enum AccessPath {
     /// 元と等価だが同一ではないASTになり、`EXPLAIN`の表示がわずかに変わる
     /// 余地があるため、それを避けるために所有権をそのまま持ち回す)。
     SeqScan { predicate: BoundExpr },
+}
+```
+
+Range探索では、`WHERE`に現れた下限と上限の候補を列ごとにいったん貯めておく必要があります。
+この一時状態を`RangeAccum`という構造体にして、`src/physical_plan.rs`に置きます。
+
+```rust
+struct RangeAccum {
+    lower: Option<(usize, Bound<Value>)>,
+    upper: Option<(usize, Bound<Value>)>,
 }
 ```
 
@@ -342,6 +373,21 @@ Projection(id, amount, name)
 `HashJoin`は`right`(内側テーブル)の全行を読み切ってハッシュテーブルへ積む**Build**を必ず1回行います。
 `right`に使える索引があるなら、この全件読み込みを丸ごと避け、`left`(外側テーブル)の行数ぶんだけ索引を`lookup`する方が少ない仕事で済むはずです。
 この章では、等値結合の鍵がちょうど1本で、かつ内側テーブルの結合列に索引があるときに限り、`HashJoin`より`IndexNestedLoopJoin`を優先します。
+
+この判定が見つけた内側テーブルの情報は、`IndexJoinTarget`という構造体にまとめます。
+`src/physical_plan.rs`に次のとおり定義します。
+
+```rust
+struct IndexJoinTarget {
+    outer_key: BoundExpr,
+    table_id: TableId,
+    table_name: String,
+    schema: Schema,
+    index_name: String,
+    column_name: String,
+}
+```
+
 この判定を行う`index_scan_target`を、`src/physical_plan.rs`に定義します。
 
 ```rust
@@ -371,6 +417,23 @@ fn index_scan_target(
 `right`が`PhysicalPlan::SeqScan`のままであることも条件にしています。
 `JOIN`の右辺には`WHERE`が押し下げられない(前節と同じ理由)ため、この章では`right`が`Filter`を伴うことはなく、この条件は常に満たされます。
 
+`index_scan_target`が見つけた内側テーブルの情報を使って選ぶ物理演算子は、`IndexNestedLoopJoinNode`という構造体で表します。
+`src/physical_plan.rs`に次のとおり定義します。
+
+```rust
+pub struct IndexNestedLoopJoinNode {
+    pub left: Box<PhysicalPlan>,
+    pub kind: JoinKind,
+    pub condition: BoundExpr,
+    pub outer_key: BoundExpr,
+    pub table_id: TableId,
+    pub table_name: String,
+    pub schema: Schema,
+    pub index_name: String,
+    pub column_name: String,
+}
+```
+
 `src/physical_plan.rs`の`optimize`の`Join`アームは、等値結合の鍵を取り出せた場合、まず`index_scan_target`を試し、それが失敗したときだけ`HashJoin`を組み立てます。
 
 ```rust
@@ -399,6 +462,26 @@ fn index_scan_target(
 `IndexNestedLoopJoinNode`が`right`を独立した`PhysicalPlan`として持たない点が、`HashJoinNode`と`NestedLoopJoinNode`との違いです。
 内側テーブルの行は、外側の1行が来るたびに`outer_key`を評価し、その値で索引を`lookup`して初めて決まります。
 `HashJoinExec`のBuildのように内側の全行を先読みして`Vec`やハッシュテーブルへ積む段階は、`src/physical_plan.rs`に定義する`IndexNestedLoopJoinExec`の`next()`にはありません。
+
+この`IndexNestedLoopJoinExec`は、`src/physical_plan.rs`に次のとおり定義します。
+
+```rust
+pub struct IndexNestedLoopJoinExec<'a> {
+    left: Box<dyn Executor + 'a>,
+    storage: &'a Storage,
+    table_id: TableId,
+    index_name: &'a str,
+    outer_key: &'a BoundExpr,
+    functions: &'a FunctionRegistry,
+    left_schema: Schema,
+    right_schema: Schema,
+    schema: Schema,
+    current_left: Option<Tuple>,
+    matches: std::vec::IntoIter<RecordId>,
+}
+```
+
+`next()`は次のようになります。
 
 ```rust
     fn next(&mut self) -> DbResult<Option<Tuple>> {

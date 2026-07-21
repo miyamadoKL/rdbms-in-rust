@@ -610,6 +610,17 @@ MCVは「Histogramが空になった」時点で、この列の非NULLの値を�
 両端とも満たせばバケツ全体を選択率1.0として数え、両端とも満たさなければ0.0です。
 片方だけ満たす(バケツの内部に境界がある)場合、`BIGINT`なら`src/estimator.rs`の`bucket_overlap_fraction`が`(value - lower) / (upper - lower)`という線形補間(区間内での`value`の位置の比率)で按分します。
 
+`src/estimator.rs`に次の`RangeOp`を定義します。
+
+```rust
+pub enum RangeOp {
+    Gt,
+    Ge,
+    Lt,
+    Le,
+}
+```
+
 ```rust
 fn bucket_overlap_fraction(op: RangeOp, value: &Value, lower: &Value, upper: &Value) -> f64 {
     let satisfies = |x: &Value| -> bool {

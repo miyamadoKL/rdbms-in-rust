@@ -58,6 +58,17 @@ pub struct Session {
 }
 ```
 
+`src/session.rs`には、`prepared`フィールドの値である`PreparedStatement`も定義します。
+`PREPARE`が登録する1件を表す型で、`bound`は`PREPARE`の時点で束縛済みの文、`param_types`は`$1`から順に並べた、文脈から推論できた型です(推論できなければ`None`のままになり、後述の「プレースホルダの型をいつ決めるか」で扱います)。
+`param_types.len()`が、この文が要求する`EXECUTE`の引数の個数になります。
+
+```rust
+struct PreparedStatement {
+    bound: BoundStatement,
+    param_types: Vec<Option<DataType>>,
+}
+```
+
 あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
 
 ```rust
@@ -242,6 +253,19 @@ pub struct ExecuteStatement {
     pub name: Ident,
     pub args: Vec<Literal>,
     pub span: Span,
+}
+```
+
+`Literal`も同じ`src/ast.rs`に定義します。
+`Expr`のリテラルバリアントだけを持つ小さな型で、式評価を経ずに直接`crate::types::Value`へ変換できます(`Session`の`literal_to_value`を参照)。
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub enum Literal {
+    Int { value: i64, span: Span },
+    Text { value: String, span: Span },
+    Bool { value: bool, span: Span },
+    Null { span: Span },
 }
 ```
 

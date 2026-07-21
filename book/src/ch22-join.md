@@ -118,6 +118,15 @@ fn parse_join_clause(&mut self) -> DbResult<Option<JoinClause>> {
 
 ### `tables`が複数要素になる
 
+`src/binder.rs`に、1個の`JOIN`の束縛結果を表す次の`BoundJoinStep`を定義します。
+
+```rust
+pub struct BoundJoinStep {
+    pub kind: JoinKind,
+    pub condition: BoundExpr,
+}
+```
+
 `src/binder.rs`の`Binder::bind_from`は、`FROM`の最初のテーブルを`resolve_table`で解決したあと、`joins`を先頭から順に処理します。
 
 ```rust
@@ -299,6 +308,25 @@ Projection(customers.name, orders.item)
 **Hash Join**は、右の行をあらかじめ結合キーでハッシュテーブルに積んでおき(Build)、左の行を1件ずつ引いては同じキーの行をハッシュテーブルから探します(Probe)。
 `ON`が等値条件でなければ、そもそも「同じキー」という概念が無いためこの手法は使えませんが、使える場面ではBuildに`m`、Probeに`n`というほぼ線形の手間で済み、比較の回数は`n + m`に比例します。
 
+`src/physical_plan.rs`に、この2つのアルゴリズムに対応する次の`HashJoinNode`と`NestedLoopJoinNode`を定義します。
+
+```rust
+pub struct HashJoinNode {
+    pub left: Box<PhysicalPlan>,
+    pub right: Box<PhysicalPlan>,
+    pub kind: JoinKind,
+    pub keys: Vec<(BoundExpr, BoundExpr)>,
+    pub condition: BoundExpr,
+}
+
+pub struct NestedLoopJoinNode {
+    pub left: Box<PhysicalPlan>,
+    pub right: Box<PhysicalPlan>,
+    pub kind: JoinKind,
+    pub condition: BoundExpr,
+}
+```
+
 この章の物理選択は、この1点だけを見る単純なルールです。
 `src/physical_plan.rs`の`optimize`に、次の分岐を追加します。
 
@@ -336,6 +364,15 @@ LogicalPlan::Join(join) => {
 統計情報(第27章)とコストモデル(第28章)が揃うまでは、「等値条件かどうか」という構文的な性質だけが、このクレートが持つ唯一の判断材料だからです。
 
 ### 等値条件をハッシュキーへ分解する
+
+`src/physical_plan.rs`に、列参照がどちら側に属するかを表す次の`Side`を定義します。
+
+```rust
+enum Side {
+    Left,
+    Right,
+}
+```
 
 `src/physical_plan.rs`の`split_equi_join_keys`は、`ON`条件を`AND`で分解し、それぞれの項が「左側だけを参照する式 = 右側だけを参照する式」という形になっているかを調べます。
 

@@ -58,6 +58,31 @@ PostgreSQL Wire Protocolは、認証方式(`SCRAM-SHA-256`等)、メッセージ
 - **request_id**: 呼び出し側が採番する識別子です。レスポンスは対応するリクエストの`request_id`をそのまま書き戻します。この章のサーバーは1本の接続の中でリクエストを1件ずつ順に処理するため、1接続だけを見れば対応関係は到着順から追えます。`request_id`を独立したフィールドとして持たせているのは、複数のリクエストを応答を待たずに送りつけるパイプライン化や、非同期クライアントを将来追加したときに、どの応答がどのリクエストのものかをクライアント側で突き合わせるためです。
 - **payload_len**: ペイロードのバイト数(`u32`)です。
 
+`src/protocol.rs`の`ProtocolError`は、フレームの読み書きに失敗したときにこれらの関数が返すエラー型です。
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum ProtocolError {
+    #[error("I/Oエラー: {0}")]
+    Io(#[from] io::Error),
+    #[error("フレームが大きすぎます: {len}バイト(上限{max}バイト)")]
+    FrameTooLarge {
+        len: u32,
+        max: u32,
+    },
+    #[error("未知のメッセージ種別です: 0x{0:02x}")]
+    UnknownMessageType(u8),
+    #[error("未知のステータスです: 0x{0:02x}")]
+    UnknownStatus(u8),
+    #[error("ペイロードの形式が不正です: {0}")]
+    MalformedPayload(String),
+    #[error("UTF-8として不正なバイト列です")]
+    InvalidUtf8,
+    #[error(transparent)]
+    Tuple(#[from] DbError),
+}
+```
+
 整数フィールドはすべて、ページファイル(第11章)やタプルのエンコード(`crate::tuple_codec`)と同じ、手書きのリトルエンディアン(`to_le_bytes`/`from_le_bytes`)で、`src/protocol.rs`に次のように書きます。
 
 ```rust
@@ -104,6 +129,16 @@ pub mod protocol;
 これを無条件に信用して`vec![0u8; payload_len as usize]`を確保すると、悪意のある、あるいは単に壊れたクライアントが`payload_len`に`u32::MAX`(4GiB弱)を書き込むだけで、受信側に4GiB近いメモリを確保させられます。
 この章では、`src/protocol.rs`の`read_raw_frame`が、`payload_len`が16MiB(`MAX_FRAME_PAYLOAD_LEN`)を超えるフレームを、ペイロードを1バイトも読まずに拒否します。
 
+`src/protocol.rs`の`RawFrame`は、フレームヘッダを読んだ直後の、まだ意味を解釈していない生のフレームです。
+
+```rust
+struct RawFrame {
+    tag: u8,
+    request_id: u32,
+    payload: Vec<u8>,
+}
+```
+
 ```rust
 fn read_raw_frame(reader: &mut impl Read) -> Result<RawFrame, ProtocolError> {
     let mut header = [0u8; FRAME_HEADER_LEN];
@@ -124,6 +159,20 @@ fn read_raw_frame(reader: &mut impl Read) -> Result<RawFrame, ProtocolError> {
 このSQLサブセットの文や、この章までの結果セットが実用上収まる範囲に、余裕を持たせて選んだ目安です。
 章が進んで大きな結果セットのストリーミングを扱うようになれば、この定数は見直しの対象になります。
 
+`src/protocol.rs`の`Response`は、クライアントへ返す応答を表す型です。
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub enum Response {
+    Rows {
+        schema: Schema,
+        rows: Vec<Tuple>,
+    },
+    Command(String),
+    Error(String),
+}
+```
+
 読み取り側だけでなく、書き出し側の`write_raw_frame`も同じ`MAX_FRAME_PAYLOAD_LEN`を検査します。
 書き出し側の検査が無いと、サーバーが`payload_len`の上限を超える`Response`を実際に書き出せてしまい、そのバイト列を同じ上限を守る公式クライアント自身が読めないという非対称が生まれます。
 `SELECT`の結果セットが大きくなるほど`Response::Rows`のペイロードは大きくなるため、この非対称は現実に起こりえます。
@@ -142,6 +191,16 @@ Response::Rows { schema, rows } => {
         return write_raw_frame(stream, STATUS_ERROR, request_id, message.as_bytes());
     }
     write_raw_frame(stream, STATUS_OK_ROWS, request_id, &payload)
+}
+```
+
+`src/protocol.rs`の`Request`は、クライアントが送るリクエストを表す型です。
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct Request {
+    pub request_id: u32,
+    pub sql: String,
 }
 ```
 
@@ -233,6 +292,15 @@ pub fn from_db_result(result: crate::error::DbResult<crate::database::QueryResul
 この章のサーバーは、その方針通りBlocking I/Oで実装します。
 
 並行モデルは最も単純な形、接続を受け付けるたびに`std::thread::spawn`でスレッドを1本立てる方式を採ります。
+
+`src/server.rs`の`Server`は、TCP接続を受け付けるサーバー本体です。
+
+```rust
+pub struct Server {
+    listener: TcpListener,
+    shared: Arc<SharedDatabase>,
+}
+```
 
 この章で新しく作成する`src/server.rs`に、次の`Server::run`を実装します。
 
@@ -431,6 +499,16 @@ match db.execute(input) {
 
 この章で新しく作成する`src/bin/minidb_client.rs`のCLIクライアントは、`Database::execute`の代わりに`Request`をフレームへ詰めて送り、返ってきた`Response`を表示します。
 バイナリ名を`minidb-client`にするため、`Cargo.toml`にも`name = "minidb-client"`、`path = "src/bin/minidb_client.rs"`という`[[bin]]`エントリを追加します。
+
+`src/bin/minidb_client.rs`は、`send`が返すエラーとして次の`ClientError`を定義します。
+
+```rust
+#[derive(Debug)]
+enum ClientError {
+    Protocol(minidb::ProtocolError),
+    RequestIdMismatch { sent: u32, received: u32 },
+}
+```
 
 ```rust
 fn send(stream: &mut TcpStream, request_id: u32, sql: &str) -> Result<Response, ClientError> {

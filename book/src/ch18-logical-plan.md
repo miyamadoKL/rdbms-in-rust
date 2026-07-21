@@ -160,6 +160,14 @@ pub struct UpdateNode {
     pub predicate: Option<BoundExpr>,
     pub input: Box<LogicalPlan>,
 }
+
+pub struct DeleteNode {
+    pub table_id: TableId,
+    pub table_name: String,
+    pub schema: Schema,
+    pub predicate: Option<BoundExpr>,
+    pub input: Box<LogicalPlan>,
+}
 ```
 
 `Insert`の子(`input`)は必ず`Values`です。

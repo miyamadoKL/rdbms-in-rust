@@ -152,6 +152,17 @@ fn persist_catalog(&self) -> DbResult<()> {
 テーブルごとに専用のカタログエントリページを持たせるといった、カタログ自体を複数ページにまたがらせる構成は、この章では扱いません。
 章末の演習で考えます。
 
+`src/storage.rs`に次の`TableEntry`を定義します。
+
+```rust
+struct TableEntry {
+    info: TableInfo,
+    /// このテーブルが使っているデータページの一覧。第13章の`HeapFile::page_ids`と
+    /// 同じ役割だが、こちらはCatalogページを介して永続化されている。
+    page_ids: Vec<PageId>,
+}
+```
+
 `src/storage.rs`の`encode_catalog`は、テーブルを`TableId`の昇順で書き出します。
 
 ```rust
@@ -166,6 +177,21 @@ sorted.sort_by_key(|(id, _)| id.0);
 デコード側(`decode_catalog`)は、第4章の`tuple_codec`と同じ手作業のカーソルで書きます。
 このカーソルには1つだけ、`tuple_codec`より注意が必要な点があります。
 `table_count`、`column_count`、`page_count`のような「これから何個読むか」を宣言する値は、バイト列が壊れていれば根拠のない数字になりえます。
+
+`src/storage.rs`に次の`DecodedCatalog`を定義します。
+
+```rust
+struct DecodedCatalog {
+    next_table_id: u64,
+    tables: HashMap<TableId, TableEntry>,
+    free_pages: Vec<PageId>,
+    /// 索引メタデータ(第24章)。索引名の重複が無いことは`decode_catalog`が
+    /// `Vec`へ積む時点で検査済み。
+    indexes: Vec<IndexInfo>,
+    /// 統計情報(第27章)。`ANALYZE`を実行していないテーブルはここに現れない。
+    stats: HashMap<TableId, TableStats>,
+}
+```
 
 `src/storage.rs`の`decode_catalog`は、次のようにこの値を読み取ります。
 
@@ -274,6 +300,16 @@ for &page_id in &self.page_ids {
 
 この`FreeSpaceMap`は新しいモジュール`free_space_map`として独立させます。
 以降のコードは、新規作成する`src/free_space_map.rs`に置きます。
+
+`src/free_space_map.rs`に次の`FreeSpaceMap`を定義します。
+
+```rust
+pub struct FreeSpaceMap {
+    free_bytes: HashMap<PageId, u16>,
+}
+```
+
+この`free_bytes`をもとに、`find_candidate`は次のように候補を絞り込みます。
 
 ```rust
 pub fn find_candidate(&self, candidates: &[PageId], needed: usize) -> Option<PageId> {

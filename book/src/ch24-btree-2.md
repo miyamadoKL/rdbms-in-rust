@@ -159,6 +159,17 @@ fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbR
 Leaf間リンクが繋がったので、範囲検索を実装します。
 下限と上限という言い方をこの章でも使いますが、境界そのものには`std::ops::Bound`をそのまま使います。
 `Bound::Included`(以上または以下)、`Bound::Excluded`(より大きい、またはより小さい)、`Bound::Unbounded`(その側に制限なし)の3種類で、`col >= 100`は`Bound::Included`、`col > 100`は`Bound::Excluded`に対応します。
+`range`の戻り値である`RangeScan`は、`src/btree.rs`に次の構造体として定義します。
+
+```rust
+pub struct RangeScan<'a> {
+    pool: &'a BufferPool,
+    key_type: DataType,
+    upper: Bound<Vec<u8>>,
+    current: Option<(PageId, usize)>,
+}
+```
+
 この境界を受け取る`range`を、`src/btree.rs`に定義します。
 
 ```rust
@@ -466,6 +477,31 @@ fn parse_create_statement(&mut self) -> DbResult<Statement> {
 
 `CREATE TABLE`が定義するのは新しいテーブル名と列名であるのに対し、`CREATE INDEX`が指定するテーブル名と列名は既存のカタログエントリを指す名前です(`DROP TABLE`の`table`と同じ立場)。
 そのため`src/binder.rs`の`Binder`(第17章)が、テーブルと列の存在確認と、`table_id`と`column_index`への解決を担当します。
+`Parser`が組み立てる`CreateIndexStatement`を、`src/ast.rs`に次のように定義します。
+
+```rust
+pub struct CreateIndexStatement {
+    pub unique: bool,
+    pub index: Ident,
+    pub table: Ident,
+    pub column: Ident,
+    pub span: Span,
+}
+```
+
+`Binder`が返す`BoundCreateIndex`を、`src/binder.rs`に次のように定義します。
+
+```rust
+pub struct BoundCreateIndex {
+    pub index_name: String,
+    pub table_name: String,
+    pub table_id: TableId,
+    pub column_name: String,
+    pub column_index: usize,
+    pub unique: bool,
+    pub span: Span,
+}
+```
 
 ```rust
 fn bind_create_index(&self, create: CreateIndexStatement) -> DbResult<BoundStatement> {
@@ -568,6 +604,14 @@ indexes × index_count:
 ```
 
 `src/storage.rs`の`Storage::open`は、このセクションを読んだあと、記録されている索引名それぞれについて対応するファイルを開き直します。
+この`HashMap`へ格納する`IndexEntry`を、`src/storage.rs`に次のように定義します。
+
+```rust
+struct IndexEntry {
+    info: IndexInfo,
+    btree: BTree,
+}
+```
 
 ```rust
 let mut indexes = HashMap::new();

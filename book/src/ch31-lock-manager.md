@@ -128,6 +128,14 @@ struct LockEntry {
 }
 ```
 
+各キーの保持者と待ち行列をまとめて管理する型が、`src/lock_manager.rs`に定義する`LockManager`です。
+
+```rust
+pub struct LockManager<K: Eq + Hash + Clone> {
+    entries: HashMap<K, LockEntry>,
+}
+```
+
 ロックが解放されるたび、`src/lock_manager.rs`の`release_all`が待ち行列の先頭から順に昇格できるかどうかを再評価します。
 
 ```rust

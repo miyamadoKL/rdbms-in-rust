@@ -97,6 +97,68 @@ BinaryOp {
 },
 ```
 
+`BoundExpr`の全体は、`src/binder.rs`に次のように定義します。
+
+```rust
+pub enum BoundExpr {
+    IntLiteral {
+        value: i64,
+        span: Span,
+    },
+    StringLiteral {
+        value: String,
+        span: Span,
+    },
+    BoolLiteral {
+        value: bool,
+        span: Span,
+    },
+    NullLiteral {
+        span: Span,
+    },
+    ColumnRef {
+        table_ordinal: usize,
+        column_index: usize,
+        name: String,
+        data_type: DataType,
+        span: Span,
+    },
+    UnaryOp {
+        op: UnaryOperator,
+        expr: Box<BoundExpr>,
+        data_type: DataType,
+        span: Span,
+    },
+    BinaryOp {
+        op: BinaryOperator,
+        lhs: Box<BoundExpr>,
+        rhs: Box<BoundExpr>,
+        data_type: DataType,
+        span: Span,
+    },
+    IsNull {
+        expr: Box<BoundExpr>,
+        negated: bool,
+        span: Span,
+    },
+    FunctionCall {
+        name: String,
+        args: Vec<BoundExpr>,
+        data_type: DataType,
+        span: Span,
+    },
+    Paren {
+        expr: Box<BoundExpr>,
+        span: Span,
+    },
+    Cast {
+        expr: Box<BoundExpr>,
+        data_type: DataType,
+        span: Span,
+    },
+}
+```
+
 型は`Binder`が式を組み立てる際に一度だけ計算し、以後(`executor`での評価)は再計算しません。
 `BoundExpr`には`data_type(&self) -> Option<DataType>`というメソッドがあり、`NullLiteral`とそれを素通しする`Paren`の入れ子だけが`None`(型が定まらない)を返します。
 値そのものではなく型だけを問う`bind_predicate`や`executor::project`は、この関数を呼ぶだけで済み、式木をもう一度たどり直す必要がありません。
@@ -142,6 +204,16 @@ impl CatalogLookup for Storage {
 }
 ```
 
+`Binder`本体を、`src/binder.rs`に次のように定義します。
+
+```rust
+pub struct Binder<'a> {
+    catalog: &'a dyn CatalogLookup,
+    functions: &'a FunctionRegistry,
+    sql: &'a str,
+}
+```
+
 `Binder`は`&dyn CatalogLookup`を受け取るだけで、今`Database`がどちらのバックエンドで動いているかを一切意識しません。
 第16章の`Database::table_info`は、この分岐を`match`で書き下ろしていましたが、この章ではその分岐を型の側(trait)へ移しました。
 `Database`自身が持つ`Backend`は、第16章の判断どおり引き続き`enum`のままにしてあります。
@@ -163,6 +235,17 @@ fn resolve_table(&self, table: &Ident, alias: Option<&Ident>) -> DbResult<BoundT
         alias: alias.map(|a| a.name.clone()),
         schema: info.schema.clone(),
     })
+}
+```
+
+`resolve_table`が返す`BoundTableRef`を、`src/binder.rs`に次のように定義します。
+
+```rust
+pub struct BoundTableRef {
+    pub table_id: TableId,
+    pub table_name: String,
+    pub alias: Option<String>,
+    pub schema: Schema,
 }
 ```
 
@@ -299,6 +382,14 @@ minidb> SELECT id FROM users AS u WHERE users.id = 1;
 ## `*`の展開と式の型検査をBinderへ統合する
 
 `SELECT *`の展開は、`src/binder.rs`の`bind_select`が射影対象リストを組み立てる中で行います。
+束縛済みの射影対象1個を表す`BoundSelectItem`を、`src/binder.rs`に次のように定義します。
+
+```rust
+pub struct BoundSelectItem {
+    pub expr: BoundExpr,
+    pub output_name: String,
+}
+```
 
 ```rust
 SelectItem::Wildcard { span } => {
@@ -362,6 +453,18 @@ minidb> SELECT id FROM users WHERE 1;
 ## Database::executeをparse→bind→executeへ再編する
 
 `src/database.rs`の`Database::execute`には、構文解析の直後に束縛を挟む1行を加えます。
+束縛の結果得られる`BoundStatement`を、`src/binder.rs`に次のように定義します。
+
+```rust
+pub enum BoundStatement {
+    Select(BoundSelect),
+    CreateTable(CreateTableStatement),
+    DropTable(DropTableStatement),
+    Insert(BoundInsert),
+    Update(BoundUpdate),
+    Delete(BoundDelete),
+}
+```
 
 ```rust
 pub fn execute(&mut self, sql: &str) -> DbResult<QueryResult> {
@@ -413,6 +516,29 @@ pub struct BoundInsert {
 }
 ```
 
+同様に、`UPDATE`には`BoundUpdate`、`DELETE`には`BoundDelete`を、`src/binder.rs`に次のように定義します。
+
+```rust
+pub struct BoundUpdate {
+    pub table_id: TableId,
+    pub table_name: String,
+    pub schema: Schema,
+    pub assignments: Vec<BoundAssignment>,
+    pub predicate: Option<BoundExpr>,
+    pub span: Span,
+}
+```
+
+```rust
+pub struct BoundDelete {
+    pub table_id: TableId,
+    pub table_name: String,
+    pub schema: Schema,
+    pub predicate: Option<BoundExpr>,
+    pub span: Span,
+}
+```
+
 `columns`は、`INSERT INTO users (name, id) VALUES (...)`のような明示的な列リストを、`Schema`上の列インデックスへ解決した並びです。
 未知の列名や、同じ列を2回指定する重複は、この束縛の時点で位置情報付きの`DbError::Bind`になります。
 第10章の`expand_to_schema`(`executor`モジュール)は、この検査を実行のたびに行っていましたが、この章からは検査済みの`Vec<usize>`を受け取るだけの、単純な並べ替えに専念できるようになりました。
@@ -426,6 +552,15 @@ minidb> INSERT INTO users (id, id) VALUES (1, 2);
 `VALUES`は既存の行を参照する構文を持たないので、列参照が現れようが無く、`Binder`が解決すべき名前もそこにはありません。
 
 `UPDATE`、`DELETE`は、テーブル名の解決に加えて、`SET`の対象列と`WHERE`の述語を束縛します。
+`bind_assignment`が返す`BoundAssignment`を、`src/binder.rs`に次のように定義します。
+
+```rust
+pub struct BoundAssignment {
+    pub column_index: usize,
+    pub value: BoundExpr,
+}
+```
+
 `SET`の対象列を束縛する`bind_assignment`は、`src/binder.rs`に次のように定義します。
 
 ```rust

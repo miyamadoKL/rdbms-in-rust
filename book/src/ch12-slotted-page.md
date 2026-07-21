@@ -140,6 +140,14 @@ Slot Directoryという間接参照は、この安定性のためにあります
 
 ## タプルを挿入する
 
+`src/slotted_page.rs`に次の`SlottedPage`を定義します。
+
+```rust
+pub struct SlottedPage<'a> {
+    payload: &'a mut [u8],
+}
+```
+
 `SlottedPage`は`Page`の`payload`を借用するビューです。
 新しく作った`payload`には`SlottedPage::init`を、すでにSlotted Pageとして書き込み済みの`payload`には`SlottedPage::open`を使います。
 `open`は`DbResult<Self>`を返します。
@@ -645,6 +653,16 @@ fn insert_reuses_a_tombstoned_slot_id() {
     assert_eq!(s3, s1);
     assert_eq!(page.slot_count(), 2);
     assert_eq!(page.get(s3), Some(&b"third"[..]));
+}
+```
+
+`src/slotted_page.rs`に次の`SlotStatus`を定義します。
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotStatus {
+    Occupied,
+    Tombstone,
 }
 ```
 

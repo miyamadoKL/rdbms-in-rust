@@ -135,6 +135,16 @@ pub mod physical_plan;
 ```
 
 `Scan`が`SeqScan`という具体的な名前に変わった以外、`LogicalPlan`とバリアントの構成は同じです。
+`src/physical_plan.rs`に、`SeqScan`が持つ情報を次の`SeqScanNode`として定義します。
+
+```rust
+pub struct SeqScanNode {
+    pub table_id: TableId,
+    pub table_name: String,
+    pub schema: Schema,
+}
+```
+
 `LogicalPlan`から`PhysicalPlan`への変換は、同じ`src/physical_plan.rs`に置く`optimize`という1つの関数が担います。
 
 ```rust
@@ -485,6 +495,15 @@ Volcanoの子として`INSERT`、`UPDATE`、`DELETE`を分解しなかった理�
 
 Lexerには`EXPLAIN`という予約語を1つ追加します(`Keyword::Explain`)。
 Parserは`EXPLAIN`の直後に、`SELECT`、`INSERT INTO`、`UPDATE`、`DELETE FROM`のいずれかだけを許します。
+`src/ast.rs`に、`EXPLAIN`文を表す`ExplainStatement`を次のように定義します。
+
+```rust
+pub struct ExplainStatement {
+    pub statement: Box<Statement>,
+    pub span: Span,
+}
+```
+
 `src/parser.rs`に次のメソッドを追加します。
 
 ```rust
@@ -567,6 +586,26 @@ Projection(name)
 ## テストで確認する
 
 各演算子の`next()`が実際に1行ずつ流れることは、`src/physical_plan.rs`に手作りの`CountingExecutor`(`next()`が呼ばれた回数を数える、テスト専用の葉演算子)を使って確認します。
+`src/physical_plan.rs`の`#[cfg(test)]`モジュールに、次のように定義します。
+
+```rust
+struct CountingExecutor {
+    schema: Schema,
+    rows: std::vec::IntoIter<Tuple>,
+    pulled: Rc<Cell<usize>>,
+}
+
+impl Executor for CountingExecutor {
+    fn output_schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn next(&mut self) -> DbResult<Option<Tuple>> {
+        self.pulled.set(self.pulled.get() + 1);
+        Ok(self.rows.next())
+    }
+}
+```
 
 ```rust
 #[test]
