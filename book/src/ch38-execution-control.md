@@ -475,6 +475,7 @@ pub fn join(mut self) {
 `src/server.rs`に次の`WaitOutcome`を定義します。
 
 ```rust
+#[derive(Debug)]
 enum WaitOutcome {
     Ready,
     Shutdown,

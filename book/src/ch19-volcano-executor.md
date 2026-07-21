@@ -138,6 +138,7 @@ pub mod physical_plan;
 `src/physical_plan.rs`に、`SeqScan`が持つ情報を次の`SeqScanNode`として定義します。
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub struct SeqScanNode {
     pub table_id: TableId,
     pub table_name: String,
@@ -145,7 +146,7 @@ pub struct SeqScanNode {
 }
 ```
 
-`LogicalPlan`から`PhysicalPlan`への変換は、同じ`src/physical_plan.rs`に置く`optimize`という1つの関数が担います。
+`LogicalPlan`から`PhysicalPlan`への変換は、`optimize`という1つの関数が担います。
 
 ```rust
 pub fn optimize(plan: LogicalPlan) -> PhysicalPlan {
@@ -498,6 +499,7 @@ Parserは`EXPLAIN`の直後に、`SELECT`、`INSERT INTO`、`UPDATE`、`DELETE F
 `src/ast.rs`に、`EXPLAIN`文を表す`ExplainStatement`を次のように定義します。
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExplainStatement {
     pub statement: Box<Statement>,
     pub span: Span,
@@ -586,7 +588,7 @@ Projection(name)
 ## テストで確認する
 
 各演算子の`next()`が実際に1行ずつ流れることは、`src/physical_plan.rs`に手作りの`CountingExecutor`(`next()`が呼ばれた回数を数える、テスト専用の葉演算子)を使って確認します。
-`src/physical_plan.rs`の`#[cfg(test)]`モジュールに、次のように定義します。
+その`#[cfg(test)]`モジュールに、次のように定義します。
 
 ```rust
 struct CountingExecutor {

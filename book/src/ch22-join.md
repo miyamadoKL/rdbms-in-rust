@@ -121,6 +121,7 @@ fn parse_join_clause(&mut self) -> DbResult<Option<JoinClause>> {
 `src/binder.rs`に、1個の`JOIN`の束縛結果を表す次の`BoundJoinStep`を定義します。
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundJoinStep {
     pub kind: JoinKind,
     pub condition: BoundExpr,
@@ -311,6 +312,7 @@ Projection(customers.name, orders.item)
 `src/physical_plan.rs`に、この2つのアルゴリズムに対応する次の`HashJoinNode`と`NestedLoopJoinNode`を定義します。
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub struct HashJoinNode {
     pub left: Box<PhysicalPlan>,
     pub right: Box<PhysicalPlan>,
@@ -319,6 +321,7 @@ pub struct HashJoinNode {
     pub condition: BoundExpr,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct NestedLoopJoinNode {
     pub left: Box<PhysicalPlan>,
     pub right: Box<PhysicalPlan>,
@@ -368,6 +371,7 @@ LogicalPlan::Join(join) => {
 `src/physical_plan.rs`に、列参照がどちら側に属するかを表す次の`Side`を定義します。
 
 ```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Side {
     Left,
     Right,

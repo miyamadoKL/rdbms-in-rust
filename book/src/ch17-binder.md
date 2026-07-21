@@ -100,6 +100,7 @@ BinaryOp {
 `BoundExpr`の全体は、`src/binder.rs`に次のように定義します。
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub enum BoundExpr {
     IntLiteral {
         value: i64,
@@ -241,6 +242,7 @@ fn resolve_table(&self, table: &Ident, alias: Option<&Ident>) -> DbResult<BoundT
 `resolve_table`が返す`BoundTableRef`を、`src/binder.rs`に次のように定義します。
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundTableRef {
     pub table_id: TableId,
     pub table_name: String,
@@ -385,6 +387,7 @@ minidb> SELECT id FROM users AS u WHERE users.id = 1;
 束縛済みの射影対象1個を表す`BoundSelectItem`を、`src/binder.rs`に次のように定義します。
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundSelectItem {
     pub expr: BoundExpr,
     pub output_name: String,
@@ -456,6 +459,7 @@ minidb> SELECT id FROM users WHERE 1;
 束縛の結果得られる`BoundStatement`を、`src/binder.rs`に次のように定義します。
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub enum BoundStatement {
     Select(BoundSelect),
     CreateTable(CreateTableStatement),
@@ -519,6 +523,7 @@ pub struct BoundInsert {
 同様に、`UPDATE`には`BoundUpdate`、`DELETE`には`BoundDelete`を、`src/binder.rs`に次のように定義します。
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundUpdate {
     pub table_id: TableId,
     pub table_name: String,
@@ -530,6 +535,7 @@ pub struct BoundUpdate {
 ```
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundDelete {
     pub table_id: TableId,
     pub table_name: String,
@@ -555,6 +561,7 @@ minidb> INSERT INTO users (id, id) VALUES (1, 2);
 `bind_assignment`が返す`BoundAssignment`を、`src/binder.rs`に次のように定義します。
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundAssignment {
     pub column_index: usize,
     pub value: BoundExpr,

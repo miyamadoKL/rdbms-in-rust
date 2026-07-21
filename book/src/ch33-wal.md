@@ -74,7 +74,8 @@ LSNは、`src/ids.rs`に次の`Lsn`として定義します。
 pub struct Lsn(pub u64);
 ```
 
-`src/wal.rs`では、この6種類を次の`LogRecordType`として表します。
+WALを扱うコードは、この章で新規作成する`src/wal.rs`にまとめます。
+まずは、この6種類を次の`LogRecordType`として表します。
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,8 +89,7 @@ pub enum LogRecordType {
 }
 ```
 
-WALを扱うコードは、この章で新規作成する`src/wal.rs`にまとめます。
-まずは、次の`LogRecord`を定義します。
+続けて、次の`LogRecord`を定義します。
 
 ```rust
 pub struct LogRecord {

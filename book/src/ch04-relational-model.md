@@ -215,7 +215,6 @@ impl Schema {
     }
 ```
 
-このほか、列の並びをそのまま返す`columns()`、列数を返す`len()`、空かどうかを返す`is_empty()`、列名から列定義そのものを引く`column()`も持たせています。
 `src/types.rs`の`impl Schema`に続けて加える、列名から列の索引を引く`index_of`が、以降の実装で中心になります。
 
 ```rust

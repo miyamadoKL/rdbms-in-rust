@@ -77,6 +77,7 @@ pub struct OrderByItem {
 `src/ast.rs`に、集約関数の種類を表す`AggregateFunc`を次のように定義します。
 
 ```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateFunc {
     Count,
     Sum,
@@ -238,6 +239,7 @@ fn rewrite_for_aggregate(
 `src/binder.rs`に、集約関数の呼び出し1個を表す`AggregateCall`を次のように定義します。
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub struct AggregateCall {
     pub func: AggregateFunc,
     pub arg: Option<Box<BoundExpr>>,
@@ -447,7 +449,7 @@ Volcanoモデルの`next()`は、呼ばれるたびにちょうど1行を返す�
 ### `HashAggregateExec`: グループごとの状態を`AggState`に持つ
 
 `src/physical_plan.rs`の`HashAggregateExec`は、`GROUP BY`が計算するグループ化キー(`Vec<Value>`)をハッシュテーブルの鍵にして、行を1件読むたびに該当するグループの状態を更新します。
-`src/physical_plan.rs`に、`HashAggregateExec`と、グループ1個ぶんの状態を持つ`AggState`を次のように定義します。
+`HashAggregateExec`と、グループ1個ぶんの状態を持つ`AggState`を次のように定義します。
 
 ```rust
 pub struct HashAggregateExec {

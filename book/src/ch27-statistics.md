@@ -613,6 +613,7 @@ MCVは「Histogramが空になった」時点で、この列の非NULLの値を�
 `src/estimator.rs`に次の`RangeOp`を定義します。
 
 ```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeOp {
     Gt,
     Ge,

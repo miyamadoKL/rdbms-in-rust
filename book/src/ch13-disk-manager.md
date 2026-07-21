@@ -485,7 +485,7 @@ pub struct Scan<'a> {
 }
 ```
 
-最後に、同じ`src/heap_file.rs`に定義する`scan`です。
+最後に定義する`scan`です。
 
 ```rust
 pub fn scan(&self) -> Scan<'_> {

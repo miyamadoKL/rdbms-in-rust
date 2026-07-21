@@ -339,6 +339,16 @@ pub struct DistinctNode {
 }
 ```
 
+並べ替えの1キーは、`src/logical_plan.rs`の`SortKey`が表します。
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortKey {
+    pub expr: BoundExpr,
+    pub desc: bool,
+}
+```
+
 `Sort`は`input`に並べ替えの`keys`を添えた`SortNode`です。
 
 ```rust

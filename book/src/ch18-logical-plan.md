@@ -161,6 +161,7 @@ pub struct UpdateNode {
     pub input: Box<LogicalPlan>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeleteNode {
     pub table_id: TableId,
     pub table_name: String,

@@ -185,11 +185,6 @@ struct DecodedCatalog {
     next_table_id: u64,
     tables: HashMap<TableId, TableEntry>,
     free_pages: Vec<PageId>,
-    /// 索引メタデータ(第24章)。索引名の重複が無いことは`decode_catalog`が
-    /// `Vec`へ積む時点で検査済み。
-    indexes: Vec<IndexInfo>,
-    /// 統計情報(第27章)。`ANALYZE`を実行していないテーブルはここに現れない。
-    stats: HashMap<TableId, TableStats>,
 }
 ```
 
@@ -304,8 +299,21 @@ for &page_id in &self.page_ids {
 `src/free_space_map.rs`に次の`FreeSpaceMap`を定義します。
 
 ```rust
+#[derive(Debug, Default)]
 pub struct FreeSpaceMap {
     free_bytes: HashMap<PageId, u16>,
+}
+```
+
+この構造体には、空のインスタンスを作る`new`も用意します。
+
+```rust
+impl FreeSpaceMap {
+    pub fn new() -> Self {
+        FreeSpaceMap {
+            free_bytes: HashMap::new(),
+        }
+    }
 }
 ```
 

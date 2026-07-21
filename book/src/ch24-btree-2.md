@@ -480,6 +480,7 @@ fn parse_create_statement(&mut self) -> DbResult<Statement> {
 `Parser`が組み立てる`CreateIndexStatement`を、`src/ast.rs`に次のように定義します。
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreateIndexStatement {
     pub unique: bool,
     pub index: Ident,
@@ -492,6 +493,7 @@ pub struct CreateIndexStatement {
 `Binder`が返す`BoundCreateIndex`を、`src/binder.rs`に次のように定義します。
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoundCreateIndex {
     pub index_name: String,
     pub table_name: String,
@@ -604,6 +606,28 @@ indexes × index_count:
 ```
 
 `src/storage.rs`の`Storage::open`は、このセクションを読んだあと、記録されている索引名それぞれについて対応するファイルを開き直します。
+
+索引のメタデータは、新規に作成する`src/index.rs`に`IndexInfo`として次のように定義します。
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexInfo {
+    pub name: String,
+    pub table_id: TableId,
+    pub column_index: usize,
+    pub column_name: String,
+    pub unique: bool,
+    pub primary_key: bool,
+    pub key_type: DataType,
+}
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod index;
+```
+
 この`HashMap`へ格納する`IndexEntry`を、`src/storage.rs`に次のように定義します。
 
 ```rust
@@ -824,8 +848,8 @@ pub fn insert(&mut self, key: &Value, rid: RecordId) -> DbResult<()> {
 
 ### 索引を使った一意性検査
 
-新しく`src/index.rs`を作ります。
-この`check_uniqueness_with_index`が、`crate::constraints::check_uniqueness`(第20章)の「候補行が既存の行と重複しないか」を確かめる部分を、索引への`lookup`に置き換えます。
+`src/index.rs`に、次の`check_uniqueness_with_index`を追加します。
+この関数が、`crate::constraints::check_uniqueness`(第20章)の「候補行が既存の行と重複しないか」を確かめる部分を、索引への`lookup`に置き換えます。
 
 ```rust
 pub fn check_uniqueness_with_index(
@@ -856,12 +880,6 @@ pub fn check_uniqueness_with_index(
     }
     Ok(())
 }
-```
-
-あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
-
-```rust
-pub mod index;
 ```
 
 `unique_index_for_column`が`None`を返すのは、`PRIMARY KEY`や`UNIQUE`の列に対応するはずのUNIQUE索引が見つからない場合です。

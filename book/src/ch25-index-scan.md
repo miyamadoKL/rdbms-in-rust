@@ -56,11 +56,13 @@ Index Scanに渡す側の情報は、`IndexScanNode`という構造体にまと�
 `src/physical_plan.rs`にこの2つを定義します。
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub enum IndexScanKind {
     Point(Value),
     Range { lower: Bound<Value>, upper: Bound<Value> },
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexScanNode {
     pub table_id: TableId,
     pub table_name: String,
@@ -91,6 +93,7 @@ Range探索では、`WHERE`に現れた下限と上限の候補を列ごとに�
 この一時状態を`RangeAccum`という構造体にして、`src/physical_plan.rs`に置きます。
 
 ```rust
+#[derive(Default)]
 struct RangeAccum {
     lower: Option<(usize, Bound<Value>)>,
     upper: Option<(usize, Bound<Value>)>,
@@ -421,6 +424,7 @@ fn index_scan_target(
 `src/physical_plan.rs`に次のとおり定義します。
 
 ```rust
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexNestedLoopJoinNode {
     pub left: Box<PhysicalPlan>,
     pub kind: JoinKind,
@@ -463,7 +467,7 @@ pub struct IndexNestedLoopJoinNode {
 内側テーブルの行は、外側の1行が来るたびに`outer_key`を評価し、その値で索引を`lookup`して初めて決まります。
 `HashJoinExec`のBuildのように内側の全行を先読みして`Vec`やハッシュテーブルへ積む段階は、`src/physical_plan.rs`に定義する`IndexNestedLoopJoinExec`の`next()`にはありません。
 
-この`IndexNestedLoopJoinExec`は、`src/physical_plan.rs`に次のとおり定義します。
+この`IndexNestedLoopJoinExec`は、次のとおりです。
 
 ```rust
 pub struct IndexNestedLoopJoinExec<'a> {

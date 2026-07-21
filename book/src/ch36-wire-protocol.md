@@ -302,7 +302,7 @@ pub struct Server {
 }
 ```
 
-この章で新しく作成する`src/server.rs`に、次の`Server::run`を実装します。
+続けて、次の`Server::run`を実装します。
 
 ```rust
 pub fn run(self) -> std::io::Result<()> {
@@ -500,13 +500,34 @@ match db.execute(input) {
 この章で新しく作成する`src/bin/minidb_client.rs`のCLIクライアントは、`Database::execute`の代わりに`Request`をフレームへ詰めて送り、返ってきた`Response`を表示します。
 バイナリ名を`minidb-client`にするため、`Cargo.toml`にも`name = "minidb-client"`、`path = "src/bin/minidb_client.rs"`という`[[bin]]`エントリを追加します。
 
-`src/bin/minidb_client.rs`は、`send`が返すエラーとして次の`ClientError`を定義します。
+`send`が返すエラーとして次の`ClientError`を定義します。
 
 ```rust
 #[derive(Debug)]
 enum ClientError {
     Protocol(minidb::ProtocolError),
     RequestIdMismatch { sent: u32, received: u32 },
+}
+```
+
+`?`によるエラー変換と`{e}`による表示のために、`Display`と`From<minidb::ProtocolError>`を次のように実装します。
+
+```rust
+impl fmt::Display for ClientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ClientError::Protocol(err) => write!(f, "{err}"),
+            ClientError::RequestIdMismatch { sent, received } => {
+                write!(f, "応答のrequest_idが一致しません: 送信は{sent}でしたが受信は{received}でした")
+            }
+        }
+    }
+}
+
+impl From<minidb::ProtocolError> for ClientError {
+    fn from(err: minidb::ProtocolError) -> Self {
+        ClientError::Protocol(err)
+    }
 }
 ```
 

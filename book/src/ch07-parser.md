@@ -246,7 +246,7 @@ pub mod parser;
 `src/parser.rs`の`Parser`に、次の基本操作を定義します。
 
 ```rust
-impl Parser {
+impl<'a> Parser<'a> {
     fn peek(&self) -> &Token {
         // `tokenize`が返すTokenの末尾は必ずEofなので、`pos`が配列末尾を
         // 超えることはない。
