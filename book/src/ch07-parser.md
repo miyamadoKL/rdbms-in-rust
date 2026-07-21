@@ -41,6 +41,38 @@ minidb> SELECT 1 + 2 * 3
 構文解析器が組み立てるASTは、`Statement`(文)と`Expr`(式)という2種類のノードからなります。
 この章では`src/ast.rs`を新規に作成し、AST関連の型をまとめて置きます。
 
+`UnaryOperator`は、単項演算子(`-x`や`NOT x`)を表す列挙型です。
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOperator {
+    /// `-x`
+    Negate,
+    /// `NOT x`
+    Not,
+}
+```
+
+`BinaryOperator`は、この処理系が対応する二項演算子をすべて列挙する型です。
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOperator {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    And,
+    Or,
+}
+```
+
 ```rust
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -115,7 +147,29 @@ pub mod ast;
 
 `Expr::ColumnRef`は`id`のような識別子が式として出てきたことだけを表し、名前を文字列として持つだけです。
 この`id`が本当にどれかのテーブルの列なのか、それとも存在しない名前なのかは、ASTの時点では判定しません。
-`CreateTableStatement`の列定義も同様で、`BIGINT`という型名を`Ident`として、つまりただの文字列として保持する`ColumnDef`を、同じ`src/ast.rs`に次のように定義します。
+
+`src/ast.rs`の`Ident`は、引用符で囲まれていない識別子を表す型で、テーブル名や列名がこの型で保持されます。
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ident {
+    pub name: String,
+    pub span: Span,
+}
+```
+
+`CreateTableStatement`は`CREATE TABLE`文を表す型で、テーブル名と列定義の並びを持ちます。
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTableStatement {
+    pub table: Ident,
+    pub columns: Vec<ColumnDef>,
+    pub span: Span,
+}
+```
+
+`CreateTableStatement`の列定義も同様で、`BIGINT`という型名を`Ident`として、つまりただの文字列として保持する`ColumnDef`を、次のように定義します。
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
@@ -189,7 +243,60 @@ struct Parser<'a> {
 pub mod parser;
 ```
 
-現在のトークンを覗く`peek`、1個読み進める`advance`、期待するキーワードや記号でなければエラーを返す`expect_keyword`、`expect_punct`、`expect_ident`という基本操作を用意し、これらを組み合わせて先頭のキーワードで分岐する`parse_statement`を、同じ`src/parser.rs`に次のように定義します。
+`src/parser.rs`の`Parser`に、次の基本操作を定義します。
+
+```rust
+impl<'a> Parser<'a> {
+    fn peek(&self) -> &Token {
+        // `tokenize`が返すTokenの末尾は必ずEofなので、`pos`が配列末尾を
+        // 超えることはない。
+        &self.tokens[self.pos]
+    }
+
+    fn peek_kind(&self) -> &TokenKind {
+        &self.peek().kind
+    }
+
+    fn advance(&mut self) -> Token {
+        let token = self.tokens[self.pos].clone();
+        if self.pos + 1 < self.tokens.len() {
+            self.pos += 1;
+        }
+        token
+    }
+
+    fn expect_keyword(&mut self, keyword: Keyword, label: &str) -> DbResult<Span> {
+        if let TokenKind::Keyword(k) = self.peek_kind()
+            && *k == keyword
+        {
+            Ok(self.advance().span)
+        } else {
+            Err(self.unexpected(label))
+        }
+    }
+
+    fn expect_punct(&mut self, expected: TokenKind, label: &str) -> DbResult<Span> {
+        if *self.peek_kind() == expected {
+            Ok(self.advance().span)
+        } else {
+            Err(self.unexpected(label))
+        }
+    }
+
+    fn expect_ident(&mut self) -> DbResult<Ident> {
+        match self.peek_kind() {
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                let span = self.advance().span;
+                Ok(Ident { name, span })
+            }
+            _ => Err(self.unexpected("識別子")),
+        }
+    }
+}
+```
+
+現在のトークンを覗く`peek`、1個読み進める`advance`、期待するキーワードや記号でなければエラーを返す`expect_keyword`、`expect_punct`、`expect_ident`という基本操作を用意し、これらを組み合わせて先頭のキーワードで分岐する`parse_statement`を、続けて次のように定義します。
 
 ```rust
 fn parse_statement(&mut self) -> DbResult<Statement> {

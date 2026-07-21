@@ -152,7 +152,18 @@ fn persist_catalog(&self) -> DbResult<()> {
 テーブルごとに専用のカタログエントリページを持たせるといった、カタログ自体を複数ページにまたがらせる構成は、この章では扱いません。
 章末の演習で考えます。
 
-`src/storage.rs`の`encode_catalog`は、テーブルを`TableId`の昇順で書き出します。
+続けて、次の`TableEntry`を定義します。
+
+```rust
+struct TableEntry {
+    info: TableInfo,
+    /// このテーブルが使っているデータページの一覧。第13章の`HeapFile::page_ids`と
+    /// 同じ役割だが、こちらはCatalogページを介して永続化されている。
+    page_ids: Vec<PageId>,
+}
+```
+
+続けて、`encode_catalog`は、テーブルを`TableId`の昇順で書き出します。
 
 ```rust
 let mut sorted: Vec<(&TableId, &TableEntry)> = tables.iter().collect();
@@ -167,7 +178,17 @@ sorted.sort_by_key(|(id, _)| id.0);
 このカーソルには1つだけ、`tuple_codec`より注意が必要な点があります。
 `table_count`、`column_count`、`page_count`のような「これから何個読むか」を宣言する値は、バイト列が壊れていれば根拠のない数字になりえます。
 
-`src/storage.rs`の`decode_catalog`は、次のようにこの値を読み取ります。
+続けて、次の`DecodedCatalog`を定義します。
+
+```rust
+struct DecodedCatalog {
+    next_table_id: u64,
+    tables: HashMap<TableId, TableEntry>,
+    free_pages: Vec<PageId>,
+}
+```
+
+続けて、`decode_catalog`は次のようにこの値を読み取ります。
 
 ```rust
 fn decode_catalog(bytes: &[u8]) -> DbResult<DecodedCatalog> {
@@ -274,6 +295,29 @@ for &page_id in &self.page_ids {
 
 この`FreeSpaceMap`は新しいモジュール`free_space_map`として独立させます。
 以降のコードは、新規作成する`src/free_space_map.rs`に置きます。
+
+続けて、次の`FreeSpaceMap`を定義します。
+
+```rust
+#[derive(Debug, Default)]
+pub struct FreeSpaceMap {
+    free_bytes: HashMap<PageId, u16>,
+}
+```
+
+この構造体には、空のインスタンスを作る`new`も用意します。
+
+```rust
+impl FreeSpaceMap {
+    pub fn new() -> Self {
+        FreeSpaceMap {
+            free_bytes: HashMap::new(),
+        }
+    }
+}
+```
+
+この`free_bytes`をもとに、`find_candidate`は次のように候補を絞り込みます。
 
 ```rust
 pub fn find_candidate(&self, candidates: &[PageId], needed: usize) -> Option<PageId> {

@@ -287,7 +287,26 @@ pub fn find(&self, key: &[u8]) -> Result<usize, usize> {
 `BTree`はページ1(ページ0はDiskManagerのFile Headerが占有します)をMetaページとして使い、現在のRootの`PageId`とキー型を持たせます。
 `Storage`(第15章)がCatalogページ専用に`PageType::Catalog`を新設したのとは対照的に、この章では新しいPage Typeを追加せず、既存の`PageType::Data`を転用します。
 Metaページが持つ情報は「Rootの`PageId`(8バイト)」と「キー型(1バイト)」の2値だけで、複数テーブルの定義という可変長のコレクションを持っていたCatalogページとは事情が異なるからです。
-`src/btree.rs`に、次の`BTree::create`を定義します。
+続けて、Leaf Pageの`payload`を書き込み用に借りる`LeafPage`という構造体を、次のように定義します。
+
+```rust
+pub struct LeafPage<'a> {
+    payload: &'a mut [u8],
+}
+```
+
+`src/btree.rs`が定義する`BTree`本体は、`pool`(`BufferPool`)、`root`(`PageId`)、`key_type`(`DataType`)、`unique`(`bool`)という4つのフィールドを持つ、次の構造体です。
+
+```rust
+pub struct BTree {
+    pool: BufferPool,
+    root: PageId,
+    key_type: DataType,
+    unique: bool,
+}
+```
+
+続けて、次の`BTree::create`を定義します。
 
 ```rust
 pub fn create(pool: BufferPool, key_type: DataType, unique: bool) -> DbResult<Self> {
@@ -314,6 +333,14 @@ pub fn create(pool: BufferPool, key_type: DataType, unique: bool) -> DbResult<Se
 `unique`の使い道が分かるまでは読み飛ばして構いません。
 
 作りたての`BTree`は、空のLeaf Page1枚だけを持つ、高さ1の木です。
+`src/btree_page.rs`は、Internal Pageの`payload`を読み取り専用で開く`InternalPageRef`という構造体も、次のように定義します。
+
+```rust
+pub struct InternalPageRef<'a> {
+    payload: &'a [u8],
+}
+```
+
 検索(`lookup`)は、Rootから葉までの経路を、`src/btree.rs`に定義する`find_leaf`で下ります。
 
 ```rust
@@ -350,6 +377,14 @@ pub fn child_for(&self, key: &[u8]) -> PageId {
         }
     }
     if lo == 0 { self.leftmost_child() } else { self.child_after(lo - 1) }
+}
+```
+
+続けて、Leaf Pageの`payload`を読み取り専用で開く`LeafPageRef`という構造体を、次のように定義します。
+
+```rust
+pub struct LeafPageRef<'a> {
+    payload: &'a [u8],
 }
 ```
 
@@ -490,6 +525,14 @@ fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbR
 「`separator`以上のキーは新しいページにある」という区切りキーの意味と、「新しいページの最小キーが`separator`そのもの」という実際の中身が、そのまま一致するからです。
 
 ### Internal Split
+
+`src/btree_page.rs`は、Internal Pageの`payload`を書き込み用に借りる`InternalPage`という構造体も、次のように定義します。
+
+```rust
+pub struct InternalPage<'a> {
+    payload: &'a mut [u8],
+}
+```
 
 `split_leaf`が返した`(区切りキー, 新しいページのId)`は、`path`から取り出した親のInternal Pageへ、Leaf Splitと同じ要領で挿入する`insert_into_internal`を、`src/btree.rs`に定義します。
 

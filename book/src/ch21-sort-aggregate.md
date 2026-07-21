@@ -74,6 +74,39 @@ pub struct OrderByItem {
 集約関数は少し特殊な扱いを要ります。
 `COUNT(*)`の`*`は、乗算演算子の`*`(`TokenKind::Star`)と同じトークンであり、`SELECT *`のワイルドカードとも同じトークンです。
 第7章の`parse_select_item`がすでに`SELECT`直後の`*`を先読みして`SelectItem::Wildcard`へ振り分けていたのと同じ理由で、`COUNT(...)`の中の`*`も通常の式として`parse_expr`に渡すわけにはいきません。
+続けて、集約関数の種類を表す`AggregateFunc`を次のように定義します。
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunc {
+    Count,
+    Sum,
+    Min,
+    Max,
+}
+
+impl AggregateFunc {
+    pub fn from_name(name: &str) -> Option<AggregateFunc> {
+        match name.to_ascii_uppercase().as_str() {
+            "COUNT" => Some(AggregateFunc::Count),
+            "SUM" => Some(AggregateFunc::Sum),
+            "MIN" => Some(AggregateFunc::Min),
+            "MAX" => Some(AggregateFunc::Max),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            AggregateFunc::Count => "COUNT",
+            AggregateFunc::Sum => "SUM",
+            AggregateFunc::Min => "MIN",
+            AggregateFunc::Max => "MAX",
+        }
+    }
+}
+```
+
 `AggregateFunc::from_name`で`COUNT`、`SUM`、`MIN`、`MAX`という名前を識別し、`parse_function_call`から専用の関数へ振り分けます。
 `src/parser.rs`に次の`parse_aggregate_call`を追加します。
 
@@ -203,6 +236,15 @@ fn rewrite_for_aggregate(
 書き換えた後の式は、`table_ordinal = 0`の`ColumnRef`になります。
 これは架空のテーブルではなく、`Aggregate`演算子が実際に生成する行の列を指します。
 `GROUP BY`の各式(先頭の列)に、集約関数呼び出し(残りの列)を続けた`Schema`を、`Binder`が`src/binder.rs`の`BoundAggregate`としてあらかじめ組み立てておくためです。
+続けて、集約関数の呼び出し1個を表す`AggregateCall`を次のように定義します。
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregateCall {
+    pub func: AggregateFunc,
+    pub arg: Option<Box<BoundExpr>>,
+}
+```
 
 ```rust
 pub struct BoundAggregate {
@@ -407,6 +449,26 @@ Volcanoモデルの`next()`は、呼ばれるたびにちょうど1行を返す�
 ### `HashAggregateExec`: グループごとの状態を`AggState`に持つ
 
 `src/physical_plan.rs`の`HashAggregateExec`は、`GROUP BY`が計算するグループ化キー(`Vec<Value>`)をハッシュテーブルの鍵にして、行を1件読むたびに該当するグループの状態を更新します。
+`HashAggregateExec`と、グループ1個ぶんの状態を持つ`AggState`を次のように定義します。
+
+```rust
+pub struct HashAggregateExec {
+    schema: Schema,
+    rows: std::vec::IntoIter<Tuple>,
+}
+
+struct AggState {
+    count: i64,
+    sum: Option<i64>,
+    extreme: Option<Value>,
+}
+
+impl AggState {
+    fn new() -> Self {
+        AggState { count: 0, sum: None, extreme: None }
+    }
+}
+```
 
 ```rust
 pub fn new(

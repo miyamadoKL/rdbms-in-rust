@@ -175,6 +175,20 @@ let stats = self.table_stats(info.id).ok_or_else(|| DbError::TableNotAnalyzed(ta
 `VACUUM [テーブル名]`は、この章がここまで温存してきたLazy Deleteの後始末を1つの文にまとめます。
 テーブル名を省略すると、カタログに登録されている全テーブルが対象になります。
 `src/storage.rs`の`Storage::vacuum_table`が、対象テーブル1つぶんの回収を担います。
+その結果は、次の`VacuumReport`という構造体にまとめて返します。
+
+```rust
+/// `Storage::vacuum_table`が1テーブルぶんの回収結果として返す要約
+/// (第39章)。`Database::execute_vacuum`のコマンドタグと、テストが回収の
+/// 効果を実測するために使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VacuumReport {
+    /// Free Page Listへ返した(完全に空になった)データページの枚数。
+    pub reclaimed_pages: usize,
+    /// 作り直した索引の本数。
+    pub rebuilt_indexes: usize,
+}
+```
 
 ```rust
 pub fn vacuum_table(&mut self, table_id: TableId) -> DbResult<VacuumReport> {
@@ -341,6 +355,18 @@ index_uses:orders_id_idx | 0
 索引が1本増えても`SHOW STATS`の列構成を変える必要はなく、`index_uses:<索引名>`という行が1つ増えるだけです。
 
 Buffer Poolのヒット率は、第14章から存在していた`BufferPool::stats`を`src/storage.rs`でそのまま公開しただけです。
+`BufferPool::stats`は、`src/buffer_pool.rs`に定義した次の`BufferPoolStats`を返します。
+
+```rust
+/// `read_page`・`write_page`のヒット/ミス回数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferPoolStats {
+    /// `page_table`にすでにページが載っていて、ディスクI/Oなしで返せた回数。
+    pub hits: u64,
+    /// `page_table`にページがなく、`DiskManager`から読み込んだ回数。
+    pub misses: u64,
+}
+```
 
 ```rust
 pub fn buffer_pool_stats(&self) -> BufferPoolStats {

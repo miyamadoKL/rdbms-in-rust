@@ -313,6 +313,21 @@ pub struct ResourceLimits {
 
 `src/session.rs`の`Session`は文を1本実行するたびに、`SharedDatabase`に設定された`ResourceLimits`を元に新しい`ExecutionContext`を作ります。
 
+続けて、次の`ExecutionSlot`を定義します。
+
+```rust
+struct ExecutionSlot {
+    cancel_flag: Arc<AtomicBool>,
+    checkpoints: Arc<AtomicUsize>,
+}
+
+impl ExecutionSlot {
+    fn fresh() -> Arc<Self> {
+        Arc::new(ExecutionSlot { cancel_flag: Arc::new(AtomicBool::new(false)), checkpoints: Arc::new(AtomicUsize::new(0)) })
+    }
+}
+```
+
 ```rust
 fn new_execution_context(&self) -> crate::cancellation::ExecutionContext {
     let slot = {
@@ -389,6 +404,15 @@ pub fn check_row_limit(&self, operator: &'static str, rows: usize) -> DbResult<(
 
 `src/server.rs`の`Server::shutdown_handle`が返す`ShutdownHandle`の`trigger`が、この手順の起点です。
 
+続けて、次の`ShutdownHandle`を定義します。
+
+```rust
+pub struct ShutdownHandle {
+    flag: Arc<AtomicBool>,
+    local_addr: SocketAddr,
+}
+```
+
 ```rust
 pub fn trigger(&self) {
     self.flag.store(true, Ordering::Release);
@@ -448,6 +472,17 @@ pub fn join(mut self) {
 
 `crate::server::handle_connection`(`src/server.rs`)の読み取りループは、次のフレームが届く前に定期的にシャットダウンフラグを確認します。
 
+続けて、次の`WaitOutcome`を定義します。
+
+```rust
+#[derive(Debug)]
+enum WaitOutcome {
+    Ready,
+    Shutdown,
+    Disconnected,
+}
+```
+
 ```rust
 fn wait_for_request_or_shutdown(stream: &mut TcpStream, shutdown: &AtomicBool) -> WaitOutcome {
     if stream.set_read_timeout(Some(POLL_INTERVAL)).is_err() {
@@ -474,6 +509,17 @@ fn wait_for_request_or_shutdown(stream: &mut TcpStream, shutdown: &AtomicBool) -
 ここで読み取りタイムアウトを外してしまうと、その待ちは無期限になり、シャットダウンフラグを二度と確認できません。
 
 そこで`src/server.rs`の`handle_connection`は、`Request::read`へ`stream`をそのまま渡さず、`ShutdownAwareReader`というラッパー越しに渡します。
+
+続けて、次の`ShutdownAwareReader`を定義します。
+
+```rust
+struct ShutdownAwareReader<'a> {
+    stream: &'a mut TcpStream,
+    shutdown: &'a AtomicBool,
+    #[cfg(test)]
+    stall_notify: Option<std::sync::mpsc::Sender<()>>,
+}
+```
 
 ```rust
 impl Read for ShutdownAwareReader<'_> {

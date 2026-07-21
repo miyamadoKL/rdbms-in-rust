@@ -122,7 +122,19 @@ fn value_to_tri(value: &Value) -> DbResult<Tri> {
 エラーメッセージには`Option<DataType>`のRust内部表現(`Some(BigInt)`)ではなく、`DataType`の`Display`実装によるSQLの型名(`BIGINT`)だけを表示します。
 `1 AND true`のような式を暗黙に`Boolean`へ変換して通す設計も選べますが、この章では暗黙変換を採らない方針(次節で改めて述べます)を通しています。
 
-`AND`と`OR`は、前節の`?`で崩れた規則を、`src/eval.rs`で9通りの組み合わせをすべて列挙するmatch式で書き直します。
+続けて、次の`tri_to_value`を定義します。
+
+```rust
+fn tri_to_value(tri: Tri) -> Value {
+    match tri {
+        Tri::True => Value::Boolean(true),
+        Tri::False => Value::Boolean(false),
+        Tri::Unknown => Value::Null,
+    }
+}
+```
+
+`AND`と`OR`は、前節の`?`で崩れた規則を、9通りの組み合わせをすべて列挙するmatch式で書き直します。
 
 ```rust
 fn tri_and(l: Tri, r: Tri) -> Tri {

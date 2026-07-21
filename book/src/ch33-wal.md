@@ -67,8 +67,29 @@ WALは、データファイルとは別のファイル(`<db_path>.wal`)に、追
 - **対象**：`TableId`と`RecordId`(第13章)の組
 - **Before Image**、**After Image**：書き換え前、書き換え後のタプルのバイト列
 
+LSNは、`src/ids.rs`に次の`Lsn`として定義します。
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Lsn(pub u64);
+```
+
 WALを扱うコードは、この章で新規作成する`src/wal.rs`にまとめます。
-まずは、次の`LogRecord`を定義します。
+まずは、この6種類を次の`LogRecordType`として表します。
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogRecordType {
+    Begin,
+    Insert,
+    Update,
+    Delete,
+    Commit,
+    Abort,
+}
+```
+
+続けて、次の`LogRecord`を定義します。
 
 ```rust
 pub struct LogRecord {
@@ -286,6 +307,16 @@ fn wal_commit_if_disk(backend: &Backend, tx_id: TransactionId, wal_last_lsn: Opt
 `SELECT`だけで終わったトランザクションには、そもそも同期して守るべき変更が無いためです。
 
 ### 明示的な`BEGIN`を伴わない1文も、それ自体が耐久性を持つ
+
+Diskバックエンドの`INSERT`、`UPDATE`、`DELETE`がWALへ書き込むための窓口は、`src/wal.rs`に次の`WalCursor`として用意します。
+
+```rust
+pub(crate) struct WalCursor<'a> {
+    wal: &'a Arc<Mutex<WalWriter>>,
+    txn_id: TransactionId,
+    prev_lsn: &'a mut Option<Lsn>,
+}
+```
 
 `BEGIN`を書かずに実行した1文(Autocommit)にも、`src/database.rs`に定義する次の`run_disk_dml`が同じ規律を適用します。
 

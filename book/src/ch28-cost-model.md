@@ -215,6 +215,23 @@ pub fn sort_cost(rows: u64) -> Cost {
 コストの計算式が揃ったところで、`physical_plan::optimize`の中身を書き換えます。第25章までの`optimize`は`storage`と`predicate`から1つの`AccessPath`をルールで決め打っていましたが、この章はまず候補をすべて`PhysicalPlan`として組み立ててから、コストで比較します。
 
 ここからは`src/physical_plan.rs`への追記です。
+
+候補どうしをコストで比べるには、行数の推定に使う統計情報を参照できなければなりません。
+`src/physical_plan.rs`に、次の`StatsLookup` traitを定義します。
+
+```rust
+/// `table_id`から[`TableStats`](第27章)を引ける、統計情報の抽象。
+///
+/// `crate::binder::CatalogLookup`と同じ考え方で、`Database`が`Backend::Memory`
+/// (プロセスのメモリ上だけの`HashMap`)と`Backend::Disk`(`Storage`が
+/// Catalogページへ永続化したもの)のどちらを使っていても、`estimate_rows`
+/// 自身はどちらのバックエンドかを意識しない。
+pub trait StatsLookup {
+    /// `table_id`の統計情報を引く。`ANALYZE`を実行していなければ`None`。
+    fn table_stats(&self, table_id: TableId) -> Option<&TableStats>;
+}
+```
+
 まず、複数の候補から最小コストのものを選ぶ`cheapest`を追加します。
 
 ```rust
@@ -296,6 +313,66 @@ fn choose_join_plan(
 
 これらを束ねる`src/physical_plan.rs`の`optimize`本体は、`storage`に加えて`stats: &dyn StatsLookup`(第27章)を受け取るようになりました。
 行数の推定にはこの`stats`を使います。
+
+`optimize`の中では、`Aggregate`、`Distinct`、`Sort`、`Limit`の4つも組み立てます。
+第21章で見たとおり`LogicalPlan`とほぼ同じ形のまま`PhysicalPlan`へ移る演算子で、それぞれ対応する構造体を定義します。
+
+```rust
+/// [`PhysicalPlan::Aggregate`]が持つ情報(第21章)。`LogicalPlan::Aggregate`と
+/// 同じ形。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregateNode {
+    pub input: Box<PhysicalPlan>,
+    pub group_by: Vec<BoundExpr>,
+    pub calls: Vec<AggregateCall>,
+    pub schema: Schema,
+}
+```
+
+`Distinct`は`input`だけを持つ`DistinctNode`です。
+
+```rust
+/// [`PhysicalPlan::Distinct`]が持つ情報(第21章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DistinctNode {
+    pub input: Box<PhysicalPlan>,
+}
+```
+
+並べ替えの1キーは、`src/logical_plan.rs`の`SortKey`が表します。
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortKey {
+    pub expr: BoundExpr,
+    pub desc: bool,
+}
+```
+
+`Sort`は`input`に並べ替えの`keys`を添えた`SortNode`です。
+
+```rust
+/// [`PhysicalPlan::Sort`]が持つ情報(第21章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortNode {
+    pub input: Box<PhysicalPlan>,
+    pub keys: Vec<SortKey>,
+}
+```
+
+`Limit`は`input`に`limit`と`offset`を添えた`LimitNode`です。
+
+```rust
+/// [`PhysicalPlan::Limit`]が持つ情報(第21章)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LimitNode {
+    pub input: Box<PhysicalPlan>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+```
+
+これらを踏まえた`optimize`本体の全体は次のとおりです。
 
 ```rust
 pub fn optimize(plan: LogicalPlan, storage: Option<&Storage>, stats: &dyn StatsLookup) -> PhysicalPlan {

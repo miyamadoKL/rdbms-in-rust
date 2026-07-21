@@ -129,6 +129,15 @@ Redoが冪等に振る舞える根拠は、突き詰めればこの1つの永続
 WALの記録を先頭から順に見ていき、トランザクションごとに「最後に書いたレコードのLSN」と「`Commit`か`Abort`をすでに見たかどうか」を追跡するだけです。
 
 この章はAnalysis、Redo、Undoをまとめて、新規モジュール`src/recovery.rs`として実装します。
+`TxState`は、次のようにトランザクションごとの状態を持ちます。
+
+```rust
+struct TxState {
+    last_lsn: Option<Lsn>,
+    resolved: bool,
+}
+```
+
 その中身は、次のように`TxState`を組み立てるところから始まります。
 
 ```rust
@@ -383,6 +392,15 @@ fn analysis_start(records: &[LogRecord]) -> (usize, Vec<(TransactionId, Option<L
 
 SQLの`CHECKPOINT`文は、現在Activeなトランザクションをすべてこの一覧として渡すだけの薄い入口です。
 通常のSQL経路の`self.tx`(高々1本)だけでなく、決定的インターリーブテストハーネス(第30章)の`harness_contexts`が同時に持ちうる複数のトランザクションも、両方ともこの一覧に含めます。
+`src/ast.rs`の`CheckpointStatement`は、次のように`CHECKPOINT`文を表します。
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckpointStatement {
+    pub span: Span,
+}
+```
+
 `src/database.rs`の`execute_checkpoint`は、次のようになっています。
 
 ```rust

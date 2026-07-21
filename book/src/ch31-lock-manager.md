@@ -128,6 +128,30 @@ struct LockEntry {
 }
 ```
 
+続けて、各キーの保持者と待ち行列をまとめて管理する`LockManager`を定義します。
+
+```rust
+pub struct LockManager<K: Eq + Hash + Clone> {
+    entries: HashMap<K, LockEntry>,
+}
+```
+
+ロックを1つも持たない空の`LockManager`は、次の`new`が作ります。
+
+```rust
+impl<K: Eq + Hash + Clone> Default for LockManager<K> {
+    fn default() -> Self {
+        LockManager { entries: HashMap::new() }
+    }
+}
+
+impl<K: Eq + Hash + Clone> LockManager<K> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+```
+
 ロックが解放されるたび、`src/lock_manager.rs`の`release_all`が待ち行列の先頭から順に昇格できるかどうかを再評価します。
 
 ```rust

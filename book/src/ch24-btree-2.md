@@ -159,7 +159,18 @@ fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbR
 Leaf間リンクが繋がったので、範囲検索を実装します。
 下限と上限という言い方をこの章でも使いますが、境界そのものには`std::ops::Bound`をそのまま使います。
 `Bound::Included`(以上または以下)、`Bound::Excluded`(より大きい、またはより小さい)、`Bound::Unbounded`(その側に制限なし)の3種類で、`col >= 100`は`Bound::Included`、`col > 100`は`Bound::Excluded`に対応します。
-この境界を受け取る`range`を、`src/btree.rs`に定義します。
+`range`の戻り値である`RangeScan`は、次の構造体として定義します。
+
+```rust
+pub struct RangeScan<'a> {
+    pool: &'a BufferPool,
+    key_type: DataType,
+    upper: Bound<Vec<u8>>,
+    current: Option<(PageId, usize)>,
+}
+```
+
+続けて、この境界を受け取る`range`を定義します。
 
 ```rust
 pub fn range<'a>(&'a self, lower: Bound<&Value>, upper: Bound<&Value>) -> DbResult<RangeScan<'a>> {
@@ -466,6 +477,33 @@ fn parse_create_statement(&mut self) -> DbResult<Statement> {
 
 `CREATE TABLE`が定義するのは新しいテーブル名と列名であるのに対し、`CREATE INDEX`が指定するテーブル名と列名は既存のカタログエントリを指す名前です(`DROP TABLE`の`table`と同じ立場)。
 そのため`src/binder.rs`の`Binder`(第17章)が、テーブルと列の存在確認と、`table_id`と`column_index`への解決を担当します。
+`Parser`が組み立てる`CreateIndexStatement`を、`src/ast.rs`に次のように定義します。
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndexStatement {
+    pub unique: bool,
+    pub index: Ident,
+    pub table: Ident,
+    pub column: Ident,
+    pub span: Span,
+}
+```
+
+`Binder`が返す`BoundCreateIndex`を、`src/binder.rs`に次のように定義します。
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundCreateIndex {
+    pub index_name: String,
+    pub table_name: String,
+    pub table_id: TableId,
+    pub column_name: String,
+    pub column_index: usize,
+    pub unique: bool,
+    pub span: Span,
+}
+```
 
 ```rust
 fn bind_create_index(&self, create: CreateIndexStatement) -> DbResult<BoundStatement> {
@@ -492,7 +530,7 @@ fn bind_create_index(&self, create: CreateIndexStatement) -> DbResult<BoundState
 }
 ```
 
-`index_exists`は、`src/binder.rs`の`CatalogLookup`(第17章)に加える新しいメソッドで、既定の実装は常に`false`を返します。
+続けて、`index_exists`は`CatalogLookup`(第17章)に加える新しいメソッドで、既定の実装は常に`false`を返します。
 
 ```rust
 pub trait CatalogLookup {
@@ -568,6 +606,36 @@ indexes × index_count:
 ```
 
 `src/storage.rs`の`Storage::open`は、このセクションを読んだあと、記録されている索引名それぞれについて対応するファイルを開き直します。
+
+索引のメタデータは、新規に作成する`src/index.rs`に`IndexInfo`として次のように定義します。
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexInfo {
+    pub name: String,
+    pub table_id: TableId,
+    pub column_index: usize,
+    pub column_name: String,
+    pub unique: bool,
+    pub primary_key: bool,
+    pub key_type: DataType,
+}
+```
+
+あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
+
+```rust
+pub mod index;
+```
+
+この`HashMap`へ格納する`IndexEntry`を、`src/storage.rs`に次のように定義します。
+
+```rust
+struct IndexEntry {
+    info: IndexInfo,
+    btree: BTree,
+}
+```
 
 ```rust
 let mut indexes = HashMap::new();
@@ -780,8 +848,8 @@ pub fn insert(&mut self, key: &Value, rid: RecordId) -> DbResult<()> {
 
 ### 索引を使った一意性検査
 
-新しく`src/index.rs`を作ります。
-この`check_uniqueness_with_index`が、`crate::constraints::check_uniqueness`(第20章)の「候補行が既存の行と重複しないか」を確かめる部分を、索引への`lookup`に置き換えます。
+`src/index.rs`に、次の`check_uniqueness_with_index`を追加します。
+この関数が、`crate::constraints::check_uniqueness`(第20章)の「候補行が既存の行と重複しないか」を確かめる部分を、索引への`lookup`に置き換えます。
 
 ```rust
 pub fn check_uniqueness_with_index(
@@ -812,12 +880,6 @@ pub fn check_uniqueness_with_index(
     }
     Ok(())
 }
-```
-
-あわせて`src/lib.rs`に次の1行を加え、このモジュールを公開します。
-
-```rust
-pub mod index;
 ```
 
 `unique_index_for_column`が`None`を返すのは、`PRIMARY KEY`や`UNIQUE`の列に対応するはずのUNIQUE索引が見つからない場合です。
