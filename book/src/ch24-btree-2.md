@@ -170,7 +170,7 @@ pub struct RangeScan<'a> {
 }
 ```
 
-この境界を受け取る`range`を、`src/btree.rs`に定義します。
+続けて、この境界を受け取る`range`を定義します。
 
 ```rust
 pub fn range<'a>(&'a self, lower: Bound<&Value>, upper: Bound<&Value>) -> DbResult<RangeScan<'a>> {
@@ -530,7 +530,7 @@ fn bind_create_index(&self, create: CreateIndexStatement) -> DbResult<BoundState
 }
 ```
 
-`index_exists`は、`src/binder.rs`の`CatalogLookup`(第17章)に加える新しいメソッドで、既定の実装は常に`false`を返します。
+続けて、`index_exists`は`CatalogLookup`(第17章)に加える新しいメソッドで、既定の実装は常に`false`を返します。
 
 ```rust
 pub trait CatalogLookup {

@@ -128,7 +128,7 @@ pub struct BoundJoinStep {
 }
 ```
 
-`src/binder.rs`の`Binder::bind_from`は、`FROM`の最初のテーブルを`resolve_table`で解決したあと、`joins`を先頭から順に処理します。
+続けて、`Binder::bind_from`は、`FROM`の最初のテーブルを`resolve_table`で解決したあと、`joins`を先頭から順に処理します。
 
 ```rust
 fn bind_from(&self, from: Option<&FromClause>) -> DbResult<(Vec<BoundTableRef>, Vec<BoundJoinStep>)> {
@@ -378,7 +378,7 @@ enum Side {
 }
 ```
 
-`src/physical_plan.rs`の`split_equi_join_keys`は、`ON`条件を`AND`で分解し、それぞれの項が「左側だけを参照する式 = 右側だけを参照する式」という形になっているかを調べます。
+続けて、`split_equi_join_keys`は、`ON`条件を`AND`で分解し、それぞれの項が「左側だけを参照する式 = 右側だけを参照する式」という形になっているかを調べます。
 
 ```rust
 fn split_equi_join_keys(condition: &BoundExpr, left_len: usize) -> Option<Vec<(BoundExpr, BoundExpr)>> {

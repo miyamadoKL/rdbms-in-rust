@@ -313,7 +313,7 @@ pub struct ResourceLimits {
 
 `src/session.rs`の`Session`は文を1本実行するたびに、`SharedDatabase`に設定された`ResourceLimits`を元に新しい`ExecutionContext`を作ります。
 
-`src/session.rs`に次の`ExecutionSlot`を定義します。
+続けて、次の`ExecutionSlot`を定義します。
 
 ```rust
 struct ExecutionSlot {
@@ -404,7 +404,7 @@ pub fn check_row_limit(&self, operator: &'static str, rows: usize) -> DbResult<(
 
 `src/server.rs`の`Server::shutdown_handle`が返す`ShutdownHandle`の`trigger`が、この手順の起点です。
 
-`src/server.rs`に次の`ShutdownHandle`を定義します。
+続けて、次の`ShutdownHandle`を定義します。
 
 ```rust
 pub struct ShutdownHandle {
@@ -472,7 +472,7 @@ pub fn join(mut self) {
 
 `crate::server::handle_connection`(`src/server.rs`)の読み取りループは、次のフレームが届く前に定期的にシャットダウンフラグを確認します。
 
-`src/server.rs`に次の`WaitOutcome`を定義します。
+続けて、次の`WaitOutcome`を定義します。
 
 ```rust
 #[derive(Debug)]
@@ -510,7 +510,7 @@ fn wait_for_request_or_shutdown(stream: &mut TcpStream, shutdown: &AtomicBool) -
 
 そこで`src/server.rs`の`handle_connection`は、`Request::read`へ`stream`をそのまま渡さず、`ShutdownAwareReader`というラッパー越しに渡します。
 
-`src/server.rs`に次の`ShutdownAwareReader`を定義します。
+続けて、次の`ShutdownAwareReader`を定義します。
 
 ```rust
 struct ShutdownAwareReader<'a> {

@@ -73,7 +73,7 @@ pub struct IndexScanNode {
 }
 ```
 
-`src/physical_plan.rs`に、次の`AccessPath`を追加します。
+続けて、次の`AccessPath`を追加します。
 
 ```rust
 enum AccessPath {
@@ -391,7 +391,7 @@ struct IndexJoinTarget {
 }
 ```
 
-この判定を行う`index_scan_target`を、`src/physical_plan.rs`に定義します。
+続けて、この判定を行う`index_scan_target`を定義します。
 
 ```rust
 fn index_scan_target(
@@ -438,7 +438,7 @@ pub struct IndexNestedLoopJoinNode {
 }
 ```
 
-`src/physical_plan.rs`の`optimize`の`Join`アームは、等値結合の鍵を取り出せた場合、まず`index_scan_target`を試し、それが失敗したときだけ`HashJoin`を組み立てます。
+続けて、`optimize`の`Join`アームは、等値結合の鍵を取り出せた場合、まず`index_scan_target`を試し、それが失敗したときだけ`HashJoin`を組み立てます。
 
 ```rust
                     match index_scan_target(storage, &right, &keys) {

@@ -236,7 +236,7 @@ fn rewrite_for_aggregate(
 書き換えた後の式は、`table_ordinal = 0`の`ColumnRef`になります。
 これは架空のテーブルではなく、`Aggregate`演算子が実際に生成する行の列を指します。
 `GROUP BY`の各式(先頭の列)に、集約関数呼び出し(残りの列)を続けた`Schema`を、`Binder`が`src/binder.rs`の`BoundAggregate`としてあらかじめ組み立てておくためです。
-`src/binder.rs`に、集約関数の呼び出し1個を表す`AggregateCall`を次のように定義します。
+続けて、集約関数の呼び出し1個を表す`AggregateCall`を次のように定義します。
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]

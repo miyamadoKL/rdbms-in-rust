@@ -306,7 +306,7 @@ pub struct BTree {
 }
 ```
 
-`src/btree.rs`に、次の`BTree::create`を定義します。
+続けて、次の`BTree::create`を定義します。
 
 ```rust
 pub fn create(pool: BufferPool, key_type: DataType, unique: bool) -> DbResult<Self> {
@@ -380,7 +380,7 @@ pub fn child_for(&self, key: &[u8]) -> PageId {
 }
 ```
 
-`src/btree_page.rs`は、Leaf Pageの`payload`を読み取り専用で開く`LeafPageRef`という構造体を、次のように定義します。
+続けて、Leaf Pageの`payload`を読み取り専用で開く`LeafPageRef`という構造体を、次のように定義します。
 
 ```rust
 pub struct LeafPageRef<'a> {

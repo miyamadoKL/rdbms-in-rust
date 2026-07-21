@@ -129,7 +129,7 @@ Redoが冪等に振る舞える根拠は、突き詰めればこの1つの永続
 WALの記録を先頭から順に見ていき、トランザクションごとに「最後に書いたレコードのLSN」と「`Commit`か`Abort`をすでに見たかどうか」を追跡するだけです。
 
 この章はAnalysis、Redo、Undoをまとめて、新規モジュール`src/recovery.rs`として実装します。
-`src/recovery.rs`の`TxState`は、次のようにトランザクションごとの状態を持ちます。
+`TxState`は、次のようにトランザクションごとの状態を持ちます。
 
 ```rust
 struct TxState {

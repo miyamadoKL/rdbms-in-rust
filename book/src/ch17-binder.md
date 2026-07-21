@@ -97,7 +97,7 @@ BinaryOp {
 },
 ```
 
-`BoundExpr`の全体は、`src/binder.rs`に次のように定義します。
+`BoundExpr`の全体は、次のように定義します。
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
@@ -205,7 +205,7 @@ impl CatalogLookup for Storage {
 }
 ```
 
-`Binder`本体を、`src/binder.rs`に次のように定義します。
+続けて、`Binder`本体を次のように定義します。
 
 ```rust
 pub struct Binder<'a> {
@@ -239,7 +239,7 @@ fn resolve_table(&self, table: &Ident, alias: Option<&Ident>) -> DbResult<BoundT
 }
 ```
 
-`resolve_table`が返す`BoundTableRef`を、`src/binder.rs`に次のように定義します。
+`resolve_table`が返す`BoundTableRef`を次のように定義します。
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
@@ -384,7 +384,7 @@ minidb> SELECT id FROM users AS u WHERE users.id = 1;
 ## `*`の展開と式の型検査をBinderへ統合する
 
 `SELECT *`の展開は、`src/binder.rs`の`bind_select`が射影対象リストを組み立てる中で行います。
-束縛済みの射影対象1個を表す`BoundSelectItem`を、`src/binder.rs`に次のように定義します。
+続けて、束縛済みの射影対象1個を表す`BoundSelectItem`を次のように定義します。
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
@@ -520,7 +520,7 @@ pub struct BoundInsert {
 }
 ```
 
-同様に、`UPDATE`には`BoundUpdate`、`DELETE`には`BoundDelete`を、`src/binder.rs`に次のように定義します。
+同様に、`UPDATE`には`BoundUpdate`、`DELETE`には`BoundDelete`を次のように定義します。
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
@@ -568,7 +568,7 @@ pub struct BoundAssignment {
 }
 ```
 
-`SET`の対象列を束縛する`bind_assignment`は、`src/binder.rs`に次のように定義します。
+続けて、`SET`の対象列を束縛する`bind_assignment`を次のように定義します。
 
 ```rust
 fn bind_assignment(&self, assignment: &Assignment, tables: &[BoundTableRef]) -> DbResult<BoundAssignment> {

@@ -656,7 +656,7 @@ fn insert_reuses_a_tombstoned_slot_id() {
 }
 ```
 
-`src/slotted_page.rs`に次の`SlotStatus`を定義します。
+続けて、次の`SlotStatus`を定義します。
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -666,7 +666,7 @@ pub enum SlotStatus {
 }
 ```
 
-`compact`の前後でタプルの中身が変わらないことは、その等価性そのものがコンパクションの正しさの定義なので、同じ`src/slotted_page.rs`で直接テストします。
+`compact`の前後でタプルの中身が変わらないことは、その等価性そのものがコンパクションの正しさの定義なので、直接テストします。
 
 ```rust
 #[test]

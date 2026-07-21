@@ -191,7 +191,7 @@ impl Schema {
     }
 ```
 
-`src/types.rs`の`Schema`に、次の4つのメソッドを定義します。
+続けて、`Schema`に次の4つのメソッドを定義します。
 
 ```rust
     /// 列の並びを返す。
@@ -215,7 +215,7 @@ impl Schema {
     }
 ```
 
-`src/types.rs`の`impl Schema`に続けて加える、列名から列の索引を引く`index_of`が、以降の実装で中心になります。
+`impl Schema`に続けて加える、列名から列の索引を引く`index_of`が、以降の実装で中心になります。
 
 ```rust
     /// 列名から列の索引を引く。見つからなければ`None`を返す。

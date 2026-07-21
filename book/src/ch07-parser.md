@@ -41,7 +41,7 @@ minidb> SELECT 1 + 2 * 3
 構文解析器が組み立てるASTは、`Statement`(文)と`Expr`(式)という2種類のノードからなります。
 この章では`src/ast.rs`を新規に作成し、AST関連の型をまとめて置きます。
 
-`src/ast.rs`の`UnaryOperator`は、単項演算子(`-x`や`NOT x`)を表す列挙型です。
+`UnaryOperator`は、単項演算子(`-x`や`NOT x`)を表す列挙型です。
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +53,7 @@ pub enum UnaryOperator {
 }
 ```
 
-`src/ast.rs`の`BinaryOperator`は、この処理系が対応する二項演算子をすべて列挙する型です。
+`BinaryOperator`は、この処理系が対応する二項演算子をすべて列挙する型です。
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,7 +158,7 @@ pub struct Ident {
 }
 ```
 
-`src/ast.rs`の`CreateTableStatement`は`CREATE TABLE`文を表す型で、テーブル名と列定義の並びを持ちます。
+`CreateTableStatement`は`CREATE TABLE`文を表す型で、テーブル名と列定義の並びを持ちます。
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
@@ -169,7 +169,7 @@ pub struct CreateTableStatement {
 }
 ```
 
-`CreateTableStatement`の列定義も同様で、`BIGINT`という型名を`Ident`として、つまりただの文字列として保持する`ColumnDef`を、同じ`src/ast.rs`に次のように定義します。
+`CreateTableStatement`の列定義も同様で、`BIGINT`という型名を`Ident`として、つまりただの文字列として保持する`ColumnDef`を、次のように定義します。
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
@@ -296,7 +296,7 @@ impl<'a> Parser<'a> {
 }
 ```
 
-現在のトークンを覗く`peek`、1個読み進める`advance`、期待するキーワードや記号でなければエラーを返す`expect_keyword`、`expect_punct`、`expect_ident`という基本操作を用意し、これらを組み合わせて先頭のキーワードで分岐する`parse_statement`を、同じ`src/parser.rs`に次のように定義します。
+現在のトークンを覗く`peek`、1個読み進める`advance`、期待するキーワードや記号でなければエラーを返す`expect_keyword`、`expect_punct`、`expect_ident`という基本操作を用意し、これらを組み合わせて先頭のキーワードで分岐する`parse_statement`を、続けて次のように定義します。
 
 ```rust
 fn parse_statement(&mut self) -> DbResult<Statement> {

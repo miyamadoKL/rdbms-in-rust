@@ -83,7 +83,7 @@ pub enum ProtocolError {
 }
 ```
 
-整数フィールドはすべて、ページファイル(第11章)やタプルのエンコード(`crate::tuple_codec`)と同じ、手書きのリトルエンディアン(`to_le_bytes`/`from_le_bytes`)で、`src/protocol.rs`に次のように書きます。
+整数フィールドはすべて、ページファイル(第11章)やタプルのエンコード(`crate::tuple_codec`)と同じ、手書きのリトルエンディアン(`to_le_bytes`/`from_le_bytes`)で、次のように書きます。
 
 ```rust
 fn write_raw_frame(writer: &mut impl Write, tag: u8, request_id: u32, payload: &[u8]) -> Result<(), ProtocolError> {
@@ -129,7 +129,7 @@ pub mod protocol;
 これを無条件に信用して`vec![0u8; payload_len as usize]`を確保すると、悪意のある、あるいは単に壊れたクライアントが`payload_len`に`u32::MAX`(4GiB弱)を書き込むだけで、受信側に4GiB近いメモリを確保させられます。
 この章では、`src/protocol.rs`の`read_raw_frame`が、`payload_len`が16MiB(`MAX_FRAME_PAYLOAD_LEN`)を超えるフレームを、ペイロードを1バイトも読まずに拒否します。
 
-`src/protocol.rs`の`RawFrame`は、フレームヘッダを読んだ直後の、まだ意味を解釈していない生のフレームです。
+続く`RawFrame`は、フレームヘッダを読んだ直後の、まだ意味を解釈していない生のフレームです。
 
 ```rust
 struct RawFrame {
@@ -194,7 +194,7 @@ Response::Rows { schema, rows } => {
 }
 ```
 
-`src/protocol.rs`の`Request`は、クライアントが送るリクエストを表す型です。
+続く`Request`は、クライアントが送るリクエストを表す型です。
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]

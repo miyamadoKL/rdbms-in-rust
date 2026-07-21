@@ -128,7 +128,7 @@ struct LockEntry {
 }
 ```
 
-各キーの保持者と待ち行列をまとめて管理する型が、`src/lock_manager.rs`に定義する`LockManager`です。
+続けて、各キーの保持者と待ち行列をまとめて管理する`LockManager`を定義します。
 
 ```rust
 pub struct LockManager<K: Eq + Hash + Clone> {

@@ -134,7 +134,7 @@ fn tri_to_value(tri: Tri) -> Value {
 }
 ```
 
-`AND`と`OR`は、前節の`?`で崩れた規則を、`src/eval.rs`で9通りの組み合わせをすべて列挙するmatch式で書き直します。
+`AND`と`OR`は、前節の`?`で崩れた規則を、9通りの組み合わせをすべて列挙するmatch式で書き直します。
 
 ```rust
 fn tri_and(l: Tri, r: Tri) -> Tri {

@@ -163,7 +163,7 @@ struct TableEntry {
 }
 ```
 
-`src/storage.rs`の`encode_catalog`は、テーブルを`TableId`の昇順で書き出します。
+続けて、`encode_catalog`は、テーブルを`TableId`の昇順で書き出します。
 
 ```rust
 let mut sorted: Vec<(&TableId, &TableEntry)> = tables.iter().collect();
@@ -188,7 +188,7 @@ struct DecodedCatalog {
 }
 ```
 
-`src/storage.rs`の`decode_catalog`は、次のようにこの値を読み取ります。
+続けて、`decode_catalog`は次のようにこの値を読み取ります。
 
 ```rust
 fn decode_catalog(bytes: &[u8]) -> DbResult<DecodedCatalog> {
@@ -296,7 +296,7 @@ for &page_id in &self.page_ids {
 この`FreeSpaceMap`は新しいモジュール`free_space_map`として独立させます。
 以降のコードは、新規作成する`src/free_space_map.rs`に置きます。
 
-`src/free_space_map.rs`に次の`FreeSpaceMap`を定義します。
+続けて、次の`FreeSpaceMap`を定義します。
 
 ```rust
 #[derive(Debug, Default)]
