@@ -159,7 +159,7 @@ fn split_leaf(&self, entries: &[(Vec<u8>, RecordId)], current_id: PageId) -> DbR
 Leaf間リンクが繋がったので、範囲検索を実装します。
 下限と上限という言い方をこの章でも使いますが、境界そのものには`std::ops::Bound`をそのまま使います。
 `Bound::Included`(以上または以下)、`Bound::Excluded`(より大きい、またはより小さい)、`Bound::Unbounded`(その側に制限なし)の3種類で、`col >= 100`は`Bound::Included`、`col > 100`は`Bound::Excluded`に対応します。
-`range`の戻り値である`RangeScan`は、`src/btree.rs`に次の構造体として定義します。
+`range`の戻り値である`RangeScan`は、次の構造体として定義します。
 
 ```rust
 pub struct RangeScan<'a> {

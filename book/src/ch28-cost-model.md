@@ -315,7 +315,7 @@ fn choose_join_plan(
 行数の推定にはこの`stats`を使います。
 
 `optimize`の中では、`Aggregate`、`Distinct`、`Sort`、`Limit`の4つも組み立てます。
-第21章で見たとおり`LogicalPlan`とほぼ同じ形のまま`PhysicalPlan`へ移る演算子で、`src/physical_plan.rs`にそれぞれ対応する構造体を定義します。
+第21章で見たとおり`LogicalPlan`とほぼ同じ形のまま`PhysicalPlan`へ移る演算子で、それぞれ対応する構造体を定義します。
 
 ```rust
 /// [`PhysicalPlan::Aggregate`]が持つ情報(第21章)。`LogicalPlan::Aggregate`と

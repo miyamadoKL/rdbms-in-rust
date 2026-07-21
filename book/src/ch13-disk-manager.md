@@ -475,7 +475,7 @@ pub fn update(&mut self, rid: RecordId, bytes: &[u8]) -> DbResult<Option<RecordI
 この設計のもとでは、`update`を呼び出す側は戻り値の`RecordId`を必ず以後のアクセスに使う必要があります。
 呼び出し側が戻り値を無視して元の`rid`を使い続けると、ページをまたぐ更新のときにその`rid`はもう存在しないレコードを指すことになります。
 
-同じ`src/heap_file.rs`に、`scan`が返す`Scan`という構造体を定義します。
+続けて、`scan`が返す`Scan`という構造体を定義します。
 
 ```rust
 pub struct Scan<'a> {

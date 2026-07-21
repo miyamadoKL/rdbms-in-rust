@@ -287,7 +287,7 @@ pub fn find(&self, key: &[u8]) -> Result<usize, usize> {
 `BTree`はページ1(ページ0はDiskManagerのFile Headerが占有します)をMetaページとして使い、現在のRootの`PageId`とキー型を持たせます。
 `Storage`(第15章)がCatalogページ専用に`PageType::Catalog`を新設したのとは対照的に、この章では新しいPage Typeを追加せず、既存の`PageType::Data`を転用します。
 Metaページが持つ情報は「Rootの`PageId`(8バイト)」と「キー型(1バイト)」の2値だけで、複数テーブルの定義という可変長のコレクションを持っていたCatalogページとは事情が異なるからです。
-`src/btree_page.rs`は、Leaf Pageの`payload`を書き込み用に借りる`LeafPage`という構造体を、次のように定義します。
+続けて、Leaf Pageの`payload`を書き込み用に借りる`LeafPage`という構造体を、次のように定義します。
 
 ```rust
 pub struct LeafPage<'a> {

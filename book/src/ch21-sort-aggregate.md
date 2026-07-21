@@ -74,7 +74,7 @@ pub struct OrderByItem {
 集約関数は少し特殊な扱いを要ります。
 `COUNT(*)`の`*`は、乗算演算子の`*`(`TokenKind::Star`)と同じトークンであり、`SELECT *`のワイルドカードとも同じトークンです。
 第7章の`parse_select_item`がすでに`SELECT`直後の`*`を先読みして`SelectItem::Wildcard`へ振り分けていたのと同じ理由で、`COUNT(...)`の中の`*`も通常の式として`parse_expr`に渡すわけにはいきません。
-`src/ast.rs`に、集約関数の種類を表す`AggregateFunc`を次のように定義します。
+続けて、集約関数の種類を表す`AggregateFunc`を次のように定義します。
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

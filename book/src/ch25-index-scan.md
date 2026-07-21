@@ -90,7 +90,7 @@ enum AccessPath {
 ```
 
 Range探索では、`WHERE`に現れた下限と上限の候補を列ごとにいったん貯めておく必要があります。
-この一時状態を`RangeAccum`という構造体にして、`src/physical_plan.rs`に置きます。
+この一時状態を`RangeAccum`という構造体にして置きます。
 
 ```rust
 #[derive(Default)]
@@ -378,7 +378,7 @@ Projection(id, amount, name)
 この章では、等値結合の鍵がちょうど1本で、かつ内側テーブルの結合列に索引があるときに限り、`HashJoin`より`IndexNestedLoopJoin`を優先します。
 
 この判定が見つけた内側テーブルの情報は、`IndexJoinTarget`という構造体にまとめます。
-`src/physical_plan.rs`に次のとおり定義します。
+続けて、次のとおり定義します。
 
 ```rust
 struct IndexJoinTarget {
@@ -421,7 +421,7 @@ fn index_scan_target(
 `JOIN`の右辺には`WHERE`が押し下げられない(前節と同じ理由)ため、この章では`right`が`Filter`を伴うことはなく、この条件は常に満たされます。
 
 `index_scan_target`が見つけた内側テーブルの情報を使って選ぶ物理演算子は、`IndexNestedLoopJoinNode`という構造体で表します。
-`src/physical_plan.rs`に次のとおり定義します。
+続けて、次のとおり定義します。
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]

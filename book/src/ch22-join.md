@@ -368,7 +368,7 @@ LogicalPlan::Join(join) => {
 
 ### 等値条件をハッシュキーへ分解する
 
-`src/physical_plan.rs`に、列参照がどちら側に属するかを表す次の`Side`を定義します。
+続けて、列参照がどちら側に属するかを表す次の`Side`を定義します。
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

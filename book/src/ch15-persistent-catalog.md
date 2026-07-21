@@ -152,7 +152,7 @@ fn persist_catalog(&self) -> DbResult<()> {
 テーブルごとに専用のカタログエントリページを持たせるといった、カタログ自体を複数ページにまたがらせる構成は、この章では扱いません。
 章末の演習で考えます。
 
-`src/storage.rs`に次の`TableEntry`を定義します。
+続けて、次の`TableEntry`を定義します。
 
 ```rust
 struct TableEntry {
@@ -178,7 +178,7 @@ sorted.sort_by_key(|(id, _)| id.0);
 このカーソルには1つだけ、`tuple_codec`より注意が必要な点があります。
 `table_count`、`column_count`、`page_count`のような「これから何個読むか」を宣言する値は、バイト列が壊れていれば根拠のない数字になりえます。
 
-`src/storage.rs`に次の`DecodedCatalog`を定義します。
+続けて、次の`DecodedCatalog`を定義します。
 
 ```rust
 struct DecodedCatalog {

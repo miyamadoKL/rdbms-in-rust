@@ -122,7 +122,7 @@ fn value_to_tri(value: &Value) -> DbResult<Tri> {
 エラーメッセージには`Option<DataType>`のRust内部表現(`Some(BigInt)`)ではなく、`DataType`の`Display`実装によるSQLの型名(`BIGINT`)だけを表示します。
 `1 AND true`のような式を暗黙に`Boolean`へ変換して通す設計も選べますが、この章では暗黙変換を採らない方針(次節で改めて述べます)を通しています。
 
-`src/eval.rs`に次の`tri_to_value`を定義します。
+続けて、次の`tri_to_value`を定義します。
 
 ```rust
 fn tri_to_value(tri: Tri) -> Value {

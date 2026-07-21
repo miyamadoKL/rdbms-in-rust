@@ -558,7 +558,7 @@ minidb> INSERT INTO users (id, id) VALUES (1, 2);
 `VALUES`は既存の行を参照する構文を持たないので、列参照が現れようが無く、`Binder`が解決すべき名前もそこにはありません。
 
 `UPDATE`、`DELETE`は、テーブル名の解決に加えて、`SET`の対象列と`WHERE`の述語を束縛します。
-`bind_assignment`が返す`BoundAssignment`を、`src/binder.rs`に次のように定義します。
+`bind_assignment`が返す`BoundAssignment`を、次のように定義します。
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]

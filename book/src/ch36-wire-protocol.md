@@ -159,7 +159,7 @@ fn read_raw_frame(reader: &mut impl Read) -> Result<RawFrame, ProtocolError> {
 このSQLサブセットの文や、この章までの結果セットが実用上収まる範囲に、余裕を持たせて選んだ目安です。
 章が進んで大きな結果セットのストリーミングを扱うようになれば、この定数は見直しの対象になります。
 
-`src/protocol.rs`の`Response`は、クライアントへ返す応答を表す型です。
+続く`Response`は、クライアントへ返す応答を表す型です。
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
