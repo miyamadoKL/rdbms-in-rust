@@ -90,7 +90,7 @@ enum AccessPath {
 ```
 
 Range探索では、`WHERE`に現れた下限と上限の候補を列ごとにいったん貯めておく必要があります。
-この一時状態を`RangeAccum`という構造体にして置きます。
+この一時状態を`RangeAccum`という構造体にまとめます。
 
 ```rust
 #[derive(Default)]
